@@ -2,10 +2,11 @@
 // faults); items are table positions n (each gives two words).
 //   "tables/<lg>"              the selected variant (gated)
 //   "tables@loop/<lg>"         the scalar model, the frontend's loop before this kernel
-//   "tables@<isa>.<K>/<lg>"    Chains on simd::Native (and Avx512Vl on AVX-512) with K vectors
-//                              per chain
+//   "tables@<isa>.<K>.<step>/<lg>"
+//                              each tier's Chains (select.hpp), at lg 6, 10, 14, 18, 22
 #include <cstddef>
 #include <cstdint>
+#include <set>
 #include <span>
 #include <string>
 #include <vector>
@@ -32,12 +33,15 @@ void add(bench::Suite& suite, const std::string& name, int lg, F f) {
     }, n);
 }
 
-template <class S, int K>
-void chains(bench::Suite& suite) {
-    using C = fps::factorials::Chains<S, K, P>;
-    for (int lg : {10, 14, 18, 22})
-        add(suite, std::string("tables@") + S::name + "." + std::to_string(K), lg,
-            [](u32* fact, u32* inverse, std::size_t n) { C::run(fact, inverse, n); });
+template <class T>
+void tier(bench::Suite& suite, std::set<std::string>& names) {
+    using fps::factorials::Step;
+    using C = fps::factorials::Chains<typename T::Isa, T::vectors, P, T::scan>;
+    const std::string name = std::string("tables@") + T::Isa::name + "." + std::to_string(T::vectors) +
+                             (T::scan == Step::shoup ? ".shoup" : ".montgomery");
+    if (!names.insert(name).second) return;
+    for (int lg : {6, 10, 14, 18, 22})
+        add(suite, name, lg, [](u32* fact, u32* inverse, std::size_t n) { C::run(fact, inverse, n); });
 }
 
 }  // namespace
@@ -52,10 +56,7 @@ int main(int argc, char** argv) {
         add(suite, "tables@loop", lg, [](u32* fact, u32* inverse, std::size_t n) {
             fps::factorials::model::tables<P>(fact, inverse, n);
         });
-    chains<fps::simd::Native, 2>(suite);
-    chains<fps::simd::Native, 4>(suite);
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
-    chains<fps::simd::Avx512Vl, 2>(suite);
-#endif
+    std::set<std::string> names;
+    [&]<class... T>(fps::factorials::Tiers<T...>) { (tier<T>(suite, names), ...); }(fps::factorials::Selected{});
     return suite.run();
 }

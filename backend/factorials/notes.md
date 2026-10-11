@@ -1,28 +1,32 @@
 # backend/factorials
 
 Tables fact[i] = i! and inverse[i] = 1 / i! modulo a prime P (2^12 < P < 2^30), i < n <= P,
-written into the caller's spans (`factorials.hpp`, API at the top). `select.hpp` picks the simd
-struct, vectors per chain and the size below which the scalar loop runs; `model.hpp` is that loop
-(the frontend's before this kernel) and the tests' reference; `transpose.hpp` holds the
-in-register transposes per vector type. The frontend's `Factorials` calls `tables` (issue #33).
+written into the caller's spans (`factorials.hpp`, API at the top). `select.hpp` picks the variant
+per target and size (tiers: simd struct, vectors per chain, chain product); `model.hpp` is the
+scalar loop (the frontend's before this kernel), run below the first tier, and the tests'
+reference; `transpose.hpp` holds the in-register lane moves per vector type (transposes, lane
+shifts). The frontend's `Factorials` calls `tables` (issue #33).
 
 ## Design
 
-`Chains<S, K, P>`: W = K S::lanes lanes, lane s covers positions [a_s, a_s + C). From lc-opt's
-product chains (`lib/poly/factorials.hpp`: `Chain`, `scan`, `scan_chunk`), rewritten on `simd`
-and `modarith` so one source runs on every target.
+`Chains<S, K, P, step>`: W = K S::lanes lanes, lane s covers positions [a_s, a_s + C). From
+lc-opt's product chains (`lib/poly/factorials.hpp`: `Chain`, `scan`, `scan_chunk`), rewritten on
+`simd` and `modarith` so one source runs on every target.
 
 - Lanes inside the tables: a_s = min(h + s C, n - C). The lanes past n - C all cover the last C
   positions (the same values, stored twice). So no lane reads a multiplier past n or writes past
   n: no scratch buffer and copy (the prototype's `factorials()` wrote 64 C words to scratch and
-  copied n of each table), and no n + 1024 <= P limit (lc-opt's). Any n >= 64 up to P.
+  copied n of each table), and no n + 1024 <= P limit (lc-opt's). Any n >= 4 S::lanes up to P.
 - Lanes aligned to fact (round 2): h < S::lanes is the words from fact to its next vector
   boundary, so every store of the lanes s < k = (n - h) / C into fact is aligned, and into
   inverse when it has fact's offset (two std::vectors of the same size do). Positions below h
   come from constant tables of i! and 1 / i!, i < 16; h! starts lane 0.
-- C = chunk(n): n / W rounded up to the vector length; from 64 on, a multiple of 16 with C / 16
-  odd (lc-opt's `scan_chunk`, against cache-set conflicts of the W streams). The rounding costs
-  at most 32 W positions of duplicate work.
+- C = chunk(n): n / W rounded up to the vector length; from 64 on, a multiple of 16, and one more
+  line (16 words) when m = C / 16 is a multiple of 512 / W (round 3). The W lanes start m lines
+  apart, so in a 64-set L1 they fall into 64 / gcd(m, 64) sets; the bump keeps it to at most 4
+  streams per set. lc-opt's `scan_chunk` bumped every even m, which at powers of two costs
+  16 W positions of duplicate work: 25% at n = 2^10 with 16 lanes. Never bumping is far worse
+  where m is a large power of two (Log).
 - Pass 1, lane products (a_s, a_s + C - 1], four factors per step (round 2): the first
   r = (C - 1) % 4 factors one by one, then x <- montgomery(x, g) with g = w (w + 1)(w + 2)(w + 3)
   in Montgomery form, w = a + r + 1 + 4j. g moves by its forward differences d1, d2, d3 (four
@@ -30,48 +34,70 @@ and `modarith` so one source runs on every target.
   G = z (z + 2) with z = w (w + 3), z(w + 4) = z(w) + 8w + 28, so G at w, w + 4, w + 8, w + 12 is
   5 Montgomery products per vector. Round 1 took two factors per step, lc-opt one. Lane k - 1
   also gives the product up to n - C (whole steps, then up to 3 scalar factors for that lane
-  only): the start of the lanes past it.
-- Scalar prefix over the lanes: last[s] = (a_s + C - 1)! = last[s - 1] a_s product[s];
-  first[s] = (a_s)! = last[s - 1] a_s. Since round 2 in groups of 4 lanes: prefixes within the
-  groups (independent chains), then each group times the previous group's last: k / 4 + 4
-  dependent products instead of k.
-- Pass 2: 1 / last[s] for all lanes at once, x^(P - 2) by right-to-left square and multiply in
-  Montgomery form (the square chain and the product chain overlap: 30 dependent steps, not 58).
-  lc-opt: Montgomery's batch inversion in scalar code.
+  only): the start of the lanes past it. The lane starts and the multipliers' bases are vector
+  ops (round 3; before, two scalar `% P` per lane: 31-65 ns of setup).
+- Pass 2, `starts` (round 3): first[s] = (a_s)! and 1 / last[s] = 1 / (a_s + C - 1)! in vector
+  registers. first is an exclusive prefix product over the lanes of g_s = (a_s + 1) ... (a_(s+1))
+  = product[s] (a_s + C) (h! shifted in at lane 0; the factor up to n - C at lane k - 1; 1 past
+  it), and 1 / last[s] = 1 / last[k - 1] times an exclusive suffix product of r_t = a_t
+  product[t] (lane t's own positions). Both in Montgomery form, log2(S::lanes) shifted products
+  within a vector (valignd, palignr, ext; Avx2 vpermd and a blend) and log2(K) across vectors.
+  One scalar exponentiation inverts last[k - 1] last[k] (the lanes past n - C all end at n - 1),
+  in scalar Montgomery form; two products split it. Before: k / 4 + 4 dependent scalar `% P`
+  products, ~4 k in all, then x^(P - 2) for all W lanes in vectors (150-230 ns: 30 steps of 4
+  contended vector products).
 - Pass 3, the scan: an up chain from (a_s)! times a_s + 1, a_s + 2, ... and a down chain from
-  1 / (a_s + C - 1)! times a_s + C - 1, a_s + C - 2, .... Multipliers in Montgomery form, so x holds
-  the plain product: m = base + u, u = j 2^32 mod P shared by all lanes (the down chain uses
-  base + P - u). x, m < 2P. Every S::lanes steps the chains' records form a block; an S::lanes x
-  S::lanes transpose turns it into vectors of consecutive positions, reduced below P and stored.
-  The chains of the next block are interleaved with the transposes and stores of the current one
-  (lc-opt's order); the last block is stored without running the chains past the end.
+  1 / (a_s + C - 1)! times a_s + C - 1, a_s + C - 2, .... x < 2P. Two chain products (`Step`):
+  - montgomery: the multiplier in Montgomery form, m = base + u, u = j 2^32 mod P shared by all
+    lanes (the down chain uses base + P - u). x holds the plain product.
+  - shoup (round 3): x m - floor(x q / 2^32) P with m plain, m = base + j, and
+    q = floor(base 2^32 / P) + floor(j 2^32 / P) (down: base - j, the difference of the two minus
+    1). The sum of two floors is floor(m 2^32 / P) or one less; with x < 2^31 the result is still
+    in [0, 2P). floor(j 2^32 / P) = -(j 2^32 mod P) P^-1 mod 2^32: one mul_lo per step for all
+    lanes. Per chain vector and step: mul_lo, mulhi, mul_sub and 2 adds; on Neon with SVE2 one
+    umulh, mul, mls (Montgomery: 2 mul, 2 umulh), on x86 4 multiplies instead of 6.
+  Every S::lanes steps the chains' records form a block; an S::lanes x S::lanes transpose turns
+  it into vectors of consecutive positions, reduced below P and stored. The chains of the next
+  block are interleaved with the transposes and stores of the current one (lc-opt's order); the
+  last block is stored without running the chains past the end.
 - Code: `[[gnu::flatten]]` on each pass and `unrolled<N>` (index sequences) keep every lambda
   and modarith call inline and every block index constant. Without them GCC 15 kept the scan's
   lambdas as calls and the transposes as loops over stack arrays: scan 0.83-0.86 ns per position
-  against 0.53-0.65 (`lc-bench`, avx2, K = 2 and 4).
-- Selection (`select.hpp`): S = simd::Native (zmm on `avx512` and `zen5`), K = 2 on x86, 4 on Neon
-  and Scalar. The loop below n = 64 (Zen 3, Neoverse V2), 96 (Zen 5), 128 (Emerald Rapids and any
-  other AVX-512 target). ymm (Avx512Vl) with K = 2, 16 lanes, from n = 2^19 on `avx512` and
-  5 2^20 on `zen5`, where zmm's 32 lanes (64 write streams) stall on memory (Log). Round 2
-  checked it again with aligned lanes: still right on Emerald Rapids for fresh tables (Log).
+  against 0.53-0.65 (`lc-bench`, avx2, K = 2 and 4). Lane moves are per-ISA intrinsics, not
+  `S::permute`: GCC built Neon's `tbl` index tables at run time on every call (round 3, Log).
+- Selection (`select.hpp`, round 3): tiers per target, from n:
+
+  | Target | Tiers (struct.K.step from n) |
+  |---|---|
+  | `avx2` (Zen 3) | Avx2.1.shoup 32, Avx2.2.shoup 2048 |
+  | `avx512` (Emerald Rapids) | Avx512Vl.1.mont 32, Avx512Vl.2.mont 256, Avx512.2.mont 1024, Avx512Vl.2.mont 2^19 |
+  | `zen5` | Avx2.1.shoup 32, Avx2.2.shoup 256, Avx512.2.mont 2048, Avx2.2.shoup 5 2^20 |
+  | `arm` (Neoverse V2) | Neon.2.shoup 32, Neon.4.shoup 1280 |
+  | `sse`, `scalar` | Sse.2.shoup 32; Scalar.4.mont 64 (not timed) |
+
+  Fewer lanes win at small n: less duplicate work (C is at least the vector length, so W C >= W
+  S::lanes positions) and fewer lanes to start. zmm (32 lanes, 64 write streams) stalls on memory
+  from 2^19 on Emerald Rapids and 5 2^20 on Zen 5 (rounds 1, 2). Shoup wins on Zen 3, Neoverse V2
+  and Zen 5's ymm; Montgomery on Emerald Rapids (vpmulld is 2 uops) and Zen 5's zmm (Log).
 
 ## Tests
 
 `test.cpp`: the model against the definition (fact[i] = fact[i - 1] i, fact[i] inverse[i] = 1);
-then `Chains` on every simd struct the machine can run with K = 2, 4, 8, and the selected
-`tables`, against the model: every n up to 1100, 2^k - 1, 2^k, 2^k + 1 up to 2^20, both sides of
-every change of C up to 2^14 (so every count of collapsed lanes), 20 random n, n = P - 1 and P
-for P = 4099 and 65537 (where the last multiplier is P = 0 mod P), and P = 1073741789 (the
-largest prime below 2^30). Guard words after n must stay untouched. Mutations caught: a lane
-start one lower, the wrong factor for the collapsed lanes, a chain stopped a block early, the down
-chain's base off by one. Placements (round 2): on fewer sizes (every n up to 300, both sides of
+then `Chains` on every simd struct the machine can run, K = 1 (round 3), 2, 4, 8, both chain
+products, and the selected `tables`, against the model: every n from 4 S::lanes up to 1100,
+2^k - 1, 2^k, 2^k + 1 up to 2^20, both sides of every change of C up to 2^14 (so every count of
+collapsed lanes), 20 random n, n = P - 1 and P for P = 4099 and 65537 (where the last multiplier is
+P = 0 mod P), and P = 1073741789 (the largest prime below 2^30). Guard words after n must stay
+untouched. Mutations caught: a lane start one lower, the wrong factor for the collapsed lanes, a
+chain stopped a block early, the down chain's base off by one, the down chain's Shoup quotient
+without its - 1 (round 3). Placements (round 2): on fewer sizes (every n up to 300, both sides of
 each change of C up to 2^12, powers of two and neighbours from 2^9 to 2^17, 8 random n), K = 2,
 tables at word offsets (1, 1), (4, 4), (12, 12), (15, 15), (0, 8), (3, 13), (9, 2) from a 64-byte
 boundary, so every h and both equal and different offsets; words before the tables must stay
-untouched too. Passes at -O2 and ASan/UBSan on `lc-amd` (scalar, sse, avx2),
-`lc-intel-test` (avx512), `lc-zen5` (round 2: `lc-zen5-test`), `lc-arm` and the Mac (scalar,
-arm). The frontend's `test_factorials.cpp` runs the kernel through `Factorials` and through
-`detail::factorial_tables` for every n <= 4099 at P = 4099.
+untouched too. The selected `tables` also at 5 2^20 + 17 (Zen 5's last tier). Passes at -O2 and
+ASan/UBSan on `lc-amd` (scalar, sse, avx2), `lc-intel-test` (avx512), `lc-zen5-test`, `lc-arm`
+and the Mac (scalar, arm). The frontend's `test_factorials.cpp` runs the kernel through
+`Factorials` and through `detail::factorial_tables` for every n <= 4099 at P = 4099.
 
 ## Measurements
 

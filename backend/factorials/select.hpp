@@ -1,58 +1,64 @@
-// The factorials variant per target and size n:
-//   n < kMinChains                 the scalar loop (model.hpp)
-//   kMinChains <= n < kMinLarge    Chains<Isa, kVectors, P>
-//   kMinLarge <= n                 Chains<IsaLarge, kVectorsLarge, P>: fewer lanes, so fewer
-//                                  write streams, where many streams stall on memory
-// -DFPS_FACTORIALS_ISA=<struct>, -DFPS_FACTORIALS_VECTORS=<K> and -DFPS_FACTORIALS_MIN_CHAINS=<n>
-// force them (a forced struct runs at every size). Measurements: notes.md.
+// The factorials variant per target and size n: the scalar loop (model.hpp) below the first tier,
+// then Chains<S, K, P, step> of the last tier whose min_size <= n. Fewer lanes (W = K S::lanes)
+// win at small n: less duplicate work and fewer lanes to start. Measurements: notes.md.
+// -DFPS_FACTORIALS_ISA=<struct>, -DFPS_FACTORIALS_VECTORS=<K>, -DFPS_FACTORIALS_STEP=<step> and
+// -DFPS_FACTORIALS_MIN_CHAINS=<n> force one tier from n on (defaults 2, shoup, 64).
 #pragma once
 
 #include <cstddef>
-#include <limits>
 
 #include "backend/simd/select.hpp"
 
 namespace fps::factorials {
 
+// The scan's chain product (Chains): Montgomery with the multiplier in Montgomery form, or Shoup
+// with the multiplier plain and its quotient stepped along.
+enum class Step { montgomery, shoup };
+
+template <class S, int K, Step step, std::size_t from>
+struct Tier {
+    using Isa = S;
+    static constexpr int vectors = K;
+    static constexpr Step scan = step;
+    static constexpr std::size_t min_size = from;
+};
+template <class... T>  // ascending min_size
+struct Tiers {};
+
 #if defined(FPS_FACTORIALS_ISA)
-using Isa = simd::FPS_FACTORIALS_ISA;
-#else
-using Isa = simd::Native;
+#if !defined(FPS_FACTORIALS_VECTORS)
+#define FPS_FACTORIALS_VECTORS 2
 #endif
-
-#if defined(FPS_FACTORIALS_VECTORS)
-inline constexpr int kVectors = FPS_FACTORIALS_VECTORS;
-#else
-// x86: 2 (4 was 10-30% slower in the scan pass); Neon (4 lanes, 32 registers) and Scalar: 4.
-inline constexpr int kVectors = Isa::lanes == 1 || (Isa::lanes == 4 && Isa::registers == 32) ? 4 : 2;
+#if !defined(FPS_FACTORIALS_STEP)
+#define FPS_FACTORIALS_STEP shoup
 #endif
-
-// chains / loop time at the threshold and below it.
-#if defined(FPS_FACTORIALS_MIN_CHAINS)
-inline constexpr std::size_t kMinChains = FPS_FACTORIALS_MIN_CHAINS;
+#if !defined(FPS_FACTORIALS_MIN_CHAINS)
+#define FPS_FACTORIALS_MIN_CHAINS 64
+#endif
+using Selected = Tiers<Tier<simd::FPS_FACTORIALS_ISA, FPS_FACTORIALS_VECTORS, Step::FPS_FACTORIALS_STEP,
+                            FPS_FACTORIALS_MIN_CHAINS>>;
 #elif defined(__znver5__)
-inline constexpr std::size_t kMinChains = 96;  // Zen 5: 0.88 at 96, 1.28 at 64
-#elif defined(__AVX512F__)
-inline constexpr std::size_t kMinChains = 128;  // Emerald Rapids: 0.90 at 128, 1.17 at 96
+// Zen 5. ymm: Shoup, Avx2 (1-4% ahead of Avx512Vl); zmm: Montgomery (Shoup 5-11% slower from
+// 2^14). zmm's 32 lanes stall on memory from 5 2^20 on (round 1; 2^23: 0.47 against ymm 0.43).
+using Selected = Tiers<Tier<simd::Avx2, 1, Step::shoup, 32>, Tier<simd::Avx2, 2, Step::shoup, 256>,
+                       Tier<simd::Avx512, 2, Step::montgomery, 2048>,
+                       Tier<simd::Avx2, 2, Step::shoup, std::size_t(5) << 20>>;
+#elif defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+// Emerald Rapids: Montgomery (Shoup 4-6% slower: vpmulld is 2 uops). zmm's 32 lanes stall on
+// memory from 2^19 on, by the tables' placement (rounds 1 and 2).
+using Selected = Tiers<Tier<simd::Avx512Vl, 1, Step::montgomery, 32>, Tier<simd::Avx512Vl, 2, Step::montgomery, 256>,
+                       Tier<simd::Avx512, 2, Step::montgomery, 1024>,
+                       Tier<simd::Avx512Vl, 2, Step::montgomery, std::size_t(1) << 19>>;
+#elif defined(__AVX2__)
+// Zen 3: Shoup.
+using Selected = Tiers<Tier<simd::Avx2, 1, Step::shoup, 32>, Tier<simd::Avx2, 2, Step::shoup, 2048>>;
+#elif defined(__SSE4_1__)
+using Selected = Tiers<Tier<simd::Sse, 2, Step::shoup, 32>>;
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+// Neoverse V2: Shoup (umulh, mul, mls with SVE2).
+using Selected = Tiers<Tier<simd::Neon, 2, Step::shoup, 32>, Tier<simd::Neon, 4, Step::shoup, 1280>>;
 #else
-inline constexpr std::size_t kMinChains = 64;  // Zen 3: 0.93, Neoverse V2: 0.85 at 64
-#endif
-
-// zmm with 32 lanes (64 streams) against ymm with 16 lanes, ns per position: Emerald Rapids
-// 0.45-0.49 or 0.71-0.83 (by the tables' placement) from 2^18 on, against 0.54-0.62; Zen 5
-// 0.37-0.47 against 0.50 up to 2^22, 0.55-0.72 against 0.50-0.54 from 5 2^20 on.
-#if !defined(FPS_FACTORIALS_ISA) && defined(__znver5__)
-using IsaLarge = simd::Avx512Vl;
-inline constexpr int kVectorsLarge = 2;
-inline constexpr std::size_t kMinLarge = std::size_t(5) << 20;
-#elif !defined(FPS_FACTORIALS_ISA) && defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
-using IsaLarge = simd::Avx512Vl;
-inline constexpr int kVectorsLarge = 2;
-inline constexpr std::size_t kMinLarge = std::size_t(1) << 19;
-#else
-using IsaLarge = Isa;
-inline constexpr int kVectorsLarge = kVectors;
-inline constexpr std::size_t kMinLarge = std::numeric_limits<std::size_t>::max();
+using Selected = Tiers<Tier<simd::Scalar, 4, Step::montgomery, 64>>;
 #endif
 
 }  // namespace fps::factorials
