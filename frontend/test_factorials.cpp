@@ -10,6 +10,7 @@
 #include <random>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "fps/fps.hpp"
@@ -59,12 +60,30 @@ void test_small_prime() {
     check(fact[Q - 1] == Q - 1, "(Q - 1)! = -1", Q, Q, Q - 1);
 }
 
-void test_tables(std::size_t n) {
-    const fps::Factorials<P> fact(n);
+void check_factorials(const fps::Factorials<P>& fact, std::size_t n) {
     check(fact.size() == n, "size", P, n, 0);
     std::vector<u32> f(n), inverse(n);
     for (std::size_t i = 0; i < n; ++i) f[i] = fact[i], inverse[i] = fact.inverse(i);
     check_tables<P>(f, inverse);
+}
+
+// The tables, then copies and moves of them (copy and move construction and assignment, and
+// self-assignment). A table entry the kernel does not write fails: i! != 0 for i < P.
+void test_tables(std::size_t n) {
+    fps::Factorials<P> fact(n);
+    check_factorials(fact, n);
+    fps::Factorials<P> copy(fact), assigned(3);
+    assigned = fact;
+    check_factorials(copy, n);
+    check_factorials(assigned, n);
+    auto& self = assigned;
+    assigned = self;
+    check_factorials(assigned, n);
+    fps::Factorials<P> moved(std::move(copy)), move_assigned(5);
+    move_assigned = std::move(assigned);
+    check_factorials(moved, n);
+    check_factorials(move_assigned, n);
+    check_factorials(fact, n);
 }
 
 // C(m, k) = m (m - 1) ... (m - k + 1) / k!, for m < P.

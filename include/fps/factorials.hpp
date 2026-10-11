@@ -8,17 +8,17 @@
 //
 // P = 998244353 only in v1 (DESIGN.md, Moduli); other P fail to compile. Indices are not checked,
 // as in std::vector's operator[]. The tables are const once built, so any number of threads may
-// read them. Building takes O(n) time and 8 n bytes.
+// read them. Building takes O(n) time and 8 n bytes; the tables are written once, by the backend.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
 #include <span>
 #include <stdexcept>
-#include <vector>
 
 #include "backend/factorials/factorials.hpp"
 #include "fps/modular.hpp"
+#include "fps/words.hpp"
 
 namespace fps {
 
@@ -40,19 +40,21 @@ class Factorials {
     static_assert(P == 998244353, "fps: v1 supports P = 998244353 only (DESIGN.md, Moduli)");
 
 public:
-    explicit Factorials(std::size_t n) : fact_(checked(n)), inverse_(n) {
-        detail::factorial_tables<P>(fact_, inverse_);
+    explicit Factorials(std::size_t n) : fact_(checked(n), kUnwritten), inverse_(n, kUnwritten) {
+        detail::factorial_tables<P>({fact_.data(), n}, {inverse_.data(), n});
     }
 
     std::size_t size() const { return fact_.size(); }
-    std::uint32_t operator[](std::size_t i) const { return fact_[i]; }
-    std::uint32_t inverse(std::size_t i) const { return inverse_[i]; }
+    std::uint32_t operator[](std::size_t i) const { return fact_.data()[i]; }
+    std::uint32_t inverse(std::size_t i) const { return inverse_.data()[i]; }
 
     std::uint32_t binomial(std::size_t n, std::size_t k) const {
-        return k > n ? 0 : mod_mul<P>(fact_[n], mod_mul<P>(inverse_[k], inverse_[n - k]));
+        return k > n ? 0 : mod_mul<P>((*this)[n], mod_mul<P>(inverse(k), inverse(n - k)));
     }
 
 private:
+    static constexpr detail::Words::Unwritten kUnwritten{};
+
     // i! for i < P is a product of nonzero residues, so it has an inverse; P! = 0 has none.
     // Checked before the tables are allocated.
     static std::size_t checked(std::size_t n) {
@@ -60,7 +62,7 @@ private:
         return n;
     }
 
-    std::vector<std::uint32_t> fact_, inverse_;  // i!, 1 / i!; values in [0, P)
+    detail::Words fact_, inverse_;  // i!, 1 / i!; values in [0, P)
 };
 
 }  // namespace fps
