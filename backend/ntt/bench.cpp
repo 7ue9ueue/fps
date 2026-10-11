@@ -44,13 +44,13 @@ void add_cases(bench::Suite& suite, const std::string& suffix, int max_lg) {
         const std::string size = "/" + std::to_string(lg);
         suite.add("forward" + suffix + size, [lg] {
             return [t = std::make_shared<Transform>(lg), f = std::make_shared<Words>(std::size_t(1) << lg)] {
-                t->forward<Forward>(f->begin());
+                t->template forward<Forward>(f->begin());
                 bench::keep(*f->begin());
             };
         }, len);
         suite.add("inverse" + suffix + size, [lg] {
             return [t = std::make_shared<Transform>(lg), f = std::make_shared<Words>(std::size_t(1) << lg)] {
-                t->inverse<Inverse>(f->begin());
+                t->template inverse<Inverse>(f->begin());
                 bench::keep(*f->begin());
             };
         }, len);
@@ -61,7 +61,7 @@ void add_cases(bench::Suite& suite, const std::string& suffix, int max_lg) {
                 const Words a(n), b(m);
                 std::copy(a.lines.data()->words, a.lines.data()->words + n, conv->a());
                 std::copy(b.lines.data()->words, b.lines.data()->words + m, conv->b());
-                return [conv] { bench::keep(*conv->multiply<Multiply>()); };
+                return [conv] { bench::keep(*conv->template multiply<Multiply>()); };
             }, len);
         }
     }

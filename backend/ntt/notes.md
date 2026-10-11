@@ -53,7 +53,72 @@ origins). Two product paths, picked per call:
 
 ## Measurements
 
+### Against lc-opt's `lib/ntt` (issue #3: the move must not cost speed)
+
+`compare_lcopt.cpp` (exploration folder, `ntt/`) links both into one binary and times
+`multiply()` on the same inputs, old and new alternating, 11 rounds (each round: median of 5
+samples of >= 2 ms). Old: lc-opt `ntt::Product` for "multiply" at lg >= 9 (factors L/2 and L/2),
+`ntt::Convolution` otherwise; "multiply_dense": factors 3L/4 and L/4 + 1. GCC 15.2 (pinned image),
+`-O2 -march=x86-64-v3`, 2026-10-11, commit 4010a7e. Ratio = fps / lc-opt, median over rounds.
+
+| lg | Zen 3 multiply | Zen 3 dense | Emerald Rapids multiply | Emerald Rapids dense |
+|---:|---:|---:|---:|---:|
+| 6 | 0.995 | 0.996 | 1.095 | 1.056 |
+| 7 | 1.005 | 1.012 | 1.023 | 1.030 |
+| 8 | 1.014 | 1.020 | 1.065 | 1.062 |
+| 9 | 0.985 | 0.965 | 0.991 | 1.008 |
+| 10 | 1.051 | 0.996 | 1.001 | 1.002 |
+| 11 | 1.002 | 0.999 | 1.006 | 1.002 |
+| 12 | 1.016 | 1.001 | 1.004 | 0.997 |
+| 13-19 | 1.004-1.006 | 0.998-1.001 | 0.996-1.001 | 0.994-1.010 |
+| 20-25 | 1.000-1.006 | 0.999-1.002 | 0.997-0.999 | 0.997-1.007 |
+| geomean (40 cases) | 1.0027 | | 1.0074 | |
+
+Zen 3 = `lc-bench` (EPYC 7B13); Emerald Rapids = `lc-intel` (Xeon 8581C). Absolute times at
+lg = 25, Zen 3: multiply 192.6 ms (lc-opt 192.8), dense 198.5 ms (199.0).
+
+From 2^9 up the move is within 0.6% (Zen 3 product path +0.4% median, IQR mostly above 1; Intel
+equal). Below 2^9 on Intel the new code is 2-9% slower (216 -> 236 ns at 2^6), reproduced in a
+second run of 21 rounds. `perf stat` at 2^6 on `lc-intel`, per call: lc-opt 904 cycles, 2400
+instructions, 19 blocked store forwards; fps 990 cycles, 2455 instructions, 28 blocked store
+forwards. `perf record`: the same asm `bottom_first` takes 197 -> 234 cycles per call; the other
+55 instructions are the out-of-line `build_table`, `convolution` and the variant dispatch.
+Forcing `always_inline` on those three changed nothing (2^6: 1.095 -> 1.086). Guess: stack layout
+(the leaf buffers) against a and b changes which loads wait on stores; not confirmed.
+
+### Absolute (lc-bench)
+
+`kernel.py bench ntt --target avx2 --rounds 3`, EPYC 7B13, GCC 15.2, `-O2 -march=x86-64-v3`,
+2026-10-11, commit 4010a7e plus the bench fix. ns per call (ns per coefficient):
+
+| lg | forward | inverse | multiply | multiply_dense |
+|---:|---:|---:|---:|---:|
+| 6 | 25 (0.39) | 131 (2.04) | 249 (3.89) | 250 (3.90) |
+| 8 | 111 (0.43) | 216 (0.84) | 703 (2.75) | 715 (2.79) |
+| 10 | 541 (0.53) | 646 (0.63) | 2671 (2.61) | 2562 (2.50) |
+| 12 | 2669 (0.65) | 2769 (0.68) | 10957 (2.68) | 11197 (2.73) |
+| 16 | 61678 (0.94) | 60717 (0.93) | 215964 (3.30) | 233249 (3.56) |
+| 20 | 1.29e6 (1.23) | 1.26e6 (1.20) | 4.31e6 (4.11) | 4.65e6 (4.44) |
+| 24 | 2.80e7 (1.67) | 2.78e7 (1.66) | 8.59e7 (5.12) | 9.30e7 (5.54) |
+| 25 | 5.67e7 (1.69) | 5.75e7 (1.71) | 1.93e8 (5.76) | 1.98e8 (5.91) |
+
+inverse/6 is 5x forward/6: the scale (L/8)^-1 is a modular power per call, about 100 ns
+(guess from the difference; multiply pays it too, as in lc-opt).
+
 ## Log
+
+2026-10-11, claude (issue #3, round 1): moved lc-opt `lib/ntt` (`ntt.hpp`, `product.hpp`, both
+generators and their output) here. Changes: namespaces `fps::ntt`; one `Convolution` picks the
+product path (lc-opt `Product`) when it fits, else the convolution path; one templated `Tree`
+for both recursions (bottom stage as a policy); `Product`'s `extra` bytes dropped; empty factors
+allowed; errors throw. Generated asm: the same text as lc-opt's (diffed: only headers, include
+paths and namespaces differ). New: variant `scalar` (the model; every target), `Transform`
+(forward and inverse alone, leaf form), `select.hpp`. Tests: tables against the definition of
+r(k), forward against the leaf form computed directly (lg <= 11) and against the scalar model
+(lg <= 18), inverse undoes forward (every lg; scalar to 2^20), products against schoolbook
+(sizes 0..40, random to 1500, lg <= 11) and random-point evaluation (every lg), both avx2 paths
+at every lg >= 9, each asm kernel against a lane model with inputs at the edges of its range.
+Pass at -O2 and ASan/UBSan: avx2, sse, scalar (`lc-amd`), scalar and arm (Mac).
 
 ## Sources
 
