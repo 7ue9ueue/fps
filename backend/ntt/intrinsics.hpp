@@ -54,17 +54,19 @@ struct Arith {
         const V t = S::sub(x, y);
         return S::min(t, S::add(t, S::broadcast(2 * kP)));
     }
-    // x f, any x -> [0, 2P). A factor's words 2i and 2i + 1 are equal (broadcasts and half
-    // broadcasts), so on x86 the product of the odd words reads q unshifted.
+    // x f, any x -> [0, 2P): Shoup's product, as modarith's. Every factor has equal words 2i and
+    // 2i + 1 (broadcasts, half broadcasts), so on x86 the odd words' product reads q unshifted: one
+    // shift less where q is not loop-invariant (bottom levels, groups of two columns).
     [[gnu::always_inline]] static V mul(V x, const Factor& f) {
         if constexpr (requires { S::mul_even(x, x); }) {
             const V even = S::mul_even(x, f.q), odd = S::mul_even(S::template shr64<32>(x), f.q);
-            V qx;
+            V qx;  // floor(x q / 2^32), joined as simd's mulhi joins (simd/notes.md)
             if constexpr (simd::detail::kMulhiPermute) qx = S::join_high(even, odd);
             else qx = S::template blend<0xaaaa>(S::template shr64<32>(even), odd);
             return whole(S::mul_sub(S::mul_lo(x, f.w), qx, S::broadcast(kP)));
+        } else {
+            return whole(M::shoup(x, f.w, f.q));
         }
-        return whole(M::shoup(x, f.w, f.q));
     }
 
     // x86: x, unchanged, through an empty asm statement. Without it GCC distributes a product
@@ -103,15 +105,13 @@ inline constexpr int kFoldMaxLog = kMaxLog;
 #endif
 
 // Software prefetch in passes over data beyond the caches: per column, the line kPrefetch words
-// ahead in each quarter, in groups on quarters of at least kPrefetchMin words and in radix-2 levels
-// on halves of at least kPrefetchHalfMin words (0: off). Emerald Rapids (notes.md, issue #5 round
-// 2): multiply 2^19-2^25 4-11% faster, forward and inverse 2^25 9-10%, 2^20-2^24 0-2%; from
-// smaller quarters, slower (2^12-2^16 1-4%), and radix-2 halves of 2^19 words cost inverse/20 3%.
-// Zen 5 ran multiply and forward 1-3% slower with it.
-#if defined(FPS_NTT_PREFETCH)
-inline constexpr std::size_t kPrefetch = FPS_NTT_PREFETCH, kPrefetchMin = FPS_NTT_PREFETCH_MIN,
-                             kPrefetchHalfMin = FPS_NTT_PREFETCH_HALF_MIN;
-#elif defined(__AVX512F__) && !defined(__znver4__) && !defined(__znver5__)
+// ahead in each quarter (prefetchw where a pass writes lines it does not read), in groups on
+// quarters of at least kPrefetchMin words and in radix-2 levels on halves of at least
+// kPrefetchHalfMin words (0: off). Emerald Rapids (notes.md, issue #5 round 2): multiply 2^19-2^25
+// 5-13% faster, forward 3-12%, inverse 2^21-2^25 1-7%; quarters of 128 KiB and more otherwise
+// share their L2 sets in 2 MiB pages. Prefetching smaller quarters was slower (2^12-2^16 1-4%),
+// and radix-2 halves of 2^19 words cost inverse/20 3%. Zen 5 ran multiply and forward 1-3% slower.
+#if defined(__AVX512F__) && !defined(__znver4__) && !defined(__znver5__)
 inline constexpr std::size_t kPrefetch = 512, kPrefetchMin = std::size_t(1) << 15, kPrefetchHalfMin = std::size_t(1) << 20;
 #else
 inline constexpr std::size_t kPrefetch = 0, kPrefetchMin = 0, kPrefetchHalfMin = 0;
