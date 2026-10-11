@@ -20,6 +20,7 @@ import shlex
 import subprocess
 import sys
 import tarfile
+import time
 from pathlib import Path
 
 ZONES = {'lc-intel': 'europe-west2-c', 'lc-intel-test': 'europe-west2-c'}  # every other VM is in europe-west2-b
@@ -31,9 +32,17 @@ def zone(vm: str) -> str:
 
 
 def ssh(vm: str, command: str, stdin: bytes | None = None, capture: bool = False) -> subprocess.CompletedProcess:
+    """Run command on vm. A connection failure (exit 255) is retried twice: every command the
+    tools send (copy, test, bench) can safely run again."""
     cmd = ['gcloud', 'compute', 'ssh', vm, f'--zone={zone(vm)}', '--quiet', f'--command={command}',
-           '--', '-o', 'LogLevel=ERROR']
-    return subprocess.run(cmd, input=stdin, capture_output=capture)
+           '--', '-o', 'LogLevel=ERROR', '-o', 'ConnectTimeout=20']
+    for attempt in range(3):
+        result = subprocess.run(cmd, input=stdin, capture_output=capture)
+        if result.returncode != 255:
+            return result
+        print(f'ssh to {vm} failed (exit 255), attempt {attempt + 1} of 3', file=sys.stderr)
+        time.sleep(15)
+    return result
 
 
 def git(*args: str) -> str:
