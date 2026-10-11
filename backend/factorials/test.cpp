@@ -98,7 +98,8 @@ using fps::factorials::Step;
 
 template <class S, int K, Step step>
 std::string variant() {
-    return std::string("Chains<") + S::name + ", " + std::to_string(K) + (step == Step::shoup ? ", shoup>" : ", montgomery>");
+    return std::string("Chains<") + S::name + ", " + std::to_string(K) +
+           (step == Step::shoup ? ", shoup>" : ", montgomery>");
 }
 
 template <class S, int K, u32 P, Step step>
@@ -174,7 +175,9 @@ int main() {
         fps::factorials::tables<4099>(std::span(fact, n), std::span(inverse, n));
     };
     for (std::size_t n : {std::size_t(0), std::size_t(4098), std::size_t(4099)}) check<4099>("tables", n, small);
-    for (std::size_t n : {std::size_t(1) << 17, std::size_t(1) << 19, (std::size_t(1) << 20) + 3, (std::size_t(5) << 20) + 17})
+    const std::size_t large[] = {std::size_t(1) << 17, std::size_t(1) << 19, (std::size_t(1) << 20) + 3,
+                                 (std::size_t(5) << 20) + 17};  // up to Zen 5's last tier
+    for (std::size_t n : large)
         for (std::size_t offset : {0, 4, 7}) check<998244353>("tables", n, selected, offset, offset);
     std::printf("%s\n", failures ? "FAIL" : "ok");
     return failures ? 1 : 0;
