@@ -2,7 +2,6 @@
 // or table entries.
 //   "<op>/<lg>"          through the API, on 2^lg items (gated)
 //   "<op>@kernel/<lg>"   the backend call the API wraps, on the same inputs
-// Factorials wraps no backend kernel yet (frontend/notes.md), so its cases have no @kernel pair.
 // Cases run in the order they are added. Each makes its inputs in its setup, so they live only
 // while it runs; the products, which map fresh memory per call, run last.
 #include <algorithm>
@@ -26,12 +25,21 @@ using Poly = fps::Polynomial<P>;
 template <class S>
 using Ops = fps::modarith::Ops<S, P>;
 
-// Builds the tables: 2^lg products, one inverse, 2^lg products, two vectors of 2^lg words.
+// Builds the tables of 2^lg entries. The @kernel case allocates the same two vectors as
+// Factorials (zero-filled, fresh pages) and calls the backend's factorials::tables.
 void factorials(bench::Suite& suite) {
     for (int lg : {10, 14, 18, 22}) {
         const std::size_t n = std::size_t(1) << lg;
         suite.add("factorials/" + std::to_string(lg), [n] {
             return [n] { bench::keep(fps::Factorials<P>(n)); };
+        }, n);
+        suite.add("factorials@kernel/" + std::to_string(lg), [n] {
+            return [n] {
+                std::vector<std::uint32_t> fact(n), inverse(n);
+                fps::factorials::tables<P>(fact, inverse);
+                bench::keep(fact);
+                bench::keep(inverse);
+            };
         }, n);
     }
 }
