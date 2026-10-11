@@ -91,6 +91,21 @@ inline constexpr int kFoldMaxLog = 17;
 inline constexpr int kFoldMaxLog = kMaxLog;
 #endif
 
+// Software prefetch in passes over data beyond the caches: per column, the line kPrefetch words
+// ahead in each quarter, in groups on quarters of at least kPrefetchMin words and in radix-2 levels
+// on halves of at least kPrefetchHalfMin words (0: off). Emerald Rapids (notes.md, issue #5 round
+// 2): multiply 2^19-2^25 4-11% faster, forward and inverse 2^25 9-10%, 2^20-2^24 0-2%; from
+// smaller quarters, slower (2^12-2^16 1-4%), and radix-2 halves of 2^19 words cost inverse/20 3%.
+// Zen 5 ran multiply and forward 1-3% slower with it.
+#if defined(FPS_NTT_PREFETCH)
+inline constexpr std::size_t kPrefetch = FPS_NTT_PREFETCH, kPrefetchMin = FPS_NTT_PREFETCH_MIN,
+                             kPrefetchHalfMin = FPS_NTT_PREFETCH_HALF_MIN;
+#elif defined(__AVX512F__) && !defined(__znver4__) && !defined(__znver5__)
+inline constexpr std::size_t kPrefetch = 512, kPrefetchMin = std::size_t(1) << 15, kPrefetchHalfMin = std::size_t(1) << 20;
+#else
+inline constexpr std::size_t kPrefetch = 0, kPrefetchMin = 0, kPrefetchHalfMin = 0;
+#endif
+
 // s r(i) for i < 8, r(i) the inverse twiddles, and their Shoup quotients: one table block. The
 // top groups that take the scale (Butterflies::inverse_group_scaled) read their twiddles here.
 struct alignas(64) ScaledBlock {
@@ -186,15 +201,32 @@ struct Butterflies : Arith<S> {
     [[gnu::always_inline]] static void store(u32* g, std::size_t q, const Column& v) {
         S::store(g, v[0]), S::store(g + q, v[1]), S::store(g + 2 * q, v[2]), S::store(g + 3 * q, v[3]);
     }
+    // body(std::bool_constant<on>{}): on if a pass whose streams are q words apart prefetches
+    // (min: kPrefetchMin or kPrefetchHalfMin).
+    template <class Body>
+    [[gnu::always_inline]] static void prefetching(std::size_t q, std::size_t min, Body body) {
+        if (kPrefetch > 0 && q >= min) return body(std::bool_constant<kPrefetch != 0>{});
+        body(std::false_type{});
+    }
+    template <bool kOn>
+    [[gnu::always_inline]] static void ahead(const u32* s) {
+        if constexpr (kOn) __builtin_prefetch(s + kPrefetch, 0, 3);
+    }
+    template <bool kOn>
+    [[gnu::always_inline]] static void ahead(const u32* s, std::size_t q) {
+        ahead<kOn>(s), ahead<kOn>(s + q), ahead<kOn>(s + 2 * q), ahead<kOn>(s + 3 * q);
+    }
 
     // Applies op to each column of the 4 quarters of `from` (S::lanes words of each), into those of
     // f (may be from).
     template <class Op>
     [[gnu::always_inline]] static void each(const u32* from, u32* f, std::size_t q, Op op) {
-        for (std::size_t j = 0; j < q; j += S::lanes) {
-            Column v;
-            load(from + j, q, v), op(v), store(f + j, q, v);
-        }
+        prefetching(q, kPrefetchMin, [&]<bool kPf> [[gnu::always_inline]] (std::bool_constant<kPf>) {
+            for (std::size_t j = 0; j < q; j += S::lanes) {
+                Column v;
+                ahead<kPf>(from + j, q), load(from + j, q, v), op(v), store(f + j, q, v);
+            }
+        });
     }
 
     // The same for an op in two stages, software pipelined if kPipe: the first stage of column
@@ -207,18 +239,20 @@ struct Butterflies : Arith<S> {
         if constexpr (!kPipe) {
             each(from, f, q, [&] [[gnu::always_inline]] (Column& v) { first(v), second(v); });
         } else {
-            Column h0, h1;
-            load(from, q, h0), first(h0);
-            std::size_t j = L;
-            for (; j + L < q; j += 2 * L) {
+            prefetching(q, kPrefetchMin, [&]<bool kPf> [[gnu::always_inline]] (std::bool_constant<kPf>) {
+                Column h0, h1;
+                load(from, q, h0), first(h0);
+                std::size_t j = L;
+                for (; j + L < q; j += 2 * L) {
+                    ahead<kPf>(from + j, q), load(from + j, q, h1), first(h1);
+                    second(h0), store(f + j - L, q, h0);
+                    ahead<kPf>(from + j + L, q), load(from + j + L, q, h0), first(h0);
+                    second(h1), store(f + j, q, h1);
+                }
                 load(from + j, q, h1), first(h1);
                 second(h0), store(f + j - L, q, h0);
-                load(from + j + L, q, h0), first(h0);
                 second(h1), store(f + j, q, h1);
-            }
-            load(from + j, q, h1), first(h1);
-            second(h0), store(f + j - L, q, h0);
-            second(h1), store(f + j, q, h1);
+            });
         }
     }
 
@@ -736,38 +770,48 @@ struct Ntt : Butterflies<S> {
             return;
         }
         const V p = S::broadcast(kP);
-        for (std::size_t i = 0; i < half; i += S::lanes) {
-            const V x = S::load(f + i), y = S::load(f + i + half);
-            S::store(f + i, add(x, y)), S::store(f + i + half, S::sub(S::add(x, p), y));
-        }
+        B::prefetching(half, kPrefetchHalfMin, [&]<bool kPf> [[gnu::always_inline]] (std::bool_constant<kPf>) {
+            for (std::size_t i = 0; i < half; i += S::lanes) {
+                B::template ahead<kPf>(f + i), B::template ahead<kPf>(f + i + half);
+                const V x = S::load(f + i), y = S::load(f + i + half);
+                S::store(f + i, add(x, y)), S::store(f + i + half, S::sub(S::add(x, p), y));
+            }
+        });
     }
 
     // Group 0 on quarters of q words: out < 4P.
     static void forward_radix4(u32* f, std::size_t q, bool sparse, const u32* r) {
         if (!sparse) return B::template forward_group<1>(f, q, 0, r);
         const F z = B::entry(r, 1);
-        for (std::size_t j = 0; j < q; j += S::lanes) {
-            const V a = S::load(f + j), b = S::load(f + j + q), zb = B::mul(b, z);
-            S::store(f + j, add(a, b)), S::store(f + j + q, diff(a, b));
-            S::store(f + j + 2 * q, add(a, zb)), S::store(f + j + 3 * q, diff(a, zb));
-        }
+        B::prefetching(q, kPrefetchMin, [&]<bool kPf> [[gnu::always_inline]] (std::bool_constant<kPf>) {
+            for (std::size_t j = 0; j < q; j += S::lanes) {
+                B::template ahead<kPf>(f + j), B::template ahead<kPf>(f + j + q);
+                const V a = S::load(f + j), b = S::load(f + j + q), zb = B::mul(b, z);
+                S::store(f + j, add(a, b)), S::store(f + j + q, diff(a, b));
+                S::store(f + j + 2 * q, add(a, zb)), S::store(f + j + 3 * q, diff(a, zb));
+            }
+        });
     }
 
     // The inverse radix-2 level, times s if s != 0: in < 2P, canonical out.
     static void inverse_radix2(u32* f, std::size_t half, u32 s) {
-        if (s == 0) {
-            for (std::size_t i = 0; i < half; i += S::lanes) {
-                const V x = S::load(f + i), y = S::load(f + i + half);
-                S::store(f + i, canonical(B::low(add(x, y)))), S::store(f + i + half, canonical(B::low(diff(x, y))));
+        B::prefetching(half, kPrefetchHalfMin, [&]<bool kPf> [[gnu::always_inline]] (std::bool_constant<kPf>) {
+            if (s == 0) {
+                for (std::size_t i = 0; i < half; i += S::lanes) {
+                    B::template ahead<kPf>(f + i), B::template ahead<kPf>(f + i + half);
+                    const V x = S::load(f + i), y = S::load(f + i + half);
+                    S::store(f + i, canonical(B::low(add(x, y)))), S::store(f + i + half, canonical(B::low(diff(x, y))));
+                }
+                return;
             }
-            return;
-        }
-        const F scale = B::factor(s);
-        for (std::size_t i = 0; i < half; i += S::lanes) {
-            const V x = S::load(f + i), y = S::load(f + i + half);
-            S::store(f + i, canonical(B::mul(add(x, y), scale)));
-            S::store(f + i + half, canonical(B::mul(diff(x, y), scale)));
-        }
+            const F scale = B::factor(s);
+            for (std::size_t i = 0; i < half; i += S::lanes) {
+                B::template ahead<kPf>(f + i), B::template ahead<kPf>(f + i + half);
+                const V x = S::load(f + i), y = S::load(f + i + half);
+                S::store(f + i, canonical(B::mul(add(x, y), scale)));
+                S::store(f + i + half, canonical(B::mul(diff(x, y), scale)));
+            }
+        });
     }
 
     // Inverse group 0 on quarters of q words, times s if s != 0: in < 2P, canonical out. With s, 4
