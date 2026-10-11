@@ -1,10 +1,10 @@
-// Tests the small kernel against the O(n m) model: every Schoolbook<S, R, P> this machine can run
-// (every simd struct, R = 1, 2, 4, 6, 8, six primes) on all shapes up to 40 x 40, term counts at the
-// bounds of the 64-bit sums, 0, 1, powers of two and their neighbours up to 1025, panels
-// (m > 1024) and long factors, and the selected multiply() with its argument orders and empty
-// factors. Inputs random, or making the largest sums or sums near them. Words past the product must
-// stay untouched. Then beats_ntt on the compiled defaults, and measure_ntt (tune.hpp). Exits nonzero
-// on a failure.
+// Tests the small kernel against the O(n m) model: every Schoolbook<S, R, P, U, Solo> this machine
+// can run (every simd struct; R = 1, 2, 4, 6, 8; R = 4, U = 2; R = 6, U = 4 with Solo = 0 and
+// 2048; six primes) on all shapes up to 40 x 40, term counts at the bounds of the 64-bit sums, 0, 1,
+// powers of two and their neighbours up to 1025, panels (m > 1024) and long factors, and the
+// selected multiply() with its argument orders and empty factors. Inputs random, or making the
+// largest sums or sums near them. Words past the product must stay untouched. Then beats_ntt on the
+// compiled defaults, and measure_ntt (tune.hpp). Exits nonzero on a failure.
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -83,13 +83,15 @@ void check(const std::string& name, const Vec& a, const Vec& b, const Vec& want,
         if (out[k] != kGuard) return fail(where + ": wrote past the product");
 }
 
-// Every Schoolbook<S, R, P> on one pair of factors, n >= m.
+// Every Schoolbook<S, R, P, U, Solo> on one pair of factors, n >= m: R = 1, 2, 4, 6, 8 with U = 1
+// and Solo = 0, and the unrolled loops and vector-at-a-time edges of the selected variants.
 template <class S, u32 P>
 void schoolbooks(const Vec& a, const Vec& b, const Vec& want) {
-    const auto one = [&]<int R> {
-        check(std::string("Schoolbook<") + S::name + ", " + std::to_string(R) + ", " + std::to_string(P) + ">", a, b,
-              want, [](const u32* x, std::size_t n, const u32* y, std::size_t m, u32* out) {
-                  fps::small::Schoolbook<S, R, P>::run(x, n, y, m, out);
+    const auto one = [&]<int R, int U = 1, std::size_t Solo = 0> {
+        check(std::string("Schoolbook<") + S::name + ", " + std::to_string(R) + ", " + std::to_string(P) + ", " +
+                  std::to_string(U) + ", " + std::to_string(Solo) + ">",
+              a, b, want, [](const u32* x, std::size_t n, const u32* y, std::size_t m, u32* out) {
+                  fps::small::Schoolbook<S, R, P, U, Solo>::run(x, n, y, m, out);
               });
     };
     one.template operator()<1>();
@@ -97,6 +99,9 @@ void schoolbooks(const Vec& a, const Vec& b, const Vec& want) {
     one.template operator()<4>();
     one.template operator()<6>();
     one.template operator()<8>();
+    one.template operator()<4, 2>();
+    one.template operator()<6, 4>();
+    one.template operator()<6, 4, 2048>();
 }
 
 template <u32 P>

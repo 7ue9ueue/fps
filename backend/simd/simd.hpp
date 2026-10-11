@@ -16,6 +16,8 @@
 // Every struct:
 //   V, lanes, registers, name
 //   load(p), store(p, a)       lanes words, any alignment
+//   store_first(p, a, k)       lanes 0 .. k - 1 of a, 0 <= k <= lanes; nothing at p + k on.
+//                              AVX-512: a masked store; others: pieces of 4, 2, 1 words
 //   broadcast(x)               every lane x
 //   add, sub, min              lane-wise; min unsigned
 //   mul_lo(a, b)               low 32 bits of a b
@@ -52,6 +54,8 @@
 //                              uint64x2_t products of lanes 0, 1 / 2, 3 (umull, umull2)
 //   mla_wide_lo(c, a, b), mla_wide_hi(c, a, b)
 //                              c + those products (umlal, umlal2)
+//   mls_wide_lo(c, a, b), mls_wide_hi(c, a, b)
+//                              c - those products, mod 2^64 (umlsl, umlsl2)
 //   lo_halves(x, y), hi_halves(x, y)
 //                              low / high 32 bits of the 64-bit lanes of x then y (uzp1, uzp2)
 //   qdmulh(a, b)               signed: high 32 bits of 2 a b, saturated (sqdmulh)
@@ -86,6 +90,9 @@ struct Scalar {
 
     static V load(const u32* p) { return *p; }
     static void store(u32* p, V a) { *p = a; }
+    static void store_first(u32* p, V a, int k) {
+        if (k) *p = a;
+    }
     static V broadcast(u32 x) { return x; }
     static V add(V a, V b) { return a + b; }
     static V sub(V a, V b) { return a - b; }
@@ -119,6 +126,15 @@ struct Sse {
 
     static V load(const u32* p) { return _mm_loadu_si128(reinterpret_cast<const __m128i*>(p)); }
     static void store(u32* p, V a) { _mm_storeu_si128(reinterpret_cast<__m128i*>(p), a); }
+    static void store_first(u32* p, V a, int k) {
+        if (k == 4) return store(p, a);
+        if (k & 2) {
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(p), a);
+            p += 2;
+            a = _mm_srli_si128(a, 8);
+        }
+        if (k & 1) *p = u32(_mm_cvtsi128_si32(a));
+    }
     static V broadcast(u32 x) { return _mm_set1_epi32(int(x)); }
     static V broadcast64(u64 x) { return _mm_set1_epi64x(std::int64_t(x)); }
     static V add(V a, V b) { return _mm_add_epi32(a, b); }
@@ -167,6 +183,21 @@ struct Avx2 {
 
     static V load(const u32* p) { return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)); }
     static void store(u32* p, V a) { _mm256_storeu_si256(reinterpret_cast<__m256i*>(p), a); }
+    static void store_first(u32* p, V a, int k) {
+        if (k == 8) return store(p, a);
+        __m128i x = _mm256_castsi256_si128(a);
+        if (k & 4) {
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(p), x);
+            p += 4;
+            x = _mm256_extracti128_si256(a, 1);
+        }
+        if (k & 2) {
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(p), x);
+            p += 2;
+            x = _mm_srli_si128(x, 8);
+        }
+        if (k & 1) *p = u32(_mm_cvtsi128_si32(x));
+    }
     static V broadcast(u32 x) { return _mm256_set1_epi32(int(x)); }
     static V broadcast64(u64 x) { return _mm256_set1_epi64x(std::int64_t(x)); }
     static V add(V a, V b) { return _mm256_add_epi32(a, b); }
@@ -207,6 +238,7 @@ struct Avx2 {
 struct Avx512Vl : Avx2 {
     static constexpr int registers = 32;
     static constexpr const char* name = "avx512vl";
+    static void store_first(u32* p, V a, int k) { _mm256_mask_storeu_epi32(p, __mmask8((1u << k) - 1), a); }
     static V permute2(V a, Index idx, V b) { return _mm256_permutex2var_epi32(a, idx, b); }
     static V join_high(V e, V o) { return permute2(e, _mm256_setr_epi32(1, 9, 3, 11, 5, 13, 7, 15), o); }
     static V mulhi(V a, V b);
@@ -228,6 +260,7 @@ struct Avx512 {
 
     static V load(const u32* p) { return _mm512_loadu_si512(p); }
     static void store(u32* p, V a) { _mm512_storeu_si512(p, a); }
+    static void store_first(u32* p, V a, int k) { _mm512_mask_storeu_epi32(p, __mmask16((1u << k) - 1), a); }
     static V broadcast(u32 x) { return _mm512_set1_epi32(int(x)); }
     static V broadcast64(u64 x) { return _mm512_set1_epi64(std::int64_t(x)); }
     static V add(V a, V b) { return _mm512_add_epi32(a, b); }
@@ -350,6 +383,16 @@ struct Neon {
 
     static V load(const u32* p) { return vld1q_u32(p); }
     static void store(u32* p, V a) { vst1q_u32(p, a); }
+    static void store_first(u32* p, V a, int k) {
+        if (k == 4) return store(p, a);
+        uint32x2_t x = vget_low_u32(a);
+        if (k & 2) {
+            vst1_u32(p, x);
+            p += 2;
+            x = vget_high_u32(a);
+        }
+        if (k & 1) vst1_lane_u32(p, x, 0);
+    }
     static V broadcast(u32 x) { return vdupq_n_u32(x); }
     static V add(V a, V b) { return vaddq_u32(a, b); }
     static V sub(V a, V b) { return vsubq_u32(a, b); }
@@ -370,6 +413,8 @@ struct Neon {
     static W mul_wide_hi(V a, V b) { return vmull_high_u32(a, b); }
     static W mla_wide_lo(W c, V a, V b) { return vmlal_u32(c, vget_low_u32(a), vget_low_u32(b)); }
     static W mla_wide_hi(W c, V a, V b) { return vmlal_high_u32(c, a, b); }
+    static W mls_wide_lo(W c, V a, V b) { return vmlsl_u32(c, vget_low_u32(a), vget_low_u32(b)); }
+    static W mls_wide_hi(W c, V a, V b) { return vmlsl_high_u32(c, a, b); }
     static V lo_halves(W x, W y) { return vuzp1q_u32(vreinterpretq_u32_u64(x), vreinterpretq_u32_u64(y)); }
     static V hi_halves(W x, W y) { return vuzp2q_u32(vreinterpretq_u32_u64(x), vreinterpretq_u32_u64(y)); }
     static V qdmulh(V a, V b) {
