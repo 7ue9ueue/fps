@@ -19,6 +19,7 @@
 //   tune::kTarget, target_name()   // this build's target (BACKEND.md), from the compiler's macros
 //   tune::cpu_name()               // x86: the brand string; Arm Linux: implementer, variant, part, revision
 //   tune::time(samples, min_ns, f...)   // median ns per call of each f, the f timed in turn
+//   tune::time_each(samples, min_ns, ids, f)   // the same for f(id), ids chosen at run time
 //   tune::text(values), tune::parse<Values>(text)
 //
 // Tuning runs only when called; until then every lookup reads the compiled defaults, so benches and
@@ -107,6 +108,37 @@ std::array<double, sizeof...(F)> time(int samples, double min_ns, F... f) {
     }
     std::array<double, kCount> median;
     for (std::size_t i = 0; i < kCount; ++i) {
+        std::ranges::sort(ns[i]);
+        median[i] = ns[i][ns[i].size() / 2];
+    }
+    return median;
+}
+
+// As time(), for candidates chosen at run time: median ns per call of f(id) for each id. Calls per
+// sample from one timed call after an untimed one (no doubling: a choice with many candidates and
+// sizes spends its budget on samples); when that is one call, the timed call is the first sample.
+// E.g. factorials' variants per size class.
+template <class F>
+std::vector<double> time_each(int samples, double min_ns, const std::vector<int>& ids, F f) {
+    const std::size_t count = ids.size();
+    std::vector<long> calls(count);
+    std::vector<std::vector<double>> ns(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        auto g = [&] { f(ids[i]); };
+        g();
+        const double once = detail::elapsed_ns(g, 1);
+        calls[i] = std::max(1L, long(min_ns / std::max(once, 1.0)));
+        if (calls[i] == 1) ns[i].push_back(once);
+    }
+    for (int s = 0; s < samples; ++s)
+        for (std::size_t i = 0; i < count; ++i) {
+            if (int(ns[i].size()) >= samples) continue;
+            auto g = [&] { f(ids[i]); };
+            if (calls[i] > 1) g();
+            ns[i].push_back(detail::elapsed_ns(g, calls[i]) / double(calls[i]));
+        }
+    std::vector<double> median(count);
+    for (std::size_t i = 0; i < count; ++i) {
         std::ranges::sort(ns[i]);
         median[i] = ns[i][ns[i].size() / 2];
     }

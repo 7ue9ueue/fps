@@ -1,7 +1,7 @@
 // Tests backend/tune: tables (defaults, set, readers on other threads), text and parse, the
 // registry and run(), wisdom (round trip; files from another CPU or target, malformed or missing,
-// change nothing), and time(). test_no_tuner.cpp builds with -DFPS_NO_TUNER. Exits nonzero on a
-// failure.
+// change nothing), time() and time_each(). test_no_tuner.cpp builds with -DFPS_NO_TUNER. Exits
+// nonzero on a failure.
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -151,6 +151,11 @@ void timing() {
         3, 1e5, [&] { for (int i = 0; i < 100; ++i) sink = sink + 1; },
         [&] { for (int i = 0; i < 10000; ++i) sink = sink + 1; });
     if (!(short_ns > 0 && long_ns > 10 * short_ns)) fail("time(): 100 and 10000 steps took " + std::to_string(short_ns) + " and " + std::to_string(long_ns) + " ns");
+    const std::vector<double> each = fps::tune::time_each(3, 1e5, {2, 0, 1}, [&](int id) {
+        for (int i = 0; i < (id == 0 ? 100 : id == 1 ? 10000 : 1000000); ++i) sink = sink + 1;
+    });
+    if (each.size() != 3 || !(each[1] > 0 && each[2] > 10 * each[1] && each[0] > 10 * each[2]))
+        fail("time_each(): ids 2, 0, 1 (10^6, 100, 10^4 steps) out of order");
 }
 
 void names() {

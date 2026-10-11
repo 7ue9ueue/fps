@@ -3,13 +3,14 @@
 //   fps::factorials::tables<P>(fact, inverse);  // fact[i] = i!, inverse[i] = 1 / i!, i < n
 //
 // fact and inverse are spans of n = fact.size() = inverse.size() words, n <= P (P! = 0 has no
-// inverse); values in [0, P). Any alignment; no checks. select.hpp picks the variant per target
-// and n:
+// inverse); values in [0, P). Any alignment; no checks. The variant per size class is a tuned
+// choice (select.hpp: `variants`, one load per call; backend/factorials/tune.hpp measures it):
 //   model::tables<P>(fact, inverse, n)          the scalar loop (model.hpp), any n <= P
 //   Chains<S, K, P, step>::run(fact, inverse, n)
 //                                               n >= Chains::kMinSize; W = K S::lanes lanes;
 //                                               step: the scan's chain product (Step)
-// Both are public, as the fast path for callers that pick their own variant.
+//   run_variant<P>(v, fact, inverse, n)         variant v of select.hpp's list, n >= kMinSizes[v]
+// All are public, as the fast path for callers that pick their own variant.
 //
 // Chains, from lc-opt's product chains (lib/poly/factorials.hpp). Lane s of W covers positions
 // [a_s, a_s + C), C = chunk(n) a multiple of the vector length, a_s = min(h + s C, n - C) with
@@ -368,18 +369,25 @@ private:
     }
 };
 
+template <class V, u32 P>
+using ChainsOf = Chains<typename V::Isa, V::vectors, P, V::scan>;
+
+// Variant v of Selected (0 the loop, i the candidate i - 1), for n >= kMinSizes[v].
+template <u32 P>
+void run_variant(int v, u32* fact, u32* inverse, std::size_t n) {
+    [&]<class... V>(Candidates<V...>) {
+        static_assert(((ChainsOf<V, P>::kMinSize == 4 * std::size_t(V::Isa::lanes)) && ...), "kMinSizes");
+        int i = 0;
+        if (!((++i == v ? (ChainsOf<V, P>::run(fact, inverse, n), true) : false) || ...))
+            model::tables<P>(fact, inverse, n);
+    }(Selected{});
+}
+
 // fact[i] = i!, inverse[i] = 1 / i! for i < n = fact.size() = inverse.size() <= P.
 template <u32 P>
 void tables(std::span<u32> fact, std::span<u32> inverse) {
     const std::size_t n = fact.size();
-    [&]<class... T>(Tiers<T...>) {
-        static_assert(((T::min_size >= Chains<typename T::Isa, T::vectors, P, T::scan>::kMinSize) && ...));
-        const int tier = ((n >= T::min_size) + ...) - 1;  // the last tier with min_size <= n
-        if (tier < 0) return model::tables<P>(fact.data(), inverse.data(), n);
-        int t = 0;
-        ((t++ == tier ? Chains<typename T::Isa, T::vectors, P, T::scan>::run(fact.data(), inverse.data(), n) : void()),
-         ...);
-    }(Selected{});
+    run_variant<P>(n < kFirstClass ? 0 : variants.get()[size_class(n)], fact.data(), inverse.data(), n);
 }
 
 }  // namespace fps::factorials
