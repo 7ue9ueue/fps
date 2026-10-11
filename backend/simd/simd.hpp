@@ -38,6 +38,11 @@
 //                              high word of lane i of o. Sse, Avx2: shr64 + blend; AVX-512: vpermt2d
 // Avx512Vl, Avx512:
 //   permute2(a, idx, b)        lane i = idx[i] < lanes ? a[idx[i]] : b[idx[i] - lanes] (vpermt2d)
+// Avx512 only, its two halves of 8 lanes from or to memory:
+//   load_halves(p, q)          lanes 0-7 from p, 8-15 from q (ymm load, vinserti64x4 from memory)
+//   store_half<h>(p, a)        lanes 8h .. 8h + 7 of a to p (ymm store, vextracti64x4 to memory)
+//   broadcast_halves(p, q)     lanes 0-7 = *p, 8-15 = *q (vpbroadcastd, masked vpbroadcastd from
+//                              memory: no shuffle uop, unlike vpermd)
 // Avx512Vl, Avx512 with __AVX512IFMA__:
 //   madd52lo(c, a, b), madd52hi(c, a, b)
 //                              64-bit lanes: c + low / high 52 bits of the 104-bit product of
@@ -254,6 +259,19 @@ struct Avx512 {
     static V madd52lo(V c, V a, V b) { return _mm512_madd52lo_epu64(c, a, b); }
     static V madd52hi(V c, V a, V b) { return _mm512_madd52hi_epu64(c, a, b); }
 #endif
+
+    static V load_halves(const u32* p, const u32* q) {
+        const __m256i low = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+        return _mm512_inserti64x4(_mm512_castsi256_si512(low), _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q)), 1);
+    }
+    template <int h>
+    static void store_half(u32* p, V a) {
+        const __m256i half = h ? _mm512_extracti64x4_epi64(a, 1) : _mm512_castsi512_si256(a);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(p), half);
+    }
+    static V broadcast_halves(const u32* p, const u32* q) {
+        return _mm512_mask_broadcastd_epi32(_mm512_set1_epi32(int(*p)), 0xff00, _mm_loadu_si32(q));
+    }
 
     using Index = __m512i;
     static Index index(const std::array<int, lanes>& from) {

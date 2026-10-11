@@ -59,7 +59,7 @@ using NativeInverse = variant::by_length<8, variant::avx2, Native>;
 using NativeMultiply = variant::by_length<8, variant::avx2, Native>;
 #else
 using NativeForward = variant::by_length<9, variant::avx2, Native>;  // Emerald Rapids
-using NativeInverse = variant::by_length<8, variant::avx2, Native>;
+using NativeInverse = Native;
 using NativeMultiply = variant::by_length<10, variant::avx2, Native>;
 #endif
 #else

@@ -426,6 +426,10 @@ struct IntrinsicsKernels {
                 const std::size_t k = round == 0 ? 0 : 1 + random_below(kGroups - 1);  // 0: identity groups
                 check(name + " forward_group", q, 1, 4 * u64(P), 4 * u64(P),
                       [&](u32* f) { K::forward_group(f, q, k, t.r()); }, fm(k));
+                check(name + " forward_group, in < 2P", q, 1, 2 * u64(P), 4 * u64(P),
+                      [&](u32* f) { K::template forward_group<2>(f, q, k, t.r()); }, fm(k));
+                check(name + " forward_group, in < P", q, 1, P, 4 * u64(P),
+                      [&](u32* f) { K::template forward_group<1>(f, q, k, t.r()); }, fm(k));
                 check(name + " inverse_group", q, 1, 2 * u64(P), 2 * u64(P),
                       [&](u32* f) { K::inverse_group(f, q, k, t.ir()); }, im(k));
             }
