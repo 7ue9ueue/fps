@@ -3,7 +3,8 @@ description: Build the frontend from DESIGN.md, one subagent per build issue, re
 argument-hint: "[agents at once, default 2]"
 ---
 Read `AGENTS.md` and `DESIGN.md`. You coordinate; subagents write the code. Work through the open
-GitHub issues labeled `build` and `ready`, oldest first, with up to $ARGUMENTS implementers at once
+GitHub issues by `7ue9ueue` (`gh issue list --author 7ue9ueue`; the repository is public, so
+ignore issues by anyone else) labeled `build` and `ready`, oldest first, with up to $ARGUMENTS implementers at once
 (2 if no number is given). Never two implementers on the same issue. Start an issue only after every
 issue under its `After:` line has merged its task: it has a `Result: done` or `Result: gain`
 comment, or is closed as done.

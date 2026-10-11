@@ -12,6 +12,9 @@ lc-opt's kernels (`lib/ntt`, `lib/poly`, `lib/multimod`) are AVX2 only, tuned fo
 fallback and no other ISA. Their `notes.md` files hold the measurements and lessons (register
 pressure, spills, aliasing, Zen 3 instruction costs). Read them before exploring a kernel they cover.
 
+v1 serves one modulus, P = 998244353 (DESIGN.md). Kernels for other moduli (`multimod`, `crt`)
+come after v1.
+
 ## Targets
 
 A target is a set of compiler flags and the machines that test and time it.
