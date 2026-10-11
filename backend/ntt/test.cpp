@@ -223,6 +223,8 @@ void test_paths() {
             test_product<avx2_convolution>("avx2 convolution path", n, m, 0, exact);
             test_product<avx2_product>("avx2 product path", n, m, 0, exact);
         }
+        test_product<avx2_convolution>("avx2 convolution path", len - len / 4, len / 4 + 1, 0, exact);
+        test_product<avx2_convolution>("avx2 convolution path", len / 4 + 1, len - 1 - len / 4, 0, exact);
     }
 }
 

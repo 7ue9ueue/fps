@@ -47,6 +47,11 @@ origins). Two product paths, picked per call:
   list-schedules it on a Zen 3 model (4 vector pipes, multiplies and shifts on 2 each, 2 loads,
   1 store per cycle) under a register budget, allocates ymm0-15 by linear scan and emits one asm
   statement. Knobs from QPoly exploration 009 (timed on EPYC 7763).
+- Top of an nv = 2 * 4^j transform (even lg >= 8), both paths and `Transform`: one pass for the
+  radix-2 level and both halves' first radix-4 groups (`forward_radix8_sparse`, lc-opt's, or
+  `forward_radix8_dense`; the dense one only from 2^16 in `Transform::forward`), 8 subtrees, then
+  `inverse_top` for the last inverse groups, the radix-2 level and the scale. Scales come from a
+  constexpr table.
 - `Transform::forward`/`inverse` (new here, not in lc-opt): the same recursion on one array with
   the asm kernels down to h = 4, and an intrinsics loop for the h = 1 level (`forward_bottom`,
   `inverse_bottom`). Not tuned.
@@ -119,6 +124,24 @@ r(k), forward against the leaf form computed directly (lg <= 11) and against the
 (sizes 0..40, random to 1500, lg <= 11) and random-point evaluation (every lg), both avx2 paths
 at every lg >= 9, each asm kernel against a lane model with inputs at the edges of its range.
 Pass at -O2 and ASan/UBSan: avx2, sse, scalar (`lc-amd`), scalar and arm (Mac).
+
+2026-10-11, claude (issue #3, round 1, second change): two speed-ups on avx2.
+- The scales (L/8)^-1 and (L/8)^-1 2^32 were modular powers per call, about 100 ns (inverse/6 was
+  131 ns against forward/6 25 ns). Now a constexpr table.
+- Even lg: the convolution path had a radix-2 pass (or a copy for a sparse factor), the first
+  radix-4 groups in each half, and a separate `scale_radix2` pass; the product path already fused
+  them. Now the convolution path and `Transform` use the product path's top: `forward_radix8`
+  (new dense variant for a full factor) and `inverse_top`. One pass over memory less each way.
+- `lc-bench` (EPYC 7B13), GCC 15.2, `-O2 -march=x86-64-v3`, 7 rounds against main (428ced1),
+  `kernel.py bench --base`: geomean 0.9178 over 80 cases. inverse/6 0.168, multiply/6 0.563,
+  multiply/8 0.864, inverse/10 0.843, multiply_dense/10 0.957, multiply_dense/16 0.973,
+  multiply_dense/20 0.964, multiply_dense/24 0.950, forward/24 0.916, inverse/24 0.935; odd lg
+  and large multiply (product path, unchanged) 0.99-1.005.
+- forward with the dense radix-8 top was slower below 2^16 (forward/10 1.067, forward/12 1.013;
+  the 8 input vectors and 6 twiddle vectors spill); now used from 2^16 only. Second run of
+  forward alone, 7 rounds: 2^16..2^24 0.913-1.005; below 2^16 1.003-1.044, including odd lg where
+  the code did not change (guess: code layout), multiply/9 and multiply/10 (product path, code
+  unchanged) 1.020 and 1.028 in the first run.
 
 ## Sources
 
