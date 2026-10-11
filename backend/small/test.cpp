@@ -1,10 +1,13 @@
 // Tests the small kernel against the O(n m) model: every Schoolbook<S, R, P, U, Solo> this machine
-// can run (every simd struct; R = 1, 2, 4, 6, 8; R = 4, U = 2; R = 6, U = 4 with Solo = 0 and
-// 2048; six primes) on all shapes up to 40 x 40, term counts at the bounds of the 64-bit sums, 0, 1,
-// powers of two and their neighbours up to 1025, panels (m > 1024) and long factors, and the
-// selected multiply() with its argument orders and empty factors. Inputs random, or making the
-// largest sums or sums near them. Words past the product must stay untouched. Then beats_ntt on the
-// compiled defaults, and measure_ntt (tune.hpp). Exits nonzero on a failure.
+// can run (every simd struct; R = 1, 2, 4, 6, 8; R = 4, U = 2; R = 6, U = 4; R = 8, U = 2; Solo
+// with R = 4, U = 1 and R = 6, U = 4; six primes) and every candidate of select.hpp's list
+// (run_variant) on all shapes up to 40 x 40, term counts at the bounds of the 64-bit sums, 0, 1,
+// powers of two and their neighbours up to 1025, panels (m > 1024) and long factors; multiply()
+// with its argument orders and empty factors, and with each candidate set for every shape class.
+// Inputs random, or making the largest sums or sums near them. Words past the product must stay
+// untouched. Then beats_ntt on the compiled defaults, measure_ntt and measure_variants (tune.hpp),
+// and both choices through wisdom. Exits nonzero on a failure.
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -83,13 +86,13 @@ void check(const std::string& name, const Vec& a, const Vec& b, const Vec& want,
         if (out[k] != kGuard) return fail(where + ": wrote past the product");
 }
 
-// Every Schoolbook<S, R, P, U, Solo> on one pair of factors, n >= m: R = 1, 2, 4, 6, 8 with U = 1
-// and Solo = 0, and the unrolled loops and vector-at-a-time edges of the selected variants.
+// Every Schoolbook<S, R, P, U, Solo> on one pair of factors, n >= m: R = 1, 2, 4, 6, 8 with U = 1,
+// and unrolled loops and vector-at-a-time edges. The target's candidates: candidates().
 template <class S, u32 P>
 void schoolbooks(const Vec& a, const Vec& b, const Vec& want) {
-    const auto one = [&]<int R, int U = 1, std::size_t Solo = 0> {
+    const auto one = [&]<int R, int U = 1, bool Solo = false> {
         check(std::string("Schoolbook<") + S::name + ", " + std::to_string(R) + ", " + std::to_string(P) + ", " +
-                  std::to_string(U) + ", " + std::to_string(Solo) + ">",
+                  std::to_string(U) + ", " + (Solo ? "true" : "false") + ">",
               a, b, want, [](const u32* x, std::size_t n, const u32* y, std::size_t m, u32* out) {
                   fps::small::Schoolbook<S, R, P, U, Solo>::run(x, n, y, m, out);
               });
@@ -101,13 +104,26 @@ void schoolbooks(const Vec& a, const Vec& b, const Vec& want) {
     one.template operator()<8>();
     one.template operator()<4, 2>();
     one.template operator()<6, 4>();
-    one.template operator()<6, 4, 2048>();
+    one.template operator()<8, 2>();
+    one.template operator()<4, 1, true>();
+    one.template operator()<6, 4, true>();
+}
+
+// Every candidate of select.hpp's list through run_variant, n >= m.
+template <u32 P>
+void candidates(const Vec& a, const Vec& b, const Vec& want) {
+    for (int v = 0; v < fps::small::kCandidates; ++v)
+        check("run_variant " + fps::small::variant_names()[v] + " P=" + std::to_string(P), a, b, want,
+              [v](const u32* x, std::size_t n, const u32* y, std::size_t m, u32* out) {
+                  fps::small::run_variant<P>(v, x, n, y, m, out);
+              });
 }
 
 template <u32 P>
 void all_structs(std::size_t n, std::size_t m, int kind) {
     const Vec a = random_vec<P>(n, kind), b = random_vec<P>(m, kind, true), want = model<P>(a, b);
     fps::simd::for_each(fps::simd::All{}, [&]<class S> { schoolbooks<S, P>(a, b, want); });
+    candidates<P>(a, b, want);
 }
 
 template <u32 P>
@@ -146,7 +162,8 @@ void long_shapes() {
         for (int kind : {1, 2}) all_structs<P>(n, m, kind);
 }
 
-// multiply(), both orders, through spans; empty factors leave out alone.
+// multiply(), both orders, through spans; empty factors leave out alone. Then with each candidate
+// set for every class, on shapes of every class.
 void selected() {
     constexpr u32 P = 998244353;
     const auto run = [](const u32* a, std::size_t n, const u32* b, std::size_t m, u32* out) {
@@ -159,6 +176,22 @@ void selected() {
             check("multiply", b, a, model<P>(b, a), run);
         }
     check("multiply", Vec{}, Vec{}, Vec{}, run);
+
+    using namespace fps::small;
+    std::vector<int> seen(kClasses);
+    for (int v = 0; v < kCandidates; ++v) {
+        Choices forced;
+        forced.fill(std::uint8_t(v));
+        variants.set(forced);
+        for (std::size_t m : {1, 2, 3, 6, 13, 30, 47, 100, 200, 300, 700, 1100})
+            for (std::size_t n : {m, m + m / 2, 3 * m, 5 * m, 9 * m}) {
+                ++seen[shape_class(n, m)];
+                const Vec a = random_vec<P>(n, 2), b = random_vec<P>(m, 2);
+                check("multiply, variant " + variant_names()[v], a, b, model<P>(a, b), run);
+            }
+    }
+    variants.set(kDefaults);
+    if (std::ranges::count(seen, 0)) fail("selected: a class without a shape");
 }
 
 // beats_ntt: short products small, long ones the NTT, past 2^25 too.
@@ -199,6 +232,65 @@ void tuned() {
     ntt_times.set(kNttDefaults);
 }
 
+// Shape classes and their points; measure_variants at a small budget (valid; classes above
+// max_octave keep start's; a margin above every change keeps start); the wisdom text; and
+// "small.variant" through tune::save / load, before "small.ntt".
+void tuned_variants() {
+    using namespace fps::small;
+    if (shape_class(1, 1) != 0 || shape_class(7, 4) != 2 * kRatios || shape_class(8, 4) != 2 * kRatios + 1 ||
+        shape_class(31, 4) != 2 * kRatios + 2 || shape_class(32, 4) != 2 * kRatios + 3 ||
+        shape_class(512, 512) != 9 * kRatios || shape_class(513, 513) != 10 * kRatios ||
+        shape_class(std::size_t(1) << 30, 5000) != kClasses - 1)
+        fail("shape_class");
+    for (int c = 0; c < kClasses; ++c)
+        for (const bool dense : {false, true}) {
+            const auto shapes = points(c, dense);
+            if (shapes.empty()) fail("points: none for class " + std::to_string(c));
+            for (const auto& [n, m] : shapes)
+                if (n < m || shape_class(n, m) != c) fail("points: a shape outside class " + std::to_string(c));
+        }
+
+    std::vector<ClassTimes> log;
+    const Choices measured = measure_variants(kDefaults, {3, false, 1, 2e3, 0}, &log);
+    if (!valid(measured) || log.size() != 4 * kRatios) fail("measure_variants: not a valid table, or classes missed");
+    for (int c = 4 * kRatios; c < kClasses; ++c)
+        if (measured[c] != kDefaults[c]) fail("measure_variants: changed a class above max_octave");
+    for (const ClassTimes& t : log) {
+        const std::vector<double>& ns = t.ns[0];
+        if (t.ns.size() != t.shapes.size() || int(ns.size()) != kCandidates || !std::ranges::all_of(ns, [](double x) {
+                return x > 0 && std::isfinite(x);
+            }))
+            fail("measure_variants: times of class " + std::to_string(t.c));
+    }
+    if (measure_variants(kDefaults, {3, false, 1, 2e3, 1e9}) != kDefaults) fail("measure_variants: changed within the margin");
+
+    if (parse(text(measured)) != measured) fail("variant text does not read back");
+    std::string bad = text(measured);
+    bad[0] = bad[0] == '1' ? '2' : '1';
+    if (parse(bad)) fail("parse took another candidate list's signature");
+    Choices too_large = measured;
+    too_large[5] = std::uint8_t(kCandidates);
+    if (parse(text(too_large))) fail("parse took a variant that does not exist");
+
+    const std::string path =
+        (std::filesystem::temp_directory_path() / ("fps-small-test-v-" + std::to_string(::getpid()))).string();
+    Choices other = kDefaults;
+    other[7] = std::uint8_t((other[7] + 1) % kCandidates);
+    variants.set(other);
+    if (!fps::tune::save(path)) fail("save");
+    variants.set(kDefaults);
+    if (!fps::tune::load(path) || variants.get() != other) fail("small.variant did not load back from wisdom");
+    std::ifstream in(path);
+    int variant_line = -1, ntt_line = -1, i = 0;
+    for (std::string line; std::getline(in, line); ++i) {
+        if (line == "small.variant " + text(other)) variant_line = i;
+        if (line.starts_with("small.ntt ")) ntt_line = i;
+    }
+    if (variant_line < 0 || ntt_line < variant_line) fail("wisdom: no small.variant line, or not before small.ntt");
+    std::filesystem::remove(path);
+    variants.set(kDefaults);
+}
+
 }  // namespace
 
 int main() {
@@ -221,6 +313,7 @@ int main() {
     selected();
     cutoff();
     tuned();
+    tuned_variants();
     std::printf("%s\n", failures ? "FAIL" : "ok");
     return failures ? 1 : 0;
 }

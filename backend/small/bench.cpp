@@ -1,8 +1,8 @@
 // Times the small kernel modulo P = 998244353 on factors of n and m coefficients into an output
 // allocated once; items are terms n m.
 //   "multiply/<n>x<m>"                  the selected variant (gated)
-//   "multiply@schoolbook.<isa>.<R>/<n>x<m>"   Schoolbook on simd::Native (and Avx512Vl on AVX-512)
-//                                       with R vectors per block
+//   "multiply@<variant>/<n>x<m>"        each candidate of select.hpp's list, e.g. avx512.r8.u2
+//                                       (run_variant)
 //   "multiply@ntt/<n>x<m>"              ntt::Convolution on the same factors with the product in
 //                                       the same output: construct, copy them in, multiply
 #include <algorithm>
@@ -16,7 +16,6 @@
 
 #include "backend/bench.hpp"
 #include "backend/ntt/ntt.hpp"
-#include "backend/simd/select.hpp"
 #include "backend/small/small.hpp"
 
 namespace {
@@ -67,12 +66,13 @@ void add(bench::Suite& suite, const std::string& op, const Shape& s, F f) {
     }, s.n * s.m);
 }
 
-template <class S, int R>
-void schoolbook(bench::Suite& suite, const Shape& s) {
-    add(suite, std::string("multiply@schoolbook.") + S::name + "." + std::to_string(R), s,
-        [](const Factors& a, const Factors& b, u32* out) {
-            fps::small::Schoolbook<S, R, P>::run(a.data(), a.size(), b.data(), b.size(), out);
-        });
+template <class... V>
+void candidates(bench::Suite& suite, const Shape& s, fps::small::Candidates<V...>) {
+    (add(suite, "multiply@" + fps::small::variant_name<V>(), s,
+         [](const Factors& a, const Factors& b, u32* out) {
+             fps::small::SchoolbookOf<V, P>::run(a.data(), a.size(), b.data(), b.size(), out);
+         }),
+     ...);
 }
 
 }  // namespace
@@ -83,17 +83,7 @@ int main(int argc, char** argv) {
         add(suite, "multiply", s, [](const Factors& a, const Factors& b, u32* out) {
             fps::small::multiply<P>(a, b, std::span(out, a.size() + b.size() - 1));
         });
-    for (const Shape& s : kShapes) {
-        using S = fps::simd::Native;
-        schoolbook<S, 2>(suite, s);
-        schoolbook<S, 4>(suite, s);
-        schoolbook<S, 6>(suite, s);
-        schoolbook<S, 8>(suite, s);
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
-        schoolbook<fps::simd::Avx512Vl, 4>(suite, s);
-        schoolbook<fps::simd::Avx512Vl, 8>(suite, s);
-#endif
-    }
+    for (const Shape& s : kShapes) candidates(suite, s, fps::small::Selected{});
     for (const Shape& s : kShapes)
         add(suite, "multiply@ntt", s, [](const Factors& a, const Factors& b, u32* out) {
             fps::ntt::Convolution conv(a.size(), b.size(), out);

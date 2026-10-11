@@ -1,5 +1,9 @@
-// tools/tune.py small: measures beats_ntt's costs on this machine and prints them as compiled
-// defaults for tuned.hpp ("field <name> <type> <values>"), with diagnostics ("# ...").
+// tools/tune.py small: measures the variant per shape class and beats_ntt's costs on this machine
+// and prints them as compiled defaults for tuned.hpp ("field <name> <type> <values>"), with
+// diagnostics ("# ...").
+//   0. measure_variants (tune.hpp) on every class, at the dense points (median of 7, samples >= 1
+//      ms). The compiled table's variant stays unless another is more than 1% faster (a rerun does
+//      not flip choices by noise). The new table is set before the next steps.
 //   1. Sweep: lg = 6 .. 17; n + m - 1 = 2^(lg - 1) + 1, 3 2^(lg - 2) and 2^lg; m = 1 .. 1024,
 //      m <= n. multiply() and the Convolution timed in turn (median of 5, samples >= 1 ms).
 //   2. The model (select.hpp) fitted to the swept shapes within 0.4x-2.5x of the NTT, least
@@ -13,8 +17,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "backend/small/tune.hpp"
@@ -108,6 +114,47 @@ void misses(const char* name, const Model& model, const std::array<double, 20>& 
                 shapes.size(), worst, std::exp(log_sum / double(shapes.size())));
 }
 
+// Step 0: the variant per class, with each class's scores (geometric mean of time / fastest) and
+// times per point; then the points the compiled and the new table send to a variant more than 2%
+// slower than the fastest there.
+fps::small::Choices measure_table() {
+    using namespace fps::small;
+    const std::vector<std::string> names = variant_names();
+    std::vector<ClassTimes> log;
+    const Choices choices = measure_variants(kDefaults, {kOctaves - 1, true, 7, 1e6, 0.01}, &log);
+    for (const ClassTimes& t : log) {
+        std::printf("# class %d (octave %d, ratio %d): %s (compiled %s)", t.c, t.c / kRatios, t.c % kRatios,
+                    names[choices[t.c]].c_str(), names[kDefaults[t.c]].c_str());
+        for (int v = 0; v < kCandidates; ++v) {
+            double score = 0;
+            for (const std::vector<double>& ns : t.ns)
+                score += std::log(ns[v] / *std::ranges::min_element(ns)) / double(t.ns.size());
+            std::printf(" %s %.3f", names[v].c_str(), std::exp(score));
+        }
+        std::printf("\n");
+        for (std::size_t p = 0; p < t.shapes.size(); ++p) {
+            std::printf("#   %zux%zu:", t.shapes[p].first, t.shapes[p].second);
+            for (const double ns : t.ns[p]) std::printf(" %.1f", ns);
+            std::printf("\n");
+        }
+    }
+    for (const auto& [name, table] : {std::pair{"compiled", kDefaults}, std::pair{"new", choices}}) {
+        int count = 0, total = 0;
+        double worst = 1, log_sum = 0;
+        for (const ClassTimes& t : log)
+            for (const std::vector<double>& ns : t.ns) {
+                const double ratio = ns[table[t.c]] / *std::ranges::min_element(ns);
+                ++total;
+                log_sum += std::log(ratio);
+                worst = std::max(worst, ratio);
+                count += ratio > 1.02;
+            }
+        std::printf("# variants, %s: %d of %d points more than 2%% slower than the fastest, worst %.3fx, geomean %.4f\n",
+                    name, count, total, worst, std::exp(log_sum / total));
+    }
+    return choices;
+}
+
 void print_field(const char* name, const double* values, int count) {
     std::printf("field %s double", name);
     for (int i = 0; i < count; ++i) std::printf(" %.4g", values[i]);
@@ -119,6 +166,8 @@ void print_field(const char* name, const double* values, int count) {
 int main() {
     std::printf("# cpu %s\n# target %s\n", fps::tune::cpu_name().c_str(), std::string(fps::tune::target_name()).c_str());
     const auto start_time = std::chrono::steady_clock::now();
+    const fps::small::Choices choices = measure_table();
+    fps::small::variants.set(choices);
     const std::vector<Shape> shapes = sweep();
     for (const Shape& s : shapes) std::printf("# shape %zux%zu lg %d small %.1f ntt %.1f\n", s.n, s.m, s.lg, s.small, s.ntt);
 
@@ -150,6 +199,9 @@ int main() {
     misses("new", model, ntt, shapes);
     std::printf("# seconds %.1f\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count());
 
+    std::printf("field signature int %u\nfield variant int", fps::small::kSignature);
+    for (const std::uint8_t v : choices) std::printf(" %d", v);
+    std::printf("\n");
     print_field("term", &model.term, 1);
     print_field("word", &model.word, 1);
     print_field("call", &model.call, 1);

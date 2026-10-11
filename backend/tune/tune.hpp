@@ -21,6 +21,7 @@
 //   tune::time(samples, min_ns, f...)   // median ns per call of each f, the f timed in turn
 //   tune::time_each(samples, min_ns, ids, f)   // the same for f(id), ids chosen at run time
 //   tune::text(values), tune::parse<Values>(text)
+//   tune::Hash{}.add(text)...value // FNV-1a: the signature of a kernel's candidate list
 //
 // Tuning runs only when called; until then every lookup reads the compiled defaults, so benches and
 // tests are deterministic (notes.md: why not lazily). -DFPS_NO_TUNER compiles the defaults in as
@@ -32,6 +33,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -173,6 +175,17 @@ std::optional<Values> parse(std::string_view s) {
     if (p != end) return std::nullopt;
     return values;
 }
+
+// FNV-1a over pieces of text. A kernel hashes the names of its candidates: tuned.hpp records the
+// hash, select.hpp checks it, and wisdom lines start with it, so a table measured for another list
+// is refused (backend/small/select.hpp).
+struct Hash {
+    std::uint32_t value = 2166136261u;
+    constexpr Hash& add(std::string_view s) {
+        for (const char c : s) value = (value ^ std::uint8_t(c)) * 16777619u;
+        return *this;
+    }
+};
 
 #ifdef FPS_NO_TUNER
 

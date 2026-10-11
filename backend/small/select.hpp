@@ -1,11 +1,24 @@
-// The small kernel's variant per target: the simd struct, the vectors per block, the unrolling and
-// the vector-at-a-time edges of the schoolbook, and the costs behind beats_ntt (small.hpp).
-// -DFPS_SMALL_ISA=<struct>, -DFPS_SMALL_VECTORS=<R>, -DFPS_SMALL_UNROLL=<U> and
-// -DFPS_SMALL_SOLO=<words> force the variant. Measurements: notes.md.
+// The small kernel's variant per target and shape, a tuned choice (backend/tune): Schoolbook<S, R,
+// P, U, Solo> of one of the target's candidates, per shape class; and the costs behind beats_ntt
+// (small.hpp).
+//
+//   shape_class(n, m)    n >= m >= 1: the octave of m, (2^(k-1), 2^k] for k <= 9 and m > 512 the
+//                        last, times 4 ratios: n < 2m, n < 4m, n < 8m, the rest
+//   variants.get()[c]    the variant of class c: an index into Selected
+//   kDefaults            compiled defaults: tools/tune.py small (tune.cpp, tuned.hpp)
+//
+// backend/small/tune.hpp measures the table on this machine. -DFPS_SMALL_ISA=<struct> forces one
+// variant, with -DFPS_SMALL_VECTORS=<R> (default 4), -DFPS_SMALL_UNROLL=<U> (1) and
+// -DFPS_SMALL_SOLO=<0 or 1> (0). Measurements: notes.md.
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
+#include <cstdint>
+#include <string>
+#include <string_view>
 
 #include "backend/simd/select.hpp"
 #include "backend/small/tuned.hpp"
@@ -13,41 +26,109 @@
 
 namespace fps::small {
 
+// Schoolbook<S, R, P, U, Solo> without P: R vectors per block, the loop with all R unrolled U times,
+// Solo the edges one vector at a time.
+template <class S, int R, int U, bool Solo>
+struct Variant {
+    using Isa = S;
+    static constexpr int vectors = R, unroll = U;
+    static constexpr bool solo = Solo;
+};
+template <class... V>
+struct Candidates {};
+
+// Per target, the variants that are fastest in some shape class on its machine; the first is the
+// variant used for every shape before the table (notes.md, Log).
 #if defined(FPS_SMALL_ISA)
-using Isa = simd::FPS_SMALL_ISA;
-#else
-using Isa = simd::Native;
+#if !defined(FPS_SMALL_VECTORS)
+#define FPS_SMALL_VECTORS 4
 #endif
-
-// Geomean over the bench shapes against the best R: 16 registers (Zen 3) R = 2, 6, 8 1.12, 1.33,
-// 1.40 of R = 4; 32 registers R = 4, 8 1.008-1.039 and 1.010-1.084 of R = 6.
-#if defined(FPS_SMALL_VECTORS)
-inline constexpr int kVectors = FPS_SMALL_VECTORS;
-#else
-inline constexpr int kVectors = Isa::registers == 32 ? 6 : 4;
+#if !defined(FPS_SMALL_UNROLL)
+#define FPS_SMALL_UNROLL 1
 #endif
-
-// Unrolling of the loop over b with all vectors of a block, on long products: Zen 3 U = 2 0.95 of
-// U = 1, Neoverse V2 U = 4 0.95; no gain on Emerald Rapids, Zen 5 1.00-1.10 (notes.md, Log).
-#if defined(FPS_SMALL_UNROLL)
-inline constexpr int kUnroll = FPS_SMALL_UNROLL;
+#if !defined(FPS_SMALL_SOLO)
+#define FPS_SMALL_SOLO 0
+#endif
+using Selected =
+    Candidates<Variant<simd::FPS_SMALL_ISA, FPS_SMALL_VECTORS, FPS_SMALL_UNROLL, bool(FPS_SMALL_SOLO)>>;
+#elif defined(__znver5__)  // zen5 (tune::kTarget)
+using Selected = Candidates<Variant<simd::Avx512, 6, 1, false>, Variant<simd::Avx512, 4, 1, false>,
+                            Variant<simd::Avx512, 8, 2, false>, Variant<simd::Avx512, 6, 1, true>,
+                            Variant<simd::Avx512, 4, 1, true>, Variant<simd::Avx512Vl, 4, 1, true>>;
+#elif defined(__AVX512F__) && defined(__AVX512BW__)  // avx512
+using Selected = Candidates<Variant<simd::Avx512, 6, 1, false>, Variant<simd::Avx512, 4, 1, false>,
+                            Variant<simd::Avx512, 6, 2, false>, Variant<simd::Avx512, 8, 1, false>,
+                            Variant<simd::Avx512, 8, 2, false>, Variant<simd::Avx512Vl, 6, 2, false>,
+                            Variant<simd::Avx512Vl, 4, 1, true>>;
+#elif defined(__AVX2__)
+using Selected = Candidates<Variant<simd::Avx2, 4, 2, false>, Variant<simd::Avx2, 4, 4, false>,
+                            Variant<simd::Avx2, 4, 1, false>, Variant<simd::Avx2, 5, 2, false>,
+                            Variant<simd::Avx2, 4, 2, true>, Variant<simd::Sse, 4, 1, true>>;
 #elif defined(__ARM_NEON) && defined(__aarch64__)
-inline constexpr int kUnroll = 4;
-#elif defined(__AVX2__) && !defined(__AVX512F__)
-inline constexpr int kUnroll = 2;
+using Selected = Candidates<Variant<simd::Neon, 6, 4, false>, Variant<simd::Neon, 6, 4, true>,
+                            Variant<simd::Neon, 4, 1, false>, Variant<simd::Neon, 8, 4, false>,
+                            Variant<simd::Neon, 8, 1, false>>;
+#elif defined(__SSE4_1__)
+using Selected = Candidates<Variant<simd::Sse, 4, 1, false>, Variant<simd::Sse, 4, 2, false>,
+                            Variant<simd::Sse, 4, 1, true>>;
 #else
-inline constexpr int kUnroll = 1;
+using Selected = Candidates<Variant<simd::Scalar, 4, 1, false>, Variant<simd::Scalar, 6, 1, false>,
+                            Variant<simd::Scalar, 8, 1, false>, Variant<simd::Scalar, 4, 2, false>,
+                            Variant<simd::Scalar, 4, 1, true>>;
 #endif
 
-// Edge blocks one vector after the other, without phases, for b of at most kSolo words: Neoverse
-// V2 0.92-0.97 of the phases for b of 8-16 words; x86 up to 1.27 on unbalanced shapes (notes.md).
-#if defined(FPS_SMALL_SOLO)
-inline constexpr std::size_t kSolo = FPS_SMALL_SOLO;
-#elif defined(__ARM_NEON) && defined(__aarch64__)
-inline constexpr std::size_t kSolo = 16;
+inline constexpr int kCandidates = []<class... V>(Candidates<V...>) { return int(sizeof...(V)); }(Selected{});
+
+// Shape classes. The octave of m sets the steps per block and the edges' length; the ratio n / m
+// the share of interior blocks.
+inline constexpr int kOctaves = 11, kRatios = 4, kClasses = kOctaves * kRatios;
+constexpr int shape_class(std::size_t n, std::size_t m) {  // n >= m >= 1
+    return std::min(int(std::bit_width(m - 1)), kOctaves - 1) * kRatios + (n >= 2 * m) + (n >= 4 * m) + (n >= 8 * m);
+}
+
+using Choices = std::array<std::uint8_t, kClasses>;
+
+// "<isa>.r<R>.u<U>", and ".solo" with Solo, e.g. "avx512.r8.u2"; and a hash of the list that
+// tuned.hpp records, so a table measured for another list does not compile.
+template <class V>
+std::string variant_name() {
+    return std::string(V::Isa::name) + ".r" + std::to_string(V::vectors) + ".u" + std::to_string(V::unroll) +
+           (V::solo ? ".solo" : "");
+}
+template <class... V>
+constexpr std::uint32_t signature(Candidates<V...>) {
+    constexpr std::string_view digits = "0123456789";
+    tune::Hash h;
+    (h.add(V::Isa::name)
+         .add(".r")
+         .add(digits.substr(V::vectors, 1))
+         .add(".u")
+         .add(digits.substr(V::unroll, 1))
+         .add(V::solo ? ".solo;" : ";"),
+     ...);
+    return h.value >> 1;  // fits an int
+}
+inline constexpr std::uint32_t kSignature = signature(Selected{});
+
+constexpr bool valid(const Choices& choices) {
+    return std::ranges::all_of(choices, [](std::uint8_t v) { return v < kCandidates; });
+}
+
+inline constexpr int kTuned = int(tune::kTarget);
+
+#if defined(FPS_SMALL_ISA)
+inline constexpr Choices kDefaults{};
 #else
-inline constexpr std::size_t kSolo = 0;
+static_assert(tuned::signature[kTuned] == kSignature, "tuned.hpp was measured for other candidates: run tools/tune.py small");
+inline constexpr Choices kDefaults = [] {
+    Choices choices{};
+    for (int c = 0; c < kClasses; ++c) choices[c] = std::uint8_t(tuned::variant[kTuned][c]);
+    return choices;
+}();
 #endif
+static_assert(valid(kDefaults));
+
+inline constinit tune::Table<kDefaults> variants;
 
 // Time of multiply(), about term n m + word (n + m) + call + square min(n, m)^2 ns: fitted per
 // target by tools/tune.py (tune.cpp) on the target's machine (tuned.hpp).
@@ -55,7 +136,6 @@ struct Model {
     double term, word, call, square;
 };
 
-inline constexpr int kTuned = int(tune::kTarget);
 inline constexpr Model kModel = {tuned::term[kTuned], tuned::word[kTuned], tuned::call[kTuned], tuned::square[kTuned]};
 
 // The NTT's time per transform length 2^lg, lg = 6 .. 25, in the model's ns: an ntt::Convolution
