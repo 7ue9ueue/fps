@@ -41,26 +41,26 @@ struct Arith {
     struct Factor {  // a constant w < P and its Shoup quotient
         V w, q;
     };
-    static Factor factor(u32 w, u32 q) { return {S::broadcast(w), S::broadcast(q)}; }
+    [[gnu::always_inline]] static Factor factor(u32 w, u32 q) { return {S::broadcast(w), S::broadcast(q)}; }
     static Factor factor(u32 w) { return factor(w, quotient(w)); }
-    static Factor entry(const u32* table, std::size_t k) { return factor(table[slot(k)], table[slot(k) + 8]); }
+    [[gnu::always_inline]] static Factor entry(const u32* table, std::size_t k) { return factor(table[slot(k)], table[slot(k) + 8]); }
 
-    static V add(V x, V y) { return S::add(x, y); }
-    static V diff(V x, V y) { return S::sub(S::add(x, S::broadcast(2 * kP)), y); }  // x - y + 2P, y <= 2P
-    static V low(V x) { return M::template reduce<2 * kP>(x); }                       // [0, 4P) -> [0, 2P)
-    static V canonical(V x) { return M::template reduce<kP>(x); }                     // [0, 2P) -> [0, P)
+    [[gnu::always_inline]] static V add(V x, V y) { return S::add(x, y); }
+    [[gnu::always_inline]] static V diff(V x, V y) { return S::sub(S::add(x, S::broadcast(2 * kP)), y); }  // x - y + 2P, y <= 2P
+    [[gnu::always_inline]] static V low(V x) { return M::template reduce<2 * kP>(x); }                       // [0, 4P) -> [0, 2P)
+    [[gnu::always_inline]] static V canonical(V x) { return M::template reduce<kP>(x); }                     // [0, 2P) -> [0, P)
     // x - y mod 2P for x, y < 2P, in [0, 2P): x - y wraps above 2P exactly when it is negative.
-    static V low_diff(V x, V y) {
+    [[gnu::always_inline]] static V low_diff(V x, V y) {
         const V t = S::sub(x, y);
         return S::min(t, S::add(t, S::broadcast(2 * kP)));
     }
-    static V mul(V x, const Factor& f) { return whole(M::shoup(x, f.w, f.q)); }  // any x -> [0, 2P)
+    [[gnu::always_inline]] static V mul(V x, const Factor& f) { return whole(M::shoup(x, f.w, f.q)); }  // any x -> [0, 2P)
 
     // x86: x, unchanged, through an empty asm statement. Without it GCC distributes a product
     // x w - q P over its uses (a + c -> (a - q P) + x w): 24 adds and subtracts per forward
     // radix-4 column instead of 19 (notes.md, issue #5). Not on Neon, where GCC fuses those adds
     // into mla/mls (products 1-2% slower with the statement).
-    static V whole(V x) {
+    [[gnu::always_inline]] static V whole(V x) {
 #if defined(__x86_64__)
         if constexpr (S::lanes > 1) asm("" : "+v"(x));
 #endif
@@ -68,76 +68,172 @@ struct Arith {
     }
 };
 
+// Whether groups pipeline their columns (Butterflies::each2): groups k > 0, forward identity groups
+// (k = 0), inverse identity groups. On L1 data (notes.md, issue #4 round 2), groups k > 0 ran
+// faster on Neoverse V2 (forward 5%, inverse 9%), Zen 5 (11%, 7%) and Emerald Rapids (2%, 5%);
+// identity groups on Neoverse V2 (1.5%, 8%) and Zen 5 (inverse 4%), while Emerald Rapids lost 1-3%.
+struct Pipelined {
+    bool groups, forward_identity, inverse_identity;
+};
+#if defined(__aarch64__)
+inline constexpr Pipelined kPipelined = {true, true, true};
+#elif defined(__znver4__) || defined(__znver5__)
+inline constexpr Pipelined kPipelined = {true, false, true};
+#else
+inline constexpr Pipelined kPipelined = {true, false, false};
+#endif
+
+// Emerald Rapids ran 2^18 4-7% slower with the scale in the top groups (3 runs; 1 MiB arrays,
+// its L2 is 2 MiB), and 2^19-2^25 within 1%: the scale stays at the top level there from 2^18.
+#if defined(__AVX512F__) && !defined(__znver4__) && !defined(__znver5__)
+inline constexpr int kFoldMaxLog = 17;
+#else
+inline constexpr int kFoldMaxLog = kMaxLog;
+#endif
+
+// s r(i) for i < 8, r(i) the inverse twiddles, and their Shoup quotients: one table block. The
+// top groups that take the scale (Butterflies::inverse_group_scaled) read their twiddles here.
+struct alignas(64) ScaledBlock {
+    u32 words[16];
+};
+constexpr ScaledBlock scaled_block(u32 s) {
+    ScaledBlock b{};
+    for (std::size_t i = 0; i < 8; ++i) {
+        b.words[i] = multiply_mod(s, kStaticTables.words[1][slot(i)]);
+        b.words[8 + i] = quotient(b.words[i]);
+    }
+    return b;
+}
+// Per length: [0] for leaf_scale (inverse), [1] for product_scale (products).
+inline constexpr auto kScaledRoots = [] {
+    std::array<std::array<ScaledBlock, kMaxLog + 1>, 2> t{};
+    for (int lg = kMinLog; lg <= kMaxLog; ++lg) t[0][lg] = scaled_block(leaf_scale(lg)), t[1][lg] = scaled_block(product_scale(lg));
+    return t;
+}();
+
 // Radix-4 butterflies on 4 quarters of q words, q a multiple of S::lanes. Group k at quarter q is
 // a polynomial mod X^4 - r(k)^2, X = x^q; x = r(k), y = r(2k), z = r(2k + 1) (scalar.hpp).
+// Each butterfly is two stages on a column of 4 vectors, first then second, so groups can
+// pipeline them across columns (each2).
 template <class S>
 struct Butterflies : Arith<S> {
     using A = Arith<S>;
     using V = typename S::V;
     using F = typename A::Factor;
+    using Column = V[4];
     using A::add, A::diff, A::low, A::low_diff, A::mul;
 
-    // In < kIn P (kIn = 1, 2 or 4), out < 4P. Inputs below 2P need no reduction (the first level).
-    template <int kIn = 4>
-    [[gnu::always_inline]] static void forward4(V& f0, V& f1, V& f2, V& f3, const F& x, const F& y, const F& z) {
-        const V a = below2(f0, kIn), b = below2(f1, kIn), c = mul(f2, x), d = mul(f3, x);
-        const V ac = low(add(a, c)), amc = low_diff(a, c);
-        const V yb = mul(add(b, d), y), zd = mul(diff(b, d), z);
-        f0 = add(ac, yb), f1 = diff(ac, yb), f2 = add(amc, zd), f3 = diff(amc, zd);
-    }
-    // x = y = 1. In < kIn P, out < 4P.
-    template <int kIn = 4>
-    [[gnu::always_inline]] static void forward4_identity(V& f0, V& f1, V& f2, V& f3, const F& z) {
-        const V a = below2(f0, kIn), b = below2(f1, kIn), c = below2(f2, kIn), d = below2(f3, kIn);
-        if constexpr (kIn == 1) {  // sums < 2P; a - c + P in (0, 2P)
-            const V ac = add(a, c), amc = S::sub(S::add(a, S::broadcast(kP)), c);
-            const V bd = add(b, d), zd = mul(diff(b, d), z);
-            f0 = add(ac, bd), f1 = diff(ac, bd), f2 = add(amc, zd), f3 = diff(amc, zd);
-            return;
-        }
-        const V ac = low(add(a, c)), amc = low_diff(a, c);
-        const V bd = low(add(b, d)), zd = mul(diff(b, d), z);
-        f0 = add(ac, bd), f1 = diff(ac, bd), f2 = add(amc, zd), f3 = diff(amc, zd);
-    }
     // x < bound P -> < 2P.
     [[gnu::always_inline]] static V below2(V x, int bound) { return bound > 2 ? low(x) : x; }
-    // In < 2P, out < 2P.
-    [[gnu::always_inline]] static void inverse4(V& f0, V& f1, V& f2, V& f3, const F& x, const F& y, const F& z) {
-        const V ab = low(add(f0, f1)), cd = low(add(f2, f3));
-        const V amb = mul(diff(f0, f1), y), cmd = mul(diff(f2, f3), z);
-        f0 = low(add(ab, cd)), f1 = low(add(amb, cmd)), f2 = mul(diff(ab, cd), x), f3 = mul(diff(amb, cmd), x);
+
+    // Forward, in < kIn P (kIn = 1, 2 or 4), out < 4P. Inputs below 2P need no reduction (the first
+    // level). First: a, b < 2P and c = x f2, d = x f3.
+    template <int kIn = 4>
+    [[gnu::always_inline]] static void forward_first(Column& v, const F& x) {
+        v[0] = below2(v[0], kIn), v[1] = below2(v[1], kIn), v[2] = mul(v[2], x), v[3] = mul(v[3], x);
     }
-    [[gnu::always_inline]] static void inverse4_identity(V& f0, V& f1, V& f2, V& f3, const F& z) {
-        const V ab = low(add(f0, f1)), cd = low(add(f2, f3));
-        const V amb = low_diff(f0, f1), cmd = mul(diff(f2, f3), z);
-        f0 = low(add(ab, cd)), f1 = low(add(amb, cmd)), f2 = low_diff(ab, cd), f3 = low_diff(amb, cmd);
+    [[gnu::always_inline]] static void forward_second(Column& v, const F& y, const F& z) {
+        const V ac = low(add(v[0], v[2])), amc = low_diff(v[0], v[2]);
+        const V yb = mul(add(v[1], v[3]), y), zd = mul(diff(v[1], v[3]), z);
+        v[0] = add(ac, yb), v[1] = diff(ac, yb), v[2] = add(amc, zd), v[3] = diff(amc, zd);
+    }
+    template <int kIn = 4>
+    [[gnu::always_inline]] static void forward4(Column& v, const F& x, const F& y, const F& z) {
+        forward_first<kIn>(v, x), forward_second(v, y, z);
     }
 
-    // Applies op to the 4 quarters of `from`, S::lanes words at a time, into those of f (may be from).
+    // x = y = 1. In < kIn P, out < 4P. First: a + c, a - c, b + d, z (b - d).
+    template <int kIn = 4>
+    [[gnu::always_inline]] static void forward_identity_first(Column& v, const F& z) {
+        const V a = below2(v[0], kIn), b = below2(v[1], kIn), c = below2(v[2], kIn), d = below2(v[3], kIn);
+        if constexpr (kIn == 1) v[0] = add(a, c), v[1] = S::sub(S::add(a, S::broadcast(kP)), c), v[2] = add(b, d);  // < 2P
+        else v[0] = low(add(a, c)), v[1] = low_diff(a, c), v[2] = low(add(b, d));
+        v[3] = mul(diff(b, d), z);
+    }
+    [[gnu::always_inline]] static void forward_identity_second(Column& v) {
+        const V ac = v[0], amc = v[1], bd = v[2], zd = v[3];
+        v[0] = add(ac, bd), v[1] = diff(ac, bd), v[2] = add(amc, zd), v[3] = diff(amc, zd);
+    }
+
+    // Inverse, in < 2P, out < 2P. First: a + b, c + d, y (a - b), z (c - d).
+    [[gnu::always_inline]] static void inverse_first(Column& v, const F& y, const F& z) {
+        const V ab = low(add(v[0], v[1])), cd = low(add(v[2], v[3]));
+        const V amb = mul(diff(v[0], v[1]), y), cmd = mul(diff(v[2], v[3]), z);
+        v[0] = ab, v[1] = cd, v[2] = amb, v[3] = cmd;
+    }
+    [[gnu::always_inline]] static void inverse_second(Column& v, const F& x) {
+        const V ab = v[0], cd = v[1], amb = v[2], cmd = v[3];
+        v[0] = low(add(ab, cd)), v[1] = low(add(amb, cmd)), v[2] = mul(diff(ab, cd), x), v[3] = mul(diff(amb, cmd), x);
+    }
+    [[gnu::always_inline]] static void inverse4(Column& v, const F& x, const F& y, const F& z) {
+        inverse_first(v, y, z), inverse_second(v, x);
+    }
+
+    // x = y = 1.
+    [[gnu::always_inline]] static void inverse_identity_first(Column& v, const F& z) {
+        const V ab = low(add(v[0], v[1])), cd = low(add(v[2], v[3]));
+        const V amb = low_diff(v[0], v[1]), cmd = mul(diff(v[2], v[3]), z);
+        v[0] = ab, v[1] = cd, v[2] = amb, v[3] = cmd;
+    }
+    [[gnu::always_inline]] static void inverse_identity_second(Column& v) {
+        const V ab = v[0], cd = v[1], amb = v[2], cmd = v[3];
+        v[0] = low(add(ab, cd)), v[1] = low(add(amb, cmd)), v[2] = low_diff(ab, cd), v[3] = low_diff(amb, cmd);
+    }
+
+    [[gnu::always_inline]] static void load(const u32* s, std::size_t q, Column& v) {
+        v[0] = S::load(s), v[1] = S::load(s + q), v[2] = S::load(s + 2 * q), v[3] = S::load(s + 3 * q);
+    }
+    [[gnu::always_inline]] static void store(u32* g, std::size_t q, const Column& v) {
+        S::store(g, v[0]), S::store(g + q, v[1]), S::store(g + 2 * q, v[2]), S::store(g + 3 * q, v[3]);
+    }
+
+    // Applies op to each column of the 4 quarters of `from` (S::lanes words of each), into those of
+    // f (may be from).
     template <class Op>
     [[gnu::always_inline]] static void each(const u32* from, u32* f, std::size_t q, Op op) {
         for (std::size_t j = 0; j < q; j += S::lanes) {
-            const u32* s = from + j;
-            V f0 = S::load(s), f1 = S::load(s + q), f2 = S::load(s + 2 * q), f3 = S::load(s + 3 * q);
-            op(f0, f1, f2, f3);
-            u32* g = f + j;
-            S::store(g, f0), S::store(g + q, f1), S::store(g + 2 * q, f2), S::store(g + 3 * q, f3);
+            Column v;
+            load(from + j, q, v), op(v), store(f + j, q, v);
         }
     }
-    template <class Op>
-    [[gnu::always_inline]] static void each(u32* f, std::size_t q, Op op) { each(f, f, q, op); }
+
+    // The same for an op in two stages, software pipelined if kPipe: the first stage of column
+    // j + 1 runs before the second of column j, so a column's two halves are not in flight at once
+    // (shorter chains per loop iteration). Unrolled by 2, so no register copies: q a multiple of
+    // 2 S::lanes (every caller: q >= 32, or q >= 16 at the top of the shortest transforms).
+    template <bool kPipe, class First, class Second>
+    [[gnu::always_inline]] static void each2(const u32* from, u32* f, std::size_t q, First first, Second second) {
+        constexpr std::size_t L = S::lanes;
+        if constexpr (!kPipe) {
+            each(from, f, q, [&] [[gnu::always_inline]] (Column& v) { first(v), second(v); });
+        } else {
+            Column h0, h1;
+            load(from, q, h0), first(h0);
+            std::size_t j = L;
+            for (; j + L < q; j += 2 * L) {
+                load(from + j, q, h1), first(h1);
+                second(h0), store(f + j - L, q, h0);
+                load(from + j + L, q, h0), first(h0);
+                second(h1), store(f + j, q, h1);
+            }
+            load(from + j, q, h1), first(h1);
+            second(h0), store(f + j - L, q, h0);
+            second(h1), store(f + j, q, h1);
+        }
+    }
 
     // Group k of `from` into f (may be from). In < kIn P, out < 4P.
     template <int kIn = 4>
     static void forward_group(const u32* from, u32* f, std::size_t q, std::size_t k, const u32* r) {
         if (k == 0) {
             const F z = A::entry(r, 1);
-            return each(from, f, q, [&] [[gnu::always_inline]] (V& a, V& b, V& c, V& d) {
-                forward4_identity<kIn>(a, b, c, d, z);
-            });
+            return each2<kPipelined.forward_identity>(
+                from, f, q, [&] [[gnu::always_inline]] (Column& v) { forward_identity_first<kIn>(v, z); },
+                [&] [[gnu::always_inline]] (Column& v) { forward_identity_second(v); });
         }
         const F x = A::entry(r, k), y = A::entry(r, 2 * k), z = A::entry(r, 2 * k + 1);
-        each(from, f, q, [&] [[gnu::always_inline]] (V& a, V& b, V& c, V& d) { forward4<kIn>(a, b, c, d, x, y, z); });
+        each2<kPipelined.groups>(from, f, q, [&] [[gnu::always_inline]] (Column& v) { forward_first<kIn>(v, x); },
+                                 [&] [[gnu::always_inline]] (Column& v) { forward_second(v, y, z); });
     }
     template <int kIn = 4>
     static void forward_group(u32* f, std::size_t q, std::size_t k, const u32* r) { forward_group<kIn>(f, f, q, k, r); }
@@ -145,10 +241,35 @@ struct Butterflies : Arith<S> {
     static void inverse_group(u32* f, std::size_t q, std::size_t k, const u32* ir) {
         if (k == 0) {
             const F z = A::entry(ir, 1);
-            return each(f, q, [&] [[gnu::always_inline]] (V& a, V& b, V& c, V& d) { inverse4_identity(a, b, c, d, z); });
+            return each2<kPipelined.inverse_identity>(
+                f, f, q, [&] [[gnu::always_inline]] (Column& v) { inverse_identity_first(v, z); },
+                [&] [[gnu::always_inline]] (Column& v) { inverse_identity_second(v); });
         }
         const F x = A::entry(ir, k), y = A::entry(ir, 2 * k), z = A::entry(ir, 2 * k + 1);
-        each(f, q, [&] [[gnu::always_inline]] (V& a, V& b, V& c, V& d) { inverse4(a, b, c, d, x, y, z); });
+        each2<kPipelined.groups>(f, f, q, [&] [[gnu::always_inline]] (Column& v) { inverse_first(v, y, z); },
+                                 [&] [[gnu::always_inline]] (Column& v) { inverse_second(v, x); });
+    }
+
+    // inverse_group with every output times s, k < 4: twiddles s y, s z, s x and one product more
+    // for the first output (5 products per column; 4 for k = 0, against 1). scaled: scaled_block(s).
+    // In < 2P, out < 2P.
+    static void inverse_group_scaled(u32* f, std::size_t q, std::size_t k, const u32* ir, const u32* scaled) {
+        const F scale = A::entry(scaled, 0), sx = A::entry(scaled, k), sy = A::entry(scaled, 2 * k),
+                sz = A::entry(scaled, 2 * k + 1);
+        const auto first = [&] [[gnu::always_inline]] (Column& v) { inverse_first(v, sy, sz); };
+        if (k == 0) {
+            return each2<kPipelined.groups>(f, f, q, first, [&] [[gnu::always_inline]] (Column& v) {
+                const V ab = v[0], cd = v[1], amb = v[2], cmd = v[3];
+                v[0] = mul(add(ab, cd), scale), v[1] = low(add(amb, cmd)), v[2] = mul(diff(ab, cd), scale);
+                v[3] = low_diff(amb, cmd);
+            });
+        }
+        const F x = A::entry(ir, k);
+        each2<kPipelined.groups>(f, f, q, first, [&] [[gnu::always_inline]] (Column& v) {
+            const V ab = v[0], cd = v[1], amb = v[2], cmd = v[3];
+            v[0] = mul(add(ab, cd), scale), v[1] = low(add(amb, cmd)), v[2] = mul(diff(ab, cd), sx);
+            v[3] = mul(diff(amb, cmd), x);
+        });
     }
 };
 
@@ -164,23 +285,41 @@ struct Bottom : Butterflies<L> {
 
     static constexpr u32 kNegInverse = u32(0) - M::kPinv;  // -P^-1 mod 2^32
 
-    // Groups [first, first + count), 32 words each, in < 4P; canonical leaves out.
-    static void forward(u32* f, std::size_t count, std::size_t first, const u32* r) {
+    // The bottom level runs kColumns columns of a group per step (both on Neon and Sse): bottom
+    // forward 10% and inverse 8% faster on Neoverse V2 than one at a time (notes.md).
+    static constexpr int kColumns = 8 / L::lanes >= 2 ? 2 : 1;
+    using Column = typename B::Column;
+
+    // Applies op to the columns of each group [first, first + count), 32 words each.
+    template <class Op>
+    [[gnu::always_inline]] static void each_group(u32* f, std::size_t count, std::size_t first, const u32* table, Op op) {
         for (std::size_t k = first; k < first + count; ++k, f += 32) {
-            const F x = B::entry(r, k), y = B::entry(r, 2 * k), z = B::entry(r, 2 * k + 1);
-            B::each(f, 8, [&] [[gnu::always_inline]] (V& a, V& b, V& c, V& d) {
-                B::forward4(a, b, c, d, x, y, z);
-                a = canonical(low(a)), b = canonical(low(b)), c = canonical(low(c)), d = canonical(low(d));
-            });
+            const F x = B::entry(table, k), y = B::entry(table, 2 * k), z = B::entry(table, 2 * k + 1);
+            for (std::size_t j = 0; j < 8; j += kColumns * L::lanes) {
+                Column v[kColumns];
+                #pragma GCC unroll 8
+                for (int c = 0; c < kColumns; ++c) B::load(f + j + c * L::lanes, 8, v[c]);
+                #pragma GCC unroll 8
+                for (int c = 0; c < kColumns; ++c) op(v[c], x, y, z);
+                #pragma GCC unroll 8
+                for (int c = 0; c < kColumns; ++c) B::store(f + j + c * L::lanes, 8, v[c]);
+            }
         }
+    }
+
+    // Groups [first, first + count), in < 4P; canonical leaves out.
+    static void forward(u32* f, std::size_t count, std::size_t first, const u32* r) {
+        each_group(f, count, first, r, [] [[gnu::always_inline]] (Column& v, const F& x, const F& y, const F& z) {
+            B::forward4(v, x, y, z);
+            v[0] = canonical(low(v[0])), v[1] = canonical(low(v[1])), v[2] = canonical(low(v[2])), v[3] = canonical(low(v[3]));
+        });
     }
 
     // In and out < 2P.
     static void inverse(u32* f, std::size_t count, std::size_t first, const u32* ir) {
-        for (std::size_t k = first; k < first + count; ++k, f += 32) {
-            const F x = B::entry(ir, k), y = B::entry(ir, 2 * k), z = B::entry(ir, 2 * k + 1);
-            B::each(f, 8, [&] [[gnu::always_inline]] (V& a, V& b, V& c, V& d) { B::inverse4(a, b, c, d, x, y, z); });
-        }
+        each_group(f, count, first, ir, [] [[gnu::always_inline]] (Column& v, const F& x, const F& y, const F& z) {
+            B::inverse4(v, x, y, z);
+        });
     }
 
     // One group's leaves for the products. Row t of window is [w_t A_t, A_t], canonical: x^i A_t
@@ -199,16 +338,16 @@ struct Bottom : Butterflies<L> {
                         B::factor(kP - yz[1], ~yz[9])};
         #pragma GCC unroll 8
         for (std::size_t j = 0; j < 8; j += L::lanes) {
-            V f[4] = {L::load(a + j), L::load(a + 8 + j), L::load(a + 16 + j), L::load(a + 24 + j)};
-            B::forward4(f[0], f[1], f[2], f[3], x, y, z);
+            Column f;
+            B::load(a + j, 8, f), B::forward4(f, x, y, z);
             #pragma GCC unroll 8
             for (int t = 0; t < 4; ++t) {
                 const V v = canonical(low(f[t]));
                 L::store(out.window[t] + 8 + j, v);
                 L::store(out.window[t] + j, canonical(B::mul(v, w[t])));
             }
-            V g[4] = {L::load(b + j), L::load(b + 8 + j), L::load(b + 16 + j), L::load(b + 24 + j)};
-            B::forward4(g[0], g[1], g[2], g[3], x, y, z);
+            Column g;
+            B::load(b + j, 8, g), B::forward4(g, x, y, z);
             #pragma GCC unroll 8
             for (int t = 0; t < 4; ++t) L::store(out.b[t] + j, canonical(low(g[t])));
         }
@@ -231,17 +370,6 @@ struct Bottom : Butterflies<L> {
             e = L::add64(e, L::mul_even(L::mul_even(e, ninv), p));
             o = L::add64(o, L::mul_even(L::mul_even(o, ninv), p));
             return low(L::join_high(e, o));
-        } else if constexpr (requires(V v) { L::mul_wide_lo(v, v); }) {
-            const V x0 = L::load(window + 8 + j), b0 = L::broadcast(b[0]);
-            auto lo = L::mul_wide_lo(x0, b0), hi = L::mul_wide_hi(x0, b0);
-            #pragma GCC unroll 8
-            for (int i = 1; i < 8; ++i) {
-                const V x = L::load(window + 8 - i + j), bi = L::broadcast(b[i]);
-                lo = L::mla_wide_lo(lo, x, bi), hi = L::mla_wide_hi(hi, x, bi);
-            }
-            const V m = L::mul_lo(L::lo_halves(lo, hi), ninv);
-            lo = L::mla_wide_lo(lo, m, p), hi = L::mla_wide_hi(hi, m, p);
-            return low(L::hi_halves(lo, hi));
         } else {
             static_assert(L::lanes == 1);
             u64 s = 0;
@@ -252,18 +380,58 @@ struct Bottom : Butterflies<L> {
         }
     }
 
+    // c[u][t]: words [u lanes, (u + 1) lanes) of leaf t's product, as leaf_product. Neon: two
+    // leaves at once, all their words (umull/umlal and their high forms), each b_i broadcast once
+    // for both words, so 8 independent sums: bottom multiply 11% faster on Neoverse V2 than one
+    // leaf and word at a time; 4 leaves at once spilled the 16 sums (notes.md).
+    static constexpr int kWords = 8 / L::lanes;
+    [[gnu::always_inline]] static void leaf_products(const Leaves& in, V (&c)[kWords][4]) {
+        if constexpr (requires(V v) { L::mul_wide_lo(v, v); }) {
+            using W = decltype(L::mul_wide_lo(V{}, V{}));
+            const V p = L::broadcast(kP), ninv = L::broadcast(kNegInverse);
+            constexpr int kBlock = 2;
+            #pragma GCC unroll 8
+            for (int t0 = 0; t0 < 4; t0 += kBlock) {
+                W lo[kWords][kBlock], hi[kWords][kBlock];
+                #pragma GCC unroll 8
+                for (int i = 0; i < 8; ++i) {
+                    #pragma GCC unroll 8
+                    for (int b = 0; b < kBlock; ++b) {
+                        const V bi = L::broadcast(in.b[t0 + b][i]);
+                        #pragma GCC unroll 8
+                        for (int u = 0; u < kWords; ++u) {
+                            const V x = L::load(in.window[t0 + b] + 8 - i + u * L::lanes);
+                            if (i == 0) lo[u][b] = L::mul_wide_lo(x, bi), hi[u][b] = L::mul_wide_hi(x, bi);
+                            else lo[u][b] = L::mla_wide_lo(lo[u][b], x, bi), hi[u][b] = L::mla_wide_hi(hi[u][b], x, bi);
+                        }
+                    }
+                }
+                #pragma GCC unroll 8
+                for (int u = 0; u < kWords; ++u) {
+                    #pragma GCC unroll 8
+                    for (int b = 0; b < kBlock; ++b) {
+                        const V m = L::mul_lo(L::lo_halves(lo[u][b], hi[u][b]), ninv);
+                        const W l = L::mla_wide_lo(lo[u][b], m, p), h = L::mla_wide_hi(hi[u][b], m, p);
+                        c[u][t0 + b] = low(L::hi_halves(l, h));
+                    }
+                }
+            }
+        } else {
+            #pragma GCC unroll 8
+            for (int u = 0; u < kWords; ++u) {
+                #pragma GCC unroll 8
+                for (int t = 0; t < 4; ++t) c[u][t] = leaf_product(in.window[t], in.b[t], u * L::lanes);
+            }
+        }
+    }
+
     // Leaf products of one group into a, then its inverse butterflies; out < 2P.
     [[gnu::always_inline]] static void multiply_leaves(u32* a, const Leaves& in, std::size_t k, const u32* ir) {
         const F x = B::entry(ir, k), y = B::entry(ir, 2 * k), z = B::entry(ir, 2 * k + 1);
+        V c[kWords][4];
+        leaf_products(in, c);
         #pragma GCC unroll 8
-        for (std::size_t j = 0; j < 8; j += L::lanes) {
-            V c[4];
-            #pragma GCC unroll 8
-            for (int t = 0; t < 4; ++t) c[t] = leaf_product(in.window[t], in.b[t], j);
-            B::inverse4(c[0], c[1], c[2], c[3], x, y, z);
-            #pragma GCC unroll 8
-            for (int t = 0; t < 4; ++t) L::store(a + 8 * t + j, c[t]);
-        }
+        for (int u = 0; u < kWords; ++u) B::inverse4(c[u], x, y, z), B::store(a + u * L::lanes, 8, c[u]);
     }
 
     // Groups [first, first + count) of a and b, in < 4P: forward butterflies, leaf products into
@@ -341,8 +509,8 @@ struct WideBottom : Butterflies<S> {
             const Pair w = twiddles(r, k, n);
             V q[4];
             load(f, q, n);
-            B::forward4(q[0], q[1], q[2], q[3], w.x, w.y, w.z);
-            for (V& v : q) v = canonical(low(v));
+            B::forward4(q, w.x, w.y, w.z);
+            q[0] = canonical(low(q[0])), q[1] = canonical(low(q[1])), q[2] = canonical(low(q[2])), q[3] = canonical(low(q[3]));
             store(f, q, n);
         }
     }
@@ -353,7 +521,7 @@ struct WideBottom : Butterflies<S> {
             const Pair w = twiddles(ir, k, n);
             V q[4];
             load(f, q, n);
-            B::inverse4(q[0], q[1], q[2], q[3], w.x, w.y, w.z);
+            B::inverse4(q, w.x, w.y, w.z);
             store(f, q, n);
         }
     }
@@ -394,8 +562,8 @@ struct WideBottom : Butterflies<S> {
         V f[4], g[4];
         load(a, f, n);
         load(b, g, n);
-        B::forward4(f[0], f[1], f[2], f[3], w.x, w.y, w.z);
-        B::forward4(g[0], g[1], g[2], g[3], w.x, w.y, w.z);
+        B::forward4(f, w.x, w.y, w.z);
+        B::forward4(g, w.x, w.y, w.z);
         #pragma GCC unroll 4
         for (int t = 0; t < 4; ++t) {
             const V at = canonical(low(f[t])), wat = canonical(B::mul(at, *weight[t]));
@@ -411,7 +579,7 @@ struct WideBottom : Butterflies<S> {
         #pragma GCC unroll 4
         for (int t = 0; t < 4; ++t) f[t] = leaf_products(in, t);
         const Pair iw = twiddles(ir, k);
-        B::inverse4(f[0], f[1], f[2], f[3], iw.x, iw.y, iw.z);
+        B::inverse4(f, iw.x, iw.y, iw.z);
         store(a, f, n);
     }
 
@@ -445,6 +613,7 @@ struct Ntt : Butterflies<S> {
     using B = Butterflies<S>;
     using V = typename S::V;
     using F = typename B::Factor;
+    using Column = typename B::Column;
     using B::add, B::diff, B::canonical, B::forward_group, B::inverse_group;
 
     // Subtrees of at most this many leaves run level by level (8 KiB per array).
@@ -502,30 +671,42 @@ struct Ntt : Butterflies<S> {
         bottom_forward(f, nv / 4, k * (nv / 4), r);
     }
 
-    static void inverse_tree(u32* f, std::size_t nv, std::size_t k, const u32* ir) {
+    // The top group of a subtree, on quarters of q words: inverse_group, times s if scaled
+    // (scaled_block(s)) is not null.
+    static void inverse_top(u32* f, std::size_t q, std::size_t k, const u32* ir, const u32* scaled) {
+        if (scaled) return B::inverse_group_scaled(f, q, k, ir, scaled);
+        inverse_group(f, q, k, ir);
+    }
+
+    // Subtree of group k with nv leaves; its top group's outputs scaled if scaled is not null
+    // (nv >= 16, k < 4).
+    static void inverse_tree(u32* f, std::size_t nv, std::size_t k, const u32* ir, const u32* scaled = nullptr) {
         if (nv > kTile) {
             const std::size_t h = nv / 4;
             for (std::size_t t = 0; t < 4; ++t) inverse_tree(f + 8 * h * t, h, 4 * k + t, ir);
-            inverse_group(f, 8 * h, k, ir);
-            return;
+            return inverse_top(f, 8 * h, k, ir, scaled);
         }
         bottom_inverse(f, nv / 4, k * (nv / 4), ir);
-        for (std::size_t h = 4; h < nv; h *= 4)
+        inverse_levels(f, nv, k, ir, scaled);
+    }
+    // The levels above the bottom of a subtree of at most kTile leaves.
+    static void inverse_levels(u32* f, std::size_t nv, std::size_t k, const u32* ir, const u32* scaled) {
+        for (std::size_t h = 4; h < nv / 4; h *= 4)
             for (std::size_t j = 0, g = k * (nv / (4 * h)); j < nv; j += 4 * h, ++g) inverse_group(f + 8 * j, 8 * h, g, ir);
+        if (nv >= 16) inverse_top(f, 2 * nv, k, ir, scaled);
     }
 
     // Both transforms, the leaf products and the inverse transform of a subtree; inputs < kIn P.
     // The first level reads a_from and b_from (a and b, or other arrays if nv >= 16).
     template <int kIn = 4>
     static void multiply_tree(const u32* a_from, const u32* b_from, u32* a, u32* b, std::size_t nv, std::size_t k,
-                              const u32* r, const u32* ir) {
+                              const u32* r, const u32* ir, const u32* scaled = nullptr) {
         std::size_t h = nv / 4;
         if (nv > kTile) {
             B::template forward_group<kIn>(a_from, a, 8 * h, k, r);
             B::template forward_group<kIn>(b_from, b, 8 * h, k, r);
             for (std::size_t t = 0; t < 4; ++t) multiply_tree(a + 8 * h * t, b + 8 * h * t, h, 4 * k + t, r, ir);
-            inverse_group(a, 8 * h, k, ir);
-            return;
+            return inverse_top(a, 8 * h, k, ir, scaled);
         }
         if (h >= 4) {  // the first level: group k alone
             B::template forward_group<kIn>(a_from, a, 8 * h, k, r);
@@ -538,12 +719,12 @@ struct Ntt : Butterflies<S> {
                 forward_group(b + 8 * j, 8 * h, g, r);
             }
         bottom_multiply(a, b, nv / 4, k * (nv / 4), r, ir);
-        for (std::size_t h = 4; h < nv; h *= 4)
-            for (std::size_t j = 0, g = k * (nv / (4 * h)); j < nv; j += 4 * h, ++g) inverse_group(a + 8 * j, 8 * h, g, ir);
+        inverse_levels(a, nv, k, ir, scaled);
     }
     template <int kIn = 4>
-    static void multiply_tree(u32* a, u32* b, std::size_t nv, std::size_t k, const u32* r, const u32* ir) {
-        multiply_tree<kIn>(a, b, a, b, nv, k, r, ir);
+    static void multiply_tree(u32* a, u32* b, std::size_t nv, std::size_t k, const u32* r, const u32* ir,
+                              const u32* scaled = nullptr) {
+        multiply_tree<kIn>(a, b, a, b, nv, k, r, ir, scaled);
     }
 
     // Top levels. Inputs canonical. If the upper half of f is zero ("sparse"), it is not read.
@@ -572,8 +753,15 @@ struct Ntt : Butterflies<S> {
         }
     }
 
-    // The inverse radix-2 level and the scale s: in < 2P, canonical out.
+    // The inverse radix-2 level, times s if s != 0: in < 2P, canonical out.
     static void inverse_radix2(u32* f, std::size_t half, u32 s) {
+        if (s == 0) {
+            for (std::size_t i = 0; i < half; i += S::lanes) {
+                const V x = S::load(f + i), y = S::load(f + i + half);
+                S::store(f + i, canonical(B::low(add(x, y)))), S::store(f + i + half, canonical(B::low(diff(x, y))));
+            }
+            return;
+        }
         const F scale = B::factor(s);
         for (std::size_t i = 0; i < half; i += S::lanes) {
             const V x = S::load(f + i), y = S::load(f + i + half);
@@ -582,19 +770,37 @@ struct Ntt : Butterflies<S> {
         }
     }
 
-    // Inverse group 0 on quarters of q words and the scale s: in < 2P, canonical out. 4 products per
-    // column, not 5: s z (c - d) and s (a - b) serve two outputs each.
+    // Inverse group 0 on quarters of q words, times s if s != 0: in < 2P, canonical out. With s, 4
+    // products per column, not 5: s z (c - d) and s (a - b) serve two outputs each.
     static void inverse_radix4(u32* f, std::size_t q, const u32* ir, u32 s) {
+        if (s == 0) {
+            const F z = B::entry(ir, 1);
+            return B::template each2<kPipelined.inverse_identity>(
+                f, f, q, [&] [[gnu::always_inline]] (Column& v) { B::inverse_identity_first(v, z); },
+                [&] [[gnu::always_inline]] (Column& v) {
+                    B::inverse_identity_second(v);
+                    v[0] = canonical(v[0]), v[1] = canonical(v[1]), v[2] = canonical(v[2]), v[3] = canonical(v[3]);
+                });
+        }
         const F scale = B::factor(s), sz = B::factor(multiply_mod(s, ir[slot(1)]));
-        B::each(f, q, [&] [[gnu::always_inline]] (V& a, V& b, V& c, V& d) {
-            const V ab = B::low(add(a, b)), cd = B::low(add(c, d));
-            const V amb = B::mul(diff(a, b), scale), cmd = B::mul(diff(c, d), sz);
-            a = canonical(B::mul(add(ab, cd), scale)), c = canonical(B::mul(diff(ab, cd), scale));
-            b = canonical(B::low(add(amb, cmd))), d = canonical(B::low(diff(amb, cmd)));
-        });
+        B::template each2<kPipelined.groups>(
+            f, f, q, [&] [[gnu::always_inline]] (Column& v) { B::inverse_first(v, scale, sz); },
+            [&] [[gnu::always_inline]] (Column& v) {
+                const V ab = v[0], cd = v[1], amb = v[2], cmd = v[3];
+                v[0] = canonical(B::mul(add(ab, cd), scale)), v[1] = canonical(B::low(add(amb, cmd)));
+                v[2] = canonical(B::mul(diff(ab, cd), scale)), v[3] = canonical(B::low(diff(amb, cmd)));
+            });
     }
 
     static constexpr bool kNarrow = !std::is_same_v<S, N>;
+
+    // The scale goes into the top groups of the subtrees below the top level when those have one
+    // (nv >= 16 leaves) and lg <= kFoldMaxLog: their scaled twiddles, else null (the top level
+    // scales). Per vector: 0.5 products fewer and 1.25 other ops more under a radix-2 top, 0.375
+    // products fewer under a radix-4 top (notes.md).
+    static const u32* fold_scale(std::size_t nv, int lg, bool product) {
+        return nv >= 16 && lg <= kFoldMaxLog ? kScaledRoots[product][lg].words : nullptr;
+    }
 
     // Top levels by lg: nv = 4^j leaves start with group 0; nv = 2 * 4^j with the radix-2 level.
     static void forward(u32* f, int lg, const u32* r) {
@@ -612,12 +818,14 @@ struct Ntt : Butterflies<S> {
             if (lg < kWideMinLog) return Ntt<N>::inverse(f, lg, ir, s);
         const std::size_t len = std::size_t(1) << lg, nv = len / 8;
         if (!has_radix2(lg)) {
-            for (std::size_t t = 0; t < 4; ++t) inverse_tree(f + t * len / 4, nv / 4, t, ir);
-            return inverse_radix4(f, len / 4, ir, s);
+            const u32* fold = fold_scale(nv / 4, lg, false);
+            for (std::size_t t = 0; t < 4; ++t) inverse_tree(f + t * len / 4, nv / 4, t, ir, fold);
+            return inverse_radix4(f, len / 4, ir, fold ? 0 : s);
         }
-        inverse_tree(f, nv / 2, 0, ir);
-        inverse_tree(f + len / 2, nv / 2, 1, ir);
-        inverse_radix2(f, len / 2, s);
+        const u32* fold = fold_scale(nv / 2, lg, false);
+        inverse_tree(f, nv / 2, 0, ir, fold);
+        inverse_tree(f + len / 2, nv / 2, 1, ir, fold);
+        inverse_radix2(f, len / 2, fold ? 0 : s);
     }
 
     static void multiply(u32* a, u32* b, std::size_t n, std::size_t m, int lg, const u32* r, const u32* ir) {
@@ -628,10 +836,11 @@ struct Ntt : Butterflies<S> {
         const u32 s = product_scale(lg);
         if (!has_radix2(lg)) {
             const std::size_t q = len / 4;
+            const u32* fold = fold_scale(nv / 4, lg, true);
             forward_radix4(a, q, sparse_a, r);
             forward_radix4(b, q, sparse_b, r);
-            for (std::size_t t = 0; t < 4; ++t) multiply_tree(a + t * q, b + t * q, nv / 4, t, r, ir);
-            return inverse_radix4(a, q, ir, s);
+            for (std::size_t t = 0; t < 4; ++t) multiply_tree(a + t * q, b + t * q, nv / 4, t, r, ir, fold);
+            return inverse_radix4(a, q, ir, fold ? 0 : s);
         }
         // After the radix-2 level a sparse factor's upper half equals its lower half, so the upper
         // subtree's first level reads the lower half instead of a copy, before the lower subtree runs
@@ -640,9 +849,10 @@ struct Ntt : Butterflies<S> {
         const bool share_a = sparse_a && nv / 2 >= 16, share_b = sparse_b && nv / 2 >= 16;
         if (!share_a) forward_radix2(a, half, sparse_a);
         if (!share_b) forward_radix2(b, half, sparse_b);
-        multiply_tree<2>(share_a ? a : a + half, share_b ? b : b + half, a + half, b + half, nv / 2, 1, r, ir);
-        multiply_tree<2>(a, b, nv / 2, 0, r, ir);
-        inverse_radix2(a, half, s);
+        const u32* fold = fold_scale(nv / 2, lg, true);
+        multiply_tree<2>(share_a ? a : a + half, share_b ? b : b + half, a + half, b + half, nv / 2, 1, r, ir, fold);
+        multiply_tree<2>(a, b, nv / 2, 0, r, ir, fold);
+        inverse_radix2(a, half, fold ? 0 : s);
     }
 };
 
