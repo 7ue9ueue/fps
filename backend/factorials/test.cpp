@@ -4,7 +4,8 @@
 // `tables` against the model: with the compiled defaults, and with each candidate set for every
 // class it runs at. Sizes: every n up to 1100, powers of two and their neighbours up to 2^20, both
 // sides of every change of the lane length C up to 2^14 and of every size class up to 2^13, random
-// n, and n = P - 1, P for small P. Placements: tables 64-byte aligned, and at word offsets 0-15
+// n, and n = P - 1, P for small P; 32 lanes with the scan's prefetch also at 2^k - 1, 2^k, 2^k + 1
+// up to 2^22. Placements: tables 64-byte aligned, and at word offsets 0-15
 // from it, the same or different for the two. Words before and after the tables must stay
 // untouched. Then the size classes, and tune.hpp: measure() at a small budget, wisdom text and
 // "factorials.variant" through tune::save / load. The sanitizer build runs a subset (kAll). Exits
@@ -58,11 +59,11 @@ private:
     std::size_t n_;
 };
 
-// Runs f(fact, inverse, n) on tables at the given word offsets and compares with the model.
+// Runs f(fact, inverse, n) on tables at the given word offsets and compares with the model's tables.
 template <u32 P, class F>
-void check(const std::string& name, std::size_t n, F f, std::size_t fact_offset = 0, std::size_t inverse_offset = 0) {
-    std::vector<u32> want_fact(n), want_inverse(n);
-    fps::factorials::model::tables<P>(want_fact.data(), want_inverse.data(), n);
+void compare(const std::string& name, const std::vector<u32>& want_fact, const std::vector<u32>& want_inverse, F f,
+             std::size_t fact_offset, std::size_t inverse_offset) {
+    const std::size_t n = want_fact.size();
     Table fact(n, fact_offset), inverse(n, inverse_offset);
     f(fact.data(), inverse.data(), n);
     const std::string where = name + " P=" + std::to_string(P) + " n=" + std::to_string(n) + " offsets " +
@@ -76,6 +77,13 @@ void check(const std::string& name, std::size_t n, F f, std::size_t fact_offset 
         }
     }
     if (!fact.guarded() || !inverse.guarded()) fail(where + ": wrote outside the tables");
+}
+
+template <u32 P, class F>
+void check(const std::string& name, std::size_t n, F f, std::size_t fact_offset = 0, std::size_t inverse_offset = 0) {
+    std::vector<u32> want_fact(n), want_inverse(n);
+    fps::factorials::model::tables<P>(want_fact.data(), want_inverse.data(), n);
+    compare<P>(name, want_fact, want_inverse, f, fact_offset, inverse_offset);
 }
 
 // The model against the definition.
@@ -117,16 +125,16 @@ using fps::factorials::Step;
 #endif
 constexpr bool kAll = FACTORIALS_TEST_ALL;
 
-template <class S, int K, Step step>
+template <class S, int K, Step step, bool prefetch = false>
 std::string variant() {
-    return std::string("Chains<") + S::name + ", " + std::to_string(K) +
-           (step == Step::shoup ? ", shoup>" : ", montgomery>");
+    return std::string("Chains<") + S::name + ", " + std::to_string(K) + (step == Step::shoup ? ", shoup" : ", montgomery") +
+           (prefetch ? ", prefetch>" : ">");
 }
 
-template <class S, int K, u32 P, Step step>
+template <class S, int K, u32 P, Step step, bool prefetch = false>
 void chains(std::size_t limit) {
-    using C = fps::factorials::Chains<S, K, P, step>;
-    const std::string name = variant<S, K, step>();
+    using C = fps::factorials::Chains<S, K, P, step, prefetch>;
+    const std::string name = variant<S, K, step, prefetch>();
     const auto run = [](u32* fact, u32* inverse, std::size_t n) { C::run(fact, inverse, n); };
     const std::vector<std::size_t> base = sizes(limit, C::kMinSize);
     std::set<std::size_t> n(base.begin(), base.end());
@@ -157,6 +165,25 @@ void placements(std::size_t limit) {
             for (auto [f, i] : offsets) check<P>(name, m, run, f, i);
 }
 
+// 32 lanes with the scan's prefetch (issue #70): sizes just below, at and above 2^18 .. 2^max_lg,
+// at the placements' offsets and both tables aligned.
+template <class S, Step step>
+void wide(int max_lg) {
+    constexpr u32 P = 998244353;
+    constexpr int K = 32 / S::lanes;
+    using C = fps::factorials::Chains<S, K, P, step, true>;
+    const std::string name = variant<S, K, step, true>();
+    const auto run = [](u32* fact, u32* inverse, std::size_t m) { C::run(fact, inverse, m); };
+    const std::pair<std::size_t, std::size_t> offsets[] = {{0, 0}, {1, 1}, {4, 4}, {12, 12},
+                                                           {15, 15}, {0, 8}, {3, 13}, {9, 2}};
+    for (int k = 18; k <= max_lg; ++k)
+        for (std::size_t n : {(std::size_t(1) << k) - 1, std::size_t(1) << k, (std::size_t(1) << k) + 1}) {
+            std::vector<u32> fact(n), inverse(n);
+            fps::factorials::model::tables<P>(fact.data(), inverse.data(), n);
+            for (auto [f, i] : offsets) compare<P>(name, fact, inverse, run, f, i);
+        }
+}
+
 template <class S>
 void test_isa() {
     const int before = failures;
@@ -169,6 +196,8 @@ void test_isa() {
     chains<S, 2, 1073741789, montgomery>(1 << 12);  // the largest prime below 2^30
     placements<S, 2, 998244353, shoup>(1 << 20);
     placements<S, 2, 4099, shoup>(4099);
+    if constexpr (S::lanes == 16) wide<S, shoup>(kAll ? 22 : 19), wide<S, montgomery>(kAll ? 22 : 19);
+    if constexpr (S::lanes >= 4 && S::lanes < 16 && kAll) wide<S, shoup>(20);
     if constexpr (kAll) {
         chains<S, 4, 998244353, montgomery>(1 << 16);
         chains<S, 8, 998244353, shoup>(1 << 16);
@@ -182,10 +211,10 @@ void test_isa() {
 
 namespace fx = fps::factorials;
 
-// Every candidate of select.hpp, also those test_isa leaves out (K = 1 Montgomery, K = 8).
+// Every candidate of select.hpp, also those test_isa leaves out (K = 1 Montgomery, K = 8, prefetch).
 template <class... V>
 void candidates(fx::Candidates<V...>) {
-    (chains<typename V::Isa, V::vectors, 998244353, V::scan>(kAll ? 1 << 18 : 1 << 14), ...);
+    (chains<typename V::Isa, V::vectors, 998244353, V::scan, V::prefetch>(kAll ? 1 << 18 : 1 << 14), ...);
 }
 
 const auto selected = [](u32* fact, u32* inverse, std::size_t n) {

@@ -6,9 +6,10 @@
 // inverse); values in [0, P). Any alignment; no checks. The variant per size class is a tuned
 // choice (select.hpp: `variants`, one load per call; backend/factorials/tune.hpp measures it):
 //   model::tables<P>(fact, inverse, n)          the scalar loop (model.hpp), any n <= P
-//   Chains<S, K, P, step>::run(fact, inverse, n)
+//   Chains<S, K, P, step, prefetch>::run(fact, inverse, n)
 //                                               n >= Chains::kMinSize; W = K S::lanes lanes;
-//                                               step: the scan's chain product (Step)
+//                                               step: the scan's chain product (Step); prefetch:
+//                                               the scan prefetches each lane's next line
 //   run_variant<P>(v, fact, inverse, n)         variant v of select.hpp's list, n >= kMinSizes[v]
 // All are public, as the fast path for callers that pick their own variant.
 //
@@ -24,6 +25,7 @@
 //   3. two chains: up from (a_s)! (times a_s + 1, a_s + 2, ...) and down from 1 / (a_s + C - 1)!
 //      (times a_s + C - 1, a_s + C - 2, ...). Every vector length of steps, an in-register
 //      transpose turns the lanes' terms into vectors of consecutive positions for the stores.
+//      With `prefetch`, each lane also prefetches the line after the one it stores.
 // Design and measurements: notes.md.
 #pragma once
 
@@ -63,7 +65,7 @@ inline constexpr auto kIota = [] {
 
 }  // namespace detail
 
-template <class S, int K, u32 P, Step kStep = Step::shoup>
+template <class S, int K, u32 P, Step kStep = Step::shoup, bool kPrefetch = false>
 class Chains {
 public:
     using M = modarith::Ops<S, P>;
@@ -363,14 +365,30 @@ private:
         detail::unrolled<kLanes>([&](auto t) { advance(0, t); });
         std::size_t i = 0;
         int cur = 0;
-        for (; i + kLanes < c; i += kLanes, cur ^= 1)
-            detail::unrolled<kLanes>([&](auto t) { advance(cur ^ 1, t), emit(cur, i, t); });
+        if constexpr (kPrefetch) {
+            // The lanes of step t also prefetch their line `ahead` words on, in their ranges: 64
+            // write streams (32 lanes) are more than Emerald Rapids' L2 prefetcher follows (notes.md).
+            const auto prefetch = [&](auto t, std::size_t ahead) {
+                detail::unrolled<K>([&](auto l) {
+                    constexpr int e = decltype(t)::value * K + decltype(l)::value;
+                    __builtin_prefetch(up_out[e] + ahead, 0, 3);
+                    __builtin_prefetch(down_out[e] - ahead, 0, 3);
+                });
+            };
+            for (; i + kLanes < c; i += kLanes, cur ^= 1) {
+                const std::size_t ahead = std::min(i + 16, c - kLanes);  // one line on; i + kLanes <= ahead < c
+                detail::unrolled<kLanes>([&](auto t) { advance(cur ^ 1, t), emit(cur, i, t), prefetch(t, ahead); });
+            }
+        } else {
+            for (; i + kLanes < c; i += kLanes, cur ^= 1)
+                detail::unrolled<kLanes>([&](auto t) { advance(cur ^ 1, t), emit(cur, i, t); });
+        }
         detail::unrolled<kLanes>([&](auto t) { emit(cur, i, t); });
     }
 };
 
 template <class V, u32 P>
-using ChainsOf = Chains<typename V::Isa, V::vectors, P, V::scan>;
+using ChainsOf = Chains<typename V::Isa, V::vectors, P, V::scan, V::prefetch>;
 
 // Variant v of Selected (0 the loop, i the candidate i - 1), for n >= kMinSizes[v].
 template <u32 P>
