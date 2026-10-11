@@ -421,8 +421,19 @@ struct IntrinsicsKernels {
                 return inverse_model(f, *t.ir(k + g), t.ir(2 * (k + g))[0], t.ir(2 * (k + g))[1]);
             };
         };
+        // Levels: count groups from k (0: an identity group first), two columns per group on zmm.
         for (std::size_t q : {32, 128}) {
             for (int round = 0; round < 8; ++round) {
+                const std::size_t count = 1 + random_below(5), k = round == 0 ? 0 : 1 + random_below(kGroups - count);
+                check(name + " forward_groups", q, count, 4 * u64(P), 4 * u64(P),
+                      [&](u32* f) { K::forward_groups(f, q, k, count, t.r()); }, fm(k));
+                check(name + " inverse_groups", q, count, 2 * u64(P), 2 * u64(P),
+                      [&](u32* f) { K::inverse_groups(f, q, k, count, t.ir()); }, im(k));
+            }
+        }
+        // 2^15: quarters long enough for the passes that prefetch (detail::intrinsics::kPrefetchMin).
+        for (std::size_t q : {32, 128, 1 << 15}) {
+            for (int round = 0; round < (q > 128 ? 2 : 8); ++round) {
                 const std::size_t k = round == 0 ? 0 : 1 + random_below(kGroups - 1);  // 0: identity groups
                 check(name + " forward_group", q, 1, 4 * u64(P), 4 * u64(P),
                       [&](u32* f) { K::forward_group(f, q, k, t.r()); }, fm(k));

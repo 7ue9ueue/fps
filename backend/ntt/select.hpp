@@ -60,7 +60,9 @@ using NativeMultiply = variant::by_length<8, variant::avx2, Native>;
 #else
 using NativeForward = variant::by_length<8, variant::avx2, Native>;  // Emerald Rapids
 using NativeInverse = Native;
-using NativeMultiply = variant::by_length<8, variant::avx2, Native>;
+// The asm at 2^7 only: intrinsics/asm, multiply and multiply_dense, 0.94 and 0.91 at 2^6, 1.05 and
+// 1.02 at 2^7 (notes.md, issue #5 round 2).
+using NativeMultiply = variant::by_length<7, Native, variant::by_length<8, variant::avx2, Native>>;
 #endif
 #else
 using Native = variant::intrinsics<fps::simd::Native>;
