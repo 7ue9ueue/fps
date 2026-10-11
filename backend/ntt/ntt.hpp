@@ -19,14 +19,16 @@
 //   t.inverse(f);                              // leaf form -> L coefficients
 //
 // Memory of a Convolution: each thread keeps the largest region a Convolution of it used and hands
-// it to the next one, so a short product costs about what multiply() costs (a 32 x 32 product on
-// Zen 3: 0.3 us, not 52 us; notes.md). Twiddle tables past 2^16 too: built once per thread for the
-// longest length so far. A second Convolution alive on the same thread maps its own region. A
-// thread frees what it keeps when it exits.
+// it to the next one. Constructing, multiplying and destroying a 32 x 32 product takes 110 ns on
+// Zen 3, against 106 ns for multiply() alone and 56 us when each Convolution mapped fresh memory
+// (notes.md). Twiddle tables past 2^16 too: one pair per thread, built for the longest length so
+// far. A second Convolution alive on the same thread maps its own region. A thread keeps 8 bytes
+// per transform word of its longest product, and 1 byte per word of tables, until it exits.
 //
-// The caller's a: pick its address so the copy into it is fast. memcpy into an address 0 to 48
-// bytes past the source's, modulo 4 KiB, is 4-20x slower on Zen 3 (4K aliasing, issue #38); 64
-// bytes or more past is fast. b is placed past a as in a Convolution's own memory.
+// The caller's a: b is placed as far past it, modulo 4 KiB, as in a Convolution's own memory, so
+// multiply() runs at least as fast. A memcpy into a ran at full speed on all four timing machines
+// with a 64 or 128 bytes before its source, or 256 bytes or more past it, a multiple of 64 bytes,
+// modulo 4 KiB; other offsets were up to 1.7x slower (notes.md).
 //
 // Leaf form. The transform splits x^L - 1 into L / 8 leaves x^8 - w_v: forward() replaces f by
 // its residues, f mod (x^8 - w_v) in words [8v, 8v + 8). w_v = (-1)^v r(v / 2), where r(k) is the

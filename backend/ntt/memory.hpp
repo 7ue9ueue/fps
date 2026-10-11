@@ -1,5 +1,5 @@
 // Memory of ntt::Convolution, kept per thread across calls (issue #38). Mapping fresh memory per
-// product cost 52 us for a 32 x 32 product on Zen 3, against 0.25 us for the product itself: the
+// product cost 56 us for a 32 x 32 product on Zen 3, against 0.11 us for the product itself: the
 // first touch of a fresh huge page (notes.md).
 //
 // Regions: mappings of whole 2 MiB pages, 2 MiB aligned, in huge pages where the system allows.
@@ -44,8 +44,8 @@ inline void unmap_region(Region r) {
     if (r.start) ::munmap(r.start, r.bytes);
 }
 
-// Per-thread state, trivially destructible so it stays usable after Closer has run (in the
-// destructors of static objects at exit): closed then means "keep nothing".
+// Per-thread state, trivially destructible so it stays usable after ThreadMemoryCloser has run
+// (in the destructors of static objects at exit): closed then means "keep no region".
 struct ThreadMemory {
     Region kept;                 // a free region
     Region tables;               // forward table, then inverse table; empty or for 2^tables_lg
