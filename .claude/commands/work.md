@@ -1,5 +1,5 @@
 ---
-description: Run backend rounds on ready kernel issues with subagents, one per issue
+description: Run rounds on ready kernel and task issues with subagents, one per issue
 argument-hint: "[agents at once, default 3]"
 ---
 Read `AGENTS.md`. Work through the open GitHub issues by `7ue9ueue` (`gh issue list --author
@@ -15,7 +15,8 @@ For each round:
    comments on the issue.
 2. Start a subagent in its own git worktree, in the background, briefed with `tools/prompt.md`.
    Fill in `{issue}`, `{round}`, and `{kernel}` and `{target}` from the issue's `Kernel:` and
-   `Target:` lines.
+   `Target:` lines. For a task issue (`Area:`, no `Kernel:`), `{kernel}` is a one-word name for
+   the area and `{target}` is `all`.
 3. When it returns, read the issue's newest `Result:` line. If the round left none, comment what
    happened, ending with `Result: no gain`.
 4. Gate the round's pull request, if it opened one. Agents never run the gate; you do:
@@ -32,4 +33,4 @@ For each round:
 
 Keep starting rounds until no issue is `ready`, then report each issue's result in a few lines.
 
-To add work, open an issue from `.github/ISSUE_TEMPLATE/kernel.md` with label `ready`.
+To add work, open an issue from `.github/ISSUE_TEMPLATE/kernel.md` or `task.md` with label `ready`.
