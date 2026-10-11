@@ -16,8 +16,8 @@
 // max(f.size(), g.size()) coefficients, f + c and f - c max(f.size(), 1), f * c f.size(), and
 // f * g f.size() + g.size() - 1 (0 if either is empty).
 //
-// The operators allocate their result and write it in one pass; +=, -= and *= c work in place and
-// allocate nothing (+= and -= only to grow).
+// The operators allocate their result and write it in one pass. +=, -= and *= c work in place
+// and allocate nothing, except += and -= with a longer g, which build the result in one pass too.
 //
 // f * g with n and m coefficients: a factor with at most one nonzero term (c x^k) makes it a
 // shift, O(n + m); min(n, m) <= 32 or n m < 3 2^16 runs schoolbook; the rest runs the backend's
@@ -66,7 +66,8 @@ constexpr std::uint32_t residue(T c) {
 
 // Coefficient storage: size() words on the heap, none reserved. Unlike std::vector it can
 // allocate without writing, so an operator writes its result in one pass, and it copies with
-// memcpy (std::vector with such an allocator copies word by word under GCC 15).
+// memcpy (std::vector with such an allocator copies word by word under GCC 15). With no spare
+// capacity, growing one word at a time costs O(n^2), and copy assignment always allocates.
 class Words {
 public:
     struct Unwritten {};
@@ -218,14 +219,15 @@ public:
         return r;
     }
 
+    // A longer g needs new memory: the sum is built there in one pass.
     Polynomial& operator+=(const Polynomial& g) {
-        if (g.size() > size()) resize(g.size());
+        if (g.size() > size()) return *this = std::as_const(*this) + g;
         add(data(), g.data(), data(), g.size());
         return *this;
     }
 
     Polynomial& operator-=(const Polynomial& g) {
-        if (g.size() > size()) resize(g.size());
+        if (g.size() > size()) return *this = std::as_const(*this) - g;
         subtract(data(), g.data(), data(), g.size());
         return *this;
     }

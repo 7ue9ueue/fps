@@ -12,7 +12,6 @@
 #include <random>
 #include <span>
 #include <string>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -111,12 +110,10 @@ void elementwise(bench::Suite& suite) {
 
 // f * g for f and g of n coefficients against ntt::Convolution on the same factors (construct,
 // copy them in, multiply). "<lg>": n = 2^lg / 2, schoolbook below lg = 10. "480x480": a shape the
-// old cutoff (n m < 2^18) ran schoolbook; it runs the NTT now. The scalar NTT takes seconds at
-// 2^22, so on scalar targets the cases stop at 2^18.
+// old cutoff (n m < 2^18) ran schoolbook; it runs the NTT now.
 void multiply(bench::Suite& suite) {
     std::vector<std::pair<std::string, std::size_t>> shapes;
-    const int max_lg = std::is_same_v<fps::ntt::SelectedMultiply, fps::ntt::variant::scalar> ? 18 : 22;
-    for (int lg = 6; lg <= max_lg; ++lg) shapes.emplace_back(std::to_string(lg), std::size_t(1) << (lg - 1));
+    for (int lg = 6; lg <= 22; ++lg) shapes.emplace_back(std::to_string(lg), std::size_t(1) << (lg - 1));
     shapes.emplace_back("480x480", 480);
     for (const auto& [size, n] : shapes) {
         const unsigned seed = unsigned(n);

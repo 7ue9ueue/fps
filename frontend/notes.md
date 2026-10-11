@@ -147,3 +147,11 @@ belongs in `backend/`).
     harness resolves these pairs to about 10% at 2^22 on `lc-zen5` and 5% at small sizes on
     `lc-intel`. The products keep their gap (it grows with size on x86, and the decomposition
     above explains it); on `lc-arm` the API now comes out 1-2% faster, again placement.
+  - Review of #39, round 2 (one finding): `+=` and `-=` with a longer g grew the left operand
+    with `Words::resize` (copy and zero fill), then rewrote every word: two passes, which the
+    rvalue `+` and `-` (e.g. `1 - x - x * x`) inherited. Now they build the result the way the
+    `const&` operator does, in one pass. Tests: shorter left operands (0 to 1000 coefficients)
+    for `+=`, `-=` and the rvalue forms, after `dirty_heap`. After #30 no default build selects
+    `ntt::variant::scalar`, so the products bench runs lg 6 to 22 on every target. The header
+    now says that `Words` has no spare capacity (growth one word at a time is O(n^2)) and that
+    copy assignment always allocates; no caller does either on a hot path.

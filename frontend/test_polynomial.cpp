@@ -221,6 +221,24 @@ void test_sums_and_scalars() {
             check_scalar(a, c);
         check_scalar(a, std::numeric_limits<u64>::max());
     }
+    // A left operand shorter than g: +=, -= and the rvalue forms build a new result.
+    for (const std::size_t n : {0, 1, 5, 64, 1000})
+        for (const std::size_t m : {n + 1, n + 7, 2 * n + 33}) {
+            const Vec a = random_vec(n), b = random_vec(m);
+            const Poly g = poly(b);
+            Poly h = poly(a);
+            dirty_heap(m);
+            h += g;
+            CHECK(vec(h) == naive_sum(a, b, 1), n, m);
+            h = poly(a);
+            dirty_heap(m);
+            h -= g;
+            CHECK(vec(h) == naive_sum(a, b, -1), n, m);
+            dirty_heap(m);
+            CHECK(vec(poly(a) + g) == naive_sum(a, b, 1), n, m);
+            dirty_heap(m);
+            CHECK(vec(poly(a) - g) == naive_sum(a, b, -1), n, m);
+        }
     // Aliasing: f with itself.
     const Vec a = random_vec(77);
     Poly f = poly(a);
@@ -231,7 +249,9 @@ void test_sums_and_scalars() {
     // DESIGN.md's forms.
     const Poly x = Poly::x();
     CHECK(vec(1 - 4 * x) == (Vec{1, P - 4}));
+    CHECK(vec(1 - x - x * x) == naive_sum(naive_sum({1}, {0, 1}, -1), {0, 0, 1}, -1));
     CHECK(vec(1 - x - x * x) == (Vec{1, P - 1, P - 1}));
+    CHECK(vec(Poly{3} + x * x * x - x) == (Vec{3, P - 1, 0, 1}));
     CHECK(vec(1 - 4 * x * x + Poly::x(4)) == (Vec{1, 0, P - 4, 0, 1}));
 }
 
