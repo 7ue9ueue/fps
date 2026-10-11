@@ -69,9 +69,9 @@ each change of C up to 2^12, powers of two and neighbours from 2^9 to 2^17, 8 ra
 tables at word offsets (1, 1), (4, 4), (12, 12), (15, 15), (0, 8), (3, 13), (9, 2) from a 64-byte
 boundary, so every h and both equal and different offsets; words before the tables must stay
 untouched too. Passes at -O2 and ASan/UBSan on `lc-amd` (scalar, sse, avx2),
-`lc-intel-test` (avx512), `lc-zen5`, `lc-arm` and the Mac (scalar, arm). The frontend's
-`test_factorials.cpp` runs the kernel through `Factorials` and through `detail::factorial_tables`
-for every n <= 4099 at P = 4099.
+`lc-intel-test` (avx512), `lc-zen5` (round 2: `lc-zen5-test`), `lc-arm` and the Mac (scalar,
+arm). The frontend's `test_factorials.cpp` runs the kernel through `Factorials` and through
+`detail::factorial_tables` for every n <= 4099 at P = 4099.
 
 ## Measurements
 
@@ -215,7 +215,7 @@ ns per position, warm buffers unless named.
 - Gate cases, this branch against main 626819e, 11 rounds, geomean of `tables/<lg>`: Zen 3
   0.891, Emerald Rapids 0.870, Zen 5 0.880 (lg 10 0.996), Neoverse V2 0.939. Frontend
   `factorials/<lg>`: Zen 3 0.949, Emerald Rapids 0.915, Zen 5 0.928, Neoverse V2 0.958. Tests
-  pass at -O2 and ASan/UBSan on every target's test machines and the Mac.
+  pass at -O2 and ASan/UBSan on every target's test machines and the Mac (rebased on df74bf7).
 - Open: (1) Neoverse V2's scan is unchanged (0.72); its loop spills block records and lane
   pointers (above). (2) The inversion (167-236 ns, 30 dependent vector products) and the scalar
   setup are most of the time below n = 2^10. (3) Zen 5 at n = 1024 gains nothing (0.996).
