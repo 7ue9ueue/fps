@@ -1,9 +1,10 @@
 // Schoolbook products on a simd struct S, modulo P, 2^12 < P < 2^30 (variant of the small kernel).
 //
-//   Schoolbook<S, R, P>::run(a, n, b, m, out);  // out = a b: n + m - 1 words; n >= m >= 1
+//   Schoolbook<S, R, P, U, Solo>::run(a, n, b, m, out);  // out = a b: n + m - 1 words; n >= m >= 1
 //
 // Inputs below P, output in [0, P). out must not overlap a or b. No allocation: scratch is on the
-// stack (about 9 KiB).
+// stack (about 9 KiB). R: vectors per block; U: unrolling of the loop with all R vectors; Solo:
+// for b of at most Solo words, the blocks at the ends of the product run one vector at a time.
 //
 // Outputs go in blocks of R vectors (R S::lanes words), their sums held in registers. For each j,
 // every vector r of the block adds a[k - j] b'[j] for its words k: one load of a at k0 + r W - j
@@ -16,13 +17,15 @@
 //   Scalar: one 64-bit sum per word.
 // Sums: products < (P - 1)^2; every Sums<P>::kFold products a fold keeps them below 2^64; the
 // last step needs them below 3P 2^32 (Sums). Blocks whose loads of a would leave [0, n) read a
-// zero-padded copy instead. b is taken in panels of at most kPanel words, so the scratch is fixed;
-// panels after the first add into out.
+// zero-padded copy of a's start or end instead, made once per panel; the last vector's words past
+// the product are not stored (store_first). b is taken in panels of at most kPanel words, so the
+// scratch is fixed; panels after the first add into out.
 #pragma once
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <type_traits>
 
 #include "backend/modarith/modarith.hpp"
@@ -34,14 +37,15 @@ using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 using u128 = unsigned __int128;
 
-// Bounds of 64-bit sums of products x y, x, y < P. fold(s) = h R1 + l for s = h 2^32 + l, with
-// R1 = 2^32 mod P: congruent to s and below kFolded. Montgomery's last step (s + m P) / 2^32 is
-// below 4P when s < 3P 2^32.
+// Bounds of 64-bit sums of products x y, x, y < P. fold(s) = s - h kQ = h R1 + l for
+// s = h 2^32 + l, with R1 = 2^32 mod P and kQ = 2^32 - R1, a multiple of P: congruent to s and
+// below kFolded. Montgomery's last step (s + m P) / 2^32 is below 4P when s < 3P 2^32.
 template <u32 P>
 struct Sums {
     static_assert(P > (1u << 12) && P < (1u << 30));
     static constexpr u128 kProduct = u128(P - 1) * (P - 1);
     static constexpr u32 kR1 = u32((u64(1) << 32) % P);
+    static constexpr u32 kQ = u32((u64(1) << 32) - kR1);
     static constexpr u128 kFolded = (u128(1) << 32) * (kR1 + 1);
     static constexpr u128 kLast = u128(3) * P << 32;
     static constexpr u128 kCap = u128(1) << 20;  // small P allow more; no j range is that long
@@ -77,8 +81,7 @@ struct EvenOdd {  // x86: 64-bit lanes by mul_even
         x.next = v;
     }
     [[gnu::always_inline]] static V fold(V s) {
-        const V low = S::template blend<0xaaaa>(s, V{});
-        return S::add64(S::mul_even(S::template shr64<32>(s), S::broadcast(Sums<P>::kR1)), low);
+        return S::sub64(s, S::mul_even(S::template shr64<32>(s), S::broadcast(Sums<P>::kQ)));
     }
     [[gnu::always_inline]] static void fold(Acc& x) { x.even = fold(x.even), x.odd = fold(x.odd); }
     [[gnu::always_inline]] static V finish(const Acc& x) {
@@ -105,10 +108,9 @@ struct Halves {  // Neon: words 0-1 and 2-3 in 64-bit lanes
         x.hi = S::mla_wide_hi(x.hi, v, b);
     }
     [[gnu::always_inline]] static void fold(Acc& x) {
-        const V low = S::lo_halves(x.lo, x.hi), high = S::hi_halves(x.lo, x.hi);
-        const V one = S::broadcast(1), r1 = S::broadcast(Sums<P>::kR1);
-        x.lo = S::mla_wide_lo(S::mul_wide_lo(low, one), high, r1);
-        x.hi = S::mla_wide_hi(S::mul_wide_hi(low, one), high, r1);
+        const V high = S::hi_halves(x.lo, x.hi), q = S::broadcast(Sums<P>::kQ);
+        x.lo = S::mls_wide_lo(x.lo, high, q);
+        x.hi = S::mls_wide_hi(x.hi, high, q);
     }
     [[gnu::always_inline]] static V finish(const Acc& x) {
         const V m = S::mul_lo(S::lo_halves(x.lo, x.hi), S::broadcast(0u - M::kPinv)), p = S::broadcast(P);
@@ -127,7 +129,7 @@ struct Single {  // one word per vector
 
     static void start(Acc& x, const u32*) { x.s = 0; }
     static void step(Acc& x, const u32* w, V b) { x.s += u64(*w) * b; }
-    static void fold(Acc& x) { x.s = (x.s >> 32) * Sums<P>::kR1 + u32(x.s); }
+    static void fold(Acc& x) { x.s -= (x.s >> 32) * Sums<P>::kQ; }
     static V finish(const Acc& x) {
         const u32 m = u32(x.s) * (0u - M::kPinv);
         const u32 r = u32((x.s + u64(m) * P) >> 32);
@@ -146,20 +148,16 @@ using Lanes = std::conditional_t<HasMulEven<S>, EvenOdd<S, P>,
 
 }  // namespace detail
 
-template <class S, int R, u32 P>
+template <class S, int R, u32 P, int U = 1, std::size_t Solo = 0>
 class Schoolbook {
 public:
     static constexpr std::size_t kWidth = S::lanes, kBlock = R * kWidth;
     static constexpr std::size_t kPanel = 1024;  // words of b per panel
 
     static void run(const u32* a, std::size_t n, const u32* b, std::size_t m, u32* out) {
-        alignas(64) u32 scaled[kPanel];
         if (m > kPanel) std::fill(out + n + kPanel - 1, out + n + m - 1, 0u);
-        for (std::size_t first = 0; first < m; first += kPanel) {
-            const std::size_t count = std::min(kPanel, m - first);
-            to_montgomery(b + first, count, scaled);
-            panel(a, n, scaled, count, out + first, first > 0);
-        }
+        for (std::size_t first = 0; first < m; first += kPanel)
+            panel(a, n, b + first, std::min(kPanel, m - first), out + first, first > 0);
     }
 
 private:
@@ -173,15 +171,33 @@ private:
         std::size_t lo, hi;
     };
 
-    // out[k] (+)= sum over j of a[k - j] b[j], k < n + m - 1, m <= kPanel. Blocks from k0 = m - 1
-    // to n - kBlock - 1 have all terms j < m in every vector and load inside a; the others
-    // (edges) go through edge().
+    // Words of a that panel() copies at most: its start up to the first vector whose windows stay in
+    // a, its end from the last interior block on, or all of a when no interior block fits.
+    static constexpr std::size_t kCopy = kPanel + kWidth + kBlock;
+
+    // out[k] (+)= sum over j of a[k - j] b[j], k < n + m - 1, m <= kPanel. Vectors at s >= m - 1 with
+    // s + kWidth < n load inside a: full blocks of R from `begin` on. The others (edges, and the
+    // interior vectors left over before the end) read a zero-padded copy of the stretch of a they
+    // load, made once for the start and once for the end. The first copy comes before b' is made:
+    // a load that spans several of its stores waits until they reach the cache.
     static void panel(const u32* a, std::size_t n, const u32* b, std::size_t m, u32* out, bool add) {
-        const std::size_t total = n + m - 1;
-        std::size_t k0 = 0;
-        for (; k0 < total && k0 + 1 < m; k0 += kBlock) edge(a, n, b, m, k0, out, add);
-        for (; k0 + kBlock < n; k0 += kBlock) full(a, k0, b, m, out + k0, add);
-        for (; k0 < total; k0 += kBlock) edge(a, n, b, m, k0, out, add);
+        alignas(64) u32 scaled[kPanel], copy[kWidth + kCopy + 2 * kWidth];
+        const std::size_t total = n + m - 1, begin = (m + kWidth - 2) / kWidth * kWidth;
+        if (begin + kBlock >= n) {  // no interior block: n < kCopy
+            pad(a, n, copy);
+            to_montgomery(b, m, scaled);
+            for (std::size_t k0 = 0; k0 < total; k0 += kBlock) edge(copy + kWidth, k0, n, scaled, m, k0, out, add);
+            return;
+        }
+        if (begin > 0) pad(a, begin + 1, copy);  // windows reach a[-(W - 1)] .. a[begin]
+        to_montgomery(b, m, scaled);
+        for (std::size_t k0 = 0; k0 < begin; k0 += kBlock)
+            edge(copy + kWidth, k0, n, scaled, m, k0, out, add, int(std::min<std::size_t>(R, (begin - k0) / kWidth)));
+        std::size_t k0 = begin;
+        for (; k0 + kBlock < n; k0 += kBlock) full(a, k0, scaled, m, out + k0, add);
+        const std::size_t q = k0 - (m - 1);  // windows reach a[q] .. a[n - 1 + W]
+        pad(a + q, n - q, copy);
+        for (; k0 < total; k0 += kBlock) edge(copy + kWidth, k0 - q, n, scaled, m, k0, out, add);
     }
 
     [[gnu::always_inline]] static void full(const u32* a, std::size_t k0, const u32* b, std::size_t m, u32* dst,
@@ -195,36 +211,31 @@ private:
             if ((j = stop) == m) break;
             fold(acc, R);
         }
-        finish(acc, R, m, dst, add);
+        finish(acc, R, m, dst, kBlock, add);
     }
 
-    // The block of outputs [k0, k0 + kBlock) near either end of the product. Vector r holds outputs
-    // [s, s + W), s = k0 + r W: terms with j in [s + 1 - n, s + W) within [0, m). Both ends of
-    // that range grow with r. The vector loads a in [s + 1 - hi, s + W - lo]; out of [0, n), the
-    // loads read a zero-padded copy. The j loop runs in phases with a fixed set of active vectors
-    // [first, last), cut every kFold terms for a fold.
-    static void edge(const u32* a, std::size_t n, const u32* b, std::size_t m, std::size_t k0, u32* out, bool add) {
-        alignas(64) u32 window[kBlock + kPanel], partial[kBlock];
+    // The block of outputs [k0, k0 + count W) near either end of the product (count = R, or fewer
+    // up to the end). Vector r holds outputs [s, s + W), s = k0 + r W: terms with j in
+    // [s + 1 - n, s + W) within [0, m). Both ends of that range grow with r. Its window at step j
+    // is src + k + r W - j: a[s - j .. s - j + W] in a zero-padded copy. The j loop runs in phases
+    // with a fixed set of active vectors [first, last), cut every kFold terms for a fold; for
+    // m <= Solo, one vector after the other instead.
+    static void edge(const u32* src, std::size_t k, std::size_t n, const u32* b, std::size_t m, std::size_t k0,
+                     u32* out, bool add, int count = R) {
         const std::size_t total = n + m - 1;
-        const int count = int(std::min<std::size_t>(R, (total - k0 + kWidth - 1) / kWidth));
+        count = int(std::min<std::size_t>(count, (total - k0 + kWidth - 1) / kWidth));
+        if (m <= Solo) {
+            for (int r = 0; r < count; ++r) {
+                const std::size_t s = k0 + r * kWidth;
+                one(src + k + r * kWidth, b, s + 1 > n ? s + 1 - n : 0, std::min(m, s + kWidth), out + s, total - s,
+                    add);
+            }
+            return;
+        }
         Range range[R];
         for (int r = 0; r < count; ++r) {
             const std::size_t s = k0 + r * kWidth;
             range[r] = {s + 1 > n ? s + 1 - n : 0, std::min(m, s + kWidth)};
-        }
-        const std::ptrdiff_t lo = std::ptrdiff_t(k0 + 1) - std::ptrdiff_t(range[0].hi);
-        const std::ptrdiff_t hi = std::ptrdiff_t(k0 + count * kWidth - range[count - 1].lo);
-        const bool whole = k0 + kBlock <= total;
-        u32* const dst = whole ? out + k0 : partial;
-        if (!whole && add) std::fill(std::copy(out + k0, out + total, partial), partial + kBlock, 0u);
-        const u32* src = a;
-        std::size_t k = k0;
-        if (lo < 0 || hi >= std::ptrdiff_t(n)) {  // window[x] = a[lo + x], 0 outside a
-            const std::ptrdiff_t from = std::max<std::ptrdiff_t>(lo, 0), to = std::min<std::ptrdiff_t>(hi + 1, n);
-            std::fill(window, window + (from - lo), 0u);
-            std::copy(a + from, a + to, window + (from - lo));
-            std::fill(window + (to - lo), window + (hi + 1 - lo), 0u);
-            src = window, k = std::size_t(std::ptrdiff_t(k0) - lo);
         }
         Acc acc[R];
 #pragma GCC unroll 16
@@ -245,47 +256,135 @@ private:
             if (j == end) break;
             fold(acc, count);
         }
-        finish(acc, count, end - begin, dst, add);
-        if (!whole) std::copy(partial, partial + (total - k0), out + k0);
+        finish(acc, count, end - begin, out + k0, total - k0, add);
+    }
+
+    // One output vector at dst: terms j in [lo, hi), window w - j; only the words below `valid` exist.
+    static void one(const u32* w, const u32* b, std::size_t lo, std::size_t hi, u32* dst, std::size_t valid, bool add) {
+        Acc acc[1];
+        L::start(acc[0], w - lo);
+        for (std::size_t j = lo;;) {
+            const std::size_t stop = std::min(hi, j + Sums<P>::kFold);
+            for (; j < stop; ++j) L::step(acc[0], w - j, S::broadcast(b[j]));
+            if (j == hi) break;
+            L::fold(acc[0]);
+        }
+        finish<1>(acc, 1, hi - lo, dst, valid, add);
     }
 
     // After `terms` steps with a fold every kFold: a last fold if needed, the last step, and the
-    // stores of the first count vectors.
-    [[gnu::always_inline]] static void finish(Acc (&acc)[R], int count, std::size_t terms, u32* dst, bool add) {
+    // stores of the first count vectors, of which only the words below `valid` exist.
+    template <int N = R>
+    [[gnu::always_inline]] static void finish(Acc (&acc)[N], int count, std::size_t terms, u32* dst, std::size_t valid,
+                                              bool add) {
         const std::size_t since = (terms - 1) % Sums<P>::kFold + 1;
         if (since > (terms > Sums<P>::kFold ? Sums<P>::kLastFromFold : Sums<P>::kLastFromZero)) fold(acc, count);
 #pragma GCC unroll 16
-        for (int r = 0; r < R; ++r) {
+        for (int r = 0; r < N; ++r) {
             if (r == count) break;
             V v = L::finish(acc[r]);
-            if (add) v = M::add(v, S::load(dst + r * kWidth));
-            S::store(dst + r * kWidth, v);
+            u32* const p = dst + r * kWidth;
+            if (r + 1 == count && valid < std::size_t(count) * kWidth)
+                return store_short(p, v, valid - r * kWidth, add);
+            if (add) v = M::add(v, S::load(p));
+            S::store(p, v);
         }
     }
 
-    // Terms j in [j, stop) of the vectors [First, Last).
+    // p[0, c) (+)= the first c < W words of v.
+    static void store_short(u32* p, V v, std::size_t c, bool add) {
+        if (add) {
+            alignas(64) u32 t[kWidth] = {};
+            copy_short(t, p, c);
+            v = M::add(v, S::load(t));
+        }
+        S::store_first(p, v, int(c));
+    }
+
+    // copy[0, W) = 0, copy[W, W + c) = a[0, c), copy[W + c, W + c + 2W) = 0.
+    static void pad(const u32* a, std::size_t c, u32* copy) {
+        u32* const dst = copy + kWidth;
+        S::store(copy, V{});
+        std::size_t x = 0;
+        for (; x + kWidth <= c; x += kWidth) S::store(dst + x, S::load(a + x));
+        if (c >= kWidth) S::store(dst + c - kWidth, S::load(a + c - kWidth));
+        else copy_short(dst, a, c);
+        S::store(dst + c, V{});
+        S::store(dst + c + kWidth, V{});
+    }
+
+    // dst[0, c) = src[0, c), c < W: pieces of 8, 4, 2 and 1 words (no call to memcpy).
+    static void copy_short(u32* dst, const u32* src, std::size_t c) {
+        std::size_t x = 0;
+        piece<8>(dst, src, c, x);
+        piece<4>(dst, src, c, x);
+        piece<2>(dst, src, c, x);
+        piece<1>(dst, src, c, x);
+    }
+
+    template <std::size_t kWords>
+    [[gnu::always_inline]] static void piece(u32* dst, const u32* src, std::size_t c, std::size_t& x) {
+        if constexpr (kWords < kWidth)
+            if (c & kWords) {
+                std::memcpy(dst + x, src + x, kWords * sizeof(u32));
+                x += kWords;
+            }
+    }
+
+    // Terms j in [j, stop) of the vectors [First, Last); the loop with all R vectors unrolled U times.
     template <int First, int Last>
     [[gnu::always_inline]] static void terms(Acc (&acc)[R], const u32* src, std::size_t k, const u32* b,
                                              std::size_t j, std::size_t stop) {
-        for (; j < stop; ++j) {
-            const V bj = S::broadcast(b[j]);
-#pragma GCC unroll 16
-            for (int r = First; r < Last; ++r) L::step(acc[r], src + k + r * kWidth - j, bj);
+        if constexpr (First == 0 && Last == R && U > 1) {
+#pragma GCC unroll U
+            for (; j < stop; ++j) step<First, Last>(acc, src, k, b, j);
+        } else {
+            for (; j < stop; ++j) step<First, Last>(acc, src, k, b, j);
         }
     }
 
-    // terms<first, last> for runtime first < last <= R.
-    template <int First = 0, int Last = R>
-    [[gnu::always_inline]] static void phase(int first, int last, Acc (&acc)[R], const u32* src, std::size_t k,
-                                             const u32* b, std::size_t j, std::size_t stop) {
-        if (first == First && last == Last) return terms<First, Last>(acc, src, k, b, j, stop);
-        if constexpr (Last > First + 1) phase<First, Last - 1>(first, last, acc, src, k, b, j, stop);
-        else if constexpr (First + 1 < R) phase<First + 1, R>(first, last, acc, src, k, b, j, stop);
+    template <int First, int Last>
+    [[gnu::always_inline]] static void step(Acc (&acc)[R], const u32* src, std::size_t k, const u32* b, std::size_t j) {
+        const V bj = S::broadcast(b[j]);
+        const u32* base = src + k - j;
+        // Neon: GCC keeps windows in registers from one j to the next (vector r's window at step j is
+        // vector r + 1's at step j + W) and pays a move for each; an opaque base stops it (notes.md).
+        if constexpr (detail::HasMulWide<S>) asm("" : "+r"(base));
+#pragma GCC unroll 16
+        for (int r = First; r < Last; ++r) L::step(acc[r], base + r * kWidth, bj);
     }
 
-    [[gnu::always_inline]] static void fold(Acc (&acc)[R], int count) {
+    // terms<first, last> for runtime first < last <= R: one jump through a table (a chain of compares
+    // cost 3-9% on products of 32-128 words a side, notes.md).
+    [[gnu::always_inline]] static void phase(int first, int last, Acc (&acc)[R], const u32* src, std::size_t k,
+                                             const u32* b, std::size_t j, std::size_t stop) {
+        static_assert(R <= 8);
+#define FPS_SMALL_PHASE(F, L)                                              \
+    case F * 16 + L:                                                       \
+        if constexpr (L <= R) return terms<F, L>(acc, src, k, b, j, stop); \
+        break;
+        switch (first * 16 + last) {
+            FPS_SMALL_PHASE(0, 1) FPS_SMALL_PHASE(0, 2) FPS_SMALL_PHASE(0, 3) FPS_SMALL_PHASE(0, 4)
+            FPS_SMALL_PHASE(0, 5) FPS_SMALL_PHASE(0, 6) FPS_SMALL_PHASE(0, 7) FPS_SMALL_PHASE(0, 8)
+            FPS_SMALL_PHASE(1, 2) FPS_SMALL_PHASE(1, 3) FPS_SMALL_PHASE(1, 4) FPS_SMALL_PHASE(1, 5)
+            FPS_SMALL_PHASE(1, 6) FPS_SMALL_PHASE(1, 7) FPS_SMALL_PHASE(1, 8)
+            FPS_SMALL_PHASE(2, 3) FPS_SMALL_PHASE(2, 4) FPS_SMALL_PHASE(2, 5) FPS_SMALL_PHASE(2, 6)
+            FPS_SMALL_PHASE(2, 7) FPS_SMALL_PHASE(2, 8)
+            FPS_SMALL_PHASE(3, 4) FPS_SMALL_PHASE(3, 5) FPS_SMALL_PHASE(3, 6) FPS_SMALL_PHASE(3, 7)
+            FPS_SMALL_PHASE(3, 8)
+            FPS_SMALL_PHASE(4, 5) FPS_SMALL_PHASE(4, 6) FPS_SMALL_PHASE(4, 7) FPS_SMALL_PHASE(4, 8)
+            FPS_SMALL_PHASE(5, 6) FPS_SMALL_PHASE(5, 7) FPS_SMALL_PHASE(5, 8)
+            FPS_SMALL_PHASE(6, 7) FPS_SMALL_PHASE(6, 8)
+            FPS_SMALL_PHASE(7, 8)
+        }
+#undef FPS_SMALL_PHASE
+        __builtin_unreachable();
+    }
+
+    template <int N>
+    [[gnu::always_inline]] static void fold(Acc (&acc)[N], int count) {
 #pragma GCC unroll 16
-        for (int r = 0; r < R; ++r)
+        for (int r = 0; r < N; ++r)
             if (r < count) L::fold(acc[r]);
     }
 

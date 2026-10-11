@@ -29,6 +29,9 @@ top). `select.hpp` picks `simd::Native` per target and lists every struct the ta
 - `shr<k>`, `shl<k>`: 32-bit lane shifts on every struct (round 2, for modarith's Barrett `split`).
 - `Avx512` halves from and to memory: `load_halves`, `store_half<h>`, `broadcast_halves` (ntt
   issue #5, for the zmm leaf products: two groups per vector, one per half).
+- `store_first(p, a, k)`: the first k lanes, nothing past them (small issue #37, round 2: the last
+  output vector of a product). AVX-512 and Avx512Vl: one masked store; Sse, Avx2, Neon: pieces of
+  4, 2 and 1 words from the register. Neon `mls_wide_lo/hi` (`umlsl`, `umlsl2`), for small's fold.
 
 ## Tests
 
@@ -179,6 +182,13 @@ from memory), `store_half<h>` (ymm store, `vextracti64x4` to memory) and `broadc
 On Emerald Rapids (`perf`, the ntt product bottom): `broadcast_halves` runs on p0 or p5 where the
 `vpermd` it replaced ran on p5 only; `load_halves` still costs a p5 uop, like `vpermt2d`. The
 simd and modarith bench binaries for avx512 are byte-identical to main's.
+
+2026-10-11, claude (small issue #37, round 2): added `store_first` and Neon `mls_wide_lo/hi`
+(Design). Tested against lane-wise copies and 64-bit products in `test.cpp` (every k from 0 to the
+lanes, guard words around). A partial store through a stack buffer and piece copies cost the small
+kernel a store-forwarding stall at 8x8 (about 18 cycles on Emerald Rapids); the masked store does
+not (`backend/small/notes.md`, Log). The simd, modarith, ntt and factorials bench binaries are
+byte-identical to main's (avx2, avx512).
 
 ## Sources
 

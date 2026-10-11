@@ -105,6 +105,13 @@ void test_common() {
         for (int i = 0; i < S::lanes; ++i)
             if (copy[offset + i] != buffer[offset + i]) fail(S::name, "load/store at offset " + std::to_string(offset));
     }
+    for (int k = 0; k <= S::lanes; ++k) {  // the first k lanes, nothing past them
+        u32 out[3 * S::lanes];
+        for (u32& x : out) x = 0xdeadbeef;
+        S::store_first(out + 1, va, k);
+        for (int i = 0; i < 3 * S::lanes; ++i)
+            if (out[i] != (i >= 1 && i <= k ? a[i - 1] : 0xdeadbeef)) fail(S::name, "store_first " + std::to_string(k));
+    }
     check<S>("broadcast", S::broadcast(a[0]), [&](int) { return a[0]; });
     check<S>("add", S::add(va, vb), [&](int i) { return a[i] + b[i]; });
     check<S>("sub", S::sub(va, vb), [&](int i) { return a[i] - b[i]; });
@@ -198,10 +205,12 @@ void test_neon() {
     for (int half = 0; half < 2; ++half) {
         const auto p = wide(half ? S::mul_wide_hi(va, vb) : S::mul_wide_lo(va, vb));
         const auto q = wide(half ? S::mla_wide_hi(cw, va, vb) : S::mla_wide_lo(cw, va, vb));
+        const auto r = wide(half ? S::mls_wide_hi(cw, va, vb) : S::mls_wide_lo(cw, va, vb));
         for (int i = 0; i < 2; ++i) {
             const u64 product = u64(a[2 * half + i]) * b[2 * half + i];
             if (p[i] != product) fail(S::name, "mul_wide");
             if (q[i] != wide(cw)[i] + product) fail(S::name, "mla_wide");
+            if (r[i] != wide(cw)[i] - product) fail(S::name, "mls_wide");
         }
     }
     const auto x = S::mul_wide_lo(va, vb), y = S::mul_wide_hi(vc, vd);
