@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "backend/factorials/factorials.hpp"
 #include "fps/modular.hpp"
 
 namespace fps {
@@ -24,15 +25,12 @@ namespace fps {
 namespace detail {
 
 // fact[i] = i! and inverse[i] = 1 / i! for i < n = fact.size() = inverse.size(); any prime
-// P < 2^32, n <= P. Two chains of n - 1 products each and one inverse.
+// P < 2^32, n <= P. The backend kernel for 2^12 < P < 2^30 (backend/factorials), else its scalar
+// model: two chains of n - 1 products each and one inverse.
 template <std::uint32_t P>
 void factorial_tables(std::span<std::uint32_t> fact, std::span<std::uint32_t> inverse) {
-    const std::size_t n = fact.size();
-    if (n == 0) return;
-    fact[0] = 1;
-    for (std::size_t i = 1; i < n; ++i) fact[i] = mod_mul<P>(fact[i - 1], std::uint32_t(i));
-    inverse[n - 1] = mod_inverse<P>(fact[n - 1]);
-    for (std::size_t i = n - 1; i > 0; --i) inverse[i - 1] = mod_mul<P>(inverse[i], std::uint32_t(i));
+    if constexpr (P > (1u << 12) && P < (1u << 30)) factorials::tables<P>(fact, inverse);
+    else factorials::model::tables<P>(fact.data(), inverse.data(), fact.size());
 }
 
 }  // namespace detail

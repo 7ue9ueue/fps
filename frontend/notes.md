@@ -155,3 +155,17 @@ belongs in `backend/`).
     `ntt::variant::scalar`, so the products bench runs lg 6 to 22 on every target. The header
     now says that `Words` has no spare capacity (growth one word at a time is O(n^2)) and that
     copy assignment always allocates; no caller does either on a hot path.
+- 2026-10-11: `detail::factorial_tables` calls the backend kernel `factorials::tables` (issue #33,
+  `backend/factorials/notes.md`) for 2^12 < P < 2^30, and the kernel's scalar model (the loop
+  above) for other P. `frontend/bench.cpp` has `factorials@kernel/<lg>`: the same two
+  zero-filled vectors and the kernel call. `test_factorials.cpp` also runs every n <= 4099 at
+  P = 4099, where the kernel path runs up to n = P.
+  - `factorials/<lg>` new/base against main (27905ef), 11 rounds, lg 10 / 14 / 18 / 22: `lc-zen5`
+    0.155 / 0.061 / 0.211 / 0.250, `lc-arm` 0.203 / 0.122 / 0.252 / 0.293. Against
+    `factorials@kernel/<lg>`: 0.998-1.008 (Zen 5), 0.985-1.001 (Neoverse V2).
+  - The allocation now costs more than the kernel from lg 18 on: at lg 22 on Zen 5, 1.79 ns per
+    entry through the API against 0.46 for the kernel into warm buffers, so 1.3 ns is the
+    zero-fill and page faults of the two vectors. Tables allocated without zero-fill and in huge
+    pages (DESIGN.md plans library-owned huge pages) should cut most of it (guess, not tried).
+    64-byte aligned tables would also let a later kernel round keep zmm on Emerald Rapids at
+    large n: 0.44 against 0.58 ns per entry (`backend/factorials/notes.md`, Log).

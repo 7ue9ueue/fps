@@ -1,6 +1,7 @@
 // Tests of fps/factorials.hpp: the tables against running products, binomials against Pascal's
 // triangle and products of k factors. Factorials<P> exists for P = 998244353 only (DESIGN.md);
-// the tables it wraps (detail::factorial_tables) are also tested on small primes, up to n = P.
+// the tables it wraps (detail::factorial_tables) are also tested on small primes, up to n = P:
+// 2, 3, 5, 101 run the scalar loop, 4099 the backend kernel.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -119,6 +120,7 @@ int main() {
     test_small_prime<3>();
     test_small_prime<5>();
     test_small_prime<101>();
+    test_small_prime<4099>();
     for (std::size_t n : {0, 1, 2, 4097}) test_detail<4294967291>(n);  // largest prime below 2^32
 
     std::mt19937_64 rng(1);
