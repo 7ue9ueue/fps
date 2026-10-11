@@ -96,7 +96,10 @@ each change of C up to 2^12, powers of two and neighbours from 2^9 to 2^17, 8 ra
 tables at word offsets (1, 1), (4, 4), (12, 12), (15, 15), (0, 8), (3, 13), (9, 2) from a 64-byte
 boundary, so every h and both equal and different offsets; words before the tables must stay
 untouched too. The selected `tables` also on both sides of every tier's threshold and at
-5 2^20 + 17 (Zen 5's last tier). Passes at -O2 and ASan/UBSan on `lc-amd` (scalar, sse, avx2),
+5 2^20 + 17 (Zen 5's last tier). The ASan/UBSan build (5x the -O2 build's compile time) runs a
+subset since round 3: K = 1, 2, 4, both chain products, P = 998244353, 4099 and 1073741789, sizes
+to 2^20 for K = 2 Shoup and 2^16 for the rest (`lc-zen5-test`: 100 s to build against 257 s for
+all of it; main's test 152 s). Passes at -O2 and ASan/UBSan on `lc-amd` (scalar, sse, avx2),
 `lc-intel-test` (avx512), `lc-zen5-test`, `lc-arm` and the Mac (scalar, arm). The frontend's `test_factorials.cpp` runs the kernel through
 `Factorials` and through `detail::factorial_tables` for every n <= 4099 at P = 4099.
 
@@ -311,14 +314,15 @@ of 11 interleaved rounds, warm tables in two std::vectors, ns per call or per po
   position, p0 busy 84% and p5 (+ p11) 94%: 2.76 vector uops per position, of which the scan
   2.25 (per chain vector and step: Montgomery 12, transpose 4, reduce 2) and the lane products
   0.36. Port-bound; Shoup has the same uop count there.
-- Gate cases, this branch (a5350ea) against main 0d2355e, 11 rounds, geomean of `tables/<lg>`:
-  Zen 3 0.743, Emerald Rapids 0.775, Zen 5 0.736, Neoverse V2 0.724 (Measurements). Frontend
-  `factorials/<lg>`: 0.861, 0.914, 0.912, 0.840. Earlier builds: before the GCD inverse, Sse
-  tiers and accumulators 0.792 / 0.828 / 0.705 / 0.756 (main's Zen 5 lg 10 took 1456 ns in that
-  run, 765 in the others); before the accumulators 0.735 / 0.782 / 0.745 / 0.722 (Zen 3 lg 8
-  292 ns there against 332 here, with the same code run at that size). Tests pass at -O2 and
-  ASan/UBSan on every target's test machines and the Mac; the test takes 42-86 s per target
-  (`lc-amd`, `lc-arm`).
+- Gate cases, this branch (a5350ea; 6142b28 rebased on main dd0df74) against main 0d2355e,
+  11 rounds, geomean of `tables/<lg>`: Zen 3 0.743, Emerald Rapids 0.775, Zen 5 0.736,
+  Neoverse V2 0.724 (Measurements). Frontend `factorials/<lg>`: 0.861, 0.914, 0.912, 0.840.
+  Earlier builds: before the GCD inverse, Sse tiers and accumulators 0.792 / 0.828 / 0.705 /
+  0.756 (main's Zen 5 lg 10 took 1456 ns in that run, 765 in the others); before the
+  accumulators 0.735 / 0.782 / 0.745 / 0.722 (Zen 3 lg 8 292 ns there against 332 here, with the
+  same code run at that size). Tests pass at -O2 and
+  ASan/UBSan on every target's test machines and the Mac. The whole test took 322 s on
+  `lc-zen5-test` (main's 190 s); with the sanitizer build on a subset (Tests), 160 s.
 - Open: (1) Emerald Rapids from 2^14 is at its p0/p5 bound with this algorithm (0.97-1.0 of
   main); fewer uops per position needs fewer products, not other ones. (2) Zen 5's zmm Shoup
   loses to Montgomery by register pressure and shifts (above); a Shoup step with fewer live

@@ -3,9 +3,9 @@
 // K = 1, 2, 4, 8, both chain products) and the selected `tables` against the model.
 // Sizes: every n up to 1100, powers of two and their neighbours up to 2^20, both sides of every
 // change of the lane length C up to 2^14 and of every tier, random n, and n = P - 1, P for small
-// P. Placements:
-// tables 64-byte aligned, and at word offsets 0-15 from it, the same or different for the two.
-// Words before and after the tables must stay untouched. Exits nonzero on a failure.
+// P. Placements: tables 64-byte aligned, and at word offsets 0-15 from it, the same or different
+// for the two. Words before and after the tables must stay untouched. The sanitizer build runs a
+// subset (kAll). Exits nonzero on a failure.
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -96,6 +96,20 @@ std::vector<std::size_t> sizes(std::size_t limit, std::size_t min) {
 
 using fps::factorials::Step;
 
+// The sanitizer build compiles 5x slower than -O2: it runs every K and both chain products, at
+// fewer sizes and primes; the -O2 build runs everything.
+#if defined(__SANITIZE_ADDRESS__)
+#define FACTORIALS_TEST_ALL 0
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define FACTORIALS_TEST_ALL 0
+#endif
+#endif
+#if !defined(FACTORIALS_TEST_ALL)
+#define FACTORIALS_TEST_ALL 1
+#endif
+constexpr bool kAll = FACTORIALS_TEST_ALL;
+
 template <class S, int K, Step step>
 std::string variant() {
     return std::string("Chains<") + S::name + ", " + std::to_string(K) +
@@ -142,18 +156,20 @@ void test_isa() {
     constexpr Step shoup = Step::shoup, montgomery = Step::montgomery;
     if constexpr (S::lanes > 1) chains<S, 1, 998244353, shoup>(1 << 16);
     chains<S, 2, 998244353, shoup>(1 << 20);
-    chains<S, 2, 998244353, montgomery>(1 << 20);
-    chains<S, 4, 998244353, shoup>(1 << 20);
-    chains<S, 4, 998244353, montgomery>(1 << 16);
-    chains<S, 8, 998244353, shoup>(1 << 16);
+    chains<S, 2, 998244353, montgomery>(kAll ? 1 << 20 : 1 << 16);
+    chains<S, 4, 998244353, shoup>(kAll ? 1 << 20 : 1 << 16);
     chains<S, 2, 4099, shoup>(4099);
-    chains<S, 2, 4099, montgomery>(4099);
-    chains<S, 4, 65537, shoup>(65537);
-    chains<S, 4, 1073741789, shoup>(1 << 12);  // the largest prime below 2^30
-    chains<S, 2, 1073741789, montgomery>(1 << 12);
+    chains<S, 2, 1073741789, montgomery>(1 << 12);  // the largest prime below 2^30
     placements<S, 2, 998244353, shoup>(1 << 20);
-    placements<S, 2, 998244353, montgomery>(1 << 16);
     placements<S, 2, 4099, shoup>(4099);
+    if constexpr (kAll) {
+        chains<S, 4, 998244353, montgomery>(1 << 16);
+        chains<S, 8, 998244353, shoup>(1 << 16);
+        chains<S, 2, 4099, montgomery>(4099);
+        chains<S, 4, 65537, shoup>(65537);
+        chains<S, 4, 1073741789, shoup>(1 << 12);
+        placements<S, 2, 998244353, montgomery>(1 << 16);
+    }
     std::printf("%-9s %s\n", S::name, failures == before ? "ok" : "FAIL");
 }
 
@@ -171,10 +187,12 @@ int main() {
         for (std::size_t from : {T::min_size...})
             for (std::size_t n : {from - 1, from}) check<998244353>("tables", n, selected);
     }(fps::factorials::Selected{});
+#if FACTORIALS_TEST_ALL
     const auto small = [](u32* fact, u32* inverse, std::size_t n) {
         fps::factorials::tables<4099>(std::span(fact, n), std::span(inverse, n));
     };
     for (std::size_t n : {std::size_t(0), std::size_t(4098), std::size_t(4099)}) check<4099>("tables", n, small);
+#endif
     const std::size_t large[] = {std::size_t(1) << 17, std::size_t(1) << 19, (std::size_t(1) << 20) + 3,
                                  (std::size_t(5) << 20) + 17};  // up to Zen 5's last tier
     for (std::size_t n : large)
