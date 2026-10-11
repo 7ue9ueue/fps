@@ -1,0 +1,116 @@
+# backend/simd
+
+Vector wrappers, one struct per ISA, so kernels are templates written once (`simd.hpp`, API at the
+top). `select.hpp` picks `simd::Native` per target and lists every struct the target can run
+(`simd::All`). Also here: `probe.cpp` (instruction latency and throughput in cycles),
+`machines.py` (machine models of the four timing machines), `stream.hpp` (bench helper).
+
+## Design
+
+- Structs `Scalar`, `Sse` (SSE4.1), `Avx2`, `Avx512Vl` (Avx2's ops on ymm with 32 registers, IFMA,
+  `vpermt2d`), `Avx512` (zmm), `Neon`. Static inline functions on 32-bit lanes; no state.
+- Thin wrappers are one instruction each. Composed ops say their instruction count in the header:
+  `mulhi` (high word of a b), `mul_shr<k>`, `join_high` (high words of two 64-bit-lane vectors,
+  interleaved), x86 `mul_sub`.
+- x86 has `mul_even` (`vpmuludq`) and 64-bit lane ops; Neon has none of that and instead products
+  of vector halves (`umull`, `umull2`, `umlal`), `uzp1/uzp2`, and the signed doubling ops
+  (`sqdmulh`, `shsub`). Kernels test for an op with `requires` and fall back to `mulhi`/`mul_lo`.
+- `permute` takes an `Index` built off the hot path, so it is one instruction everywhere (byte
+  tables for `pshufb` and `tbl`, word indices for `vpermd`).
+- `Native`: `Avx512` (zmm) on `avx512` and `zen5`, `Avx2`, `Sse`, `Neon`, `Scalar`. zmm against
+  ymm (Avx512Vl), modarith streams: Emerald Rapids 1.34x (Montgomery) and 1.39x (Shoup) faster,
+  Zen 5 1.96x and 2.04x.
+- `mulhi` on AVX-512 joins its halves with one `vpermt2d` instead of `vpsrlq` + blend, except on
+  Zen 4/5 (`__znver4__`, `__znver5__`), where Shoup got 5% slower with it (Log).
+- SVE2 is not wrapped: Neoverse V2's SVE vectors are 128-bit like NEON (Arm's guide; not measured).
+
+## Tests
+
+`test.cpp`: every struct the machine can run, 2000 random trials each (words drawn with edge
+values 0, 1, 2^31 - 1, 2^31, 2^32 - 2, 2^32 - 1 one time in eight), every wrapper against lane-wise
+scalar arithmetic: unaligned loads and stores at every offset, `mul_shr<k>` for k = 1, 7, 16, 29,
+31, 32 with products at the 2^(32+k) limit, blends with 6 masks, random permutes, IFMA against
+128-bit products, `sqdmulh` saturation. Passes at -O2 and ASan/UBSan on every target's test
+machines (`lc-amd` scalar/sse/avx2, `lc-intel-test` avx512, `lc-zen5`, `lc-arm`, Mac scalar/arm).
+
+## Instruction costs
+
+`probe.cpp`, GCC 15.2, cycles (latency / reciprocal throughput). Clock from a dependent chain of
+register adds in the same run: Zen 3 3.46 GHz, Emerald Rapids 4.18, Zen 5 4.12, Neoverse V2 2.97.
+`machines.py` holds these with pipe sets. 2026-10-10, commit f4baa1e.
+
+| Instruction | Zen 3 (`lc-bench`) | Emerald Rapids (`lc-intel`) | Zen 5 (`lc-zen5`) |
+|---|---|---|---|
+| vpaddd ymm | 1 / 0.25 | 1.67 / 0.33 | 2 / 0.25 |
+| vpminud ymm | 1 / 0.25 | 2 / 0.5 | 2 / 0.25 |
+| vpmuludq ymm | 3 / 0.5 | 5 / 0.5 | 3 / 0.5 |
+| vpmulld ymm | 3 / 0.5 | 10 / 1.03 | 3 / 0.5 |
+| vpsrlq ymm | 1 / 0.5 | 1 / 0.5 | 2 / 0.5 |
+| vpblendd ymm | 1 / 0.25 | 1.67 / 0.33 | 2 / 0.25 |
+| vpermd ymm | 3 / 1.34 | 3 / 1.0 | 4 / 0.5 |
+| vpermt2d ymm | - | 3 / 1.0 | 4 / 0.5 |
+| vpmadd52luq ymm | - | 4 / 0.5 | 4 / 0.5 |
+| vpaddd zmm | - | 2.5 / 0.5 | 2 / 0.25 |
+| vpminud zmm | - | 3 / 1.0 | 2 / 0.25 |
+| vpmuludq zmm | - | 5.8 / 0.53 | 3 / 0.5 |
+| vpmulld zmm | - | 11.5 / 1.06 | 3 / 0.5 |
+| vpsrlq zmm | - | 1 / 1.0 | 2 / 0.5 |
+| vpblendmd zmm | - | 2.5 / 0.5 | 2 / 0.25 |
+| vpermt2d zmm | - | 4 / 1.0 | 5 / 0.5 |
+| vpmadd52luq zmm | - | 4.2 / 0.53 | 4 / 0.5 |
+
+Mixed pairs (reciprocal throughput per instruction): `vpmuludq + vpmulld` 0.5 on Zen 3 and 5
+(same pipes), 0.75 ymm / 0.79 zmm on Emerald Rapids (`vpmulld` is 2 uops); `vpmuludq + vpsrlq`
+0.25 on Zen (disjoint pipes), 0.5 / 0.53 on Emerald Rapids; IFMA + `vpmuludq` 0.5 everywhere
+(shared pipes).
+
+Neoverse V2 (`lc-arm`), 128-bit: add, sub, umin, shsub, uzp1, uzp2, bsl, tbl 2 / 0.25; mul, umull,
+umull2, sqdmulh 4 / 0.5; mla, mls, umlal, umlal2 1.15 / 0.5 (through the accumulator); ushr, shrn
+2 / 0.5. Mixed: mul + umull and mul + sqdmulh 0.5 (shared pipes), mul + add and umull + uzp2 0.33
+(not 0.25).
+
+Per CPU, for the kernels:
+- `vpmulld` costs as much as `vpmuludq` on Zen 3 and 5, twice (2 uops, latency 10-11.5) on Emerald
+  Rapids.
+- On Emerald Rapids, zmm shifts and `vpminud` run on one port (p0), half the ymm rate.
+- Zen 5 has latency 2 for simple integer ops (Zen 3: 1) and four full 512-bit pipes.
+- On Neoverse V2, accumulating multiplies chain at ~1 cycle through the accumulator.
+
+## Composed products, streams
+
+`bench.cpp`: out[i] = op(a[i], b[i]) over 2048 words, 11 rounds, median ns per word (cycles per
+vector at the clock above). 2026-10-10, commit f4baa1e, GCC 15.2, `tools/kernel.py` flags.
+
+| Case | Zen 3 | Emerald Rapids | Zen 5 | Neoverse V2 |
+|---|---|---|---|---|
+| mul_lo | 0.049 (1.3) | 0.032 (2.2) | 0.022 (1.5) | 0.088 (1.1) |
+| mulhi | 0.075 (2.1) | 0.049 (3.3) | 0.032 (2.1) | 0.097 (1.2) |
+| mul_shr<29> | 0.080 (2.2) | 0.063 (4.2) | 0.030 (2.0) | 0.117 (1.4) |
+
+## Log
+
+2026-10-10, claude (issue #2, round 1):
+- Wrote the structs, tests, bench, probe and models. Tests pass on every target (Tests).
+- Probe calibration: a chain of `add $1, reg` measured 24 "GHz" on `lc-intel`: Golden Cove-class
+  cores fold add-immediate chains at rename. Register-register adds give 4.18 GHz.
+- Bench arrays: first 4096 words with the output (48 KiB): out of Zen 3's 32 KiB L1, and
+  `std::vector`'s 16-byte alignment split every zmm load. Now 2048 words, 64-byte aligned, n + 48
+  words apart, read through local pointers (`stream.hpp`).
+- `mulhi` join by `vpermt2d` (one uop on p5 / FP1-2) instead of `vpsrlq` + `vpblendd` (2 uops).
+  Paired against the previous commit (3ba9970), same run, 11 rounds, new/base:
+  `lc-intel` mulhi zmm 0.815, ymm 0.882; modarith shoup 0.961, barrett 0.951, montgomery 0.984;
+  `lc-zen5` mulhi zmm 0.953, ymm 0.832, but shoup 1.051 (IQR 1.048-1.058) and every latency chain
+  8-25% slower (`vpermt2d` latency 4-5 against 2 + 2). Kept on Intel; Zen 4/5 keep the blend in
+  `mulhi` (montgomery's join still uses `vpermt2d` there: 0.933).
+- Open: the cheapest streams (mul_lo, add, sub) are bimodal per process on some machines: Zen 5
+  add 31 or 41 ns per call, Neoverse V2 mul_lo 181 or 224, Zen 3 mul_lo 80 or 102, the same binary
+  in different runs. Not the data addresses: 2 MiB-aligned arrays (fixed low 21 address bits) kept
+  it. Guess: code or physical-page placement. The gate's median of paired rounds should absorb a
+  minority mode, but a 1-2% verdict on these cases is not reliable.
+
+## Sources
+
+- Instruction costs: measured here. Pipe names and port layouts from AMD's Zen 3 and Zen 5, Intel's
+  and Arm's Neoverse V2 optimization guides; uops.info for the idea of mixed-pair probes. No code
+  used.
+- lc-opt's NTT generator (`lib/ntt/gen_kernels.py`) holds the Zen 3 model this one extends.
