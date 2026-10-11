@@ -153,10 +153,13 @@ struct Butterflies : Arith<S> {
     [[gnu::always_inline]] static V below2(V x, int bound) { return bound > 2 ? low(x) : x; }
 
     // Forward, in < kIn P (kIn = 1, 2 or 4), out < 4P. Inputs below 2P need no reduction (the first
-    // level). First: a, b < 2P and c = x f2, d = x f3.
-    template <int kIn = 4>
+    // level). Quarters t >= kLoad are zero (a first level from a short source), and their products
+    // are not computed. First: a, b < 2P and c = x f2, d = x f3.
+    template <int kIn = 4, int kLoad = 4>
     [[gnu::always_inline]] static void forward_first(Column& v, const F& x) {
-        v[0] = below2(v[0], kIn), v[1] = below2(v[1], kIn), v[2] = mul(v[2], x), v[3] = mul(v[3], x);
+        v[0] = below2(v[0], kIn), v[1] = below2(v[1], kIn);
+        if constexpr (kLoad > 2) v[2] = mul(v[2], x);
+        if constexpr (kLoad > 3) v[3] = mul(v[3], x);
     }
     [[gnu::always_inline]] static void forward_second(Column& v, const F& y, const F& z) {
         const V ac = low(add(v[0], v[2])), amc = low_diff(v[0], v[2]);
@@ -206,11 +209,20 @@ struct Butterflies : Arith<S> {
         v[0] = low(add(ab, cd)), v[1] = low(add(amb, cmd)), v[2] = low_diff(ab, cd), v[3] = low_diff(amb, cmd);
     }
 
+    // Quarters t < kLoad of a column; the others are zero.
+    template <int kLoad = 4>
     [[gnu::always_inline]] static void load(const u32* s, std::size_t q, Column& v) {
-        v[0] = S::load(s), v[1] = S::load(s + q), v[2] = S::load(s + 2 * q), v[3] = S::load(s + 3 * q);
+        const V zero = S::broadcast(0);
+        v[0] = kLoad > 0 ? S::load(s) : zero, v[1] = kLoad > 1 ? S::load(s + q) : zero;
+        v[2] = kLoad > 2 ? S::load(s + 2 * q) : zero, v[3] = kLoad > 3 ? S::load(s + 3 * q) : zero;
     }
+    // Quarters t < kStore of a column.
+    template <int kStore = 4>
     [[gnu::always_inline]] static void store(u32* g, std::size_t q, const Column& v) {
-        S::store(g, v[0]), S::store(g + q, v[1]), S::store(g + 2 * q, v[2]), S::store(g + 3 * q, v[3]);
+        if constexpr (kStore > 0) S::store(g, v[0]);
+        if constexpr (kStore > 1) S::store(g + q, v[1]);
+        if constexpr (kStore > 2) S::store(g + 2 * q, v[2]);
+        if constexpr (kStore > 3) S::store(g + 3 * q, v[3]);
     }
     // body(std::bool_constant<on>{}): on if a pass whose streams are q words apart prefetches
     // (min: kPrefetchMin or kPrefetchHalfMin).
@@ -223,9 +235,13 @@ struct Butterflies : Arith<S> {
     [[gnu::always_inline]] static void ahead(const u32* s) {
         if constexpr (kOn) __builtin_prefetch(s + kPrefetch, 0, 3);
     }
-    template <bool kOn>
+    // Quarters t < kCount.
+    template <bool kOn, int kCount = 4>
     [[gnu::always_inline]] static void ahead(const u32* s, std::size_t q) {
-        ahead<kOn>(s), ahead<kOn>(s + q), ahead<kOn>(s + 2 * q), ahead<kOn>(s + 3 * q);
+        if constexpr (kCount > 0) ahead<kOn>(s);
+        if constexpr (kCount > 1) ahead<kOn>(s + q);
+        if constexpr (kCount > 2) ahead<kOn>(s + 2 * q);
+        if constexpr (kCount > 3) ahead<kOn>(s + 3 * q);
     }
     // For lines written, not read: prefetchw (x86; GCC emits it for __builtin_prefetch only with
     // -mprfchw, which the targets' flags lack).
@@ -239,51 +255,71 @@ struct Butterflies : Arith<S> {
 #endif
         }
     }
-    // The quarters of f if they are not those of `from` (write: from != f).
-    template <bool kOn>
+    // The quarters t < kStore of f that a pass writes without reading: all of them if they are not
+    // those of `from` (write: from != f), else those from kLoad on (`from` zero there).
+    template <bool kOn, int kLoad = 4, int kStore = 4>
     [[gnu::always_inline]] static void ahead_write(bool write, const u32* f, std::size_t q) {
-        if (kOn && write) ahead_write<kOn>(f), ahead_write<kOn>(f + q), ahead_write<kOn>(f + 2 * q), ahead_write<kOn>(f + 3 * q);
+        if constexpr (kOn) {
+            const auto quarter = [&] [[gnu::always_inline]] (int t) {
+                if (t < kStore && (write || t >= kLoad)) ahead_write<kOn>(f + t * q);
+            };
+            quarter(0), quarter(1), quarter(2), quarter(3);
+        }
     }
 
-    // Applies op to each column of the 4 quarters of `from` (S::lanes words of each), into those of
-    // f (may be from).
-    template <class Op>
-    [[gnu::always_inline]] static void each(const u32* from, u32* f, std::size_t q, Op op) {
+    // Applies op to the columns [0, words) of the 4 quarters of `from` (S::lanes words of each),
+    // into those of f (may be from). Quarters t >= kLoad of `from` are zero, not read; quarters
+    // t >= kStore of f are not written.
+    template <int kLoad = 4, int kStore = 4, class Op>
+    [[gnu::always_inline]] static void each(const u32* from, u32* f, std::size_t q, std::size_t words, Op op) {
         prefetching(q, kPrefetchMin, [&]<bool kPf> [[gnu::always_inline]] (std::bool_constant<kPf>) {
             const bool write = from != f;
-            for (std::size_t j = 0; j < q; j += S::lanes) {
+            for (std::size_t j = 0; j < words; j += S::lanes) {
                 Column v;
-                ahead<kPf>(from + j, q), ahead_write<kPf>(write, f + j, q), load(from + j, q, v), op(v), store(f + j, q, v);
+                ahead<kPf, kLoad>(from + j, q), ahead_write<kPf, kLoad, kStore>(write, f + j, q);
+                load<kLoad>(from + j, q, v), op(v), store<kStore>(f + j, q, v);
             }
         });
+    }
+    template <class Op>
+    [[gnu::always_inline]] static void each(const u32* from, u32* f, std::size_t q, Op op) {
+        each(from, f, q, q, op);
     }
 
     // The same for an op in two stages, software pipelined if kPipe: the first stage of column
     // j + 1 runs before the second of column j, so a column's two halves are not in flight at once
-    // (shorter chains per loop iteration). Unrolled by 2, so no register copies: q a multiple of
-    // 2 S::lanes (every caller: q >= 32, or q >= 16 at the top of the shortest transforms).
-    template <bool kPipe, class First, class Second>
-    [[gnu::always_inline]] static void each2(const u32* from, u32* f, std::size_t q, First first, Second second) {
+    // (shorter chains per loop iteration). Unrolled by 2, so no register copies: words a
+    // multiple of 2 S::lanes (every caller: quarters q >= 32, or q >= 16 at the top of the shortest
+    // transforms; first and last levels in steps of 2 S::lanes).
+    template <bool kPipe, int kLoad = 4, int kStore = 4, class First, class Second>
+    [[gnu::always_inline]] static void each2(const u32* from, u32* f, std::size_t q, std::size_t words, First first,
+                                             Second second) {
         constexpr std::size_t L = S::lanes;
         if constexpr (!kPipe) {
-            each(from, f, q, [&] [[gnu::always_inline]] (Column& v) { first(v), second(v); });
+            each<kLoad, kStore>(from, f, q, words, [&] [[gnu::always_inline]] (Column& v) { first(v), second(v); });
         } else {
             prefetching(q, kPrefetchMin, [&]<bool kPf> [[gnu::always_inline]] (std::bool_constant<kPf>) {
                 const bool write = from != f;
                 Column h0, h1;
-                load(from, q, h0), first(h0);
+                load<kLoad>(from, q, h0), first(h0);
                 std::size_t j = L;
-                for (; j + L < q; j += 2 * L) {
-                    ahead<kPf>(from + j, q), ahead_write<kPf>(write, f + j, q), load(from + j, q, h1), first(h1);
-                    second(h0), store(f + j - L, q, h0);
-                    ahead<kPf>(from + j + L, q), ahead_write<kPf>(write, f + j + L, q), load(from + j + L, q, h0), first(h0);
-                    second(h1), store(f + j, q, h1);
+                for (; j + L < words; j += 2 * L) {
+                    ahead<kPf, kLoad>(from + j, q), ahead_write<kPf, kLoad, kStore>(write, f + j, q);
+                    load<kLoad>(from + j, q, h1), first(h1);
+                    second(h0), store<kStore>(f + j - L, q, h0);
+                    ahead<kPf, kLoad>(from + j + L, q), ahead_write<kPf, kLoad, kStore>(write, f + j + L, q);
+                    load<kLoad>(from + j + L, q, h0), first(h0);
+                    second(h1), store<kStore>(f + j, q, h1);
                 }
-                load(from + j, q, h1), first(h1);
-                second(h0), store(f + j - L, q, h0);
-                second(h1), store(f + j, q, h1);
+                load<kLoad>(from + j, q, h1), first(h1);
+                second(h0), store<kStore>(f + j - L, q, h0);
+                second(h1), store<kStore>(f + j, q, h1);
             });
         }
+    }
+    template <bool kPipe, class First, class Second>
+    [[gnu::always_inline]] static void each2(const u32* from, u32* f, std::size_t q, First first, Second second) {
+        each2<kPipe>(from, f, q, q, first, second);
     }
 
     // Group k of `from` into f (may be from). In < kIn P, out < 4P.
@@ -296,15 +332,33 @@ struct Butterflies : Arith<S> {
     template <int kIn>
     [[gnu::always_inline]] static void forward_group_inline(const u32* from, u32* f, std::size_t q, std::size_t k,
                                                             const u32* r) {
-        if (k == 0) {
+        forward_group_part<kIn, 4>(from, f, q, q, k, r);
+    }
+    // Columns [0, words) of group k, from the quarters t < kLoad of `from` (the others are zero, not
+    // read). In < kIn P, out < 4P. With one quarter every output is its input.
+    template <int kIn, int kLoad>
+    [[gnu::always_inline]] static void forward_group_part(const u32* from, u32* f, std::size_t q, std::size_t words,
+                                                          std::size_t k, const u32* r) {
+        if constexpr (kLoad <= 1) {
+            prefetching(q, kPrefetchMin, [&]<bool kPf> [[gnu::always_inline]] (std::bool_constant<kPf>) {
+                const bool write = from != f;
+                for (std::size_t j = 0; j < words; j += S::lanes) {
+                    ahead<kPf, kLoad>(from + j, q), ahead_write<kPf, kLoad>(write, f + j, q);
+                    const V a = kLoad ? S::load(from + j) : S::broadcast(0);
+                    S::store(f + j, a), S::store(f + j + q, a), S::store(f + j + 2 * q, a), S::store(f + j + 3 * q, a);
+                }
+            });
+        } else if (k == 0) {
             const F z = A::entry(r, 1);
-            return each2<kPipelined.forward_identity>(
-                from, f, q, [&] [[gnu::always_inline]] (Column& v) { forward_identity_first<kIn>(v, z); },
+            each2<kPipelined.forward_identity, kLoad>(
+                from, f, q, words, [&] [[gnu::always_inline]] (Column& v) { forward_identity_first<kIn>(v, z); },
                 [&] [[gnu::always_inline]] (Column& v) { forward_identity_second(v); });
+        } else {
+            const F x = A::entry(r, k), y = A::entry(r, 2 * k), z = A::entry(r, 2 * k + 1);
+            each2<kPipelined.groups, kLoad>(
+                from, f, q, words, [&] [[gnu::always_inline]] (Column& v) { forward_first<kIn, kLoad>(v, x); },
+                [&] [[gnu::always_inline]] (Column& v) { forward_second(v, y, z); });
         }
-        const F x = A::entry(r, k), y = A::entry(r, 2 * k), z = A::entry(r, 2 * k + 1);
-        each2<kPipelined.groups>(from, f, q, [&] [[gnu::always_inline]] (Column& v) { forward_first<kIn>(v, x); },
-                                 [&] [[gnu::always_inline]] (Column& v) { forward_second(v, y, z); });
     }
 
     static void inverse_group(u32* f, std::size_t q, std::size_t k, const u32* ir) { inverse_group_inline(f, q, k, ir); }
@@ -806,21 +860,52 @@ struct Ntt : Butterflies<S> {
         if (nv >= 16) inverse_top(f, 2 * nv, k, ir, scaled);
     }
 
+    // Columns per call of a product's first and last levels (detail::first_level, last_level):
+    // each2 runs two at a time.
+    static constexpr std::size_t kStep = 2 * S::lanes;
+
+    // The words a subtree's first level reads: a pointer to all of them, or a Source: n words from
+    // p, zero past them (a product from spans).
+    struct Source {
+        const u32* p;
+        std::size_t n;
+    };
+
+    // Group k on quarters of q words from `from` into f; in < kIn P.
+    template <int kIn>
+    [[gnu::always_inline]] static void first_group(const u32* from, u32* f, std::size_t q, std::size_t k, const u32* r) {
+        B::template forward_group<kIn>(from, f, q, k, r);
+    }
+    template <int kIn>
+    static void first_group(Source s, u32* f, std::size_t q, std::size_t k, const u32* r) {
+        if (s.n >= 4 * q) return B::template forward_group<kIn>(s.p, f, q, k, r);
+        first_level<4>(s.p, s.n, f, q, kStep,
+                       [&] [[gnu::always_inline]] (auto blocks, const u32* from, u32* to, std::size_t words) {
+                           first_group_part<kIn, decltype(blocks)::value>(from, to, q, words, k, r);
+                       });
+    }
+    template <int kIn, int kLoad>
+    [[gnu::noinline]] static void first_group_part(const u32* from, u32* f, std::size_t q, std::size_t words,
+                                                   std::size_t k, const u32* r) {
+        B::template forward_group_part<kIn, kLoad>(from, f, q, words, k, r);
+    }
+
     // Both transforms, the leaf products and the inverse transform of a subtree; inputs < kIn P.
-    // The first level reads a_from and b_from (a and b, or other arrays if nv >= 16).
-    template <int kIn = 4>
-    static void multiply_tree(const u32* a_from, const u32* b_from, u32* a, u32* b, std::size_t nv, std::size_t k,
-                              const u32* r, const u32* ir, const u32* scaled = nullptr) {
+    // The first level reads a_from and b_from (a and b, or other memory if nv >= 16): pointers or
+    // Sources (first_group).
+    template <int kIn = 4, class From>
+    static void multiply_tree(From a_from, From b_from, u32* a, u32* b, std::size_t nv, std::size_t k, const u32* r,
+                              const u32* ir, const u32* scaled = nullptr) {
         std::size_t h = nv / 4;
         if (nv > kTile) {
-            B::template forward_group<kIn>(a_from, a, 8 * h, k, r);
-            B::template forward_group<kIn>(b_from, b, 8 * h, k, r);
+            first_group<kIn>(a_from, a, 8 * h, k, r);
+            first_group<kIn>(b_from, b, 8 * h, k, r);
             for (std::size_t t = 0; t < 4; ++t) multiply_tree(a + 8 * h * t, b + 8 * h * t, h, 4 * k + t, r, ir);
             return inverse_top(a, 8 * h, k, ir, scaled);
         }
         if (h >= 4) {  // the first level: group k alone
-            B::template forward_group<kIn>(a_from, a, 8 * h, k, r);
-            B::template forward_group<kIn>(b_from, b, 8 * h, k, r);
+            first_group<kIn>(a_from, a, 8 * h, k, r);
+            first_group<kIn>(b_from, b, 8 * h, k, r);
             h /= 4;
         }
         for (; h >= 4; h /= 4) {
@@ -912,6 +997,132 @@ struct Ntt : Butterflies<S> {
             });
     }
 
+    // Products from spans (detail::Product). The first level reads a factor from a source of n
+    // words in caller memory, zero past them (detail::first_level), and the last level writes the
+    // product's first count words to caller memory (detail::last_level), any alignment. The *_part
+    // functions run the columns [0, words) of a level from `from` to f: blocks t < kLoad read
+    // (forward), t < kStore written (inverse); each is its own function, picked with an inlined
+    // switch (avx2.hpp, Products from spans). Products in place keep the levels above.
+
+    // The radix-2 level on halves of `half` words: out < 2P. One half read: copied to both.
+    template <int kLoad>
+    [[gnu::noinline]] static void forward_radix2_part(const u32* from, u32* f, std::size_t half, std::size_t words) {
+        const V p = S::broadcast(kP);
+        const bool write = from != f;
+        B::prefetching(half, kPrefetchHalfMin, [&]<bool kPf> [[gnu::always_inline]] (std::bool_constant<kPf>) {
+            for (std::size_t i = 0; i < words; i += S::lanes) {
+                if constexpr (kLoad > 0) B::template ahead<kPf>(from + i);
+                if constexpr (kLoad > 1) B::template ahead<kPf>(from + i + half);
+                if (write || kLoad == 0) B::template ahead_write<kPf>(f + i);
+                if (write || kLoad < 2) B::template ahead_write<kPf>(f + i + half);
+                const V x = kLoad > 0 ? S::load(from + i) : S::broadcast(0);
+                if constexpr (kLoad < 2) {
+                    if (write || kLoad == 0) S::store(f + i, x);
+                    S::store(f + i + half, x);
+                } else {
+                    const V y = S::load(from + i + half);
+                    S::store(f + i, add(x, y)), S::store(f + i + half, S::sub(S::add(x, p), y));
+                }
+            }
+        });
+    }
+    static void forward_radix2_from(const u32* from, std::size_t n, u32* f, std::size_t half) {
+        first_level<2>(from, n, f, half, S::lanes,
+                       [&] [[gnu::always_inline]] (auto blocks, const u32* s, u32* d, std::size_t words) {
+                           forward_radix2_part<decltype(blocks)::value>(s, d, half, words);
+                       });
+    }
+
+    // Group 0 on quarters of q words, from the quarters t < kLoad of `from`: out < 4P. Two quarters
+    // read: a + b, a - b, a + z b, a - z b.
+    template <int kLoad>
+    [[gnu::noinline]] static void forward_radix4_part(const u32* from, u32* f, std::size_t q, std::size_t words,
+                                                      const u32* r) {
+        if constexpr (kLoad == 2) forward_radix4_sparse(from, f, q, words, r);
+        else B::template forward_group_part<1, kLoad>(from, f, q, words, 0, r);
+    }
+    [[gnu::always_inline]] static void forward_radix4_sparse(const u32* from, u32* f, std::size_t q, std::size_t words,
+                                                             const u32* r) {
+        const F z = B::entry(r, 1);
+        B::prefetching(q, kPrefetchMin, [&]<bool kPf> [[gnu::always_inline]] (std::bool_constant<kPf>) {
+            const bool write = from != f;
+            for (std::size_t j = 0; j < words; j += S::lanes) {
+                B::template ahead<kPf, 2>(from + j, q), B::template ahead_write<kPf, 2>(write, f + j, q);
+                const V a = S::load(from + j), b = S::load(from + j + q), zb = B::mul(b, z);
+                S::store(f + j, add(a, b)), S::store(f + j + q, diff(a, b));
+                S::store(f + j + 2 * q, add(a, zb)), S::store(f + j + 3 * q, diff(a, zb));
+            }
+        });
+    }
+    static void forward_radix4_from(const u32* from, std::size_t n, u32* f, std::size_t q, const u32* r) {
+        first_level<4>(from, n, f, q, kStep,
+                       [&] [[gnu::always_inline]] (auto blocks, const u32* s, u32* d, std::size_t words) {
+                           forward_radix4_part<decltype(blocks)::value>(s, d, q, words, r);
+                       });
+    }
+
+    // The inverse radix-2 level, times s if s != 0: in < 2P, canonical out.
+    template <int kStore>
+    [[gnu::noinline]] static void inverse_radix2_part(const u32* from, u32* f, std::size_t half, std::size_t words,
+                                                      u32 s) {
+        B::prefetching(half, kPrefetchHalfMin, [&]<bool kPf> [[gnu::always_inline]] (std::bool_constant<kPf>) {
+            if (s == 0) {
+                for (std::size_t i = 0; i < words; i += S::lanes) {
+                    B::template ahead<kPf>(from + i), B::template ahead<kPf>(from + i + half);
+                    const V x = S::load(from + i), y = S::load(from + i + half);
+                    S::store(f + i, canonical(B::low(add(x, y))));
+                    if constexpr (kStore > 1) S::store(f + i + half, canonical(B::low(diff(x, y))));
+                }
+                return;
+            }
+            const F scale = B::factor(s);
+            for (std::size_t i = 0; i < words; i += S::lanes) {
+                B::template ahead<kPf>(from + i), B::template ahead<kPf>(from + i + half);
+                const V x = S::load(from + i), y = S::load(from + i + half);
+                S::store(f + i, canonical(B::mul(add(x, y), scale)));
+                if constexpr (kStore > 1) S::store(f + i + half, canonical(B::mul(diff(x, y), scale)));
+            }
+        });
+    }
+    static void inverse_radix2_out(u32* f, std::size_t half, u32* out, std::size_t count, u32 s) {
+        last_level<2>(f, half, out, count, S::lanes, [&] [[gnu::always_inline]] (auto blocks, const u32* from, u32* to,
+                                                                 std::size_t words) {
+            constexpr int T = decltype(blocks)::value;
+            if constexpr (T > 0) inverse_radix2_part<T>(from, to, half, words, s);
+        });
+    }
+
+    // Inverse group 0 on quarters of q words, times s if s != 0: in < 2P, canonical out. With s, 4
+    // products per column, not 5: s z (c - d) and s (a - b) serve two outputs each.
+    template <int kStore>
+    [[gnu::noinline]] static void inverse_radix4_part(const u32* from, u32* f, std::size_t q, std::size_t words,
+                                                      const u32* ir, u32 s) {
+        if (s == 0) {
+            const F z = B::entry(ir, 1);
+            return B::template each2<kPipelined.inverse_identity, 4, kStore>(
+                from, f, q, words, [&] [[gnu::always_inline]] (Column& v) { B::inverse_identity_first(v, z); },
+                [&] [[gnu::always_inline]] (Column& v) {
+                    B::inverse_identity_second(v);
+                    v[0] = canonical(v[0]), v[1] = canonical(v[1]), v[2] = canonical(v[2]), v[3] = canonical(v[3]);
+                });
+        }
+        const F scale = B::factor(s), sz = B::factor(multiply_mod(s, ir[slot(1)]));
+        B::template each2<kPipelined.groups, 4, kStore>(
+            from, f, q, words, [&] [[gnu::always_inline]] (Column& v) { B::inverse_first(v, scale, sz); },
+            [&] [[gnu::always_inline]] (Column& v) {
+                const V ab = v[0], cd = v[1], amb = v[2], cmd = v[3];
+                v[0] = canonical(B::mul(add(ab, cd), scale)), v[1] = canonical(B::low(add(amb, cmd)));
+                v[2] = canonical(B::mul(diff(ab, cd), scale)), v[3] = canonical(B::low(diff(amb, cmd)));
+            });
+    }
+    static void inverse_radix4_out(u32* f, std::size_t q, u32* out, std::size_t count, const u32* ir, u32 s) {
+        last_level<4>(f, q, out, count, kStep, [&] [[gnu::always_inline]] (auto blocks, const u32* from, u32* to,
+                                                           std::size_t words) {
+            constexpr int T = decltype(blocks)::value;
+            if constexpr (T > 0) inverse_radix4_part<T>(from, to, q, words, ir, s);
+        });
+    }
+
     static constexpr bool kNarrow = !std::is_same_v<S, N>;
 
     // The scale goes into the top groups of the subtrees below the top level when those have one
@@ -974,6 +1185,38 @@ struct Ntt : Butterflies<S> {
         multiply_tree<2>(a, b, nv / 2, 0, r, ir, fold);
         inverse_radix2(a, half, fold ? 0 : s);
     }
+
+    // The product p (detail::Product).
+    static void multiply(const Product& p, const u32* r, const u32* ir) {
+        if constexpr (kNarrow)
+            if (p.lg < kWideMinLog) return Ntt<N>::multiply(p, r, ir);
+        const std::size_t len = std::size_t(1) << p.lg, nv = len / 8;
+        const u32 s = product_scale(p.lg);
+        if (!has_radix2(p.lg)) {
+            const std::size_t q = len / 4;
+            const u32* fold = fold_scale(nv / 4, p.lg, true);
+            forward_radix4_from(p.f, p.n, p.a, q, r);
+            forward_radix4_from(p.g, p.m, p.b, q, r);
+            for (std::size_t t = 0; t < 4; ++t) multiply_tree(p.a + t * q, p.b + t * q, nv / 4, t, r, ir, fold);
+            return inverse_radix4_out(p.a, q, p.out, p.count, ir, fold ? 0 : s);
+        }
+        // A factor of at most half the length ("sparse") is its own residue mod x^(len/2) - 1 and
+        // mod x^(len/2) + 1: no radix-2 level, both subtrees' first levels read it, the upper one
+        // first. Not for nv / 2 = 4, whose first level is the bottom (in place only).
+        const std::size_t half = len / 2;
+        const bool share_a = p.n <= half && nv / 2 >= 16, share_b = p.m <= half && nv / 2 >= 16;
+        if (!share_a) forward_radix2_from(p.f, p.n, p.a, half);
+        if (!share_b) forward_radix2_from(p.g, p.m, p.b, half);
+        const auto source = [half](bool share, const u32* f, std::size_t n, u32* a) {
+            return share ? Source{f, n} : Source{a, half};
+        };
+        const u32* fold = fold_scale(nv / 2, p.lg, true);
+        multiply_tree<2>(source(share_a, p.f, p.n, p.a + half), source(share_b, p.g, p.m, p.b + half), p.a + half,
+                         p.b + half, nv / 2, 1, r, ir, fold);
+        multiply_tree<2>(source(share_a, p.f, p.n, p.a), source(share_b, p.g, p.m, p.b), p.a, p.b, nv / 2, 0, r, ir,
+                         fold);
+        inverse_radix2_out(p.a, half, p.out, p.count, fold ? 0 : s);
+    }
 };
 
 }  // namespace fps::ntt::detail::intrinsics
@@ -998,6 +1241,10 @@ struct intrinsics {
     static void multiply(std::uint32_t* a, std::uint32_t* b, std::size_t n, std::size_t m, int lg,
                          const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
         Ntt::multiply(a, b, n, m, lg, roots, inverse_roots);
+    }
+
+    static void multiply(const detail::Product& p, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
+        Ntt::multiply(p, roots, inverse_roots);
     }
 };
 

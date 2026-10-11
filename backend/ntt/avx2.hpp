@@ -317,6 +317,212 @@ inline void product(u32* a_words, u32* b_words, bool sparse_a, bool sparse_b, in
     inverse_radix8(a, q, ir, product_scale(lg));
 }
 
+// Products from spans (detail::Product, ntt::multiply). Their first level reads a factor from a
+// source of n words in caller memory, zero past them (detail::first_level), and their last level
+// writes the product's first count words to caller memory (detail::last_level), any alignment.
+// The *_part<T> functions run columns j < columns of a level from the vectors at s + 8 (j + t h),
+// to f[j + t h] (forward: blocks t < T read), or from f to o + 8 (j + t h) (inverse: t < T
+// written). Products in place (Convolution) keep the levels above: through these, 2^6-2^7
+// products ran 2-4% slower on Emerald Rapids and Zen 5 (notes.md, issue #38 round 2).
+
+inline Vec loadu(const u32* p) { return _mm256_loadu_si256(reinterpret_cast<const Vec*>(p)); }
+inline void storeu(u32* p, Vec x) { _mm256_storeu_si256(reinterpret_cast<Vec*>(p), x); }
+
+// The radix-2 level on halves of h vectors, halves t < kLoad of s read (the rest zero): the sum
+// and difference, < 2P: inputs canonical, no reduction.
+template <int kLoad>
+[[gnu::noinline]] void forward_radix2_part(const u32* s, Vec* f, std::size_t columns, std::size_t h) {
+    const bool write = s != reinterpret_cast<const u32*>(f);  // else f[j] holds x already
+    for (std::size_t j = 0; j < columns; ++j) {
+        const Vec x = kLoad > 0 ? loadu(s + 8 * j) : _mm256_setzero_si256();
+        if constexpr (kLoad < 2) {
+            if (write || kLoad == 0) f[j] = x;
+            f[j + h] = x;
+        } else {
+            const Vec y = loadu(s + 8 * (j + h));
+            f[j] = add(x, y), f[j + h] = diff_canonical(x, y);
+        }
+    }
+}
+
+inline void forward_radix2_from(const u32* f, std::size_t n, u32* to, std::size_t h) {
+    first_level<2>(f, n, to, 8 * h, 8, [&] [[gnu::always_inline]] (auto blocks, const u32* s, u32* d, std::size_t words) {
+        forward_radix2_part<decltype(blocks)::value>(s, reinterpret_cast<Vec*>(d), words / 8, h);
+    });
+}
+
+// The first radix-4 level of a transform, group 0 (z = r(1)), on quarters of h vectors, quarters
+// t < kLoad of s read: the asm kernels forward_top_from and forward_top3_from for four and three.
+template <int kLoad>
+[[gnu::noinline]] void forward_radix4_part(const u32* s, Vec* f, std::size_t columns, std::size_t h, const u32* roots) {
+    if constexpr (kLoad == 4) {
+        kernels::forward_top_from(s, f, columns, h, roots);
+    } else if constexpr (kLoad == 3) {
+        kernels::forward_top3_from(s, f, columns, h, roots);
+    } else {
+        const Factor z = entry(roots, 1);
+        for (std::size_t j = 0; j < columns; ++j) {
+            const Vec a = kLoad > 0 ? loadu(s + 8 * j) : _mm256_setzero_si256();
+            if constexpr (kLoad < 2) {
+                f[j] = a, f[j + h] = a, f[j + 2 * h] = a, f[j + 3 * h] = a;
+            } else {
+                const Vec b = loadu(s + 8 * (j + h)), zb = multiply(b, z);  // < 4P
+                f[j] = add(a, b), f[j + h] = diff(a, b), f[j + 2 * h] = add(a, zb), f[j + 3 * h] = diff(a, zb);
+            }
+        }
+    }
+}
+
+inline void forward_radix4_from(const u32* f, std::size_t n, u32* to, std::size_t h, const u32* roots) {
+    first_level<4>(f, n, to, 8 * h, 16, [&] [[gnu::always_inline]] (auto blocks, const u32* s, u32* d, std::size_t words) {
+        forward_radix4_part<decltype(blocks)::value>(s, reinterpret_cast<Vec*>(d), words / 8, h, roots);
+    });
+}
+
+// inverse_identity() and the scale on quarters of h vectors (z = r^-1(1)): canonical output,
+// count words of it to out. w: as product_kernels::inverse_top4's.
+template <int T>
+[[gnu::noinline]] void inverse_radix4_part(const Vec* f, u32* o, std::size_t columns, std::size_t h, const Vec* w) {
+    product_kernels::inverse_top4_to<T>(f, o, columns, h, w);
+}
+
+inline void inverse_radix4_out(u32* f, std::size_t h, u32* out, std::size_t count, const u32* inverse_roots,
+                               u32 scale) {
+    const u32 sz = multiply_mod(scale, inverse_roots[slot(1)]);
+    alignas(32) const Vec w[4] = {broadcast(scale), broadcast(quotient(scale)), broadcast(sz), broadcast(quotient(sz))};
+    last_level<4>(f, 8 * h, out, count, 16, [&] [[gnu::always_inline]] (auto blocks, const u32* s, u32* d, std::size_t words) {
+        constexpr int T = decltype(blocks)::value;
+        if constexpr (T > 0) inverse_radix4_part<T>(reinterpret_cast<const Vec*>(s), d, words / 8, h, w);
+    });
+}
+
+// scale_radix2() on halves of h vectors, halves t < T of the output to o (products at lg = 6).
+template <int T>
+[[gnu::noinline]] void scale_radix2_part(const Vec* f, u32* o, std::size_t columns, std::size_t h, u32 s) {
+    const Factor scale(s);
+    for (std::size_t j = 0; j < columns; ++j) {
+        const Vec x = f[j], y = f[j + h];
+        storeu(o + 8 * j, reduce(multiply(add(x, y), scale), kP));
+        if constexpr (T > 1) storeu(o + 8 * (j + h), reduce(multiply(diff(x, y), scale), kP));
+    }
+}
+
+inline void scale_radix2_out(u32* f, std::size_t h, u32* out, std::size_t count, u32 scale) {
+    last_level<2>(f, 8 * h, out, count, 8, [&] [[gnu::always_inline]] (auto blocks, const u32* s, u32* d, std::size_t words) {
+        constexpr int T = decltype(blocks)::value;
+        if constexpr (T > 0) scale_radix2_part<T>(reinterpret_cast<const Vec*>(s), d, words / 8, h, scale);
+    });
+}
+
+// First level of an nv = 2 * 4^j transform, nv = 8q, in one pass: the radix-2 level and the first
+// radix-4 group of each half (group 0 to f[0, 4q), group 1 to f[4q, 8q)). Blocks t < kLoad of s
+// read, the rest zero; outputs < 4P. With kLoad <= 4 the upper half is zero: modulo x^(n/2) - 1
+// and x^(n/2) + 1 the factor is then its lower half, and the radix-2 level adds nothing.
+template <int kLoad>
+[[gnu::noinline]] void forward_radix8_part(const u32* s, Vec* f, std::size_t columns, std::size_t q, const u32* roots) {
+    const Factor i = entry(roots, 1), y = entry(roots, 2), z = entry(roots, 3);
+    const Vec zero = _mm256_setzero_si256();
+    for (std::size_t j = 0; j < columns; ++j) {
+        const auto in = [&] [[gnu::always_inline]] (std::size_t t) { return t < kLoad ? loadu(s + 8 * (j + t * q)) : zero; };
+        if constexpr (kLoad <= 4) {
+            const Vec f0 = in(0), f1 = in(1), f2 = in(2), f3 = in(3);
+            // Group 0 (twiddles 1, 1, i): every term < 2P.
+            const Vec g0 = add(f0, f2), g1 = add(f1, f3);
+            const Vec h0 = diff_canonical(f0, f2), ih1 = kLoad > 1 ? multiply(diff_canonical(f1, f3), i) : zero;
+            f[j] = add(g0, g1), f[j + q] = diff(g0, g1);
+            f[j + 2 * q] = add(h0, ih1), f[j + 3 * q] = diff(h0, ih1);
+            // Group 1 (twiddles i, y, z).
+            const Vec if2 = kLoad > 2 ? multiply(f2, i) : zero, if3 = kLoad > 3 ? multiply(f3, i) : zero;
+            const Vec u0 = reduce(add(f0, if2), 2 * kP), v0 = reduce(diff(f0, if2), 2 * kP);
+            const Vec yu1 = kLoad > 1 ? multiply(add(f1, if3), y) : zero, zv1 = kLoad > 1 ? multiply(diff(f1, if3), z) : zero;
+            f[j + 4 * q] = add(u0, yu1), f[j + 5 * q] = diff(u0, yu1);
+            f[j + 6 * q] = add(v0, zv1), f[j + 7 * q] = diff(v0, zv1);
+        } else {
+            // The halves mod x^(n/2) - 1 and x^(n/2) + 1, < 2P.
+            const auto halves = [&] [[gnu::always_inline]] (std::size_t t, Vec& u, Vec& v) {
+                const Vec low = in(t);
+                if (t + 4 < kLoad) {
+                    const Vec high = in(t + 4);
+                    u = add(low, high), v = diff_canonical(low, high);
+                } else {
+                    u = v = low;
+                }
+            };
+            Vec u0, u1, u2, u3, v0, v1, v2, v3;
+            halves(0, u0, v0), halves(1, u1, v1), halves(2, u2, v2), halves(3, u3, v3);
+            // Group 0 (twiddles 1, 1, i).
+            const Vec g0 = reduce(add(u0, u2), 2 * kP), g1 = reduce(add(u1, u3), 2 * kP);
+            const Vec h0 = reduce(diff(u0, u2), 2 * kP), ih1 = multiply(diff(u1, u3), i);
+            f[j] = add(g0, g1), f[j + q] = diff(g0, g1);
+            f[j + 2 * q] = add(h0, ih1), f[j + 3 * q] = diff(h0, ih1);
+            // Group 1 (twiddles i, y, z).
+            const Vec iv2 = multiply(v2, i), iv3 = multiply(v3, i);
+            const Vec a0 = reduce(add(v0, iv2), 2 * kP), c0 = reduce(diff(v0, iv2), 2 * kP);
+            const Vec yb = multiply(add(v1, iv3), y), zd = multiply(diff(v1, iv3), z);
+            f[j + 4 * q] = add(a0, yb), f[j + 5 * q] = diff(a0, yb);
+            f[j + 6 * q] = add(c0, zd), f[j + 7 * q] = diff(c0, zd);
+        }
+    }
+}
+
+inline void forward_radix8_from(const u32* f, std::size_t n, u32* to, std::size_t q, const u32* roots) {
+    first_level<8>(f, n, to, 8 * q, 8, [&] [[gnu::always_inline]] (auto blocks, const u32* s, u32* d, std::size_t words) {
+        forward_radix8_part<decltype(blocks)::value>(s, reinterpret_cast<Vec*>(d), words / 8, q, roots);
+    });
+}
+
+// The last inverse level of each half, the radix-2 level and the scale in one pass over the 8q
+// vectors after the subtrees: canonical output, count words of it to out. w: as
+// product_kernels::inverse_top's.
+template <int T>
+[[gnu::noinline]] void inverse_radix8_part(const Vec* f, u32* o, std::size_t columns, std::size_t q, const Vec* w) {
+    product_kernels::inverse_top_to<T>(f, o, columns, q, w);
+}
+
+inline void inverse_radix8_out(u32* f, std::size_t q, u32* out, std::size_t count, const u32* ir, u32 scale) {
+    const u32 z0 = ir[slot(1)], y1 = ir[slot(2)], z1 = ir[slot(3)], x1 = ir[slot(1)];
+    const u32 twiddles[6] = {scale,
+                             multiply_mod(scale, z0),
+                             multiply_mod(scale, y1),
+                             multiply_mod(scale, z1),
+                             multiply_mod(scale, x1),
+                             x1};
+    alignas(32) Vec w[12];
+    for (int i = 0; i < 6; ++i) w[2 * i] = broadcast(twiddles[i]), w[2 * i + 1] = broadcast(quotient(twiddles[i]));
+    last_level<8>(f, 8 * q, out, count, 8, [&] [[gnu::always_inline]] (auto blocks, const u32* s, u32* d, std::size_t words) {
+        constexpr int T = decltype(blocks)::value;
+        if constexpr (T > 0) inverse_radix8_part<T>(reinterpret_cast<const Vec*>(s), d, words / 8, q, w);
+    });
+}
+
+// The product p (detail::Product); the scale is fused into the last inverse level. A factor's
+// words past its n are neither read nor needed.
+template <class Bottom>
+inline void product(const Product& p, const u32* r, const u32* ir) {
+    const std::size_t nv = (std::size_t(1) << p.lg) / 8;
+    auto* a = reinterpret_cast<Vec*>(p.a);
+    auto* b = reinterpret_cast<Vec*>(p.b);
+    const Tree<Bottom> tree(r, ir);
+    if (!has_radix2(p.lg)) {
+        const std::size_t h = nv / 4;
+        forward_radix4_from(p.f, p.n, p.a, h, r);
+        forward_radix4_from(p.g, p.m, p.b, h, r);
+        tree.visit(a, b, h, 4, 0);
+        return inverse_radix4_out(p.a, h, p.out, p.count, ir, product_scale(p.lg));
+    }
+    if (nv == 8) {  // lg = 6: subtrees of 4 vectors
+        forward_radix2_from(p.f, p.n, p.a, 4);
+        forward_radix2_from(p.g, p.m, p.b, 4);
+        tree.visit(a, b, 4, 2, 0);
+        return scale_radix2_out(p.a, 4, p.out, p.count, product_scale(p.lg));
+    }
+    const std::size_t q = nv / 8;
+    forward_radix8_from(p.f, p.n, p.a, q, r);
+    forward_radix8_from(p.g, p.m, p.b, q, r);
+    tree.visit(a, b, q, 8, 0);
+    inverse_radix8_out(p.a, q, p.out, p.count, ir, product_scale(p.lg));
+}
+
 // Transforms alone. The bottom level (h = 1) has a group per 4 vectors, each with its own twiddles.
 
 // Forward groups [first, first + count) with h = 1, values < 4P in; canonical leaves out. first
@@ -422,6 +628,11 @@ struct avx2 {
         if (lg == 7 || lg == 8)
             return detail::avx2::product<detail::avx2::GroupBottom>(a, b, sparse_a, sparse_b, lg, roots, inverse_roots);
         detail::avx2::product<detail::avx2::PairBottom>(a, b, sparse_a, sparse_b, lg, roots, inverse_roots);
+    }
+
+    static void multiply(const detail::Product& p, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
+        if (p.lg == 7 || p.lg == 8) return detail::avx2::product<detail::avx2::GroupBottom>(p, roots, inverse_roots);
+        detail::avx2::product<detail::avx2::PairBottom>(p, roots, inverse_roots);
     }
 };
 

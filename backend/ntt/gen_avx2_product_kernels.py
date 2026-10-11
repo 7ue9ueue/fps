@@ -15,6 +15,8 @@ stage differs from avx2_kernels.hpp's in three ways, measured on Zen 3 (notes.md
 Its functions are always inlined, so the operands stay in registers between statements.
 inverse_top fuses avx2_kernels.hpp's inverse_identity, inverse (group 1) and scale_radix2 into one
 pass, with the scale folded into the twiddles: 5 more Shoup products per column instead of 8.
+inverse_top_to and inverse_top4_to (products from spans) write the first T output blocks to o:
+the ops of the other outputs are dropped (a product cut to fewer words than the transform).
 
 Usage: gen_avx2_product_kernels.py [--check]   (--check: exit 1 if avx2_product_kernels.hpp differs)
 """
@@ -146,7 +148,7 @@ def function(part):
 TOP_TWIDDLES = ['S', 'SZ0', 'SY1', 'SZ1', 'SX1', 'X1']
 
 
-def top_column(ga, gb):
+def top_column(ga, gb, blocks):
     c = ga.c
     shoup = lambda g, x, name: g.shoup(x, c['W' + name], c['Q' + name])
     f = [ga.quarter(i) for i in range(4)]
@@ -160,22 +162,29 @@ def top_column(ga, gb):
     v = [shoup(gb, gb.add(ab, cd), 'S'), gb.low(gb.add(amb, cmd)),
          shoup(gb, gb.diff(ab, cd), 'SX1'), shoup(gb, gb.diff(amb, cmd), 'X1')]
     for t in range(4):
-        ga.store_quarter(ga.canonical(ga.add(u[t], v[t])), t)
-        gb.store_quarter(gb.canonical(gb.diff(u[t], v[t])), t)
+        if t < blocks:
+            ga.store_quarter(ga.canonical(ga.add(u[t], v[t])), t)
+        if 4 + t < blocks:
+            gb.store_quarter(gb.canonical(gb.diff(u[t], v[t])), t)
 
 
-def top_body():
+def top_body(blocks=8, to=False):
+    """to: the first `blocks` output blocks to o (o2 for blocks 4..7), else all 8 in place."""
     consts = {'P': gk.Value('creg', reg=15), '2P': gk.Value('creg', reg=14)}
     for i, name in enumerate(TOP_TWIDDLES):  # w[2i] value, w[2i + 1] quotient, broadcast
         consts['W' + name] = gk.Value('cmem', mem=64 * i)
         consts['Q' + name] = gk.Value('cmem', mem=64 * i + 32)
-    ga, gb = gk.Graph(consts, array='a'), gk.Graph(consts, array='b')
+    ga = gk.Graph(consts, array='a', out='o' if to else None)
+    gb = gk.Graph(consts, array='b', out='o2' if to else None)
     gb.ops = ga.ops  # one column: two address bases, one op list
-    top_column(ga, gb)
-    seq = gk.schedule(ga.ops, 14, gk.Knobs())
+    top_column(ga, gb, blocks)
+    seq = gk.schedule(gk.prune(ga.ops), 14, gk.Knobs())
     reg = gk.allocate(seq, {14, 15})
     head = ['vpbroadcastd %[P], %%ymm15', 'vpbroadcastd %[P2], %%ymm14', '.p2align 5', '1:']
-    tail = ['add $32, %[a]', 'add $32, %[b]', 'cmp %[end], %[a]', 'jne 1b']
+    tail = ['add $32, %[a]', 'add $32, %[b]']
+    if to:
+        tail += ['add $32, %[o]'] + (['add $32, %[o2]'] if blocks > 4 else [])
+    tail += ['cmp %[end], %[a]', 'jne 1b']
     return head + [gk.emit(o, reg) for o in seq] + tail
 
 
@@ -199,6 +208,29 @@ def top_function():
     return lines
 
 
+TOP_TO_DOC = '''\
+// inverse_top() for a product from spans: columns j < columns of the result's blocks t < T to the
+// vectors at o + 8 (tq + j), any alignment.
+template <int T>
+void inverse_top_to(const Vec* a, std::uint32_t* o, std::size_t columns, std::size_t q, const Vec* w);
+'''
+
+
+def top_to_function(blocks):
+    lines = ['template <>',
+             f'inline void inverse_top_to<{blocks}>(const Vec* a, std::uint32_t* o, std::size_t columns, std::size_t q,',
+             '                                  const Vec* w) {',
+             '    const Vec* b = a + 4 * q;']
+    if blocks > 4:
+        lines += ['    std::uint32_t* o2 = o + 32 * q;']
+    lines += ['    const Vec* const end = a + columns;', '    asm volatile(']
+    lines += gk.asm_lines(top_body(blocks, True))
+    lines += ['        : [a] "+r"(a), [b] "+r"(b), [o] "+r"(o)' + (', [o2] "+r"(o2)' if blocks > 4 else ''),
+              '        : [end] "r"(end), [h] "r"(32 * q), [h3] "r"(96 * q), [w] "r"(w), [P] "m"(kP), [P2] "m"(k2P)',
+              '        : ' + gk.CLOBBERS + ', "cc");', '}']
+    return lines
+
+
 # Inverse top of a transform of 4q vectors (odd lg): the identity group and the scale s, folded into
 # its twiddles s and s z, z = r^-1(1). Values < 2P in, canonical out; two columns per iteration:
 #   out = s (f0 + f1) + s (f2 + f3), s (f0 - f1) + s z (f2 - f3), and the two differences.
@@ -210,35 +242,60 @@ inline void inverse_top4(Vec* a, std::size_t q, const Vec* w) {
     Vec* const end = a + q;
     asm volatile('''
 
+TOP4_TO_DOC = '''\
+// inverse_top4() for a product from spans: columns j < columns of the result's quarters t < T to
+// the vectors at o + 8 (tq + j), any alignment. columns even.
+template <int T>
+void inverse_top4_to(const Vec* a, std::uint32_t* o, std::size_t columns, std::size_t q, const Vec* w);
+'''
 
-def top4_column(g):
+
+def top4_column(g, blocks):
     c = g.c
     shoup = lambda x, name: g.shoup(x, c['W' + name], c['Q' + name])
     f = [g.quarter(i) for i in range(4)]
     sab, samb = shoup(g.add(f[0], f[1]), 'S'), shoup(g.diff(f[0], f[1]), 'S')
     scd, scmd = shoup(g.add(f[2], f[3]), 'S'), shoup(g.diff(f[2], f[3]), 'SZ')
-    g.store_quarter(g.canonical(g.add(sab, scd)), 0)
-    g.store_quarter(g.canonical(g.add(samb, scmd)), 1)
-    g.store_quarter(gk.canonical_difference(g, sab, scd), 2)
-    g.store_quarter(gk.canonical_difference(g, samb, scmd), 3)
+    outputs = [lambda: g.canonical(g.add(sab, scd)), lambda: g.canonical(g.add(samb, scmd)),
+               lambda: gk.canonical_difference(g, sab, scd), lambda: gk.canonical_difference(g, samb, scmd)]
+    for t in range(blocks):
+        g.store_quarter(outputs[t](), t)
 
 
-def top4_function():
+def top4_body(blocks=4, to=False):
+    """to: the first `blocks` output quarters to o, else all 4 in place."""
     consts = {'P': gk.Value('creg', reg=15), '2P': gk.Value('creg', reg=14)}
     for i, name in enumerate(['S', 'SZ']):  # w[2i] value, w[2i + 1] quotient, broadcast
         consts['W' + name] = gk.Value('cmem', mem=64 * i)
         consts['Q' + name] = gk.Value('cmem', mem=64 * i + 32)
     ops = []
     for k in range(2):
-        g = gk.Graph(consts, disp=32 * k)
-        top4_column(g)
+        g = gk.Graph(consts, disp=32 * k, out='o' if to else None)
+        top4_column(g, blocks)
         ops += g.ops
-    seq = gk.schedule(ops, 14, TOP4_KNOBS)
+    seq = gk.schedule(gk.prune(ops), 14, TOP4_KNOBS)
     reg = gk.allocate(seq, {14, 15})
     body = ['vpbroadcastd %[P], %%ymm15', 'vpbroadcastd %[P2], %%ymm14', '.p2align 5', '1:']
-    body += [gk.emit(o, reg) for o in seq] + ['add $64, %[a]', 'cmp %[end], %[a]', 'jne 1b']
-    lines = TOP4_DOC.split('\n') + gk.asm_lines(body)
+    tail = ['add $64, %[a]'] + (['add $64, %[o]'] if to else []) + ['cmp %[end], %[a]', 'jne 1b']
+    return body + [gk.emit(o, reg) for o in seq] + tail
+
+
+def top4_function():
+    lines = TOP4_DOC.split('\n') + gk.asm_lines(top4_body())
     lines += ['        : [a] "+r"(a)',
+              '        : [end] "r"(end), [h] "r"(32 * q), [h3] "r"(96 * q), [w] "r"(w), [P] "m"(kP), [P2] "m"(k2P)',
+              '        : ' + gk.CLOBBERS + ', "cc");', '}']
+    return lines
+
+
+def top4_to_function(blocks):
+    lines = ['template <>',
+             f'inline void inverse_top4_to<{blocks}>(const Vec* a, std::uint32_t* o, std::size_t columns, std::size_t q,',
+             '                                   const Vec* w) {',
+             '    const Vec* const end = a + columns;', '    asm volatile(']
+    body = top4_body(blocks, True)
+    lines += gk.asm_lines(body)
+    lines += ['        : [a] "+r"(a), [o] "+r"(o)',
               '        : [end] "r"(end), [h] "r"(32 * q), [h3] "r"(96 * q), [w] "r"(w), [P] "m"(kP), [P2] "m"(k2P)',
               '        : ' + gk.CLOBBERS + ', "cc");', '}']
     return lines
@@ -257,6 +314,7 @@ HEADER = '''\
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 #include "backend/ntt/avx2_kernels.hpp"
 
@@ -273,7 +331,14 @@ def generate():
     lines = HEADER.split('\n')
     for part in ('first', 'last', 'both'):
         lines += function(part) + ['']
-    lines += top_function() + [''] + top4_function() + ['', '}  // namespace fps::ntt::avx2_product_kernels']
+    lines += top_function() + [''] + top4_function() + ['']
+    lines += TOP_TO_DOC.split('\n')
+    for blocks in range(1, 9):
+        lines += top_to_function(blocks) + ['']
+    lines += TOP4_TO_DOC.split('\n')
+    for blocks in range(1, 5):
+        lines += top4_to_function(blocks) + ['']
+    lines += ['}  // namespace fps::ntt::avx2_product_kernels']
     return '\n'.join(lines) + '\n'
 
 
