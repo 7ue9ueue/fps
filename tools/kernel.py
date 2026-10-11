@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Test and time backend kernels, per target (see TARGETS and BACKEND.md).
 
-  kernel.py test KERNEL [--target T]
-      Build backend/KERNEL/test.cpp for target T at -O2 and with ASan/UBSan; run both.
-  kernel.py bench KERNEL [--target T] [--base DIR] [--rounds N] [--filter RE] [--json FILE]
-      Time backend/KERNEL/bench.cpp. With --base (another checkout, e.g. of main), time both in
+  kernel.py test UNIT [--target T]
+      Build every test*.cpp of the unit for target T at -O2 and with ASan/UBSan; run them all.
+  kernel.py bench UNIT [--target T] [--base DIR] [--rounds N] [--filter RE] [--json FILE]
+      Time the unit's bench.cpp. With --base (another checkout, e.g. of main), time both in
       the same run, alternating, and print each case's paired ratio new/base: below 1 is faster.
+
+A unit is a backend kernel (folder backend/<kernel>/) or `frontend` (folder frontend/, headers in
+include/fps/).
   kernel.py check
       Run every backend/*/gen_*.py --check: generated files match their generators.
 
@@ -33,7 +36,7 @@ from pathlib import Path
 
 IMAGE = 'mirror.gcr.io/library/gcc:15.2.0@sha256:3ae15afe768b06d0c0fe088d822ba5f8045c26630bdacc8d8e7713cf5d8e7289'
 MAC = sys.platform == 'darwin'
-CXX = ('clang++' if MAC else 'g++') + ' -std=c++23 -Wall -Wextra -I.'
+CXX = ('clang++' if MAC else 'g++') + ' -std=c++23 -Wall -Wextra -I. -Iinclude'
 
 # Targets as in BACKEND.md: compiler flags, the machines that test them ('mac' is the local Mac) and
 # the one that times them (None: never timed). needs: /proc/cpuinfo flags a machine must have.
@@ -164,13 +167,17 @@ def cpu_name() -> str:
     return platform.processor()
 
 
-def build(tree: Path, kernel: str, kind: str, target: str, sanitize: bool = False) -> Path:
-    """Compile backend/<kernel>/<kind>.cpp in tree, from relative paths, so the same sources give
+def unit_dir(unit: str) -> str:
+    return 'frontend' if unit == 'frontend' else f'backend/{unit}'
+
+
+def build(tree: Path, unit: str, source: str, target: str, sanitize: bool = False) -> Path:
+    """Compile <unit folder>/<source> in tree, from relative paths, so the same sources give
     byte-identical binaries in any tree."""
-    out = f'build/{target}/{kernel}-{kind}{"-san" if sanitize else ""}'
+    out = f'build/{target}/{unit}-{Path(source).stem}{"-san" if sanitize else ""}'
     opt = '-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all' if sanitize else '-O2'
     result = sh({'w': tree}, lambda _: f'mkdir -p build/{target}\n'
-                f'{CXX} {opt} {flags(target)} backend/{kernel}/{kind}.cpp -o {out}')
+                f'{CXX} {opt} {flags(target)} {unit_dir(unit)}/{source} -o {out}')
     if result.returncode:
         sys.exit(f'build failed in {tree}:\n{result.stdout}{result.stderr}')
     return tree / out
@@ -179,15 +186,20 @@ def build(tree: Path, kernel: str, kind: str, target: str, sanitize: bool = Fals
 def test(args) -> int:
     require_cpu(args.target)
     tree = Path('.')
-    for sanitize in (False, True):
-        binary = build(tree, args.kernel, 'test', args.target, sanitize)
-        result = sh({'w': tree}, lambda _: './' + shlex.quote(str(binary.relative_to(tree))))
-        sys.stdout.write(result.stdout + result.stderr)
-        label = 'ASan/UBSan' if sanitize else '-O2'
-        if result.returncode:
-            print(f'FAIL {args.kernel} {args.target} {label}')
-            return 1
-        print(f'pass {args.kernel} {args.target} {label}')
+    sources = sorted(p.name for p in Path(unit_dir(args.kernel)).glob('test*.cpp'))
+    if not sources:
+        print(f'FAIL {args.kernel}: no test*.cpp in {unit_dir(args.kernel)}')
+        return 1
+    for source in sources:
+        for sanitize in (False, True):
+            binary = build(tree, args.kernel, source, args.target, sanitize)
+            result = sh({'w': tree}, lambda _: './' + shlex.quote(str(binary.relative_to(tree))))
+            sys.stdout.write(result.stdout + result.stderr)
+            label = f'{source} {"ASan/UBSan" if sanitize else "-O2"}'
+            if result.returncode:
+                print(f'FAIL {args.kernel} {args.target} {label}')
+                return 1
+            print(f'pass {args.kernel} {args.target} {label}')
     return 0
 
 
@@ -196,7 +208,7 @@ def bench(args) -> int:
     trees = {'new': Path('.')}
     if args.base:
         trees['base'] = Path(args.base)
-    binaries = {name: build(tree, args.kernel, 'bench', args.target) for name, tree in trees.items()}
+    binaries = {name: build(tree, args.kernel, 'bench.cpp', args.target) for name, tree in trees.items()}
     report = {'kernel': args.kernel, 'target': args.target, 'flags': flags(args.target),
               'cpu': cpu_name(), 'compiler': 'clang++' if MAC else IMAGE, 'rounds': args.rounds,
               'identical': False, 'cases': {}}
@@ -273,8 +285,8 @@ def main() -> int:
     p = sub.add_parser('check')
     p.set_defaults(run=check)
     args = parser.parse_args()
-    if args.command != 'check' and not Path(f'backend/{args.kernel}').is_dir():
-        sys.exit(f'no kernel backend/{args.kernel}')
+    if args.command != 'check' and not Path(unit_dir(args.kernel)).is_dir():
+        sys.exit(f'no unit {unit_dir(args.kernel)}')
     timing_host = socket.gethostname().split('.')[0] in {t['time'] for t in TARGETS.values()}
     with bench_lock() if timing_host or args.command == 'bench' else contextlib.nullcontext():
         return args.run(args)

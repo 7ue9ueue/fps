@@ -7,7 +7,8 @@ Two parts:
 
 - **Backend**: the kernels (NTT now, more later), tuned per CPU. Agents explore them in rounds;
   see Backend and Process.
-- **Frontend**: the user API, planned in `DESIGN.md`. Build it from that plan.
+- **Frontend**: the user API, planned in `DESIGN.md`. Built from that plan issue by issue with
+  `/build`; see Process.
 
 ## Hard rules
 
@@ -72,13 +73,18 @@ Speed is the point of this library. The lc-opt kernels are already fast; the API
 AGENTS.md                  rules (CLAUDE.md imports it)
 DESIGN.md                  the user API (frontend)
 BACKEND.md                 the kernel plan: targets, variants, exploration order
-backend/bench.hpp          timing harness for kernel benches
+include/fps/               the frontend: the user API (`#include <fps/fps.hpp>`)
+frontend/                  its tests (test_<area>.cpp), bench.cpp and notes.md
+backend/bench.hpp          timing harness for kernel and frontend benches
 backend/<kernel>/          one kernel: headers (API at the top), test.cpp, bench.cpp, notes.md, gen_*.py
-tools/kernel.py            test and time a kernel, per target (VMs; the Mac for scalar and arm)
+tools/kernel.py            test and time a unit (a kernel or the frontend), per target
 tools/vm.py                run a command on a VM in a copy of your checkout
 tools/gate.py              test and time a pull request on every target; merge it if it passes
 tools/prompt.md            brief for one backend round
-.claude/commands/work.md   /work: rounds on ready issues with subagents
+tools/prompt_build.md      brief for building one frontend issue
+tools/prompt_review.md     brief for reviewing a frontend pull request against DESIGN.md
+.claude/commands/work.md   /work: backend rounds on ready issues with subagents
+.claude/commands/build.md  /build: frontend issues, each implemented, reviewed and gated
 ```
 
 ## Backend
@@ -103,12 +109,14 @@ The Mac drives the VMs. The VMs cannot fetch this private repository: `tools/vm.
 - `python3 tools/vm.py <vm> [--base REV] '<command>'` copies your working tree to
   `~/hpc_library/<branch>` on the VM and runs the command there. With `--base`, REV goes to
   `$BASE` as well.
-- `python3 tools/kernel.py`, on a VM, or on the Mac for `scalar` and `arm`:
-  - `test <kernel> --target <t>`: -O2 and ASan/UBSan builds.
-  - `bench <kernel> --target <t> [--base $BASE]`: same-run paired ratios; below 1 is faster.
+- `python3 tools/kernel.py`, on a VM, or on the Mac for `scalar` and `arm`. A unit is a kernel
+  name or `frontend`. Builds use `-I. -Iinclude`.
+  - `test <unit> --target <t>`: every `test*.cpp` of the unit, -O2 and ASan/UBSan.
+  - `bench <unit> --target <t> [--base $BASE]`: same-run paired ratios; below 1 is faster.
   - `check`: generators.
-- `python3 tools/gate.py <pr> --merge` is the only way into `main`. It tests every affected kernel on
-  every target, times each against `main` on the target's timing machine, comments the result on
+- `python3 tools/gate.py <pr> --merge` is the only way into `main`. It tests every affected unit on
+  every target (the frontend too, when `include/`, `frontend/` or a kernel it includes changes),
+  times each against `main` on the target's timing machine, comments the result on
   the PR, and squash-merges if all tests pass and no target is slower (geomean of new/base <= 1).
   `gate.py <rev> --base <rev>` runs the same checks on local commits, without a PR.
   Issues and pull requests share numbers: pass the pull request's.
@@ -124,6 +132,11 @@ Backend work happens in rounds: one subagent per round, started by `/work` and b
 `tools/prompt.md`. Each GitHub issue (`.github/ISSUE_TEMPLATE/kernel.md`) is labeled `ready`,
 `running`, `blocked` (needs the user) or `done`. `/work` reads the `Result:` line each round ends
 with (`BACKEND.md`, Working in parallel).
+
+Frontend work is building to a plan, not exploring: `/build` takes issues labeled `build`, one
+implementer each (`tools/prompt_build.md`), then a reviewer who checks the pull request against
+DESIGN.md (`tools/prompt_review.md`), then the gate. An issue ends with `Result: done`. `/work`
+skips `build` issues.
 
 Agents may open issues and comment on any issue. Open one from the template, labeled `ready`, for
 work found outside your round: a bug, a new kernel, an idea for another target. Search open issues
