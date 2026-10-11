@@ -137,7 +137,9 @@ std::vector<std::uint32_t> roots(f);      // distinct roots in [0, P)
 std::vector<std::pair<Polynomial, int>> factor(f);   // monic irreducible factors, multiplicities
 ```
 
-`Factorials<P> fact(n)`: `fact[i]`, `fact.inverse(i)`, `fact.binomial(n, k)` for i, n < size.
+`Factorials<P> fact(n)`, n <= P: `fact[i]` = i!, `fact.inverse(i)` = 1/i!, `fact.binomial(n, k)`
+= C(n, k) (0 for k > n), for i, n < `fact.size()`. n > P throws: P! = 0 has no inverse. Indices
+are not checked, as in `operator[]`.
 
 Scalars: `fps::mod_mul<P>(a, b)`, `fps::mod_pow<P>(a, e)`, `fps::mod_inverse<P>(a)`. They work for
 any prime P < 2^32, not only 998244353: they need no kernels.

@@ -2,4 +2,5 @@
 // this header includes every part that exists so far.
 #pragma once
 
+#include "fps/factorials.hpp"
 #include "fps/modular.hpp"
