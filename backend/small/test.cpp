@@ -3,17 +3,25 @@
 // bounds of the 64-bit sums, 0, 1, powers of two and their neighbours up to 1025, panels
 // (m > 1024) and long factors, and the selected multiply() with its argument orders and empty
 // factors. Inputs random, or making the largest sums or sums near them. Words past the product must
-// stay untouched. Exits nonzero on a failure.
+// stay untouched. Then beats_ntt on the compiled defaults, and measure_ntt (tune.hpp). Exits nonzero
+// on a failure.
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <random>
 #include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <unistd.h>
+
 #include "backend/simd/select.hpp"
 #include "backend/small/small.hpp"
+#include "backend/small/tune.hpp"
 
 namespace {
 
@@ -159,6 +167,33 @@ void cutoff() {
     if (!beats_ntt(std::size_t(1) << 27, 1)) fail("beats_ntt: x^k past 2^25 goes to the NTT");
 }
 
+// measure_ntt with a small budget: times positive; past max_lg the start times the ratio at
+// max_lg; a margin above every change keeps the start. Then the choice "small.ntt" through wisdom.
+void tuned() {
+    using namespace fps::small;
+    const auto times = measure_ntt(kModel, kNttDefaults, {8, 1, 1e4, 0});
+    for (const double t : times)
+        if (!(t > 0 && std::isfinite(t))) fail("measure_ntt: a time of " + std::to_string(t));
+    const double ratio = times[8 - 6] / kNttDefaults[8 - 6];
+    for (int lg = 9; lg <= 25; ++lg)
+        if (std::abs(times[lg - 6] / (kNttDefaults[lg - 6] * ratio) - 1) > 1e-12)
+            fail("measure_ntt: lg " + std::to_string(lg) + " is not the default times the ratio at max_lg");
+    if (measure_ntt(kModel, kNttDefaults, {8, 1, 1e4, 1e9}) != kNttDefaults) fail("measure_ntt: changed within the margin");
+
+    const std::string path =
+        (std::filesystem::temp_directory_path() / ("fps-small-test-" + std::to_string(::getpid()))).string();
+    ntt_times.set(times);
+    if (!fps::tune::save(path)) fail("save");
+    ntt_times.set(kNttDefaults);
+    if (!fps::tune::load(path) || ntt_times.get() != times) fail("small.ntt did not load back from wisdom");
+    std::ifstream in(path);
+    bool found = false;
+    for (std::string line; std::getline(in, line);) found |= line == "small.ntt " + fps::tune::text(times);
+    if (!found) fail("no small.ntt line in the wisdom");
+    std::filesystem::remove(path);
+    ntt_times.set(kNttDefaults);
+}
+
 }  // namespace
 
 int main() {
@@ -180,6 +215,7 @@ int main() {
     long_shapes<1073741789>();
     selected();
     cutoff();
+    tuned();
     std::printf("%s\n", failures ? "FAIL" : "ok");
     return failures ? 1 : 0;
 }

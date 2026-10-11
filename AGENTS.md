@@ -89,7 +89,9 @@ include/fps/               the frontend: the user API (`#include <fps/fps.hpp>`)
 frontend/                  its tests (test_<area>.cpp), bench.cpp and notes.md
 backend/bench.hpp          timing harness for kernel and frontend benches
 backend/<kernel>/          one kernel: headers (API at the top), test.cpp, bench.cpp, notes.md, gen_*.py
+backend/tune/              run-time tuning of kernels' choices, wisdom files
 tools/kernel.py            test and time a unit (a kernel or the frontend), per target
+tools/tune.py              measure a kernel's tuned choices per target; write their compiled defaults
 tools/vm.py                run a command on a VM in a copy of your checkout
 tools/gate.py              test and time a pull request on every target; merge it if it passes
 tools/prompt.md            brief for one backend round
@@ -110,6 +112,8 @@ and time variants, and how agents work in parallel. A kernel lives in `backend/<
   are reported. Pass the items per call (coefficients, vectors) for a per-element unit;
 - generated code: the generator `gen_*.py` and its output, both committed; `gen_*.py --check`
   exits nonzero if they differ;
+- tuned choices (`backend/tune`): `tune.hpp` measures them at run time, `tune.cpp` for
+  `tools/tune.py`, which writes `tuned.json` and `tuned.hpp` (compiled defaults per target);
 - `notes.md`: design, measurements per target, and the attempt log.
 
 Targets and their machines are `TARGETS` in `tools/kernel.py`, kept in step with `BACKEND.md`.
@@ -125,7 +129,10 @@ The Mac drives the VMs. `tools/vm.py` sends your working tree over ssh, uncommit
   name or `frontend`. Builds use `-I. -Iinclude`.
   - `test <unit> --target <t>`: every `test*.cpp` of the unit, -O2 and ASan/UBSan.
   - `bench <unit> --target <t> [--base $BASE]`: same-run paired ratios; below 1 is faster.
-  - `check`: generators.
+  - `check`: generators, and `tools/tune.py --check`.
+- `python3 tools/tune.py <kernel> [--target <t>]`, on the Mac: runs `backend/<kernel>/tune.cpp` on
+  each target's timing machine (lc-bench for `scalar` and `sse`) under the bench lock and writes the
+  kernel's compiled defaults (`tuned.json`, `tuned.hpp`).
 - `python3 tools/gate.py <pr> --merge` is the only way into `main`. It tests every affected unit on
   every target (the frontend too, when `include/`, `frontend/` or a kernel it includes changes),
   times each against `main` on the target's timing machine (gated cases only), comments the

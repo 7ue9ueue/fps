@@ -10,13 +10,15 @@
 //   Schoolbook<S, R, P>::run(a, n, b, m, out)    n >= m >= 1; blocks of R vectors (schoolbook.hpp)
 //
 // beats_ntt(n, m), for factors of n and m coefficients: true where multiply() is expected to run
-// faster than an ntt::Convolution with the product in the caller's memory, on this target. A cost
-// model fitted to measurements (select.hpp). On the timed targets: min(n, m) up to 38-130 next to
-// a factor of about 1000 coefficients, 53-175 next to one of 16000 (the higher ends where the
-// product just passes a power of two), and n = m up to 25-104. It compares against the NTT on
-// main when it was measured; re-measure it when either kernel gets faster (notes.md). Lengths past
-// 2^25 count the NTT at twice the time per doubling, so huge products still go to the NTT (which
-// throws) and a short factor of any length to multiply().
+// faster than an ntt::Convolution with the product in the caller's memory, on this target: a cost
+// model of multiply() against the NTT's time per transform length (select.hpp), one acquire load
+// per call. Both are compiled defaults measured on the target's machine by tools/tune.py; the NTT
+// times are a tuned choice ("small.ntt", tune.hpp) that tune::run() measures on this machine and
+// tune::save() / load() keep. Rerun tools/tune.py small when either kernel gets faster. On the
+// timed targets: min(n, m) up to 38-131 next to a factor of about 1000 coefficients, 54-180 next to
+// one of 16000 (the higher ends where the product just passes a power of two), and n = m up to
+// 24-104. Lengths past 2^25 count the NTT at twice the time per doubling, so huge products still
+// go to the NTT (which throws) and a short factor of any length to multiply().
 // Design and measurements: notes.md.
 #pragma once
 
@@ -41,13 +43,17 @@ void multiply(std::span<const u32> a, std::span<const u32> b, std::span<u32> out
     Schoolbook<Isa, kVectors, P>::run(a.data(), a.size(), b.data(), b.size(), out.data());
 }
 
+// The model's ns for multiply() on factors of n and m coefficients (select.hpp).
+inline double model_ns(const Model& model, std::size_t n, std::size_t m) {
+    const double x = double(n), y = double(m), s = double(std::min(n, m));
+    return model.term * x * y + model.word * (x + y) + model.call + model.square * s * s;
+}
+
 inline bool beats_ntt(std::size_t n, std::size_t m) {
     if (n == 0 || m == 0) return true;
     const int lg = std::max(6, int(std::bit_width(n + m - 2)));
-    const double x = double(n), y = double(m), s = double(std::min(n, m));
-    const double small = kCosts.term * x * y + kCosts.word * (x + y) + kCosts.call + kCosts.square * s * s;
-    const double ntt = lg <= 25 ? kCosts.ntt[lg - 6] : std::ldexp(kCosts.ntt[19], lg - 25);
-    return small < ntt;
+    const auto& ntt = ntt_times.get();
+    return model_ns(kModel, n, m) < (lg <= 25 ? ntt[lg - 6] : std::ldexp(ntt[19], lg - 25));
 }
 
 }  // namespace fps::small

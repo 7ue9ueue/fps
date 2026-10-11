@@ -4,7 +4,9 @@ Status: draft, 2026-10-10. The user API is in `DESIGN.md`.
 
 The backend is the kernels under the API: NTTs, pointwise products, small products, CRT,
 element-wise loops. Each kernel has several variants; agents explore them in rounds and keep each
-variant where it wins. Header-only: the variant is chosen at compile time.
+variant where it wins. Header-only: the ISA is chosen at compile time; variants, cutoffs and layouts
+that are tuned choices (`backend/tune`) have compiled defaults per target, measured on the target's
+machine by `tools/tune.py`, and run-time tuning (explicit, FFTW-style wisdom) can replace them.
 
 ## Starting point
 
@@ -62,6 +64,12 @@ Kernels to start with: `simd` (per-ISA vector wrappers), `modarith`, `ntt`, `mul
 - Each variant has a name. `backend/<kernel>/select.hpp` picks the variant and size thresholds per
   target from the macros; `-DFPS_<KERNEL>_<OP>=<variant>` forces one. No function pointers or
   virtual calls on hot paths.
+- Tuned choices instead of hand-picked thresholds (`backend/tune/notes.md`): a choice is a table
+  (`tune::Table`) the kernel reads once per call, outside loops. `backend/<kernel>/tune.hpp`
+  measures it at run time and registers it; `backend/<kernel>/tune.cpp` measures it for
+  `tools/tune.py <kernel>`, which writes the compiled defaults per target (`tuned.json`,
+  `tuned.hpp`; `tune.py --check` runs in `kernel.py check`). After a kernel gets faster, rerun
+  `tools/tune.py`. Benches and tests read the compiled defaults, never fresh tuning.
 - Bench cases: `<op>/<size>` times the selected variant (gated); `<op>@<variant>/<size>` times one
   variant (reported). Sizes 2^6..2^25, to see L1, L2, L3 and memory.
 - Before optimizing, estimate the floor: multiply uops over multiply pipes, or bytes over
