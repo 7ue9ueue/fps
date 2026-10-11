@@ -15,6 +15,7 @@
 
 namespace {
 
+using fps::modarith::Barrett;
 using fps::modarith::Montgomery;
 using fps::modarith::Shoup;
 using fps::modarith::u32;
@@ -165,6 +166,13 @@ struct Tester {
         montgomery_variants();
         shoup_variants();
         binary("barrett", P, P, O::barrett, Model::barrett);
+        if constexpr (fps::modarith::has<S>(Barrett::wide))
+            binary("barrett@wide", P, P, [](V a, V b) { return O::template barrett_as<Barrett::wide>(a, b); },
+                   Model::barrett);
+        binary("barrett@mulhi", P, P, [](V a, V b) { return O::template barrett_as<Barrett::mulhi>(a, b); },
+               Model::barrett);
+        binary("barrett@split", P, P, [](V a, V b) { return O::template barrett_as<Barrett::split>(a, b); },
+               Model::barrett);
         ifma();
     }
 };

@@ -138,12 +138,13 @@ NEOVERSE_V2 = Machine(
     loads_per_cycle={128: 3}, stores_per_cycle={128: 2},
     ops=_ops({
         **{(m, 128): (2, 0.25, 'V0 V1 V2 V3') for m in ('add', 'sub', 'umin', 'shsub', 'uzp1', 'uzp2', 'bsl', 'tbl')},
-        **{(m, 128): (4, 0.5, 'V0 V2') for m in ('mul', 'umull', 'umull2', 'sqdmulh')},
+        **{(m, 128): (4, 0.5, 'V0 V2') for m in ('mul', 'umull', 'umull2', 'sqdmulh', 'umulh')},  # umulh: SVE2
         **{(m, 128): (1.15, 0.5, 'V0 V2') for m in ('mla', 'mls', 'umlal', 'umlal2')},
         ('ushr', 128): (2, 0.5, 'V1 V3'),
         ('shrn', 128): (2, 0.5, 'V1 V3'),
+        ('usra', 128): (1.15, 0.5, 'V1 V3'),  # latency through the accumulator
     }),
-    guess=(('ushr', 128), ('shrn', 128), ('shsub', 128), ('bsl', 128), ('tbl', 128)),
+    guess=(('ushr', 128), ('shrn', 128), ('usra', 128), ('shsub', 128), ('bsl', 128), ('tbl', 128)),
     notes=('A multiply mixed 1:1 with add or uzp2 runs at 0.333 cycles per instruction, not 0.25: '
            'the ALU ops do not all move to V1/V3. mla/umlal from the multiplicands: not measured '
            '(guess: 4, as mul).'),

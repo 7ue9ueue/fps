@@ -19,10 +19,11 @@
 //   broadcast(x)               every lane x
 //   add, sub, min              lane-wise; min unsigned
 //   mul_lo(a, b)               low 32 bits of a b
+//   shr<k>(a), shl<k>(a)       logical shifts, 1 <= k <= 31
 //   mul_sub(c, a, b)           c - a b (low 32 bits); Neon: one mls, x86: mul_lo + sub
 //   mulhi(a, b)                composed: high 32 bits of a b. x86: 6 instructions (2 mul_even;
 //                              5 with AVX-512 off Zen),
-//                              Neon: 3 (umull, umull2, uzp2)
+//                              Neon: 3 (umull, umull2, uzp2); 1 with SVE2 (umulh)
 //   mul_shr<k>(a, b)           composed: (a b) >> k, 1 <= k <= 32, valid if it is < 2^32.
 //                              x86: 7 instructions (6 for k = 32), Neon: 4 (3 for k = 32)
 //   blend<mask>(a, b)          lane i from b if bit i of mask is set, else from a
@@ -62,6 +63,10 @@
 #if defined(__ARM_NEON) && defined(__aarch64__)
 #include <arm_neon.h>
 #endif
+#if defined(__ARM_NEON) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE2)
+#include <arm_neon_sve_bridge.h>
+#include <arm_sve.h>
+#endif
 
 namespace fps::simd {
 
@@ -81,6 +86,10 @@ struct Scalar {
     static V sub(V a, V b) { return a - b; }
     static V min(V a, V b) { return a < b ? a : b; }
     static V mul_lo(V a, V b) { return a * b; }
+    template <int k>
+    static V shr(V a) { return a >> k; }
+    template <int k>
+    static V shl(V a) { return a << k; }
     static V mul_sub(V c, V a, V b) { return c - a * b; }
     static V mulhi(V a, V b) { return V(u64(a) * b >> 32); }
     template <int k>
@@ -111,6 +120,10 @@ struct Sse {
     static V sub(V a, V b) { return _mm_sub_epi32(a, b); }
     static V min(V a, V b) { return _mm_min_epu32(a, b); }
     static V mul_lo(V a, V b) { return _mm_mullo_epi32(a, b); }
+    template <int k>
+    static V shr(V a) { return _mm_srli_epi32(a, k); }
+    template <int k>
+    static V shl(V a) { return _mm_slli_epi32(a, k); }
     static V mul_sub(V c, V a, V b) { return sub(c, mul_lo(a, b)); }
     static V mul_even(V a, V b) { return _mm_mul_epu32(a, b); }
     static V add64(V a, V b) { return _mm_add_epi64(a, b); }
@@ -155,6 +168,10 @@ struct Avx2 {
     static V sub(V a, V b) { return _mm256_sub_epi32(a, b); }
     static V min(V a, V b) { return _mm256_min_epu32(a, b); }
     static V mul_lo(V a, V b) { return _mm256_mullo_epi32(a, b); }
+    template <int k>
+    static V shr(V a) { return _mm256_srli_epi32(a, k); }
+    template <int k>
+    static V shl(V a) { return _mm256_slli_epi32(a, k); }
     static V mul_sub(V c, V a, V b) { return sub(c, mul_lo(a, b)); }
     static V mul_even(V a, V b) { return _mm256_mul_epu32(a, b); }
     static V add64(V a, V b) { return _mm256_add_epi64(a, b); }
@@ -212,6 +229,10 @@ struct Avx512 {
     static V sub(V a, V b) { return _mm512_sub_epi32(a, b); }
     static V min(V a, V b) { return _mm512_min_epu32(a, b); }
     static V mul_lo(V a, V b) { return _mm512_mullo_epi32(a, b); }
+    template <int k>
+    static V shr(V a) { return _mm512_srli_epi32(a, k); }
+    template <int k>
+    static V shl(V a) { return _mm512_slli_epi32(a, k); }
     static V mul_sub(V c, V a, V b) { return sub(c, mul_lo(a, b)); }
     static V mul_even(V a, V b) { return _mm512_mul_epu32(a, b); }
     static V add64(V a, V b) { return _mm512_add_epi64(a, b); }
@@ -316,6 +337,10 @@ struct Neon {
     static V sub(V a, V b) { return vsubq_u32(a, b); }
     static V min(V a, V b) { return vminq_u32(a, b); }
     static V mul_lo(V a, V b) { return vmulq_u32(a, b); }
+    template <int k>
+    static V shr(V a) { return vshrq_n_u32(a, k); }
+    template <int k>
+    static V shl(V a) { return vshlq_n_u32(a, k); }
     static V mul_sub(V c, V a, V b) { return vmlsq_u32(c, a, b); }
     template <unsigned mask>
     static V blend(V a, V b) {  // bsl with a constant mask
@@ -336,7 +361,15 @@ struct Neon {
         return vreinterpretq_u32_s32(vhsubq_s32(vreinterpretq_s32_u32(a), vreinterpretq_s32_u32(b)));
     }
 
+#if defined(__ARM_FEATURE_SVE2)
+    // SVE2 umulh on the low 128 bits of the z registers (any vector length).
+    static V mulhi(V a, V b) {
+        const svuint32_t x = svset_neonq_u32(svundef_u32(), a), y = svset_neonq_u32(svundef_u32(), b);
+        return svget_neonq_u32(svmulh_u32_x(svptrue_b32(), x, y));
+    }
+#else
     static V mulhi(V a, V b) { return hi_halves(mul_wide_lo(a, b), mul_wide_hi(a, b)); }
+#endif
     template <int k>
     static V mul_shr(V a, V b) {
         static_assert(1 <= k && k <= 32);

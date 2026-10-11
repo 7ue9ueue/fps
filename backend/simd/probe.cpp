@@ -103,6 +103,12 @@ std::vector<Probe> probes() {
         MIX("mul + sqdmulh", "mul v\\r\\().4s, v14.4s, v15.4s", "sqdmulh v\\r\\().4s, v14.4s, v15.4s"),
         MIX("mul + add", "mul v\\r\\().4s, v14.4s, v15.4s", "add v\\r\\().4s, v14.4s, v15.4s"),
         MIX("umull + uzp2", "umull v\\r\\().2d, v14.2s, v15.2s", "uzp2 v\\r\\().4s, v14.4s, v15.4s"),
+#if defined(__ARM_FEATURE_SVE2)
+        PROBE("umulh z.s (sve2)", "umulh z0.s, z0.s, z1.s", "umulh z\\r\\().s, z14.s, z15.s"),
+        MIX("mul + umulh", "mul v\\r\\().4s, v14.4s, v15.4s", "umulh z\\r\\().s, z14.s, z15.s"),
+        MIX("umulh + add", "umulh z\\r\\().s, z14.s, z15.s", "add v\\r\\().4s, v14.4s, v15.4s"),
+        PROBE("usra 4s", "usra v0.4s, v1.4s, #13", "usra v\\r\\().4s, v15.4s, #13"),
+#endif
 #undef A3
 #undef ACC
 #endif

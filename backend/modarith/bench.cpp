@@ -15,6 +15,7 @@
 
 namespace {
 
+using fps::modarith::Barrett;
 using fps::modarith::Montgomery;
 using fps::modarith::Shoup;
 using fps::modarith::u32;
@@ -80,8 +81,17 @@ void variants(bench::Suite& suite, const std::string& suffix) {
         chain<S>(suite, "shoup_chain@ifma" + suffix, op);
     }
     // Barrett needs a < P: the chain reduces first (one sub and one min more per step).
-    stream<S>(suite, "barrett@mulhi" + suffix, [](V a, V b) { return O::barrett(a, b); });
-    chain<S>(suite, "barrett_chain@mulhi" + suffix, [](V x, V c) { return O::barrett(O::template reduce<P>(x), c); });
+    const auto barrett = [&]<Barrett v>(const char* name) {
+        if constexpr (fps::modarith::has<S>(v)) {
+            stream<S>(suite, std::string("barrett@") + name + suffix,
+                      [](V a, V b) { return O::template barrett_as<v>(a, b); });
+            chain<S>(suite, std::string("barrett_chain@") + name + suffix,
+                     [](V x, V c) { return O::template barrett_as<v>(O::template reduce<P>(x), c); });
+        }
+    };
+    barrett.template operator()<Barrett::mulhi>("mulhi");
+    barrett.template operator()<Barrett::wide>("wide");
+    barrett.template operator()<Barrett::split>("split");
 }
 
 }  // namespace
