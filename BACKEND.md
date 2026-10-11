@@ -86,4 +86,4 @@ Kernels to start with: `simd` (per-ISA vector wrappers), `modarith`, `ntt`, `mul
   test machine, not the timing machine.
 - A change merges only if every target's tests pass and no target gets slower.
 - A round ends with a comment on its issue: what was tried, the numbers, and a last line that is
-  exactly `Result: gain` or `Result: no gain`. An issue stops after 5 rounds, or 2 in a row without gain.
+  exactly `Result: gain` or `Result: no gain`. An issue stops after 3 rounds, or 2 in a row without gain.
