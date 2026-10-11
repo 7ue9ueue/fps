@@ -2,8 +2,9 @@
 
 Run-time tuning of the kernels' choices (variants, cutoffs, layouts), FFTW-style: issue #54. API:
 `tune.hpp` (at the top). Tests: `test.cpp`, `test_no_tuner.cpp` (built with `-DFPS_NO_TUNER`).
-The first converted choice: small's NTT times behind `small::beats_ntt` ("small.ntt",
-`backend/small/tune.hpp`).
+Converted choices: small's NTT times behind `small::beats_ntt` ("small.ntt",
+`backend/small/tune.hpp`, round 1); factorials' variant per size class ("factorials.variant",
+`backend/factorials/tune.hpp`, round 2).
 
 ## Design
 
@@ -45,8 +46,26 @@ The first converted choice: small's NTT times behind `small::beats_ntt` ("small.
   a product's path, and the gate's benches, depend on noise. Benches and tests read the compiled
   defaults.
 - The frontend's `fps::tune()`, `save_wisdom` and `load_wisdom` (DESIGN.md) wrap `tune::run`,
-  `save` and `load`; they need `backend/small/tune.hpp` included (it pulls in the NTT) for small's
-  choice to be registered.
+  `save` and `load`; they need `backend/small/tune.hpp` (it pulls in the NTT) and
+  `backend/factorials/tune.hpp` included for those choices to be registered.
+- A variant choice (factorials, round 2): the target's variants are a compile-time list
+  (`Candidates<Variant<S, K, step>...>`, all instantiated); the table holds one byte per size
+  class, the index of the variant (0 the scalar loop); the kernel runs it through a chain of
+  compares on the index (`run_variant`), no function pointers. Size classes are quarter octaves
+  (e, e + w], w = 2^(k-2): they end at round sizes. `tuned.hpp` also records a hash of the
+  target's list, and `select.hpp` static_asserts it, so a table measured for another list does
+  not compile; the wisdom line starts with the same hash, and a line for another list, or with a
+  variant that cannot run at its class's least n, is malformed (load sets nothing).
+- Measuring a variant choice (`factorials::measure`): dense, then sparse. Dense: each class up
+  to 2^dense_lg at `points` sizes (just past a round size, and the class end), every variant
+  timed in turn by `tune::time_each` (calls per sample from one timed call; a call that alone
+  fills a sample is the first sample), the least geometric mean of time / fastest wins unless
+  start's is within the margin. Sparse: one size per octave, 2^k, up to 2^sparse_lg, decides the
+  octave's classes with a wider margin (one size cannot place a change inside an octave);
+  2^sparse_lg decides every larger class. A variant more than 2x the fastest and narrower than
+  it is not timed at larger sizes (the loop from about 64 on), except where start uses it.
+  tune.cpp runs the dense part to 2^24 at 4 points, 7 samples of 1 ms, against the previous
+  compiled table with a 2% margin, so a rerun only moves classes that changed by more than that.
 
 ## Measurements
 
@@ -135,6 +154,73 @@ for 3 runs of `measure_ntt` at `kRunTime`.
 On the home machines tuning keeps what the compiled defaults give; on another CPU it removes
 nearly every loss (avx512 on Zen 5: the NTT times at lg 7-9 went up 36-54%).
 
+### factorials.variant (round 2)
+
+GCC 15.2, `tools/kernel.py` flags, 2026-10-11, this branch on main 47736ca. Programs in
+`~/Documents/hpc_library-explore/tune/r2/`: `fine.cpp` (every variant at 4 sizes per quarter
+octave, 16 to 2^22, 7 samples of 200 us), `runtime.cpp` (validation and run-time cost),
+`lookup.cpp`, `analyze.py`, `summarize.py`; outputs in `out/`.
+
+Lookup, ns per decision (`lookup.cpp`: 4096 sizes log-uniform in [1, 2^20], median of 11
+samples of 2 ms, 3 rounds): main's compile-time tier compare against `variants.get()[size_class(n)]`.
+
+| Machine | call: main | tuned | inline: main | tuned | `FPS_NO_TUNER` call: tuned |
+|---|---:|---:|---:|---:|---:|
+| Zen 3 | 1.45 | 2.11-2.13 | 1.14 | 1.04 | 2.23 |
+| Emerald Rapids | 1.44 | 1.45-1.54 | 0.42 | 0.76 | 1.17-1.25 |
+| Zen 5 | 1.06 | 1.17-1.18 | 0.23 | 1.32 | 1.16-1.17 |
+| Neoverse V2 | 0.77-0.79 | 1.44-1.58 | 0.90-0.94 | 0.83 | 1.10-1.14 |
+
+Up to 0.8 ns more per call than main's compares (the class: a leading-zero count and two
+shifts), against 140-190 ns for the smallest tiered call (n = 64). In the bench binary,
+`tables/6` against the same variant called directly (`tables@<variant>/6`): Zen 3 165 / 164 ns,
+Emerald Rapids 166 / 164, Zen 5 140 / 140, Neoverse V2 187 / 187: nothing beyond noise.
+
+Cost of `tune::run()` for this choice (`kRunTime` = dense to 2^17 at 2 points, sparse to 2^20,
+3 samples of 10 us, margins 3% and 5%), 5 runs: Zen 3 57-61 ms, Emerald Rapids 49-52, Zen 5
+37-39, Neoverse V2 88-90; dense only to 2^16: 47, 43-46, 33, 73. Other builds: avx2 on Emerald
+Rapids 45-47, avx2 on Zen 5 37-38, avx512 on Zen 5 38-40; the arm build (clang) on an Apple M4
+95-112 (a laptop; indicative). Above "a few ms per choice": the choice has 88 classes and
+times 5-9 variants at each; well under a second. Samples of 20 us cost 11-25 ms more and
+decided within 0.1% of 10 us; one sample cost half and lost 1.2-2x as much on the home
+machines (Zen 5, n <= 2^16: 1.0043-1.0075 against 1.0032-1.0036). The sparse part costs 13-43
+ms (Zen 5 to Neoverse V2); without it a table from another CPU keeps its large-n losses
+(below).
+
+`tools/tune.py factorials`: 18-33 s per timed target, 56-62 s for scalar on `lc-bench`. A second
+run from the first run's table (2% margin) changed 0-5 of 88 classes per target (scalar 0,
+sse 5, avx2 4, avx512 2, zen5 4, arm 1); on the second run's points the first table's geomean
+loss was 1.0009-1.0080 against 1.0007-1.0039 for the second's.
+
+Decisions (`runtime.cpp`): 240 sizes log-uniform in (16, 2^22], not on the measured grid, every
+variant timed there (median of 7, samples of 200 us, fresh std::vectors per size). Per table:
+sizes more than 2% slower than the fastest variant, the worst ratio, the geomean of chosen /
+fastest; n <= 2^16 (159 sizes) | n > 2^16 (81). Run-time tuning: 5 runs at `kRunTime`.
+
+| Build on machine | compiled defaults | tuned at run time |
+|---|---|---|
+| avx2 on Zen 3 (home) | 18, 1.081, 1.0061 \| 0, 1.012, 1.0002 | 10-11, 1.081, 1.0040-1.0044 \| 0-1, 1.0002-1.0013 |
+| avx512 on Emerald Rapids (home) | 8, 1.050, 1.0026 \| 33, 1.200, 1.0475 | 10-16, 1.050-1.102, 1.0028-1.0047 \| 32-36, 1.049-1.053 |
+| zen5 on Zen 5 (home) | 19, 1.155, 1.0076 \| 4, 1.084, 1.0025 | 8, 1.054, 1.0021 \| 4, 1.0026 |
+| arm on Neoverse V2 (home) | 2, 1.026, 1.0011 \| 0, 1.019, 1.0003 | the same (no class changed) |
+| avx2 on Emerald Rapids (Zen 3's table) | 126, 1.396, 1.1131 \| 77, 1.128, 1.0554 | 7-9, 1.057-1.100, 1.0028-1.0039 \| 0-53, 1.0002-1.0361 |
+| avx2 on Zen 5 (Zen 3's table) | 67, 1.198, 1.0402 \| 0 | 5-17, 1.0018-1.0065 \| 0 |
+| avx512 on Zen 5 (Emerald Rapids' table) | 82, 1.560, 1.0774 \| 76, 1.353, 1.1967 | 8-13, 1.117, 1.0038-1.0054 \| 24-31, 1.22-1.32, 1.035-1.050 |
+| arm on Apple M4 (V2's table; clang, indicative) | 146, 1.606, 1.2244 \| 81, 1.506, 1.4344 | 4-7, 1.0017-1.0026 \| 0, 1.0005 |
+
+On the home machines tuning keeps nearly every class (0-7 of 88 change) and the compiled table
+is already within 0.3-0.8% of the fastest variant at sizes it was not measured at; on another
+CPU tuning removes most of the loss. What stays:
+- Emerald Rapids from 2^19: at sizes off the measured grid zmm K = 2 is often 1.15x faster
+  than ymm K = 2, but at the round sizes the table measures (and the gate times) 1.15-1.3x
+  slower: zmm's 32 lanes are fast or slow by n (factorials notes, Open). A size class cannot
+  tell them apart.
+- avx512 on Zen 5 at 2^16-2^18: Zen 5's L2 edge; times there move 10-30% between runs.
+- avx2 on Emerald Rapids from 2^17: ymm Montgomery is 3-6% faster than the Shoup that Zen 3's
+  table has, near the 5% sparse margin: 2 of 5 runs moved it.
+With the sparse margin at 3% (instead of 5%) every run moved it (1.0002), but one of 3 runs on
+Emerald Rapids itself then lost 2% at large n (1.0754 against 1.0524).
+
 ## Log
 
 2026-10-11, claude (issue #54, round 1): the mechanism, and small's NTT times converted.
@@ -157,6 +243,35 @@ nearly every loss (avx512 on Zen 5: the NTT times at lg 7-9 went up 36-54%).
   Emerald Rapids it moved small-lg values by 5-18% on the home machines and made the decisions
   slightly worse than the defaults (Zen 3 worst 1.003x -> 1.09x, Emerald Rapids 1.004x -> 1.11x
   on the validation shapes). Fixed as above.
+
+2026-10-11, claude (issue #54, round 2): factorials' variant per size class converted.
+- Representation. Round 3's tiers (min_size per tier, a variant each) became a byte per size
+  class. Exploration (`fine.cpp`, 284 sizes per machine, every variant): main's tiers lose
+  (geomean of chosen / fastest) 1.0063 on Zen 3, 1.0132 Emerald Rapids, 1.0942 Zen 5, 1.0033
+  Neoverse V2, 1.0148 sse, 1.2976 scalar; a per-class table decided on 4 sizes per class
+  1.0010, 1.0012, 1.0004-1.0021, 1.0007, 1.0016, 1.0007 (Zen 5's 1.09: zmm K = 1 Shoup, never
+  tried before, wins at most sizes).
+- Classes [e, e + w) were tried first: one variant per class cannot serve n = 64 (8 lanes of
+  8: no slack) and n = 65 (the same lanes cover 128); deciding on the class's lower edge lost
+  1.0064-1.0222 at the other sizes, on all 4 sizes it lost at the edges (Zen 3 n = 64: 1.09,
+  a gated size). Classes (e, e + w] put the round size at the class end, where every variant
+  covers n without slack: on all 4 sizes, 0-1 of 72 round sizes more than 2% slower.
+- Run-time measurement, first version: dense classes to 2^16, start's variant kept above. On
+  the Apple M4 (arm build, V2's table) it left n > 2^16 at 1.46x; with avx2 on Emerald Rapids
+  at 1.05x. Measuring dense to 2^20 cost 145-390 ms. Added the sparse part (one size per
+  octave to 2^20). With the dense margin (3%) for it, Zen 5's own table got worse at
+  (2^16, 2^17] (1.0102 -> 1.0218): 2^17 alone picked zmm K = 1 for an octave where zmm K = 2
+  wins below 1.4e5. Fixed by dense to 2^17 and a separate sparse margin (10% kept the home
+  tables but left avx2 on Emerald Rapids at 1.05x; 5% chosen).
+- A bug the tests found (lc-amd): with a huge margin measure() still changed a class, because
+  start's variant had been dropped as slow at a smaller class (noise at 1 sample of 2 us).
+  start's variants are now always timed where start uses them. And the test of the sparse part
+  first wanted the first of the fastest variants: on `lc-amd` the clock tied two (sse, one call
+  of 1.2 us each) and measure() kept start's, which is one of them. It now wants a fastest.
+- Not kept: 4 points per dense class at run time (40-75% more time, decisions no better;
+  Zen 5 n <= 2^16 1.0048-1.0067 against 1.0032-1.0036); dense only to 2^14 (Zen 3 n <= 2^16
+  1.0065 against 1.0032-1.0044). Kept: dropping a narrow variant once it is 2x the fastest
+  (the loop from about 64, Sse.1 from about 1024).
 
 ## Sources
 

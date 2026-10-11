@@ -1,13 +1,29 @@
-// The factorials variant per target and size n: the scalar loop (model.hpp) below the first tier,
-// then Chains<S, K, P, step> of the last tier whose min_size <= n. Fewer lanes (W = K S::lanes)
-// win at small n: less duplicate work and fewer lanes to start. Measurements: notes.md.
+// The factorials variant per target and size n, a tuned choice (backend/tune): the scalar loop
+// (model.hpp) or Chains<S, K, P, step> of one of the target's candidates, per size class.
+//
+//   size_class(n)            n >= kFirstClass: quarter octaves (e, e + 2^(k-2)], e = 2^k (1 + q / 4)
+//   variants.get()[c]        the variant of class c: 0 the loop, i >= 1 the candidate Selected[i - 1]
+//   kDefaults                compiled defaults: tools/tune.py factorials (tune.cpp, tuned.hpp)
+//
+// Below kFirstClass the loop. A candidate's lanes cover W C(n) >= n positions (Chains::chunk), a
+// step function of n whose steps fall on multiples of its lane grid: a class ends at a round size
+// (a best case) and the other sizes tune.hpp times sit just past round sizes (worst cases).
+// backend/factorials/tune.hpp measures the table on this machine.
 // -DFPS_FACTORIALS_ISA=<struct>, -DFPS_FACTORIALS_VECTORS=<K>, -DFPS_FACTORIALS_STEP=<step> and
-// -DFPS_FACTORIALS_MIN_CHAINS=<n> force one tier from n on (defaults 2, shoup, 64).
+// -DFPS_FACTORIALS_MIN_CHAINS=<n> force one variant from the class of n on (defaults 2, shoup, 64).
+// Measurements: notes.md.
 #pragma once
 
+#include <algorithm>
+#include <array>
+#include <bit>
 #include <cstddef>
+#include <cstdint>
+#include <string_view>
 
+#include "backend/factorials/tuned.hpp"
 #include "backend/simd/select.hpp"
+#include "backend/tune/tune.hpp"
 
 namespace fps::factorials {
 
@@ -15,15 +31,14 @@ namespace fps::factorials {
 // with the multiplier plain and its quotient stepped along.
 enum class Step { montgomery, shoup };
 
-template <class S, int K, Step step, std::size_t from>
-struct Tier {
+template <class S, int K, Step step>
+struct Variant {
     using Isa = S;
     static constexpr int vectors = K;
     static constexpr Step scan = step;
-    static constexpr std::size_t min_size = from;
 };
-template <class... T>  // ascending min_size
-struct Tiers {};
+template <class... V>
+struct Candidates {};
 
 #if defined(FPS_FACTORIALS_ISA)
 #if !defined(FPS_FACTORIALS_VECTORS)
@@ -35,32 +50,90 @@ struct Tiers {};
 #if !defined(FPS_FACTORIALS_MIN_CHAINS)
 #define FPS_FACTORIALS_MIN_CHAINS 64
 #endif
-using Selected = Tiers<Tier<simd::FPS_FACTORIALS_ISA, FPS_FACTORIALS_VECTORS, Step::FPS_FACTORIALS_STEP,
-                            FPS_FACTORIALS_MIN_CHAINS>>;
-#elif defined(__znver5__)
-// Zen 5. ymm: Shoup on Avx512Vl (Avx2's K = 2 ran 2.4x slower in one build); zmm: Montgomery
-// (Shoup 5-11% slower from 2^14). zmm's 32 lanes stall on memory from 5 2^20 on (round 1).
-using Selected = Tiers<Tier<simd::Sse, 1, Step::shoup, 16>, Tier<simd::Avx512Vl, 1, Step::shoup, 48>,
-                       Tier<simd::Avx512Vl, 2, Step::shoup, 256>, Tier<simd::Avx512, 2, Step::montgomery, 2048>,
-                       Tier<simd::Avx512Vl, 2, Step::shoup, std::size_t(5) << 20>>;
-#elif defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
-// Emerald Rapids: Montgomery (Shoup 4-6% slower: vpmulld is 2 uops). zmm's 32 lanes stall on
-// memory from 2^19 on, by the tables' placement (rounds 1 and 2).
-using Selected = Tiers<Tier<simd::Sse, 1, Step::shoup, 16>, Tier<simd::Avx512Vl, 1, Step::montgomery, 48>,
-                       Tier<simd::Avx512Vl, 2, Step::montgomery, 256>, Tier<simd::Avx512, 2, Step::montgomery, 1024>,
-                       Tier<simd::Avx512Vl, 2, Step::montgomery, std::size_t(1) << 19>>;
+using Selected = Candidates<Variant<simd::FPS_FACTORIALS_ISA, FPS_FACTORIALS_VECTORS, Step::FPS_FACTORIALS_STEP>>;
+#elif defined(__AVX512F__) && defined(__AVX512BW__)  // avx512, zen5 (tune::kTarget)
+using Selected = Candidates<Variant<simd::Sse, 1, Step::shoup>, Variant<simd::Avx512Vl, 1, Step::shoup>,
+                            Variant<simd::Avx512Vl, 1, Step::montgomery>, Variant<simd::Avx512Vl, 2, Step::montgomery>,
+                            Variant<simd::Avx512, 1, Step::shoup>, Variant<simd::Avx512, 1, Step::montgomery>,
+                            Variant<simd::Avx512, 2, Step::shoup>, Variant<simd::Avx512, 2, Step::montgomery>>;
 #elif defined(__AVX2__)
-// Zen 3: Shoup.
-using Selected = Tiers<Tier<simd::Sse, 1, Step::shoup, 16>, Tier<simd::Avx2, 1, Step::shoup, 48>,
-                       Tier<simd::Avx2, 2, Step::shoup, 2048>>;
-#elif defined(__SSE4_1__)
-using Selected = Tiers<Tier<simd::Sse, 1, Step::shoup, 16>, Tier<simd::Sse, 2, Step::shoup, 256>>;
+using Selected = Candidates<Variant<simd::Sse, 1, Step::shoup>, Variant<simd::Avx2, 1, Step::shoup>,
+                            Variant<simd::Avx2, 1, Step::montgomery>, Variant<simd::Avx2, 2, Step::shoup>,
+                            Variant<simd::Avx2, 2, Step::montgomery>>;
 #elif defined(__ARM_NEON) && defined(__aarch64__)
-// Neoverse V2: Shoup (umulh, mul, mls with SVE2).
-using Selected = Tiers<Tier<simd::Neon, 1, Step::shoup, 16>, Tier<simd::Neon, 2, Step::shoup, 64>,
-                       Tier<simd::Neon, 4, Step::shoup, 1280>>;
+using Selected = Candidates<Variant<simd::Neon, 1, Step::shoup>, Variant<simd::Neon, 1, Step::montgomery>,
+                            Variant<simd::Neon, 2, Step::shoup>, Variant<simd::Neon, 2, Step::montgomery>,
+                            Variant<simd::Neon, 4, Step::shoup>, Variant<simd::Neon, 4, Step::montgomery>>;
+#elif defined(__SSE4_1__)
+using Selected = Candidates<Variant<simd::Sse, 1, Step::shoup>, Variant<simd::Sse, 1, Step::montgomery>,
+                            Variant<simd::Sse, 2, Step::shoup>, Variant<simd::Sse, 2, Step::montgomery>>;
 #else
-using Selected = Tiers<Tier<simd::Scalar, 4, Step::montgomery, 64>>;
+using Selected = Candidates<Variant<simd::Scalar, 2, Step::shoup>, Variant<simd::Scalar, 2, Step::montgomery>,
+                            Variant<simd::Scalar, 4, Step::shoup>, Variant<simd::Scalar, 4, Step::montgomery>>;
 #endif
+
+// Size classes: (e, e + 2^(k-2)] for e = 2^k (1 + q / 4), k >= 4, q < 4; the last also takes every
+// larger n. Class c is (class_end(c - 1), class_end(c)].
+inline constexpr std::size_t kFirstClass = 17;  // below: the loop
+inline constexpr int kClasses = 88;             // up to 2^26
+constexpr int size_class(std::size_t n) {  // n >= kFirstClass
+    const std::size_t m = n - 1;
+    const int k = std::bit_width(m) - 1;
+    return std::min(4 * (k - 4) + int(m >> (k - 2) & 3), kClasses - 1);
+}
+constexpr std::size_t class_end(int c) { return std::size_t(5 + c % 4) << (c / 4 + 2); }
+constexpr std::size_t class_start(int c) { return c == 0 ? kFirstClass : class_end(c - 1) + 1; }
+
+using Choices = std::array<std::uint8_t, kClasses>;
+
+// The candidates' names, e.g. "avx512.1.shoup", and a hash of the list that tuned.hpp records, so
+// a table measured for another list does not compile.
+template <class V>
+constexpr std::string_view step_name = V::scan == Step::shoup ? "shoup" : "montgomery";
+template <class... V>
+constexpr std::uint32_t signature(Candidates<V...>) {
+    std::uint32_t h = 2166136261u;  // FNV-1a over "isa.K.step;" per candidate
+    const auto add = [&h](std::string_view s) {
+        for (const char c : s) h = (h ^ std::uint8_t(c)) * 16777619u;
+    };
+    ((add(V::Isa::name), add("."), add(std::string_view("0123456789").substr(V::vectors, 1)), add("."),
+      add(step_name<V>), add(";")),
+     ...);
+    return h >> 1;  // fits an int
+}
+inline constexpr std::uint32_t kSignature = signature(Selected{});
+
+// The least n each variant runs: 0 for the loop, Chains::kMinSize = 4 S::lanes for the rest.
+inline constexpr auto kMinSizes = []<class... V>(Candidates<V...>) {
+    return std::array<std::size_t, sizeof...(V) + 1>{0, 4 * std::size_t(V::Isa::lanes)...};
+}(Selected{});
+
+// A table is valid if every class's variant exists and runs at the class's least n.
+constexpr bool valid(const Choices& choices) {
+    for (int c = 0; c < kClasses; ++c)
+        if (choices[c] >= kMinSizes.size() || kMinSizes[choices[c]] > class_start(c)) return false;
+    return true;
+}
+
+#if defined(FPS_FACTORIALS_ISA)
+inline constexpr Choices kDefaults = [] {
+    Choices choices{};
+    for (int c = 0; c < kClasses; ++c)
+        choices[c] = class_start(c) >= std::max<std::size_t>(FPS_FACTORIALS_MIN_CHAINS, kMinSizes[1]);
+    return choices;
+}();
+#else
+inline constexpr int kTuned = int(tune::kTarget);
+static_assert(tuned::signature[kTuned] == kSignature,
+              "tuned.hpp was measured for other candidates: run tools/tune.py factorials");
+inline constexpr Choices kDefaults = [] {
+    Choices choices{};
+    for (int c = 0; c < kClasses; ++c) choices[c] = std::uint8_t(tuned::variant[kTuned][c]);
+    return choices;
+}();
+#endif
+static_assert(valid(kDefaults));
+
+inline constinit tune::Table<kDefaults> variants;
 
 }  // namespace fps::factorials
