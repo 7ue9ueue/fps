@@ -15,7 +15,10 @@ Passes if every test passes and, per target, the geomean over units of new/base 
 geomean over its gated cases) is at most 1. Byte-identical bench binaries count as 1.
 
 For a pull request it posts the report as a comment and sets the commit status `gate` on its
-head, which `main` requires; with --merge it squash-merges on a pass. The last line of the report
+head, which `main` requires; with --merge it squash-merges on a pass. Merges hold a lock on this
+Mac, so two gates never both merge against the same main. If main moved during the run, the gate
+runs again only when the new commits on main touch a unit this pull request affects (with the same
+include closure) or a shared file; otherwise the result still holds and it merges. The last line of the report
 is "Gate: pass" or "Gate: fail".
 
 The repository is public and the gate runs a pull request's code on the VMs and this Mac, so it
@@ -24,6 +27,7 @@ refuses pull requests by any account but the repository's owner, and pull reques
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import math
 import re
@@ -34,6 +38,7 @@ import tarfile
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 from kernel import TARGETS, summarize, table, unit_dir
 from vm import rev_tar, ship, ssh
@@ -42,8 +47,11 @@ ROUNDS = 21
 SHARED = re.compile(r'^(backend/[^/]+|tools/kernel\.py)$')  # files outside a kernel folder
 
 
+ROOT = Path(__file__).resolve().parent.parent  # paths below are relative to the repository root
+
+
 def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(['git', *args], check=check, capture_output=True, text=True)
+    return subprocess.run(['git', *args], check=check, capture_output=True, text=True, cwd=ROOT)
 
 
 def log(message: str) -> None:
@@ -65,13 +73,16 @@ def units_in(tree: str) -> list[str]:
     return sorted(units)
 
 
-def affected(base: str, tree: str) -> list[str]:
-    units = units_in(tree)
+def affected(base: str, tree: str, includes: str | None = None) -> list[str]:
+    """Units the changes from base to tree affect. The units and their includes are read from
+    `includes` (default: tree)."""
+    includes = includes or tree
+    units = units_in(includes)
     changed = git('diff', '--name-only', base, tree).stdout.split()
     if any(SHARED.match(path) for path in changed):
         return units
     hit = {u for u in units if any(path.startswith(tuple(unit_paths(u))) for path in changed)}
-    uses = {u: set(git('grep', '-h', '-o', '-E', r'backend/[A-Za-z0-9_]+/', tree, '--',
+    uses = {u: set(git('grep', '-h', '-o', '-E', r'backend/[A-Za-z0-9_]+/', includes, '--',
                        *unit_paths(u), check=False).stdout.split()) for u in units}
     while True:  # add units that include an affected kernel, until nothing changes
         more = {u for u in units if u not in hit and any(f'backend/{h}/' in uses[u] for h in hit)}
@@ -167,8 +178,8 @@ def gh_json(*args: str) -> dict:
     return json.loads(subprocess.run(['gh', *args], check=True, capture_output=True, text=True).stdout)
 
 
-def gate(args) -> tuple[bool, str, str, str]:
-    """Returns (passed, report, the base commit it ran against, the head commit)."""
+def gate(args) -> tuple[bool, str, str, str, list[str]]:
+    """Returns (passed, report, the base commit it ran against, the head commit, affected units)."""
     git('fetch', '--quiet', 'origin', 'main')
     pr = args.target if args.target.isdigit() else None
     if pr:
@@ -196,13 +207,13 @@ def gate(args) -> tuple[bool, str, str, str]:
     base = git('rev-parse', args.base).stdout.strip()
     merged = git('merge-tree', '--write-tree', base, head, check=False)
     if merged.returncode:
-        return False, f'Conflicts with {args.base} ({base[:10]}): rebase first.\n\nGate: fail', base, head
+        return False, f'Conflicts with {args.base} ({base[:10]}): rebase first.\n\nGate: fail', base, head, []
     tree = merged.stdout.split()[0]
 
     kernels = affected(base, tree)
     lines = [f'Gate for {label} ({head[:10]}) merged into {args.base} ({base[:10]}).', '']
     if not kernels:
-        return True, '\n'.join(lines + ['No unit affected.', '', 'Gate: pass']), base, head
+        return True, '\n'.join(lines + ['No unit affected.', '', 'Gate: pass']), base, head, []
     lines += [f'Units: {", ".join(kernels)}', '']
     new_tar = subprocess.run(['git', 'archive', '--format=tar.gz', tree], check=True, capture_output=True).stdout
     base_tar = rev_tar(base)
@@ -212,7 +223,7 @@ def gate(args) -> tuple[bool, str, str, str]:
     passed = all(ok for ok, _ in results)
     lines += [text + '\n' for _, text in results]
     lines.append('Gate: ' + ('pass' if passed else 'fail'))
-    return passed, '\n'.join(lines), base, head
+    return passed, '\n'.join(lines), base, head, kernels
 
 
 def set_status(head: str, passed: bool, url: str) -> None:
@@ -223,6 +234,21 @@ def set_status(head: str, passed: bool, url: str) -> None:
                     '-f', f'target_url={url}'], check=True, capture_output=True)
 
 
+def merge_lock():
+    """Held from the last look at main to the merge."""
+    path = Path.home() / '.cache' / 'fps' / 'gate-merge.lock'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = open(path, 'w')
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    return lock
+
+
+def stale(base: str, tip: str, merged: str, units: list[str]) -> bool:
+    """Whether commits that landed on main between base and tip can change this gate's result.
+    merged: the pull request merged into tip, whose includes decide what depends on what."""
+    return bool(set(affected(base, tip, merged)) & set(units))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('target', help='pull request number or git revision')
@@ -231,7 +257,7 @@ def main() -> int:
     args = parser.parse_args()
     pr = args.target if args.target.isdigit() else None
     for _ in range(3):
-        passed, report, base, head = gate(args)
+        passed, report, base, head, units = gate(args)
         print(report)
         if pr:
             url = subprocess.run(['gh', 'pr', 'comment', pr, '--body-file', '-'], input=report, text=True,
@@ -239,15 +265,22 @@ def main() -> int:
             set_status(head, passed, url)
         if not (passed and args.merge and pr):
             return 0 if passed else 1
-        git('fetch', '--quiet', 'origin', 'main')
-        if git('rev-parse', 'origin/main').stdout.strip() != base:
-            log('main moved during the gate: running it again')
-            continue
-        subprocess.run(['gh', 'pr', 'merge', pr, '--squash'], check=True)
-        return 0
-    log('main kept moving; not merged')
+        with merge_lock():
+            git('fetch', '--quiet', 'origin', 'main')
+            tip = git('rev-parse', 'origin/main').stdout.strip()
+            if tip != base:
+                merged = git('merge-tree', '--write-tree', tip, head, check=False)
+                if merged.returncode:
+                    log(f'main moved to {tip[:10]} and now conflicts: rebase, then run the gate again')
+                    return 1
+                if stale(base, tip, merged.stdout.split()[0], units):
+                    log(f'main moved to {tip[:10]} and touches {", ".join(units)}: running the gate again')
+                    continue
+                log(f'main moved to {tip[:10]} but touches none of {", ".join(units) or "no units"}: merging')
+            subprocess.run(['gh', 'pr', 'merge', pr, '--squash'], check=True)
+            return 0
+    log('main kept changing the affected units; not merged')
     return 1
-
 
 if __name__ == '__main__':
     sys.exit(main())
