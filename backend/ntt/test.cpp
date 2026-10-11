@@ -338,6 +338,17 @@ void test_loops() {
             expect(v.begin()[j] == mul(s, add(in[j], in[j + 8 * h])), "scale_radix2 sum", j);
             expect(v.begin()[j + 8 * h] == mul(s, sub(in[j], in[j + 8 * h])), "scale_radix2 difference", j);
         }
+        // inverse_radix4: s inverse_identity(f), canonical.
+        Words w(32 * h);
+        fill(w.begin(), 32 * h, 2 * u64(P));
+        const std::vector<u32> top(w.begin(), w.begin() + 32 * h);
+        impl::inverse_radix4(vec(w), h, t.ir(), s);
+        for (std::size_t j = 0; j < 8 * h; ++j) {
+            std::array<u32, 4> f;
+            for (std::size_t q = 0; q < 4; ++q) f[q] = top[j + 8 * h * q];
+            const auto expected = inverse_model(f, 1, 1, *t.ir(1));
+            for (std::size_t q = 0; q < 4; ++q) expect(w.begin()[j + 8 * h * q] == mul(s, expected[q]), "inverse_radix4", j);
+        }
     }
 }
 

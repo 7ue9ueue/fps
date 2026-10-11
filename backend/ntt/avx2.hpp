@@ -220,16 +220,10 @@ inline void forward_radix4(Vec* f, std::size_t h, bool sparse, const u32* roots)
 }
 
 // inverse_identity() and the scale s: canonical output; z = r^-1(1).
-inline void inverse_radix4(Vec* f, std::size_t h, const u32* inverse_roots, const Factor& s) {
-    const Factor z = entry(inverse_roots, 1);
-    const auto scale = [&s](Vec x) { return reduce(multiply(x, s), kP); };
-    for (std::size_t j = 0; j < h; ++j) {
-        const Vec p0 = f[j], p1 = f[j + h], p2 = f[j + 2 * h], p3 = f[j + 3 * h];  // < 2P
-        const Vec ab = reduce(add(p0, p1), 2 * kP), cd = reduce(add(p2, p3), 2 * kP);
-        const Vec amb = reduce(diff(p0, p1), 2 * kP), cmd = multiply(diff(p2, p3), z);
-        f[j] = scale(add(ab, cd)), f[j + h] = scale(add(amb, cmd));
-        f[j + 2 * h] = scale(diff(ab, cd)), f[j + 3 * h] = scale(diff(amb, cmd));
-    }
+inline void inverse_radix4(Vec* f, std::size_t h, const u32* inverse_roots, u32 s) {
+    const u32 sz = multiply_mod(s, inverse_roots[slot(1)]);
+    alignas(32) const Vec w[4] = {broadcast(s), broadcast(quotient(s)), broadcast(sz), broadcast(quotient(sz))};
+    product_kernels::inverse_top4(f, h, w);
 }
 
 // kernels::scale_radix2 with the scale s.
@@ -312,7 +306,7 @@ inline void product(u32* a_words, u32* b_words, bool sparse_a, bool sparse_b, in
         forward_radix4(a, h, sparse_a, r);
         forward_radix4(b, h, sparse_b, r);
         tree.visit(a, b, h, 4, 0);
-        return inverse_radix4(a, h, ir, Factor(product_scale(lg)));
+        return inverse_radix4(a, h, ir, product_scale(lg));
     }
     if (nv == 8) {  // lg = 6: subtrees of 4 vectors
         forward_radix2(a, 4, sparse_a);
@@ -400,7 +394,7 @@ inline void inverse(u32* words, int lg, const u32* ir) {
     const std::size_t nv = (std::size_t(1) << lg) / 8;
     if (!has_radix2(lg)) {
         inverse_trees(f, nv / 4, 4, 0, ir);
-        return inverse_radix4(f, nv / 4, ir, Factor(leaf_scale(lg)));
+        return inverse_radix4(f, nv / 4, ir, leaf_scale(lg));
     }
     if (nv == 8) {
         inverse_trees(f, 4, 2, 0, ir);
