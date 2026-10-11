@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""Merge gate for backend changes. Runs on the Mac; needs git, gh and gcloud.
+
+  gate.py PR [--merge]          a pull request, merged into origin/main
+  gate.py REV [--base REV]      a local revision, merged into --base (default origin/main)
+
+For every target in tools/kernel.py, on the target's machines:
+  - test: kernel.py check, then kernel.py test for every affected kernel, on each test machine
+    ('mac' is this Mac, with clang);
+  - time, if the target has a timing machine: kernel.py bench against the base, 21 rounds;
+    on a slowdown, 21 more, pooled.
+Affected kernels: those changed, those that include them, or all if a shared file changed.
+Passes if every test passes and, per target, the geomean over kernels of new/base (each kernel's
+geomean over its gated cases) is at most 1. Byte-identical bench binaries count as 1.
+
+For a pull request it posts the report as a comment; with --merge it squash-merges on a pass.
+The last line of the report is "Gate: pass" or "Gate: fail".
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import io
+import subprocess
+import sys
+import tarfile
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+
+from kernel import TARGETS, summarize, table
+from vm import rev_tar, ship, ssh
+
+ROUNDS = 21
+SHARED = re.compile(r'^(backend/[^/]+|tools/kernel\.py)$')  # files outside a kernel folder
+
+
+def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(['git', *args], check=check, capture_output=True, text=True)
+
+
+def log(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def kernels_in(tree: str) -> list[str]:
+    names = git('ls-tree', '--name-only', tree, 'backend/', check=False).stdout.split()
+    return sorted(n.split('/')[1] for n in names
+                  if git('cat-file', '-e', f'{tree}:{n}/test.cpp', check=False).returncode == 0)
+
+
+def affected(base: str, tree: str) -> list[str]:
+    kernels = kernels_in(tree)
+    changed = git('diff', '--name-only', base, tree).stdout.split()
+    if any(SHARED.match(path) for path in changed):
+        return kernels
+    hit = {path.split('/')[1] for path in changed if path.startswith('backend/')} & set(kernels)
+    uses = {k: set(git('grep', '-h', '-o', '-E', r'backend/[A-Za-z0-9_]+/', tree, '--',
+                       f'backend/{k}/', check=False).stdout.split()) for k in kernels}
+    while True:  # add kernels that include an affected one, until nothing changes
+        more = {k for k in kernels if k not in hit and any(f'backend/{h}/' in uses[k] for h in hit)}
+        if not more:
+            return sorted(hit)
+        hit |= more
+
+
+def bench(vm: str, path: str, base_path: str, kernel: str, target: str) -> dict:
+    command = (f'cd {path} && python3 tools/kernel.py bench {kernel} --target {target} '
+               f'--base $HOME/{base_path} --rounds {ROUNDS} --json gate.json >/dev/null && cat gate.json')
+    result = ssh(vm, command, capture=True)
+    if result.returncode:
+        raise RuntimeError(f'bench {kernel} on {vm} failed:\n{result.stderr.decode()}')
+    return json.loads(result.stdout)
+
+
+def kernel_ratio(report: dict) -> float | None:
+    return 1.0 if report['identical'] else summarize(report['cases'])[1]
+
+
+def geomean(values: list[float]) -> float | None:
+    return math.exp(sum(map(math.log, values)) / len(values)) if values else None
+
+
+def run_tests(machine: str, name: str, new_tar: bytes, target: str, kernels: list[str]) -> subprocess.CompletedProcess:
+    tests = [f'python3 tools/kernel.py test {k} --target {target}' for k in kernels]
+    if machine == 'mac':  # generators are checked on the VMs
+        with tempfile.TemporaryDirectory() as tree:
+            tarfile.open(fileobj=io.BytesIO(new_tar), mode='r:gz').extractall(tree)
+            return subprocess.run(' && '.join(tests), shell=True, cwd=tree, capture_output=True)
+    path = ship(machine, name, new_tar)
+    result = ssh(machine, f'cd {path} && ' + ' && '.join(['python3 tools/kernel.py check'] + tests), capture=True)
+    ssh(machine, f'rm -rf {path}')
+    return result
+
+
+def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, base: str,
+               kernels: list[str]) -> tuple[bool, str]:
+    spec = TARGETS[target]
+    name = f'gate-{label}-{target}'
+    out = [f'### {target}: `{spec["flags"] or "no flags"}`', '']
+    for machine in spec['test']:
+        log(f'[{target}] testing on {machine}')
+        result = run_tests(machine, name, new_tar, target, kernels)
+        lines = [line for line in result.stdout.decode().splitlines() if line.startswith(('pass', 'FAIL'))]
+        out.append(f'Tests on {machine}: ' + ('pass' if result.returncode == 0 else 'FAIL'))
+        out += [f'- {line}' for line in lines]
+        if result.returncode:
+            out += ['', '```', (result.stdout + result.stderr).decode()[-3000:], '```']
+            return False, '\n'.join(out)
+    if spec['time'] is None:
+        return True, '\n'.join(out + ['', f'{target}: tested, not timed'])
+
+    timed = [k for k in kernels if git('cat-file', '-e', f'{base}:backend/{k}/bench.cpp', check=False).returncode == 0]
+    path = ship(spec['time'], name, new_tar)
+    base_path = ship(spec['time'], f'{name}.base', base_tar)
+    reports = {}
+    for k in timed:
+        log(f'[{target}] timing {k} on {spec["time"]}')
+        reports[k] = bench(spec['time'], path, base_path, k, target)
+        ratio = kernel_ratio(reports[k])
+        if ratio is not None and ratio > 1:
+            log(f'[{target}] {k}: {ratio:.4f}, timing {ROUNDS} more rounds')
+            again = bench(spec['time'], path, base_path, k, target)
+            for case, times in again['cases'].items():
+                for side, values in times.items():
+                    reports[k]['cases'].setdefault(case, {}).setdefault(side, []).extend(values)
+            reports[k]['rounds'] += again['rounds']
+    ssh(spec['time'], f'rm -rf {path} {base_path}')
+
+    ratios = {k: kernel_ratio(r) for k, r in reports.items()}
+    overall = geomean([r for r in ratios.values() if r is not None])
+    cpu = next(iter(reports.values()))['cpu'] if reports else spec['time']
+    out += ['', f'Timing on {spec["time"]} ({cpu}), new/base, below 1 is faster:']
+    for k in kernels:
+        if k not in reports:
+            out.append(f'- {k}: no bench in base, not timed')
+        elif reports[k]['identical']:
+            out.append(f'- {k}: byte-identical bench binaries')
+        else:
+            rows, ratio = summarize(reports[k]['cases'])
+            value = f'{ratio:.4f}' if ratio is not None else 'no gated cases'
+            out += [f'- {k}: **{value}** ({reports[k]["rounds"]} rounds)', '',
+                    '<details><summary>cases</summary>', '', table(rows), '', '</details>', '']
+    passed = overall is None or overall <= 1
+    out.append(f'{target}: ' + ('no timed kernels' if overall is None else f'{overall:.4f}')
+               + ('' if passed else ' SLOWER'))
+    return passed, '\n'.join(out)
+
+
+def gate(args) -> tuple[bool, str, str]:
+    """Returns (passed, report, the base commit it ran against)."""
+    git('fetch', '--quiet', 'origin', 'main')
+    pr = args.target if args.target.isdigit() else None
+    if pr:
+        info = json.loads(subprocess.run(['gh', 'pr', 'view', pr, '--json', 'headRefOid,state'],
+                                         check=True, capture_output=True, text=True).stdout)
+        if info['state'] != 'OPEN':
+            sys.exit(f'pull request {pr} is {info["state"].lower()}')
+        git('fetch', '--quiet', 'origin', f'pull/{pr}/head')
+        head, label = info['headRefOid'], f'pr{pr}'
+    else:
+        head = git('rev-parse', args.target).stdout.strip()
+        label = head[:10]
+    base = git('rev-parse', args.base).stdout.strip()
+    merged = git('merge-tree', '--write-tree', base, head, check=False)
+    if merged.returncode:
+        return False, f'Conflicts with {args.base} ({base[:10]}): rebase first.\n\nGate: fail', base
+    tree = merged.stdout.split()[0]
+
+    kernels = affected(base, tree)
+    lines = [f'Gate for {label} ({head[:10]}) merged into {args.base} ({base[:10]}).', '']
+    if not kernels:
+        return True, '\n'.join(lines + ['No kernel affected.', '', 'Gate: pass']), base
+    lines += [f'Kernels: {", ".join(kernels)}', '']
+    new_tar = subprocess.run(['git', 'archive', '--format=tar.gz', tree], check=True, capture_output=True).stdout
+    base_tar = rev_tar(base)
+    with ThreadPoolExecutor(len(TARGETS)) as pool:
+        futures = [pool.submit(run_target, t, label, new_tar, base_tar, base, kernels) for t in TARGETS]
+        results = [f.result() for f in futures]
+    passed = all(ok for ok, _ in results)
+    lines += [text + '\n' for _, text in results]
+    lines.append('Gate: ' + ('pass' if passed else 'fail'))
+    return passed, '\n'.join(lines), base
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('target', help='pull request number or git revision')
+    parser.add_argument('--base', default='origin/main')
+    parser.add_argument('--merge', action='store_true', help='squash-merge the pull request on a pass')
+    args = parser.parse_args()
+    pr = args.target if args.target.isdigit() else None
+    for _ in range(3):
+        passed, report, base = gate(args)
+        print(report)
+        if pr:
+            subprocess.run(['gh', 'pr', 'comment', pr, '--body-file', '-'], input=report, text=True, check=True)
+        if not (passed and args.merge and pr):
+            return 0 if passed else 1
+        git('fetch', '--quiet', 'origin', 'main')
+        if git('rev-parse', 'origin/main').stdout.strip() != base:
+            log('main moved during the gate: running it again')
+            continue
+        subprocess.run(['gh', 'pr', 'merge', pr, '--squash'], check=True)
+        return 0
+    log('main kept moving; not merged')
+    return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
