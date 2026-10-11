@@ -12,7 +12,8 @@ For every target in tools/kernel.py, on the target's machines:
 Units are the backend kernels and the frontend (see tools/kernel.py). Affected units: those
 changed, those that include them, or all if a shared file changed.
 Passes if every test passes and, per target, the geomean over units of new/base (each unit's
-geomean over its gated cases) is at most 1. Byte-identical bench binaries count as 1.
+geomean over its gated cases) is at most TOLERANCE (1.005). Byte-identical bench binaries count
+as 1. The tolerance absorbs code-layout and same-process effects on unchanged code (0.1-1% seen).
 
 For a pull request it posts the report as a comment and sets the commit status `gate` on its
 head, which `main` requires; with --merge it squash-merges on a pass. Merges hold a lock on this
@@ -44,6 +45,7 @@ from kernel import TARGETS, summarize, table, unit_dir
 from vm import rev_tar, ship, ssh
 
 ROUNDS = 21
+TOLERANCE = 1.005  # new/base per target; above it, ROUNDS more rounds are pooled and judged again
 SHARED = re.compile(r'^(backend/[^/]+|tools/kernel\.py)$')  # files outside a kernel folder
 
 
@@ -155,7 +157,7 @@ def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, base: s
         log(f'[{target}] timing {k} on {spec["time"]}')
         reports[k] = bench(spec['time'], path, base_path, k, target)
         ratio = kernel_ratio(reports[k])
-        if ratio is not None and ratio > 1:
+        if ratio is not None and ratio > TOLERANCE:
             log(f'[{target}] {k}: {ratio:.4f}, timing {ROUNDS} more rounds')
             again = bench(spec['time'], path, base_path, k, target)
             pool(reports[k], again)
@@ -175,9 +177,9 @@ def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, base: s
             value = f'{ratio:.4f}' if ratio is not None else 'no gated cases'
             out += [f'- {k}: **{value}** ({reports[k]["rounds"]} rounds)', '',
                     '<details><summary>cases</summary>', '', table(rows), '', '</details>', '']
-    passed = overall is None or overall <= 1
+    passed = overall is None or overall <= TOLERANCE
     out.append(f'{target}: ' + ('no timed kernels' if overall is None else f'{overall:.4f}')
-               + ('' if passed else ' SLOWER'))
+               + ('' if passed else f' SLOWER (limit {TOLERANCE})'))
     return passed, '\n'.join(out)
 
 
