@@ -50,18 +50,22 @@ Speed is the point of this library. The lc-opt kernels are already fast; the API
 
 ## Machines
 
-We share lc-opt's VMs. Its `AGENTS.md` (Machines, Instruction sets) is the full reference.
+We share lc-opt's VMs and add three for the backend targets (`BACKEND.md`). lc-opt's `AGENTS.md`
+(Machines, Instruction sets) is the full reference.
 
 | Machine | CPU | Use |
 |---|---|---|
 | Mac | ARM64 | Edit, build, correctness. x86 binaries run under Rosetta; never time them. |
-| `lc-intel` | Xeon 8581C, AVX-512, PMU on | Profiling with `perf` (core events, top-down; no L3 events). |
+| `lc-intel` | Xeon 8581C, AVX-512, PMU on | `avx512` timing. Profiling with `perf` (core events, top-down; no L3 events). |
 | `lc-amd` | EPYC 7B13 (Zen 3) | Builds and tests. No hardware counters. |
 | `lc-bench` | EPYC 7B13 (Zen 3) | Timing only. Do not build or test here. |
 | `lc-k68` | EPYC 7B13, Linux 6.8 | Timing of code heavy in page faults or huge pages. Keep it on 6.8. |
+| `lc-intel-test` | Xeon 8581C, AVX-512, no PMU | `avx512` builds and tests. |
+| `lc-zen5` | EPYC 9B45 (Zen 5), AVX-512, no PMU | `zen5` builds, tests and timing. |
+| `lc-arm` | Axion (Neoverse V2), NEON, SVE2, PMU on | `arm` builds, tests and timing; `perf`. |
 
-- GCP project `project-c73e6eb1-e167-4d7a-a31`, region `europe-west2`. Zones: `lc-intel` is in
-  `europe-west2-c`, the rest in `europe-west2-b`.
+- GCP project `project-c73e6eb1-e167-4d7a-a31`, region `europe-west2`. Zones: `lc-intel` and
+  `lc-intel-test` are in `europe-west2-c`, the rest in `europe-west2-b`.
   Connect: `gcloud compute ssh <name> --zone=<zone>`.
 - All run Ubuntu 24.04 with Docker and the `gcc:15.2.0` image. Build with GCC 15.2.
 - Copy this repo with `gcloud compute scp --recurse` (or `git` once it has a remote) into
