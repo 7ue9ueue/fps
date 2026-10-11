@@ -33,7 +33,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
-#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -44,6 +43,7 @@
 #include "backend/ntt/ntt.hpp"
 #include "backend/simd/select.hpp"
 #include "fps/modular.hpp"
+#include "fps/words.hpp"
 
 namespace fps {
 
@@ -63,45 +63,6 @@ constexpr std::uint32_t residue(T c) {
         return std::uint32_t(std::uint64_t(c) % P);
     }
 }
-
-// Coefficient storage: size() words on the heap, none reserved. Unlike std::vector it can
-// allocate without writing, so an operator writes its result in one pass, and it copies with
-// memcpy (std::vector with such an allocator copies word by word under GCC 15). With no spare
-// capacity, growing one word at a time costs O(n^2), and copy assignment always allocates.
-class Words {
-public:
-    struct Unwritten {};
-
-    Words() = default;
-    explicit Words(std::size_t n) : Words(n, Unwritten{}) { std::fill_n(data(), n, 0u); }
-    Words(std::size_t n, Unwritten)
-        : words_(n ? std::make_unique_for_overwrite<std::uint32_t[]>(n) : nullptr), size_(n) {}
-    Words(const Words& w) : Words(w.size_, Unwritten{}) { std::copy_n(w.data(), size_, data()); }
-    Words(Words&& w) noexcept : words_(std::move(w.words_)), size_(std::exchange(w.size_, 0)) {}
-    Words& operator=(const Words& w) { return *this = Words(w); }
-    Words& operator=(Words&& w) noexcept {
-        words_ = std::move(w.words_);
-        size_ = std::exchange(w.size_, 0);
-        return *this;
-    }
-
-    std::size_t size() const { return size_; }
-    std::uint32_t* data() { return words_.get(); }
-    const std::uint32_t* data() const { return words_.get(); }
-
-    // Words past the old size are zero.
-    void resize(std::size_t n) {
-        if (n <= size_) return void(size_ = n);
-        Words w(n, Unwritten{});
-        std::copy_n(data(), size_, w.data());
-        std::fill(w.data() + size_, w.data() + n, 0u);
-        *this = std::move(w);
-    }
-
-private:
-    std::unique_ptr<std::uint32_t[]> words_;
-    std::size_t size_ = 0;
-};
 
 // out[i] = op(a[i], b[i]) for i < n, as op.template operator()<S>(x, y) on vectors of
 // simd::Native, then on single words (simd::Scalar). out may be a or b.

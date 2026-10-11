@@ -25,8 +25,8 @@ using Poly = fps::Polynomial<P>;
 template <class S>
 using Ops = fps::modarith::Ops<S, P>;
 
-// Builds the tables of 2^lg entries. The @kernel case allocates the same two vectors as
-// Factorials (zero-filled, fresh pages) and calls the backend's factorials::tables.
+// Builds the tables of 2^lg entries. The @kernel case allocates two unwritten tables, as
+// Factorials does, and calls the backend's factorials::tables.
 void factorials(bench::Suite& suite) {
     for (int lg : {10, 14, 18, 22}) {
         const std::size_t n = std::size_t(1) << lg;
@@ -35,10 +35,11 @@ void factorials(bench::Suite& suite) {
         }, n);
         suite.add("factorials@kernel/" + std::to_string(lg), [n] {
             return [n] {
-                std::vector<std::uint32_t> fact(n), inverse(n);
-                fps::factorials::tables<P>(fact, inverse);
-                bench::keep(fact);
-                bench::keep(inverse);
+                auto fact = std::make_unique_for_overwrite<std::uint32_t[]>(n);
+                auto inverse = std::make_unique_for_overwrite<std::uint32_t[]>(n);
+                fps::factorials::tables<P>({fact.get(), n}, {inverse.get(), n});
+                bench::keep(fact[n - 1]);
+                bench::keep(inverse[n - 1]);
             };
         }, n);
     }
