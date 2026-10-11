@@ -118,8 +118,10 @@ void elementwise(bench::Suite& suite) {
 }
 
 // f * g for f and g of n coefficients against ntt::Convolution on the same factors (construct,
-// copy them in, multiply). "<lg>": n = 2^lg / 2, schoolbook below lg = 10. "480x480": a shape the
-// old cutoff (n m < 2^18) ran schoolbook; it runs the NTT now.
+// copy them in, multiply). "<lg>": n = 2^lg / 2. "480x480": a shape an old cutoff (n m < 2^18) ran
+// schoolbook. Products small::beats_ntt gives to small::multiply (e.g. lg = 6 on most targets)
+// are still timed against the Convolution here; short_products() times them against
+// small::multiply.
 void multiply(bench::Suite& suite) {
     std::vector<std::pair<std::string, std::size_t>> shapes;
     for (int lg = 6; lg <= 22; ++lg) shapes.emplace_back(std::to_string(lg), std::size_t(1) << (lg - 1));
@@ -143,6 +145,28 @@ void multiply(bench::Suite& suite) {
     }
 }
 
+// f * g on shapes small::beats_ntt gives to small::multiply on every timed target, against
+// small::multiply into new memory, as f * g writes its result: "<n>x<m>".
+void short_products(bench::Suite& suite) {
+    for (const auto& [n, m] : std::vector<std::pair<std::size_t, std::size_t>>{{16, 16}, {4096, 4}, {4096, 16}}) {
+        const std::string size = "/" + std::to_string(n) + "x" + std::to_string(m);
+        const unsigned seed = unsigned(n + m);
+        suite.add("multiply" + size, [n, m, seed] {
+            return [f = random_poly(n, seed), g = random_poly(m, seed + 1)] {
+                const Poly h = f * g;
+                bench::keep(h);
+            };
+        }, n * m);
+        suite.add("multiply@kernel" + size, [n, m, seed] {
+            return [f = random_poly(n, seed), g = random_poly(m, seed + 1)] {
+                auto h = std::make_unique_for_overwrite<std::uint32_t[]>(f.size() + g.size() - 1);
+                fps::small::multiply<P>(f.span(), g.span(), std::span(h.get(), f.size() + g.size() - 1));
+                bench::keep(h[0]);
+            };
+        }, n * m);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -150,6 +174,7 @@ int main(int argc, char** argv) {
     factorials(suite);
     binomial(suite);
     elementwise(suite);
+    short_products(suite);
     multiply(suite);
     return suite.run();
 }
