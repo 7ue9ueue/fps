@@ -24,6 +24,10 @@ Two parts:
   - Say what changed and why in the commit message and in the module's `notes.md`.
   - Keep the doc and the code in step: no commit where they disagree.
   - Tell the user in your final report. No need to ask first.
+- When a request is unclear, ask before acting. Do not guess at intent; say what is unclear and
+  offer the options you see.
+- When you need a permission or access you lack (a VM, a gcloud login, a credential, a blocked
+  command), stop and ask the user for help. Do not work around it.
 
 ## Design
 
