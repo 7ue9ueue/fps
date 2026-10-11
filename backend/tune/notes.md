@@ -4,7 +4,8 @@ Run-time tuning of the kernels' choices (variants, cutoffs, layouts), FFTW-style
 `tune.hpp` (at the top). Tests: `test.cpp`, `test_no_tuner.cpp` (built with `-DFPS_NO_TUNER`).
 Converted choices: small's NTT times behind `small::beats_ntt` ("small.ntt",
 `backend/small/tune.hpp`, round 1); factorials' variant per size class ("factorials.variant",
-`backend/factorials/tune.hpp`, round 2).
+`backend/factorials/tune.hpp`, round 2); small's schoolbook variant per shape class
+("small.variant", `backend/small/tune.hpp`, round 3).
 
 ## Design
 
@@ -66,6 +67,19 @@ Converted choices: small's NTT times behind `small::beats_ntt` ("small.ntt",
   it is not timed at larger sizes (the loop from about 64 on), except where start uses it.
   tune.cpp runs the dense part to 2^24 at 4 points, 7 samples of 1 ms, against the previous
   compiled table with a 2% margin, so a rerun only moves classes that changed by more than that.
+- A two-dimensional variant choice (small, round 3): the class is the octave of m (11) times 4
+  ratios n / m (below 2, 4, 8, the rest), 44 classes; the target's 3-7 candidates
+  (`Variant<S, R, U, Solo>`) are a compile-time list as in factorials, with the same signature
+  check. The dispatch (`run_candidate`) is a fold over the list inlined into the caller, which GCC
+  turns into a jump table; each candidate's `run` there is a single call (`panel`, or `panels`
+  for b over 1024 words), so the caller grows by a few instructions per candidate. A lambda with
+  captures in that place (factorials' `run_variant` form) cost 6 ns per call on Zen 3: its closure
+  went through the stack and the call was not inlined (Log). `measure_variants` times every
+  candidate at a few shapes per class (m at the octave's end and 3/4 of it, n / m 1 / 3 / 6 / 16
+  by ratio class; tune.cpp: also m just past the octave's start, two or three ratios per class)
+  and keeps the current variant unless another's geometric mean of time / fastest is better by
+  the margin. Run time measures classes with m <= 256 only (beats_ntt sends larger m to the NTT).
+  "small.variant" is registered before "small.ntt", which times multiply().
 
 ## Measurements
 
@@ -221,6 +235,88 @@ CPU tuning removes most of the loss. What stays:
 With the sparse margin at 3% (instead of 5%) every run moved it (1.0002), but one of 3 runs on
 Emerald Rapids itself then lost 2% at large n (1.0754 against 1.0524).
 
+### small.variant (round 3)
+
+GCC 15.2, `tools/kernel.py` flags, 2026-10-11, this branch on main e452c18 (#37 round 2), then
+rebased onto e66ce2f (#5 round 2, #70 round 1) for the third `tune.py` run and the final benches.
+Programs in `~/Documents/hpc_library-explore/tune/r3/`: `sweep.cpp` (every candidate on a grid),
+`analyze*.py`, `validate.cpp`, `loop.cpp` and `loops.sh` (one call in a loop, paired builds),
+`fg.cpp` (f * g in a loop), `fe32.cpp` (f * g against its parts), `lookup.cpp`; outputs in `out/`.
+
+Exploration (`sweep.cpp`, `analyze*.py`): 531 shapes per target (m 1-1024, n / m 1-2048, at most
+2^22 terms), 7-12 candidates each (R 2-8, U 1-4, Solo, the narrower structs), 7 samples of 300 us.
+Geometric mean of chosen / fastest candidate: one fixed variant (main's) Zen 3 1.023, Emerald
+Rapids 1.032, Zen 5 1.021, Neoverse V2 1.031, sse 1.046, scalar 1.050. A table per class, in
+sample: by the octave of m alone (11 classes) 1.012-1.017 on the timed four; octave times 4
+ratios (44) 1.008-1.011; octave times the octave of n (97) 1.005-1.007. 44 classes, two-fold
+cross-validated (decided on half the shapes, scored on the other half): 1.0095-1.015. Greedy
+pruning of the candidates (drop the one that costs least): 5-7 keep the 44-class table within
+0.0003 of all of them; the lists in `select.hpp` are those.
+
+Lookup and dispatch, in the call (`loops.sh`: `multiply` in a loop against the same variant
+called directly, median of 7, 3 interleaved runs):
+- A lambda with captures doing the dispatch (factorials' form): 8x8 on Zen 3 40.9 ns against
+  34.2 called directly, every shape +6 ns: the closure went through the stack and the call was
+  not inlined. As an inlined fold (`run_candidate`): +1.5-2.2 ns on Zen 3, +1.1-1.5 ns on Zen 5
+  at 16x16-48x48. A jump table or a chain of compares (`-fno-jump-tables`), and a bounds hint,
+  made no difference; `run` out of line cost 1-2 ns more.
+- With `run` one call of `panel` (the panel loop out of line, `panels`), against main's direct
+  call: Zen 3 8x8 29.0 against 34.9 (the table's variant), 16x16 53.9 / 56.0, 32x32 136.8 /
+  136.6; Zen 5 8x8 19.0 / 20.2, 16x16 30.2 / 30.5, 32x32 54.5 / 54.4, 48x48 90.5 / 89.6.
+- `lookup.cpp` (the lookup alone, `variants.get()[shape_class(n, m)]`, 4096 random shapes,
+  median of 11 samples of 2 ms, 3 runs): inline / through a noinline call, ns per decision: Zen 3
+  1.59 / 2.03, Emerald Rapids 1.06 / 1.16, Zen 5 1.15 / 1.22, Neoverse V2 1.33-1.35 / 1.51;
+  `FPS_NO_TUNER` (a constant table) Zen 3 1.49 / 1.74, Emerald Rapids 1.05 / 1.17, Zen 5 1.15 /
+  1.22, Neoverse V2 1.33 / 1.68. The class costs a leading-zero count and three compares; the
+  acquire load costs nothing measurable.
+
+Bench against main e66ce2f (`kernel.py bench`, 11 rounds, the gate's 22 shapes): Zen 3 0.9933,
+Emerald Rapids 0.9968, Zen 5 0.9954, Neoverse V2 0.9754; frontend `multiply` cases 1.0044, 1.0013,
+0.9932, 0.9937 (`backend/small/notes.md`, Log).
+
+Cost of tuning: `tune::run()` for "small.variant" (`kVariantRunTime`: classes with m <= 256, 2
+points, 3 samples of 10 us, margin 3%) 9.1-9.4 ms on Zen 5, 11.6-11.9 Emerald Rapids, 13.0-13.2
+Zen 3, 12.7-13.0 Neoverse V2; both of small's choices together 56-68 ms. Measuring 3 m per class
+on the Apple M4 cost 38-49 ms against 11-22 and decided no better. `tools/tune.py small`: 22-32 s
+per timed target (round 1: 16-26), 82 s for scalar on `lc-bench`. A second `tune.py` run, from the
+first run's table with a 1% margin, changed 3-4 of 44 classes per target (Emerald Rapids 21: the
+first run had a 2% margin), and the first table scored 1.0034-1.0174 on the second run's points
+against 1.0022-1.0088 for the second. A third run (on main e66ce2f) changed 0-6 classes; on its
+points the second table scored 1.0024-1.0130, the third 1.0024-1.0093.
+
+Decisions (`validate.cpp`, the final table, on e66ce2f): 240 shapes, m log-uniform in [1, 1024],
+n / m in [1, 2^12], at most 2^22 terms, off the measured points; every candidate timed there
+(median of 7, samples of 200 us). Geometric mean of chosen / fastest candidate, for the shapes
+beats_ntt gives to small (186-197 of 240) \| the rest; run-time tuning: 5 runs at
+`kVariantRunTime` (classes changed in brackets).
+
+| Build on machine | main's variant | compiled defaults | tuned at run time |
+|---|---|---|---|
+| avx2 on Zen 3 (home) | 1.0471 \| 1.0181 | 1.0109 \| 1.0044 | 1.0194-1.0216 \| 1.0044 (1-2) |
+| avx512 on Emerald Rapids (home) | 1.0425 \| 1.0179 | 1.0103 \| 1.0076 | 1.0099-1.0130 \| 1.0029-1.0051 (2-4) |
+| zen5 on Zen 5 (home) | 1.0279 \| 1.0040 | 1.0161 \| 1.0040 | 1.0170-1.0175 \| 1.0040 (1-2) |
+| arm on Neoverse V2 (home) | 1.0299 \| 1.0394 | 1.0204 \| 1.0017 | 1.0206-1.0224 \| 1.0012-1.0017 (2-5) |
+| avx2 on Emerald Rapids (Zen 3's table) | 1.0402 \| 1.0071 | 1.0390 \| 1.0039 | 1.0244-1.0265 \| 1.0035 (13-17) |
+| avx2 on Zen 5 (Zen 3's table) | 1.0187 \| 1.0031 | 1.0125 \| 1.0024 | 1.0152-1.0164 \| 1.0024 (8-9) |
+| avx512 on Zen 5 (Emerald Rapids' table) | 1.0302 \| 1.0073 | 1.0167 \| 1.0070 | 1.0139-1.0158 \| 1.0070-1.0084 (6-10) |
+| arm on Apple M4 (V2's table; clang, laptop) | 1.0394 \| 1.0302 | 1.1030 \| 1.2038 | 1.0317-1.0431 \| 1.0292-1.0358 (23-25) |
+
+- On every home machine the compiled table loses less than main's single variant (small: 1.0-2.0%
+  against 2.8-4.7%). Run-time tuning there changes 1-5 classes and lands within 0.1-1% of the
+  compiled table (2 points and 3 samples of 10 us per class against tune.py's 5-8 points and 7
+  samples of 1 ms).
+- On another CPU: Zen 3's table on Emerald Rapids is no better than main's variant, and tuning
+  removes a third of the loss; on Zen 5 both tables are already better than main's. V2's table on
+  the M4 (clang) is worse than main's variant (U = 1 variants run 1.3-1.4x slower there); tuning
+  brings it back to main's level. The round-2 table (V2's, before the rebase) gave the same
+  picture on the M4: 1.084 \| 1.215 compiled, 1.021-1.029 \| 1.035-1.039 tuned.
+- Worst single shapes: m <= 5 (a few vectors, 20-30 ns: 109x1 1.34 on Zen 5, 100x3 1.15 on
+  Emerald Rapids).
+
+The frontend bench's NTT-only shapes move with code layout: main against main with one unused
+function added to `frontend/bench.cpp` (no kernel changed), 11 rounds: Zen 3 `multiply/6` 1.075,
+`/7` 0.973, geomean 1.0022; Zen 5 `/9` 1.031, `/10` 1.023; Emerald Rapids within 0.6%.
+
 ## Log
 
 2026-10-11, claude (issue #54, round 1): the mechanism, and small's NTT times converted.
@@ -272,6 +368,38 @@ Emerald Rapids itself then lost 2% at large n (1.0754 against 1.0524).
   Zen 5 n <= 2^16 1.0048-1.0067 against 1.0032-1.0036); dense only to 2^14 (Zen 3 n <= 2^16
   1.0065 against 1.0032-1.0044). Kept: dropping a narrow variant once it is 2x the fastest
   (the loop from about 64, Sse.1 from about 1024).
+
+2026-10-11, claude (issue #54, round 3): small's schoolbook variant per shape class converted
+("small.variant"). Measurements above (small.variant); the kernel side in `backend/small/notes.md`.
+- Representation. Small's R, U, Solo and struct were one variant per target. The time depends on
+  m (steps per block, the edges' length) and on n / m (interior blocks against edges), so the
+  class is two-dimensional: 11 octaves of m times 4 ratios. Fewer ratio classes (2-3) lost
+  0.04-0.2% more on the sweep; the octave of n instead of the ratio (97 classes) gained 0.3% for
+  twice the classes. Exact ratio compares (n >= 2m, 4m, 8m) against bit_width(n) -
+  bit_width(m): 0-0.0006 better, the same cost. Solo, a threshold on m before, is now a
+  candidate's flag: the octave of m already decides it.
+- The candidate lists come from the sweep (greedy pruning), 3-7 per target; index 0 is main's
+  variant. avx512 and zen5 get different lists (`__znver5__`, as `tune::kTarget`).
+- Measurement: run time times 2 points per class (m at the octave's end and 3/4 of it) at one
+  ratio per class (two for the long class offline); classes with m > 256 keep the compiled table
+  (beats_ntt sends them to the NTT). tune.cpp: 3 m per class and 2-3 ratios, 7 samples of 1 ms.
+- Its first run kept main's variant within 2%. On Emerald Rapids and Zen 5 that kept R6 U1 in
+  classes where R6 U2 or R8 U2 is 1-1.5% faster (16x16 to 256x256), and the bench there was 1.0071
+  and 1.0088 against main. With a 1% margin (the second run, from the first run's table) Emerald
+  Rapids reached 1.0008 (and 0.9957 with the change below); Zen 5 kept R6 U1 at those classes.
+- Dispatch, in the order tried: a lambda with captures, as factorials does: +6 ns per call on Zen
+  3; an inlined fold: +1-2 ns; then each candidate's `run` reduced to one call of `panel` (the
+  multi-panel loop and its memset out of line in `panels`): the bench went from 1.0084 to 0.9991
+  on Zen 5, from 0.9935 to 0.9896 on Zen 3, from 1.0008 to 0.9957 on Emerald Rapids. Not kept:
+  `run` out of line (+1-2 ns), `multiply` out of line (+1-1.5 ns), the `panel` body inlined into
+  `run` (Zen 3 8x8 37.0 against 30.2), `-fno-jump-tables` and an unreachable-bounds hint (no
+  change).
+- A mistake to avoid: `origin/main` moved while this round ran (another agent's fetch: #72, #73),
+  so `vm.py --base origin/main` compared later runs against a main with a faster NTT; the
+  frontend's NTT-only shapes then read 1.04-1.09 on Emerald Rapids (main's `multiply/21` 10.36 ->
+  9.46 ms). Pin the base by its hash. After a rebase onto e66ce2f and a third `tune.py` run, the
+  frontend is 0.993-1.004 (above). Zen 3's `multiply/6`-`/7` (1.076, 1.060) are layout: main
+  against main with one unused function reads 1.075 and 0.973 there.
 
 ## Sources
 

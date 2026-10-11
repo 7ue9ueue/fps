@@ -4,7 +4,7 @@
 //
 // Inputs below P, output in [0, P). out must not overlap a or b. No allocation: scratch is on the
 // stack (about 9 KiB). R: vectors per block; U: unrolling of the loop with all R vectors; Solo:
-// for b of at most Solo words, the blocks at the ends of the product run one vector at a time.
+// the blocks at the ends of the product run one vector at a time, without phases.
 //
 // Outputs go in blocks of R vectors (R S::lanes words), their sums held in registers. For each j,
 // every vector r of the block adds a[k - j] b'[j] for its words k: one load of a at k0 + r W - j
@@ -148,16 +148,16 @@ using Lanes = std::conditional_t<HasMulEven<S>, EvenOdd<S, P>,
 
 }  // namespace detail
 
-template <class S, int R, u32 P, int U = 1, std::size_t Solo = 0>
+template <class S, int R, u32 P, int U = 1, bool Solo = false>
 class Schoolbook {
 public:
     static constexpr std::size_t kWidth = S::lanes, kBlock = R * kWidth;
     static constexpr std::size_t kPanel = 1024;  // words of b per panel
 
+    // One call for b of at most one panel: callers inline it once per candidate (small.hpp).
     static void run(const u32* a, std::size_t n, const u32* b, std::size_t m, u32* out) {
-        if (m > kPanel) std::fill(out + n + kPanel - 1, out + n + m - 1, 0u);
-        for (std::size_t first = 0; first < m; first += kPanel)
-            panel(a, n, b + first, std::min(kPanel, m - first), out + first, first > 0);
+        if (m <= kPanel) return panel(a, n, b, m, out, false);
+        panels(a, n, b, m, out);
     }
 
 private:
@@ -165,6 +165,13 @@ private:
     using M = modarith::Ops<S, P>;
     using V = typename S::V;
     using Acc = typename L::Acc;
+
+    // b of more than one panel: panels after the first add into out.
+    [[gnu::noinline]] static void panels(const u32* a, std::size_t n, const u32* b, std::size_t m, u32* out) {
+        std::fill(out + n + kPanel - 1, out + n + m - 1, 0u);
+        for (std::size_t first = 0; first < m; first += kPanel)
+            panel(a, n, b + first, std::min(kPanel, m - first), out + first, first > 0);
+    }
 
     // The terms of one output vector: j in [lo, hi).
     struct Range {
@@ -218,20 +225,27 @@ private:
     // up to the end). Vector r holds outputs [s, s + W), s = k0 + r W: terms with j in
     // [s + 1 - n, s + W) within [0, m). Both ends of that range grow with r. Its window at step j
     // is src + k + r W - j: a[s - j .. s - j + W] in a zero-padded copy. The j loop runs in phases
-    // with a fixed set of active vectors [first, last), cut every kFold terms for a fold; for
-    // m <= Solo, one vector after the other instead.
+    // with a fixed set of active vectors [first, last), cut every kFold terms for a fold; with Solo,
+    // one vector after the other instead.
     static void edge(const u32* src, std::size_t k, std::size_t n, const u32* b, std::size_t m, std::size_t k0,
                      u32* out, bool add, int count = R) {
         const std::size_t total = n + m - 1;
         count = int(std::min<std::size_t>(count, (total - k0 + kWidth - 1) / kWidth));
-        if (m <= Solo) {
+        if constexpr (Solo) {
             for (int r = 0; r < count; ++r) {
                 const std::size_t s = k0 + r * kWidth;
                 one(src + k + r * kWidth, b, s + 1 > n ? s + 1 - n : 0, std::min(m, s + kWidth), out + s, total - s,
                     add);
             }
-            return;
+        } else {
+            phases(src, k, n, b, m, k0, out, add, count);
         }
+    }
+
+    // edge() without Solo.
+    [[gnu::always_inline]] static void phases(const u32* src, std::size_t k, std::size_t n, const u32* b,
+                                              std::size_t m, std::size_t k0, u32* out, bool add, int count) {
+        const std::size_t total = n + m - 1;
         Range range[R];
         for (int r = 0; r < count; ++r) {
             const std::size_t s = k0 + r * kWidth;
