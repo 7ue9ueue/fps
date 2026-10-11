@@ -143,7 +143,8 @@ python3 tools/vm.py lc-bench --base origin/main 'python3 tools/kernel.py bench n
 
 Backend work happens in rounds: one subagent per round, started by `/work` and briefed with
 `tools/prompt.md`. Each GitHub issue (`.github/ISSUE_TEMPLATE/kernel.md`) is labeled `ready`,
-`running`, `blocked` (needs the user) or `done`. `/work` reads the `Result:` line each round ends
+`running`, `blocked` (needs the user), `done`, or `backlog` (planned for later; nobody starts it
+until the user labels it `ready`). `/work` reads the `Result:` line each round ends
 with (`BACKEND.md`, Working in parallel).
 
 Frontend work is building to a plan, not exploring: `/build` takes issues labeled `build`, one
