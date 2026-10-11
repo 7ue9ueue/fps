@@ -169,3 +169,28 @@ belongs in `backend/`).
     pages (DESIGN.md plans library-owned huge pages) should cut most of it (guess, not tried).
     64-byte aligned tables would also let a later kernel round keep zmm on Emerald Rapids at
     large n: 0.44 against 0.58 ns per entry (`backend/factorials/notes.md`, Log).
+- 2026-10-11: `Factorials` stores its tables in `detail::Words`, allocated unwritten (#51), so the
+  kernel writes each entry once; no zero fill first. `Words` moved from `polynomial.hpp` to its own
+  header, `fps/words.hpp`, as both headers use it. API and behaviour unchanged. The bench's
+  `factorials@kernel/<lg>` now calls the kernel on two unwritten tables
+  (`make_unique_for_overwrite`), the memory the API must return. No 64-byte alignment: with
+  `unique_ptr<uint32_t[]>` it needs an aligned `new` and a matching deleter, more than one line.
+  - Tests: copies and moves of `Factorials` (construction, assignment, self-assignment) on every
+    size. A dropped write of the last entry fails them: i! != 0 for i < P, whatever the memory held.
+  - Bench, 11 rounds, GCC 15.2, origin/main 03c970b against this change; ns per entry, medians:
+
+    | Machine (target) | lg | new/base | API / kernel (IQR) | API | kernel (fresh) | base API |
+    |---|---:|---:|---:|---:|---:|---:|
+    | `lc-bench` (avx2) | 10 / 14 / 18 / 22 | 0.964 / 0.893 / 1.029 / 1.013 | 1.004 / 1.000 / 1.003 / 1.000 (0.995-1.010) | 1.34 / 0.67 / 4.08 / 4.50 | 1.34 / 0.67 / 4.06 / 4.49 | 1.39 / 0.75 / 3.96 / 4.43 |
+    | `lc-intel` (avx512) | 10 / 14 / 18 / 22 | 0.955 / 0.799 / 0.858 / 0.837 | 1.002 / 1.000 / 1.000 / 0.999 (0.990-1.009) | 1.02 / 0.49 / 2.06 / 2.28 | 1.02 / 0.49 / 2.06 / 2.27 | 1.07 / 0.62 / 2.41 / 2.72 |
+    | `lc-zen5` (zen5) | 10 / 14 / 18 / 22 | 0.941 / 0.887 / 0.932 / 0.878 | 0.970 / 1.001 / 1.001 / 1.006 (0.969-1.013) | 0.86 / 0.32 / 1.36 / 1.54 | 0.88 / 0.32 / 1.36 / 1.53 | 0.91 / 0.36 / 1.45 / 1.76 |
+    | `lc-arm` (arm) | 10 / 14 / 18 / 22 | 0.974 / 0.948 / 0.972 / 1.021 | 1.001 / 1.000 / 1.000 / 0.990 (0.984-1.013) | 1.63 / 0.94 / 2.37 / 2.87 | 1.63 / 0.94 / 2.37 / 2.88 | 1.68 / 0.99 / 2.44 / 2.87 |
+
+    The API is within noise of the kernel on fresh tables at every lg. Dropping the fill saves 12-16%
+    at lg 22 on `lc-intel` and `lc-zen5`, nothing on `lc-arm` and `lc-bench`; on `lc-bench` lg 18
+    is 3% slower (IQR 1.028-1.031; cause not known; guess: the page faults now land inside the
+    kernel's 32 scattered lanes instead of a sequential fill). From lg 18 the fresh pages dominate:
+    at lg 22 the kernel into warm buffers takes 0.73 (Zen 3), 0.58 (Emerald Rapids), 0.46 (Zen 5)
+    and 0.92 (Neoverse V2) ns per entry (`backend/factorials/notes.md`), against 4.49, 2.27, 1.53 and
+    2.88 into fresh ones. Only memory the library keeps or maps in huge pages (DESIGN.md, Memory)
+    can close that; not tried here.
