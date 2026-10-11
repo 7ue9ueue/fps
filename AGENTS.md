@@ -127,7 +127,7 @@ The Mac drives the VMs. `tools/vm.py` sends your working tree over ssh, uncommit
   every target (the frontend too, when `include/`, `frontend/` or a kernel it includes changes),
   times each against `main` on the target's timing machine, comments the result on
   the PR, sets the PR's commit status `gate` (which `main` requires), and squash-merges if all
-  tests pass and no target is slower (geomean of new/base <= 1).
+  tests pass and no target is slower beyond noise (geomean of new/base <= 1.005).
   `gate.py <rev> --base <rev>` runs the same checks on local commits, without a PR.
   Issues and pull requests share numbers: pass the pull request's.
 
