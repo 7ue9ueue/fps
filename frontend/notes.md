@@ -105,3 +105,45 @@ belongs in `backend/`).
     - `std::vector`'s own offset is as fast as 64 bytes past.
 
     On `lc-intel` the offset changes memcpy by at most 10%.
+  - Review of #39, round 1 (four findings), and what changed:
+    1. The header now states the cost of `f * g` against the kernel (0.6% to 6% on x86) and the
+       fast path: `fps::ntt::Convolution` itself today, `fps::raw::mul` after #38.
+    2. Element-wise operators. They copied an lvalue f, then ran the stream in place: two
+       passes. Now each writes its result in one pass into new, unwritten memory; `+` and `-`
+       with an rvalue left operand still work in place. `std::vector` cannot allocate without
+       writing, and with a non-initializing allocator GCC 15 copies it word by word (checked in
+       the asm), so the storage is now `detail::Words`: a `unique_ptr<uint32_t[]>` and a size,
+       copied with memcpy. New bench pairs `add`, `sub`, `neg`, `scale` (`f * c`) at lg 10, 14,
+       18, 22; the kernel case is the modarith stream into new memory, as the operator's result.
+    3. Cutoff `n m < 2^18` -> `n m < 3 2^16` (443 x 443, the crossover measured on `lc-bench`).
+       New bench pair `multiply/480x480`, a shape the old cutoff ran schoolbook.
+    4. Scalars are integer types of at most 64 bits (`detail::Integer`); `__int128` no longer
+       compiles (static_assert in the test). DESIGN.md says so.
+  - Bench order (a note from the backend coordinator: cases in one process affect each other).
+    The cases run Factorials first, then the element-wise pairs, then the products, which map
+    fresh memory per call. Every case makes its inputs in its setup, so they live only while it
+    runs.
+  - Tests: copies, moves and self-assignment; the rvalue forms; shapes at the new cutoff
+    (443 x 443, 443 x 444, 3071 x 64, 64 x 3072). `dirty_heap(n)` frees n words of P - 1 before
+    `truncate` and `reverse`, so a word they forget to write shows up: glibc reuses the block (a
+    dropped zero fill in `reverse` fails 31 checks on `lc-amd`); the Mac's allocator zeroes small
+    blocks on free, so there it passes anyway. 10 mutations of the new code: 8 fail the test on
+    the Mac, the `reverse` one fails it on Linux, and the tenth (a cutoff of 4 2^16) is no bug.
+  - API / kernel after these changes, median of 11 rounds, GCC 15.2, main 27905ef plus this PR:
+
+    | case | `lc-bench` (avx2) | `lc-intel` (avx512) | `lc-zen5` (zen5) | `lc-arm` (arm) |
+    |---|---:|---:|---:|---:|
+    | add/10, /14, /18, /22 | 0.77, 0.97, 1.01, 1.02 | 0.99, 0.99, 1.00, 1.00 | 0.60, 0.83, 0.95, 1.03 | 0.87, 0.94, 0.99, 0.98 |
+    | sub | 0.75, 0.97, 1.01, 0.99 | 1.02, 1.03, 1.00, 1.00 | 0.62, 0.84, 0.96, 1.04 | 0.96, 0.97, 1.00, 0.98 |
+    | neg | 0.83, 0.86, 0.92, 0.93 | 0.95, 0.98, 1.00, 1.00 | 0.46, 0.44, 0.69, 0.73 | 0.89, 0.73, 0.90, 0.97 |
+    | scale | 1.00, 1.00, 1.02, 0.97 | 0.98, 0.98, 0.99, 1.00 | 0.98, 0.84, 0.89, 1.08 | 0.99, 1.00, 1.00, 1.00 |
+    | multiply/10, /14, /18, /22 | 1.005, 1.019, 1.027, 1.061 | 1.013, 1.047, 1.030, 1.045 | 1.004, 1.015, 1.017, 1.033 | 0.989, 0.981, 0.985 (/18) |
+    | multiply/480x480 | 1.017 | 1.015 | 1.003 | 0.992 |
+
+    The element-wise pairs run the same modarith ops on the same inputs into the same kind of
+    memory, yet range from 0.44 to 1.08. Placement, not work: on `lc-zen5`, running each kernel
+    case before its API case (sizes 18 and 22 only) moved scale/22 from 1.077 to 0.973 and
+    neg/22 from 0.73 to 0.85, and a second run of avx512 add/10 gave 1.06 against 0.99. So this
+    harness resolves these pairs to about 10% at 2^22 on `lc-zen5` and 5% at small sizes on
+    `lc-intel`. The products keep their gap (it grows with size on x86, and the decomposition
+    above explains it); on `lc-arm` the API now comes out 1-2% faster, again placement.

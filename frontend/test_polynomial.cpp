@@ -59,7 +59,12 @@ Vec vec(const Poly& f) { return Vec(f.span().begin(), f.span().end()); }
 
 Poly poly(const Vec& a) { return Poly(std::span<const u32>(a)); }
 
+// Frees n words of P - 1, so the next allocation of n words likely reuses them: a result word the
+// library forgets to write then shows up.
+void dirty_heap(std::size_t n) { (void)poly(Vec(n, P - 1)); }
+
 u32 mul(u32 a, u32 b) { return u32(u64(a) * b % P); }
+
 
 Vec naive_product(const Vec& a, const Vec& b) {
     if (a.empty() || b.empty()) return {};
@@ -107,6 +112,15 @@ void test_class() {
     CHECK(vec(poly(c)) == c);
     CHECK(vec(Poly(std::span<const u32>(c.data(), 0))).empty());
     CHECK(vec(Poly{P - 1, 0}) == (Vec{P - 1, 0}));
+    // Copies, moves, self-assignment.
+    Poly copy = poly(c), moved = copy;
+    CHECK(vec(copy) == c && vec(moved) == c);
+    const Poly taken = std::move(moved);
+    moved = copy;
+    copy = std::as_const(copy);
+    CHECK(vec(taken) == c && vec(moved) == c && vec(copy) == c);
+    moved = Poly{4, 5};
+    CHECK(vec(moved) == (Vec{4, 5}));
 
     Poly g{1, 2, 3};
     g[1] = 7;
@@ -128,7 +142,9 @@ void test_class() {
             Vec t(k, 0), r(k, 0);
             for (std::size_t i = 0; i < std::min(k, n); ++i) t[i] = a[i], r[k - 1 - i] = a[i];
             const Poly f = poly(a);
+            dirty_heap(k);
             CHECK(vec(f.truncate(k)) == t, n, k);
+            dirty_heap(k);
             CHECK(vec(f.reverse(k)) == r, n, k);
         }
         const Poly f = poly(a);
@@ -148,6 +164,15 @@ void test_errors() {
     CHECK(throws<std::length_error>([&] { (void)(f * g); }));
 }
 
+// Scalars are integers of at most 64 bits: wider ones (__int128) would be cut, so they do not
+// compile.
+template <class T>
+constexpr bool takes_scalar = requires(const Poly& f, Poly& g, T c) {
+    f + c, c + f, f - c, c - f, f * c, c * f, g += c, g -= c, g *= c;
+};
+static_assert(takes_scalar<char> && takes_scalar<int> && takes_scalar<std::int64_t> && takes_scalar<u64>);
+static_assert(!takes_scalar<__int128> && !takes_scalar<unsigned __int128> && !takes_scalar<double>);
+
 template <class T>
 void check_scalar(const Vec& a, T c) {
     const u32 r = u32(((__int128)c % P + P) % P);
@@ -159,6 +184,7 @@ void check_scalar(const Vec& a, T c) {
     CHECK(vec(f + c) == plus && vec(c + f) == plus, a.size(), r);
     CHECK(vec(f - c) == minus && vec(c - f) == from, a.size(), r);
     CHECK(vec(f * c) == naive_scale(a, r) && vec(c * f) == naive_scale(a, r), a.size(), r);
+    CHECK(vec(Poly(f) + c) == plus && vec(c - Poly(f)) == from && vec(Poly(f) * c) == naive_scale(a, r));
     Poly g = f;
     g += c;
     CHECK(vec(g) == plus);
@@ -177,6 +203,8 @@ void test_sums_and_scalars() {
             const Poly f = poly(a), g = poly(b);
             CHECK(vec(f + g) == naive_sum(a, b, 1), n, m);
             CHECK(vec(f - g) == naive_sum(a, b, -1), n, m);
+            CHECK(vec(Poly(f) + g) == naive_sum(a, b, 1), n, m);
+            CHECK(vec(Poly(f) - g) == naive_sum(a, b, -1), n, m);
             Poly h = f;
             h += g;
             CHECK(vec(h) == naive_sum(a, b, 1), n, m);
@@ -230,9 +258,9 @@ void check_long_product(std::size_t n, std::size_t m) {
 void test_products() {
     for (const std::size_t n : kSizes)
         for (const std::size_t m : kSizes) check_product(random_vec(n, int(rng() % 4)), random_vec(m, int(rng() % 4)));
-    // Around the schoolbook limits (n m = 2^18, min(n, m) = 32); the largest sums on both paths.
+    // Around the schoolbook limits (n m = 3 2^16, min(n, m) = 32); the largest sums on both paths.
     for (const auto& [n, m] : std::vector<std::pair<std::size_t, std::size_t>>{
-             {511, 513}, {512, 511}, {512, 512}, {4095, 64}, {64, 4096}, {9000, 32}, {33, 9000}, {700, 1500}})
+             {443, 443}, {443, 444}, {512, 384}, {512, 511}, {3071, 64}, {64, 3072}, {9000, 32}, {33, 9000}})
         for (const int kind : {0, 3}) check_product(random_vec(n, kind), random_vec(m, kind));
     // Shifts: a factor with one nonzero term, or none.
     for (const std::size_t n : {std::size_t(1), std::size_t(64), std::size_t(3000)})

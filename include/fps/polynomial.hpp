@@ -9,17 +9,23 @@
 //   f[i], f.coeff(i), f.resize(n), f.span()     // coeff(i) is 0 past the end
 //   f.truncate(n), f.reverse(n), f(c)           // f mod x^n; x^(n-1) f(1/x) mod x^n; f at c
 //   f + g, f - g, -f, f * g                     // exact; also +=, -=, *=
-//   f + c, c + f, f - c, c - f, f * c, c * f    // c any integer, taken mod P; also +=, -=, *=
+//   f + c, c + f, f - c, c - f, f * c, c * f    // c an integer of at most 64 bits, taken mod P
 //
 // Coefficients are canonical, in [0, P), in and out: the constructors throw std::domain_error on
 // one >= P. size() counts trailing zeros and nothing trims: f + g and f - g have
 // max(f.size(), g.size()) coefficients, f + c and f - c max(f.size(), 1), f * c f.size(), and
 // f * g f.size() + g.size() - 1 (0 if either is empty).
 //
+// The operators allocate their result and write it in one pass; +=, -= and *= c work in place and
+// allocate nothing (+= and -= only to grow).
+//
 // f * g with n and m coefficients: a factor with at most one nonzero term (c x^k) makes it a
-// shift, O(n + m); min(n, m) <= 32 or n m < 2^18 runs schoolbook; the rest runs the backend's
-// ntt::Convolution, which needs n + m - 1 <= 2^25 (else std::length_error) and leaves the product
-// in its own memory, so f * g copies it out. Every call allocates its result.
+// shift, O(n + m); min(n, m) <= 32 or n m < 3 2^16 runs schoolbook; the rest runs the backend's
+// ntt::Convolution, which needs n + m - 1 <= 2^25 (else std::length_error). The Convolution keeps
+// the product in its own memory, so f * g copies it out: 0.6% to 6% over the kernel on x86 from
+// 2^10 coefficients (frontend/notes.md). The fast path is fps::ntt::Convolution itself, reading
+// the product from multiply(); once backend issue #38 lets it write into caller memory, the fast
+// path is fps::raw::mul (DESIGN.md, Raw functions).
 #pragma once
 
 #include <algorithm>
@@ -27,12 +33,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
-#include <vector>
 
 #include "backend/modarith/modarith.hpp"
 #include "backend/ntt/ntt.hpp"
@@ -43,8 +49,12 @@ namespace fps {
 
 namespace detail {
 
-// c mod P for an integer c of at most 64 bits.
-template <std::uint32_t P, std::integral T>
+// A scalar for the operators: an integer type of at most 64 bits, so residue() is exact.
+template <class T>
+concept Integer = std::integral<T> && sizeof(T) <= 8;
+
+// c mod P.
+template <std::uint32_t P, Integer T>
 constexpr std::uint32_t residue(T c) {
     if constexpr (std::is_signed_v<T>) {
         const std::int64_t r = std::int64_t(c) % std::int64_t(P);
@@ -53,6 +63,44 @@ constexpr std::uint32_t residue(T c) {
         return std::uint32_t(std::uint64_t(c) % P);
     }
 }
+
+// Coefficient storage: size() words on the heap, none reserved. Unlike std::vector it can
+// allocate without writing, so an operator writes its result in one pass, and it copies with
+// memcpy (std::vector with such an allocator copies word by word under GCC 15).
+class Words {
+public:
+    struct Unwritten {};
+
+    Words() = default;
+    explicit Words(std::size_t n) : Words(n, Unwritten{}) { std::fill_n(data(), n, 0u); }
+    Words(std::size_t n, Unwritten)
+        : words_(n ? std::make_unique_for_overwrite<std::uint32_t[]>(n) : nullptr), size_(n) {}
+    Words(const Words& w) : Words(w.size_, Unwritten{}) { std::copy_n(w.data(), size_, data()); }
+    Words(Words&& w) noexcept : words_(std::move(w.words_)), size_(std::exchange(w.size_, 0)) {}
+    Words& operator=(const Words& w) { return *this = Words(w); }
+    Words& operator=(Words&& w) noexcept {
+        words_ = std::move(w.words_);
+        size_ = std::exchange(w.size_, 0);
+        return *this;
+    }
+
+    std::size_t size() const { return size_; }
+    std::uint32_t* data() { return words_.get(); }
+    const std::uint32_t* data() const { return words_.get(); }
+
+    // Words past the old size are zero.
+    void resize(std::size_t n) {
+        if (n <= size_) return void(size_ = n);
+        Words w(n, Unwritten{});
+        std::copy_n(data(), size_, w.data());
+        std::fill(w.data() + size_, w.data() + n, 0u);
+        *this = std::move(w);
+    }
+
+private:
+    std::unique_ptr<std::uint32_t[]> words_;
+    std::size_t size_ = 0;
+};
 
 // out[i] = op(a[i], b[i]) for i < n, as op.template operator()<S>(x, y) on vectors of
 // simd::Native, then on single words (simd::Scalar). out may be a or b.
@@ -83,9 +131,10 @@ inline std::optional<Term> single_term(std::span<const std::uint32_t> f) {
 
 // Whether a product of n and m coefficients runs schoolbook rather than ntt::Convolution. On Zen 3
 // schoolbook costs 0.24 ns per term; a Convolution 51 us at any short length (a fresh mapping per
-// call) plus 3 to 4.5 ns per coefficient of its length (frontend/notes.md).
+// call) plus 3 to 4.5 ns per coefficient of its length. They meet near 443 x 443 (3 2^16 terms)
+// and, for long factors, between m = 32 and m = 48 (frontend/notes.md).
 constexpr bool schoolbook_wins(std::size_t n, std::size_t m) {
-    return std::min(n, m) <= 32 || n * m < (std::size_t(1) << 18);
+    return std::min(n, m) <= 32 || n * m < 3 * (std::size_t(1) << 16);
 }
 
 // out = a b for out.size() = a.size() + b.size() - 1, in blocks of 64 outputs. 64-bit sums: a
@@ -117,164 +166,202 @@ class Polynomial {
 public:
     Polynomial() = default;
     explicit Polynomial(std::size_t n) : c_(n) {}
-    Polynomial(std::initializer_list<std::uint32_t> c) : c_(c) { check_canonical(); }
-    explicit Polynomial(std::span<const std::uint32_t> c) : c_(c.begin(), c.end()) { check_canonical(); }
+    Polynomial(std::initializer_list<std::uint32_t> c) : Polynomial(std::span(c.begin(), c.size())) {}
+    explicit Polynomial(std::span<const std::uint32_t> c) : Polynomial(c.size(), kUnwritten) {
+        std::ranges::copy(c, data());
+        if (std::ranges::any_of(c, [](std::uint32_t v) { return v >= P; }))
+            throw std::domain_error("fps::Polynomial: coefficient >= P");
+    }
 
     static Polynomial x(std::size_t k = 1) {
         Polynomial f(k + 1);
-        f.c_[k] = 1;
+        f[k] = 1;
         return f;
     }
 
     std::size_t size() const { return c_.size(); }
 
     int degree() const {
-        std::size_t d = c_.size();
-        while (d > 0 && c_[d - 1] == 0) --d;
+        std::size_t d = size();
+        while (d > 0 && data()[d - 1] == 0) --d;
         return int(d) - 1;
     }
 
-    std::uint32_t& operator[](std::size_t i) { return c_[i]; }
-    std::uint32_t operator[](std::size_t i) const { return c_[i]; }
-    std::uint32_t coeff(std::size_t i) const { return i < c_.size() ? c_[i] : 0; }
+    std::uint32_t& operator[](std::size_t i) { return data()[i]; }
+    std::uint32_t operator[](std::size_t i) const { return data()[i]; }
+    std::uint32_t coeff(std::size_t i) const { return i < size() ? data()[i] : 0; }
     void resize(std::size_t n) { c_.resize(n); }
-    std::span<std::uint32_t> span() { return c_; }
-    std::span<const std::uint32_t> span() const { return c_; }
+    std::span<std::uint32_t> span() { return {data(), size()}; }
+    std::span<const std::uint32_t> span() const { return {data(), size()}; }
 
     Polynomial truncate(std::size_t n) const {
-        Polynomial g;
-        g.c_.assign(c_.begin(), c_.begin() + std::ptrdiff_t(std::min(n, size())));
-        g.c_.resize(n);
+        Polynomial g(n, kUnwritten);
+        const std::size_t k = std::min(n, size());
+        std::copy_n(data(), k, g.data());
+        std::fill(g.data() + k, g.data() + n, 0u);
         return g;
     }
 
     // g[i] = f[n - 1 - i].
     Polynomial reverse(std::size_t n) const {
-        Polynomial g(n);
+        Polynomial g(n, kUnwritten);
         const std::size_t k = std::min(n, size());
-        std::reverse_copy(c_.begin(), c_.begin() + std::ptrdiff_t(k), g.c_.begin() + std::ptrdiff_t(n - k));
+        std::fill_n(g.data(), n - k, 0u);
+        std::reverse_copy(data(), data() + k, g.data() + (n - k));
         return g;
     }
 
     // Horner's rule; any c < 2^32.
     std::uint32_t operator()(std::uint32_t c) const {
         std::uint32_t r = 0;
-        for (std::size_t i = c_.size(); i-- > 0;) r = Word::add(mod_mul<P>(r, c), c_[i]);
+        for (std::size_t i = size(); i-- > 0;) r = Word::add(mod_mul<P>(r, c), data()[i]);
         return r;
     }
 
     Polynomial& operator+=(const Polynomial& g) {
-        if (g.size() > size()) c_.resize(g.size());
-        detail::lanewise(c_.data(), g.c_.data(), c_.data(), g.size(),
-                         []<class S>(typename S::V x, typename S::V y) { return Ops<S>::add(x, y); });
+        if (g.size() > size()) resize(g.size());
+        add(data(), g.data(), data(), g.size());
         return *this;
     }
 
     Polynomial& operator-=(const Polynomial& g) {
-        if (g.size() > size()) c_.resize(g.size());
-        detail::lanewise(c_.data(), g.c_.data(), c_.data(), g.size(),
-                         []<class S>(typename S::V x, typename S::V y) { return Ops<S>::sub(x, y); });
+        if (g.size() > size()) resize(g.size());
+        subtract(data(), g.data(), data(), g.size());
         return *this;
     }
 
     Polynomial& operator*=(const Polynomial& g) { return *this = *this * g; }
 
-    template <std::integral T>
+    template <detail::Integer T>
     Polynomial& operator+=(T c) {
-        if (c_.empty()) c_.resize(1);
-        c_[0] = Word::add(c_[0], detail::residue<P>(c));
+        if (size() == 0) resize(1);
+        data()[0] = Word::add(data()[0], detail::residue<P>(c));
         return *this;
     }
 
-    template <std::integral T>
+    template <detail::Integer T>
     Polynomial& operator-=(T c) {
-        if (c_.empty()) c_.resize(1);
-        c_[0] = Word::sub(c_[0], detail::residue<P>(c));
+        if (size() == 0) resize(1);
+        data()[0] = Word::sub(data()[0], detail::residue<P>(c));
         return *this;
     }
 
-    template <std::integral T>
+    template <detail::Integer T>
     Polynomial& operator*=(T c) {
-        scale(c_.data(), detail::residue<P>(c), c_.data(), size());
+        scale(data(), detail::residue<P>(c), data(), size());
         return *this;
     }
 
-    friend Polynomial operator+(Polynomial f, const Polynomial& g) {
+    friend Polynomial operator+(const Polynomial& f, const Polynomial& g) {
+        const Polynomial& longer = f.size() >= g.size() ? f : g;
+        const std::size_t n = std::min(f.size(), g.size());
+        Polynomial h(longer.size(), kUnwritten);
+        add(f.data(), g.data(), h.data(), n);
+        std::copy(longer.data() + n, longer.data() + longer.size(), h.data() + n);
+        return h;
+    }
+
+    friend Polynomial operator+(Polynomial&& f, const Polynomial& g) {
         f += g;
-        return f;
+        return std::move(f);
     }
 
-    friend Polynomial operator-(Polynomial f, const Polynomial& g) {
+    friend Polynomial operator-(const Polynomial& f, const Polynomial& g) {
+        const std::size_t n = std::min(f.size(), g.size());
+        Polynomial h(std::max(f.size(), g.size()), kUnwritten);
+        subtract(f.data(), g.data(), h.data(), n);
+        std::copy(f.data() + n, f.data() + f.size(), h.data() + n);  // f is the longer
+        negate(g.data() + n, h.data() + n, g.size() - n);            // g is the longer
+        return h;
+    }
+
+    friend Polynomial operator-(Polynomial&& f, const Polynomial& g) {
         f -= g;
-        return f;
+        return std::move(f);
     }
 
-    friend Polynomial operator-(Polynomial f) {
-        detail::lanewise(f.c_.data(), f.c_.data(), f.c_.data(), f.size(),
-                         []<class S>(typename S::V x, typename S::V) { return Ops<S>::sub(S::broadcast(0), x); });
-        return f;
+    friend Polynomial operator-(const Polynomial& f) {
+        Polynomial h(f.size(), kUnwritten);
+        negate(f.data(), h.data(), f.size());
+        return h;
     }
 
     friend Polynomial operator*(const Polynomial& f, const Polynomial& g) {
-        if (f.c_.empty() || g.c_.empty()) return {};
+        if (f.size() == 0 || g.size() == 0) return {};
         if (const auto t = detail::single_term(g.span())) return shifted(f, *t, g.size());
         if (const auto t = detail::single_term(f.span())) return shifted(g, *t, f.size());
         if (detail::schoolbook_wins(f.size(), g.size())) {
-            Polynomial h(f.size() + g.size() - 1);
-            detail::schoolbook<P>(f.c_, g.c_, h.c_);
+            Polynomial h(f.size() + g.size() - 1, kUnwritten);
+            detail::schoolbook<P>(f.span(), g.span(), h.span());
             return h;
         }
         return convolution(f, g);
     }
 
-    template <std::integral T>
+    // f + c, c + f and f - c change one coefficient: the copy of f is their one pass.
+    template <detail::Integer T>
     friend Polynomial operator+(Polynomial f, T c) {
         f += c;
         return f;
     }
 
-    template <std::integral T>
+    template <detail::Integer T>
     friend Polynomial operator+(T c, Polynomial f) {
         f += c;
         return f;
     }
 
-    template <std::integral T>
+    template <detail::Integer T>
     friend Polynomial operator-(Polynomial f, T c) {
         f -= c;
         return f;
     }
 
-    template <std::integral T>
-    friend Polynomial operator-(T c, Polynomial f) {
-        f = -std::move(f);
-        f += c;
-        return f;
+    template <detail::Integer T>
+    friend Polynomial operator-(T c, const Polynomial& f) {
+        Polynomial h = -f;
+        h += c;
+        return h;
     }
 
-    template <std::integral T>
-    friend Polynomial operator*(Polynomial f, T c) {
-        f *= c;
-        return f;
+    template <detail::Integer T>
+    friend Polynomial operator*(const Polynomial& f, T c) {
+        Polynomial h(f.size(), kUnwritten);
+        scale(f.data(), detail::residue<P>(c), h.data(), f.size());
+        return h;
     }
 
-    template <std::integral T>
-    friend Polynomial operator*(T c, Polynomial f) {
-        f *= c;
-        return f;
+    template <detail::Integer T>
+    friend Polynomial operator*(T c, const Polynomial& f) {
+        return f * c;
     }
 
 private:
     template <class S>
     using Ops = modarith::Ops<S, P>;
     using Word = Ops<simd::Scalar>;
+    static constexpr detail::Words::Unwritten kUnwritten{};
 
-    void check_canonical() const {
-        if (std::ranges::any_of(c_, [](std::uint32_t c) { return c >= P; }))
-            throw std::domain_error("fps::Polynomial: coefficient >= P");
+    Polynomial(std::size_t n, detail::Words::Unwritten u) : c_(n, u) {}
+
+    std::uint32_t* data() { return c_.data(); }
+    const std::uint32_t* data() const { return c_.data(); }
+
+    // The streams, for i < n; out may be a or b.
+    static void add(const std::uint32_t* a, const std::uint32_t* b, std::uint32_t* out, std::size_t n) {
+        detail::lanewise(a, b, out, n, []<class S>(typename S::V x, typename S::V y) { return Ops<S>::add(x, y); });
     }
 
-    // out[i] = c a[i] for i < n, by Shoup's multiplication; out may be a.
+    static void subtract(const std::uint32_t* a, const std::uint32_t* b, std::uint32_t* out, std::size_t n) {
+        detail::lanewise(a, b, out, n, []<class S>(typename S::V x, typename S::V y) { return Ops<S>::sub(x, y); });
+    }
+
+    static void negate(const std::uint32_t* a, std::uint32_t* out, std::size_t n) {
+        detail::lanewise(a, a, out, n,
+                         []<class S>(typename S::V x, typename S::V) { return Ops<S>::sub(S::broadcast(0), x); });
+    }
+
+    // out[i] = c a[i] by Shoup's multiplication.
     static void scale(const std::uint32_t* a, std::uint32_t c, std::uint32_t* out, std::size_t n) {
         const std::uint32_t q = Word::shoup_quotient(c);
         detail::lanewise(a, a, out, n, [c, q]<class S>(typename S::V x, typename S::V) {
@@ -284,23 +371,26 @@ private:
 
     // f t for the term t of a factor of m coefficients: f.size() + m - 1 coefficients.
     static Polynomial shifted(const Polynomial& f, detail::Term t, std::size_t m) {
-        Polynomial h(f.size() + m - 1);
-        if (t.c == 1) std::ranges::copy(f.c_, h.c_.begin() + std::ptrdiff_t(t.k));
-        else scale(f.c_.data(), t.c, h.c_.data() + t.k, f.size());
+        Polynomial h(f.size() + m - 1, kUnwritten);
+        std::uint32_t* const middle = h.data() + t.k;
+        std::fill(h.data(), middle, 0u);
+        if (t.c == 1) std::copy_n(f.data(), f.size(), middle);
+        else scale(f.data(), t.c, middle, f.size());
+        std::fill(middle + f.size(), h.data() + h.size(), 0u);
         return h;
     }
 
     static Polynomial convolution(const Polynomial& f, const Polynomial& g) {
         ntt::Convolution conv(f.size(), g.size());
-        std::ranges::copy(f.c_, conv.a());
-        std::ranges::copy(g.c_, conv.b());
+        std::copy_n(f.data(), f.size(), conv.a());
+        std::copy_n(g.data(), g.size(), conv.b());
         const std::uint32_t* product = conv.multiply();
-        Polynomial h;
-        h.c_.assign(product, product + conv.size());
+        Polynomial h(conv.size(), kUnwritten);
+        std::copy_n(product, conv.size(), h.data());
         return h;
     }
 
-    std::vector<std::uint32_t> c_;
+    detail::Words c_;
 };
 
 }  // namespace fps

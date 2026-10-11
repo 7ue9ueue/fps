@@ -91,8 +91,8 @@ public:
 ```
 
 Arithmetic, all exact: `f + g`, `f - g`, `-f`, `f * g`, `f / g` (quotient), `f % g` (remainder);
-with a scalar c, any integer type taken mod P: `f + c`, `c + f`, `f - c`, `c - f`, `f * c`,
-`c * f`; and the compound forms (`+=`, `*=`, ...). With `x = Poly::x()`:
+with a scalar c, an integer of at most 64 bits taken mod P: `f + c`, `c + f`, `f - c`, `c - f`,
+`f * c`, `c * f`; and the compound forms (`+=`, `*=`, ...). With `x = Poly::x()`:
 
 | Code | Meaning |
 |---|---|
