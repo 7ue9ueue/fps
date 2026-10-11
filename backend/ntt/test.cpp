@@ -22,6 +22,13 @@ using namespace fps::ntt;
 
 constexpr u32 P = kModulus;
 constexpr int kScalarMaxLog = 20;  // the scalar variant is slow; ASan makes it slower
+// Under ASan every variant stops at 2^20: above it the run took 4x as long (156 s against 36 s on
+// lc-zen5-test). -O2 builds test the vector variants up to 2^kMaxLog.
+#if __has_feature(address_sanitizer)  // GCC 14+ and clang
+constexpr int kVectorMaxLog = 20;
+#else
+constexpr int kVectorMaxLog = kMaxLog;
+#endif
 
 std::mt19937_64 rng(2026);
 int failures = 0;
@@ -497,7 +504,7 @@ void test_intrinsics() {
     fps::simd::for_each(fps::simd::All{}, []<class S> {
         const std::string name = std::string("intrinsics ") + S::name;
         IntrinsicsKernels<S>::run(name);
-        test_variant<variant::intrinsics<S>>(name.c_str(), S::lanes == 1 ? kScalarMaxLog : kMaxLog);
+        test_variant<variant::intrinsics<S>>(name.c_str(), S::lanes == 1 ? kScalarMaxLog : kVectorMaxLog);
     });
 }
 
@@ -681,7 +688,7 @@ void test_avx2() {
     test_bottom_levels();
     test_group_bottom();
     test_bottoms();
-    test_variant<variant::avx2>("avx2", kMaxLog);
+    test_variant<variant::avx2>("avx2", kVectorMaxLog);
 }
 
 #endif

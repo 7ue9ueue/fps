@@ -128,9 +128,10 @@ The Mac drives the VMs. `tools/vm.py` sends your working tree over ssh, uncommit
   - `check`: generators.
 - `python3 tools/gate.py <pr> --merge` is the only way into `main`. It tests every affected unit on
   every target (the frontend too, when `include/`, `frontend/` or a kernel it includes changes),
-  times each against `main` on the target's timing machine, comments the result on
-  the PR, sets the PR's commit status `gate` (which `main` requires), and squash-merges if all
-  tests pass and no target is slower beyond noise (geomean of new/base <= 1.005).
+  times each against `main` on the target's timing machine (gated cases only), comments the
+  result on the PR, sets the PR's commit status `gate` (which `main` requires), and squash-merges
+  if all tests pass and no target is slower beyond noise (geomean of new/base <= 1.005).
+  Only the coordinators (`/work`, `/build`) run it (Process).
   `gate.py <rev> --base <rev>` runs the same checks on local commits, without a PR.
   Issues and pull requests share numbers: pass the pull request's.
 
@@ -152,6 +153,10 @@ implementer each (`tools/prompt_build.md`), then a reviewer who checks the pull 
 DESIGN.md (`tools/prompt_review.md`), then the gate. An issue ends with `Result: done`. `/work`
 skips `build` issues.
 
+Subagents never run the gate or wait for it: they open a pull request, comment on their issue,
+and return. The coordinator gates each pull request (`tools/gate.py <pr> --merge`), one at a time,
+and sends a failure (a test, a slowdown, a conflict with main) back to an agent to fix.
+
 Agents may open issues and comment on any issue. Open one from the template, labeled `ready`, for
 work found outside your round: a bug, a new kernel, an idea for another target. Search open issues
 first; comment on a match instead of opening a duplicate. Reply to an issue when you have something
@@ -159,7 +164,7 @@ useful for it: an answer, a measurement, a related finding.
 
 ## Machines
 
-We share lc-opt's VMs and add three for the backend targets (`BACKEND.md`). lc-opt's `AGENTS.md`
+We share lc-opt's VMs and add four for the backend targets (`BACKEND.md`). lc-opt's `AGENTS.md`
 (Machines, Instruction sets) is the full reference.
 
 | Machine | CPU | Use |
@@ -170,7 +175,8 @@ We share lc-opt's VMs and add three for the backend targets (`BACKEND.md`). lc-o
 | `lc-bench` | EPYC 7B13 (Zen 3) | `avx2` timing only. Build and test elsewhere; `kernel.py bench` builds its two binaries here under the lock. |
 | `lc-k68` | EPYC 7B13, Linux 6.8 | Timing of code heavy in page faults or huge pages. Keep it on 6.8. |
 | `lc-intel-test` | Xeon 8581C, AVX-512, no PMU | `avx512` builds and tests. |
-| `lc-zen5` | EPYC 9B45 (Zen 5), AVX-512, no PMU | `zen5` builds, tests and timing. |
+| `lc-zen5` | EPYC 9B45 (Zen 5), AVX-512, no PMU | `zen5` timing only. Build and test on `lc-zen5-test`. |
+| `lc-zen5-test` | EPYC 9B45 (Zen 5), AVX-512, no PMU | `zen5` builds and tests. |
 | `lc-arm` | Axion (Neoverse V2), NEON, SVE2, PMU on | `arm` builds, tests and timing; `perf`. |
 
 - GCP project `project-c73e6eb1-e167-4d7a-a31`, region `europe-west2`. Zones: `lc-intel` and
