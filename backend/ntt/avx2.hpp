@@ -209,9 +209,9 @@ inline void forward_radix2(Vec* f, std::size_t h, bool sparse) {
     }
 }
 
-// forward_identity() on canonical input; z = r(1).
+// The first radix-4 level of a transform, on canonical input; z = r(1).
 inline void forward_radix4(Vec* f, std::size_t h, bool sparse, const u32* roots) {
-    if (!sparse) return kernels::forward_identity(f, h, roots);
+    if (!sparse) return kernels::forward_top(f, h, roots);
     const Factor z = entry(roots, 1);
     for (std::size_t j = 0; j < h; ++j) {
         const Vec a = f[j], b = f[j + h], zb = multiply(b, z);  // < 4P
@@ -382,7 +382,10 @@ inline constexpr int kDenseRadix8MinLog = 16;
 inline void forward(u32* words, int lg, const u32* r) {
     auto* f = reinterpret_cast<Vec*>(words);
     const std::size_t nv = (std::size_t(1) << lg) / 8;
-    if (!has_radix2(lg)) return forward_trees(f, nv, 1, 0, r);
+    if (!has_radix2(lg)) {
+        kernels::forward_top(f, nv / 4, r);
+        return forward_trees(f, nv / 4, 4, 0, r);
+    }
     if (lg < kDenseRadix8MinLog) {
         forward_radix2(f, nv / 2, false);
         return forward_trees(f, nv / 2, 2, 0, r);

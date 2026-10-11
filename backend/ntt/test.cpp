@@ -312,6 +312,8 @@ void test_loops() {
             test_loop("forward_identity", h, 4 * u64(P), 4 * u64(P),
                       [&](Vec* f, std::size_t n) { k::forward_identity(f, n, t.r()); },
                       [&](const std::array<u32, 4>& f) { return forward_model(f, 1, 1, *t.r(1)); });
+            test_loop("forward_top", h, P, 4 * u64(P), [&](Vec* f, std::size_t n) { k::forward_top(f, n, t.r()); },
+                      [&](const std::array<u32, 4>& f) { return forward_model(f, 1, 1, *t.r(1)); });
             test_loop("inverse_identity", h, 2 * u64(P), 2 * u64(P),
                       [&](Vec* f, std::size_t n) { k::inverse_identity(f, n, t.ir()); },
                       [&](const std::array<u32, 4>& f) { return inverse_model(f, 1, 1, *t.ir(1)); });

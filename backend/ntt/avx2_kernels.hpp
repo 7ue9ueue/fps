@@ -540,6 +540,76 @@ inline void forward_identity(Vec* a, std::size_t h, const std::uint32_t* y) {
         : "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15", "memory", "cc");
 }
 
+// forward_identity() on canonical input: the first level of a transform. h even.
+inline void forward_top(Vec* a, std::size_t h, const std::uint32_t* y) {
+    Vec* const end = a + h;
+    asm volatile(
+        "vpbroadcastd %[P], %%ymm15\n\t"
+        "vpbroadcastd %[P2], %%ymm14\n\t"
+        "vbroadcastss 4(%[y]), %%ymm12\n\t"
+        "vbroadcastss 36(%[y]), %%ymm13\n\t"
+        ".p2align 5\n\t"
+        "1:\n\t"
+        "vmovdqa (%[a],%[h]), %%ymm0\n\t"
+        "vmovdqa 32(%[a],%[h]), %%ymm1\n\t"
+        "vmovdqa (%[a]), %%ymm2\n\t"
+        "vmovdqa 32(%[a]), %%ymm3\n\t"
+        "vpaddd %%ymm15, %%ymm0, %%ymm4\n\t"
+        "vpaddd (%[a],%[h3]), %%ymm0, %%ymm0\n\t"
+        "vpaddd %%ymm15, %%ymm1, %%ymm5\n\t"
+        "vpsubd (%[a],%[h3]), %%ymm4, %%ymm4\n\t"
+        "vpaddd 32(%[a],%[h3]), %%ymm1, %%ymm1\n\t"
+        "vpsubd 32(%[a],%[h3]), %%ymm5, %%ymm5\n\t"
+        "vpsrlq $32, %%ymm4, %%ymm6\n\t"
+        "vpmuludq %%ymm13, %%ymm4, %%ymm7\n\t"
+        "vpmulld %%ymm12, %%ymm4, %%ymm4\n\t"
+        "vpsrlq $32, %%ymm5, %%ymm8\n\t"
+        "vpmuludq %%ymm13, %%ymm5, %%ymm9\n\t"
+        "vpmuludq %%ymm13, %%ymm6, %%ymm6\n\t"
+        "vpaddd %%ymm15, %%ymm2, %%ymm10\n\t"
+        "vpmuludq %%ymm13, %%ymm8, %%ymm8\n\t"
+        "vpmulld %%ymm12, %%ymm5, %%ymm5\n\t"
+        "vpaddd %%ymm15, %%ymm3, %%ymm11\n\t"
+        "vpaddd (%[a],%[h],2), %%ymm2, %%ymm2\n\t"
+        "vpsrlq $32, %%ymm7, %%ymm7\n\t"
+        "vpsubd (%[a],%[h],2), %%ymm10, %%ymm10\n\t"
+        "vpaddd 32(%[a],%[h],2), %%ymm3, %%ymm3\n\t"
+        "vpsrlq $32, %%ymm9, %%ymm9\n\t"
+        "vpblendd $170, %%ymm6, %%ymm7, %%ymm6\n\t"
+        "vpsubd 32(%[a],%[h],2), %%ymm11, %%ymm11\n\t"
+        "vpaddd %%ymm14, %%ymm2, %%ymm7\n\t"
+        "vpblendd $170, %%ymm8, %%ymm9, %%ymm8\n\t"
+        "vpmulld %%ymm15, %%ymm6, %%ymm6\n\t"
+        "vpaddd %%ymm0, %%ymm2, %%ymm2\n\t"
+        "vpsubd %%ymm0, %%ymm7, %%ymm0\n\t"
+        "vpmulld %%ymm15, %%ymm8, %%ymm8\n\t"
+        "vpaddd %%ymm14, %%ymm10, %%ymm7\n\t"
+        "vpaddd %%ymm14, %%ymm3, %%ymm9\n\t"
+        "vpaddd %%ymm1, %%ymm3, %%ymm3\n\t"
+        "vmovdqa %%ymm2, (%[a])\n\t"
+        "vpaddd %%ymm14, %%ymm11, %%ymm2\n\t"
+        "vpsubd %%ymm1, %%ymm9, %%ymm1\n\t"
+        "vmovdqa %%ymm0, (%[a],%[h])\n\t"
+        "vpsubd %%ymm6, %%ymm4, %%ymm6\n\t"
+        "vmovdqa %%ymm3, 32(%[a])\n\t"
+        "vpsubd %%ymm8, %%ymm5, %%ymm8\n\t"
+        "vpaddd %%ymm6, %%ymm10, %%ymm10\n\t"
+        "vpsubd %%ymm6, %%ymm7, %%ymm6\n\t"
+        "vmovdqa %%ymm1, 32(%[a],%[h])\n\t"
+        "vpaddd %%ymm8, %%ymm11, %%ymm11\n\t"
+        "vpsubd %%ymm8, %%ymm2, %%ymm8\n\t"
+        "vmovdqa %%ymm10, (%[a],%[h],2)\n\t"
+        "vmovdqa %%ymm6, (%[a],%[h3])\n\t"
+        "vmovdqa %%ymm11, 32(%[a],%[h],2)\n\t"
+        "vmovdqa %%ymm8, 32(%[a],%[h3])\n\t"
+        "add $64, %[a]\n\t"
+        "cmp %[end], %[a]\n\t"
+        "jne 1b\n\t"
+        : [a] "+r"(a)
+        : [end] "r"(end), [h] "r"(32 * h), [h3] "r"(96 * h), [y] "r"(y), [P] "m"(kP), [P2] "m"(k2P)
+        : "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15", "memory", "cc");
+}
+
 // inverse() for group 0; z = y[1]: pass the inverse table start. h even.
 inline void inverse_identity(Vec* a, std::size_t h, const std::uint32_t* y) {
     Vec* const end = a + h;

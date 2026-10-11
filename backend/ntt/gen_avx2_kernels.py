@@ -188,6 +188,19 @@ def forward_identity(g):
     g.store_quarter(g.diff(amc, z), 3)
 
 
+def forward_top(g):
+    """forward_identity on canonical inputs: no reduction before the outputs, which are < 4P."""
+    c = g.c
+    a, b, cc, dd = (g.quarter(i) for i in range(4))
+    ac, bd = g.add(a, cc), g.add(b, dd)  # < 2P
+    amc = g.op('vpsubd', g.op('vpaddd', a, c['P']), cc)  # < 2P
+    z = g.shoup(g.op('vpsubd', g.op('vpaddd', b, c['P']), dd), c['WZ'], c['QZ'])
+    g.store_quarter(g.add(ac, bd), 0)
+    g.store_quarter(g.diff(ac, bd), 1)
+    g.store_quarter(g.add(amc, z), 2)
+    g.store_quarter(g.diff(amc, z), 3)
+
+
 def inverse_identity(g):
     c = g.c
     f0, f1, f2, f3 = (g.quarter(i) for i in range(4))
@@ -492,6 +505,8 @@ LOOPS = [
         'Inverse radix-4 butterflies j < h of one group, values < 2P; inverse twiddles. h even.')),
     Loop('forward_identity', forward_identity, 'z', doc=(
         'forward() for group 0 (x = y = 1); z = y[1]: pass the table start. h even.')),
+    Loop('forward_top', forward_top, 'z', doc=(
+        'forward_identity() on canonical input: the first level of a transform. h even.')),
     Loop('inverse_identity', inverse_identity, 'z', doc=(
         'inverse() for group 0; z = y[1]: pass the inverse table start. h even.')),
     Loop('scale_radix2', scale_radix2, 'z', doc=(
