@@ -6,7 +6,7 @@ labels: ready
 ---
 Kernel: `{kernel}`
 Target: `{target}`
-After: none
+After: none (or issues whose task must be merged first: #n, #m)
 Rounds: 5
 
 Task: {what to do; for speed work, the cases that matter}
