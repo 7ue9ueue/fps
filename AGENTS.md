@@ -28,6 +28,8 @@ Two parts:
   offer the options you see.
 - When you need a permission or access you lack (a VM, a gcloud login, a credential, a blocked
   command), stop and ask the user for help. Do not work around it.
+- An unattended agent asks on its issue: a comment with the question and the options you see,
+  then the `blocked` label. Then it stops and returns.
 
 ## Design
 
@@ -108,7 +110,7 @@ Targets and their machines are `TARGETS` in `tools/kernel.py`, kept in step with
 
 ## Tools
 
-The Mac drives the VMs. The VMs cannot fetch this private repository: `tools/vm.py` sends trees over ssh.
+The Mac drives the VMs. `tools/vm.py` sends your working tree over ssh, uncommitted changes included.
 
 - `python3 tools/vm.py <vm> [--base REV] '<command>'` copies your working tree to
   `~/hpc_library/<branch>` on the VM and runs the command there. With `--base`, REV goes to

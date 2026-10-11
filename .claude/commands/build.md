@@ -22,8 +22,8 @@ For each issue:
    merging, and returns the pull request's number.
 3. Review: start a second subagent, in the background, briefed with `tools/prompt_review.md`
    (fill in `{issue}` and `{pr}`). It has not seen the implementer's reasoning, only the issue,
-   DESIGN.md and the diff. It comments on the pull request; the last line is `Review: pass` or
-   `Review: changes`.
+   DESIGN.md and the diff. It comments on the pull request; the last line is `Review: pass`,
+   `Review: changes`, or `Review: blocked`.
 4. On `Review: changes`, send the implementer the review's link with SendMessage. It fixes, passes
    the gate again and returns; then review again with a new reviewer. After two reviews with
    changes, label the issue `blocked` and comment for the user what is unresolved.
@@ -31,5 +31,5 @@ For each issue:
    Check that the issue's last comment ends with `Result: done`, then close it with the label `done`.
 6. Remove the worktree once the implementer has stopped all background work.
 
-If the implementer labels the issue `blocked`, leave it for the user. Keep starting issues until
-none is ready, then report each issue's result in a few lines.
+If the implementer or the reviewer labels the issue `blocked`, leave it for the user. Keep starting
+issues until none is ready, then report each issue's result in a few lines.

@@ -9,7 +9,7 @@
   python3 tools/vm.py lc-amd 'python3 tools/kernel.py test ntt'
   python3 tools/vm.py lc-bench --base origin/main 'python3 tools/kernel.py bench ntt --base $BASE'
 
-The VMs cannot fetch the private repository, so trees travel as tar streams over ssh.
+Trees travel as tar streams over ssh: the VMs need no git access, and run uncommitted changes too.
 """
 from __future__ import annotations
 

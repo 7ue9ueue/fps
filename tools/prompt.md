@@ -1,5 +1,6 @@
 You are working on backend kernel(s) {kernel}, target `{target}`, round {round} of issue #{issue}.
-You are unattended: the user is offline, so do not ask questions. Decide and act.
+You are unattended: the user is offline. Decide and act. To ask the user (AGENTS.md), comment on
+issue #{issue} with the question and the options, add the `blocked` label, and return.
 
 1. Read `AGENTS.md`, `BACKEND.md`, issue #{issue} with its comments, and each kernel's
    `backend/<kernel>/notes.md` if it exists.
@@ -15,5 +16,3 @@ You are unattended: the user is offline, so do not ask questions. Decide and act
 7. Finish with one comment on issue #{issue}: what you tried, the numbers, and a last line that is
    exactly `Result: gain` or `Result: no gain`. A gain is a merged speed-up, or the issue's task
    merged.
-
-If something only the user can fix stops you, comment why on issue #{issue} and add the `blocked` label.
