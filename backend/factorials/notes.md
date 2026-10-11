@@ -12,19 +12,29 @@ in-register transposes per vector type. The frontend's `Factorials` calls `table
 product chains (`lib/poly/factorials.hpp`: `Chain`, `scan`, `scan_chunk`), rewritten on `simd`
 and `modarith` so one source runs on every target.
 
-- Lanes inside the tables: a_s = min(s C, n - C). The lanes past n - C all cover the last C
+- Lanes inside the tables: a_s = min(h + s C, n - C). The lanes past n - C all cover the last C
   positions (the same values, stored twice). So no lane reads a multiplier past n or writes past
   n: no scratch buffer and copy (the prototype's `factorials()` wrote 64 C words to scratch and
   copied n of each table), and no n + 1024 <= P limit (lc-opt's). Any n >= 64 up to P.
+- Lanes aligned to fact (round 2): h < S::lanes is the words from fact to its next vector
+  boundary, so every store of the lanes s < k = (n - h) / C into fact is aligned, and into
+  inverse when it has fact's offset (two std::vectors of the same size do). Positions below h
+  come from constant tables of i! and 1 / i!, i < 16; h! starts lane 0.
 - C = chunk(n): n / W rounded up to the vector length; from 64 on, a multiple of 16 with C / 16
   odd (lc-opt's `scan_chunk`, against cache-set conflicts of the W streams). The rounding costs
   at most 32 W positions of duplicate work.
-- Pass 1, lane products (a_s, a_s + C - 1]: x <- montgomery(x, g) with g = (a + 2j + 1)(a + 2j + 2)
-  in Montgomery form, two factors per step. g moves by its first difference d (a modular add), d
-  by 8 2^32 mod P (a second add). lc-opt took one factor per step. Lane k - 1 (k = n / C, the
-  last lane at s C) also gives the product up to n - C: the start of the lanes past it.
-- Scalar prefix over the lanes: last[s] = (a_s + C - 1)! = last[s - 1] a_s product[s], one
-  dependent product per lane; first[s] = (a_s)! = last[s - 1] a_s.
+- Pass 1, lane products (a_s, a_s + C - 1], four factors per step (round 2): the first
+  r = (C - 1) % 4 factors one by one, then x <- montgomery(x, g) with g = w (w + 1)(w + 2)(w + 3)
+  in Montgomery form, w = a + r + 1 + 4j. g moves by its forward differences d1, d2, d3 (four
+  modular adds per step; d4 = 4! 4^4 is constant). The start values come from vector products:
+  G = z (z + 2) with z = w (w + 3), z(w + 4) = z(w) + 8w + 28, so G at w, w + 4, w + 8, w + 12 is
+  5 Montgomery products per vector. Round 1 took two factors per step, lc-opt one. Lane k - 1
+  also gives the product up to n - C (whole steps, then up to 3 scalar factors for that lane
+  only): the start of the lanes past it.
+- Scalar prefix over the lanes: last[s] = (a_s + C - 1)! = last[s - 1] a_s product[s];
+  first[s] = (a_s)! = last[s - 1] a_s. Since round 2 in groups of 4 lanes: prefixes within the
+  groups (independent chains), then each group times the previous group's last: k / 4 + 4
+  dependent products instead of k.
 - Pass 2: 1 / last[s] for all lanes at once, x^(P - 2) by right-to-left square and multiply in
   Montgomery form (the square chain and the product chain overlap: 30 dependent steps, not 58).
   lc-opt: Montgomery's batch inversion in scalar code.
@@ -42,7 +52,8 @@ and `modarith` so one source runs on every target.
 - Selection (`select.hpp`): S = simd::Native (zmm on `avx512` and `zen5`), K = 2 on x86, 4 on Neon
   and Scalar. The loop below n = 64 (Zen 3, Neoverse V2), 96 (Zen 5), 128 (Emerald Rapids and any
   other AVX-512 target). ymm (Avx512Vl) with K = 2, 16 lanes, from n = 2^19 on `avx512` and
-  5 2^20 on `zen5`, where zmm's 32 lanes (64 write streams) stall on memory (Log).
+  5 2^20 on `zen5`, where zmm's 32 lanes (64 write streams) stall on memory (Log). Round 2
+  checked it again with aligned lanes: still right on Emerald Rapids for fresh tables (Log).
 
 ## Tests
 
@@ -53,7 +64,11 @@ every change of C up to 2^14 (so every count of collapsed lanes), 20 random n, n
 for P = 4099 and 65537 (where the last multiplier is P = 0 mod P), and P = 1073741789 (the
 largest prime below 2^30). Guard words after n must stay untouched. Mutations caught: a lane
 start one lower, the wrong factor for the collapsed lanes, a chain stopped a block early, the down
-chain's base off by one. Passes at -O2 and ASan/UBSan on `lc-amd` (scalar, sse, avx2),
+chain's base off by one. Placements (round 2): on fewer sizes (every n up to 300, both sides of
+each change of C up to 2^12, powers of two and neighbours from 2^9 to 2^17, 8 random n), K = 2,
+tables at word offsets (1, 1), (4, 4), (12, 12), (15, 15), (0, 8), (3, 13), (9, 2) from a 64-byte
+boundary, so every h and both equal and different offsets; words before the tables must stay
+untouched too. Passes at -O2 and ASan/UBSan on `lc-amd` (scalar, sse, avx2),
 `lc-intel-test` (avx512), `lc-zen5`, `lc-arm` and the Mac (scalar, arm). The frontend's
 `test_factorials.cpp` runs the kernel through `Factorials` and through `detail::factorial_tables`
 for every n <= 4099 at P = 4099.
@@ -61,40 +76,39 @@ for every n <= 4099 at P = 4099.
 ## Measurements
 
 `bench.cpp`, P = 998244353, buffers allocated once (warm), median ns per position over 11 rounds
-(each position is two words, one per table). GCC 15.2, `tools/kernel.py` flags, 2026-10-11.
+(each position is two words, one per table). GCC 15.2, `tools/kernel.py` flags, 2026-10-11,
+round 2 (this branch on main 626819e); round 1's numbers in brackets.
 
 | lg | Zen 3 `lc-bench` (avx2) | Emerald Rapids `lc-intel` (avx512) | Zen 5 `lc-zen5` | Neoverse V2 `lc-arm` |
 |---:|---:|---:|---:|---:|
-| 6 | 7.70 (loop 8.24) | 6.51 (loop) | 6.63 (loop) | 8.09 (loop 9.55) |
-| 8 | 2.43 | 2.85 | 2.21 | 2.78 |
-| 10 | 1.30 (loop 7.02) | 0.975 (loop 5.79) | 0.751 (loop 5.88) | 1.59 (loop 8.13) |
-| 12 | 0.776 | 0.626 | 0.480 | 1.07 |
-| 14 | 0.658 (loop 6.93) | 0.484 (loop 5.74) | 0.320 (loop 5.83) | 0.935 (loop 8.04) |
-| 16 | 0.654 | 0.449 | 0.281 | 0.901 |
-| 18 | 0.663 (loop 6.94) | 0.457 (loop 5.76) | 0.385 (loop 5.83) | 0.895 (loop 8.04) |
-| 20 | 0.666 | 0.575 (ymm) | 0.379 | 0.894 |
-| 22 | 0.727 (loop 6.95) | 0.582 (ymm, loop 5.77) | 0.464 (loop 5.83) | 0.918 (loop 8.04) |
+| 6 | 6.85 (7.70; loop 8.24) | 6.66 (loop) | 6.63 (loop) | 7.73 (8.09; loop 9.55) |
+| 8 | 2.27 (2.43) | 2.44 (2.85) | 1.83 (2.21) | 2.63 (2.78) |
+| 10 | 1.18 (1.30; loop 7.02) | 0.837 (0.975; loop 5.79) | 0.746 (0.751; loop 5.88) | 1.49 (1.59; loop 8.13) |
+| 12 | 0.704 (0.776) | 0.553 (0.626) | 0.419 (0.480) | 0.999 (1.07) |
+| 14 | 0.605 (0.658) | 0.433 (0.484) | 0.275 (0.320) | 0.875 (0.935) |
+| 16 | 0.583 (0.654) | 0.403 (0.449) | 0.238 (0.281) | 0.844 (0.901) |
+| 18 | 0.597 (0.663) | 0.395 (0.457) | 0.361 (0.385) | 0.838 (0.895) |
+| 20 | 0.595 (0.666) | 0.493 (ymm; 0.575) | 0.352 (0.379) | 0.840 (0.894) |
+| 22 | 0.611 (0.727) | 0.493 (ymm; 0.582) | 0.380 (0.464) | 0.995 (0.918) |
 
-Against the loop (the frontend's code before this kernel), lg 14 / 18 / 22: Zen 3 10.5x / 10.5x /
-9.6x, Emerald Rapids 11.9x / 12.6x / 9.9x, Zen 5 18.2x / 15.1x / 12.6x, Neoverse V2 8.6x / 9.0x /
-8.8x. The issue's estimate from lc-opt's notes was about 0.6 ns per position on Zen 3; this is
-0.65-0.73.
+The tables in the bench are two std::vectors, 16 bytes off a 64-byte boundary from lg 15 on.
+Neoverse V2 at lg 22 varies by run: main's own time was 1.05 in the same run (round 1: 0.918).
 
-Through the frontend (`frontend/bench.cpp`, `factorials/<lg>`: fresh zero-filled vectors each
-call), new/base against main (27905ef) on `lc-zen5` and `lc-arm`, 11 rounds: lg 10 0.155 and 0.203,
-lg 14 0.061 and 0.122, lg 18 0.211 and 0.252, lg 22 0.250 and 0.293. `factorials/<lg>` against
-`factorials@kernel/<lg>` (the same two vectors and the kernel call): 0.998-1.008 on Zen 5,
-0.985-1.001 on Neoverse V2. At lg 22 the allocation (zero-fill and page faults of 32 MiB) is
-1.3 ns of Zen 5's 1.79 ns per position; the kernel itself 0.46.
+Through the frontend (`frontend/bench.cpp`, `factorials/<lg>`: since #51 two unwritten tables
+per call, not zero-filled vectors), new/base against main 626819e, 11 rounds, lg 10 / 14 / 18 /
+22: Zen 3 0.917 / 0.911 / 0.986 / 0.984, Emerald Rapids 0.848 / 0.885 / 0.970 / 0.963, Zen 5
+0.898 / 0.871 / 0.971 / 0.978, Neoverse V2 0.945 / 0.936 / 0.975 / 0.979. From lg 18 on the page faults of the
+fresh tables cost more than the kernel (2-4 ns per position against 0.4-0.8).
 
-Passes at n = 2^18 (`explore/phases.cpp`, best of 7, ns per position; final code):
+Passes at n = 2^18 (`explore/phases.cpp`, best of 7, ns per position; round 2's lane products,
+round 1 in brackets):
 
 | Machine (S, K) | lane products | inversion | scan | all |
 |---|---:|---:|---:|---:|
-| Zen 3 (avx2, 2) | 0.120 | 215 ns | 0.524 | 0.648 |
-| Emerald Rapids (zmm, 2) | 0.092 | 215 ns | 0.364 | 0.457 |
-| Zen 5 (zmm, 2) | 0.071 | 167 ns | 0.314 | 0.389 |
-| Neoverse V2 (neon, 4) | 0.172 | 236 ns | 0.720 | 0.894 |
+| Zen 3 (avx2, 2) | 0.066 (0.120) | 216 ns | 0.545 | 0.595 |
+| Emerald Rapids (zmm, 2) | 0.046 (0.092) | 216 ns | 0.360 | 0.389 |
+| Zen 5 (zmm, 2) | 0.036 (0.071) | 168 ns | 0.303 | 0.351 |
+| Neoverse V2 (neon, 4) | 0.114 (0.172) | 236 ns | 0.720 | 0.837 |
 
 Floors, multiplies only: two Montgomery products per position in the scan, 6 `vpmuludq` per 8
 lanes on Zen 3's 2 multiply pipes = 0.75 cycles = 0.22 ns per position; Neoverse V2 4 multiplies
@@ -148,15 +162,68 @@ Exploration files (the `explore/*.cpp` programs named below, `run.sh` and their 
   model otherwise; numbers in Measurements.
 - Open: (1) 64-byte aligned tables would let zmm run at 0.44 instead of 0.58 on Emerald Rapids at
   large n; the frontend's tables are std::vectors. Aligning the lanes to the pointer needs both
-  tables at the same offset, or separate up and down lane grids. (2) The frontend's allocation
+  tables at the same offset, or separate up and down lane grids. (Round 2: done for fact's grid;
+  zmm still loses at large n, see below.) (2) The frontend's allocation
   costs more than the kernel from 2^18 on (zero-fill and page faults). (3) Non-temporal stores for
   tables past the last-level cache, not tried. (4) Neoverse V2's scan (0.72) is 2x its multiply
   floor; the transposes and stores cost 0.3 of it.
+
+2026-10-11, claude (issue #33, round 2). GCC 15.2, `tools/kernel.py` flags; base main e754d90,
+then 626819e after #51. Exploration files (`explore/*.cpp`, `variants.hpp`, `mainf/` = main's
+kernel renamed for side-by-side runs, `run.sh`, outputs in `out/`):
+`~/Documents/hpc_library-explore/factorials/r2/`. Timings: medians of 7-11 interleaved rounds,
+ns per position, warm buffers unless named.
+- Lanes aligned to fact (`align.cpp`, `variants.hpp` kShift): tables 64-byte aligned ("a64"),
+  both 16 bytes off ("off16", std::vector's place), fact aligned and inverse 32 bytes off
+  ("mixed"), both 4 bytes off. Zen 3 avx2 off16: lg 20 / 22 / 23 0.72 / 0.89 / 0.91 -> 0.65 /
+  0.65 / 0.66, a64 unchanged (0.65). Emerald Rapids zmm off16 lg 16-18 0.46-0.47 -> 0.45; Zen 5
+  lg 15-16 1-2%. Neoverse V2 within 1% except the 4-byte offset at lg 21-23 (0.92-1.12 ->
+  0.90-1.05). Kept, with the head from constant tables (a scalar chain for the head cost Zen 5
+  2-15% at n = 256-1024, `small.cpp`).
+- Non-temporal zmm stores (`_mm512_stream_si512`), the lanes past n - C also aligned and a
+  scalar tail of < 16 positions: warm, Emerald Rapids 0.46-0.49 at lg 18-23 for every placement
+  (plain zmm 0.45 to lg 19, then 0.60-2.8; ymm 0.55-0.74); Zen 5 0.30-0.31 from lg 17 (plain
+  0.36-0.55; at lg 16 0.315 against 0.276). With the lanes past n - C misaligned and stored plain
+  among streamed lanes, Emerald Rapids took 0.59-1.43. ymm and xmm stream stores write half
+  lines: Zen 3 2.8-3.3, Emerald Rapids ymm 14-17. But on fresh tables (`fresh.cpp`,
+  `fresh2.cpp`: allocated per call, as `Factorials` does) streaming loses: Emerald Rapids lg 20
+  unwritten 3.61 against main 2.21 and plain zmm 2.27, zero-filled 3.33 against 2.64; Zen 5 lg 18
+  unwritten 1.81 against plain 1.37 (page faults zero each page into the cache, then every
+  streamed line evicts it). The frontend's `factorials/22` on Emerald Rapids, then zero-filled:
+  1.58x main. Not kept: the warm gain is a bench artifact; callers write fresh tables.
+- zmm with aligned lanes against ymm at large n on Emerald Rapids, plain stores (`fresh2.cpp`):
+  lg 20 zero-filled 2.85 against 2.64, unwritten 2.27 against 2.21, warm 0.63 against 0.58; lg 22
+  warm 0.80 against 0.59. ymm kept from 2^19. Zen 5's switch (5 2^20) is above the gated sizes;
+  left as is.
+- Four factors per lane-product step (finite differences of a quartic) against two:
+  `phases.cpp` at 2^18 above (lane products halved on every machine). Paired, kernel bench,
+  four against two (both with aligned lanes): Zen 3 0.88-0.93 at every gated size (geomean
+  0.911), Neoverse V2 0.92-0.96 (0.940). At n = 1024 too (Zen 3 0.911, V2 0.945): the 5-product
+  setup costs less than the halved chain.
+- Prefix over the lanes in groups of 4: in the same commit; not timed alone. Expected from the
+  scalar product's latency (about 12 cycles): 31 -> 11 dependent products on zmm, 15 -> 7 on
+  Neoverse V2.
+- Neon scan variants (`neon.cpp`, `lc-arm`, K = 4, 2^18, main 0.896): chain products reduced to
+  [0, P) inside the product (min(r, r + P)) instead of at the store 0.876; plus st4 one-lane stores
+  instead of transposes 1.54; plus ld4 from a stack block instead of transposes 0.915; plus
+  premultiplied q = x m' (round 1's idea) 0.903; K = 6 0.880; K = 8 0.944; the block index hidden
+  from the compiler (no induction variable per lane pointer) 0.877. `perf stat` (`lc-arm`, sudo):
+  10.5 instructions and 2.7 cycles per position, IPC 3.9, 46% of the 8 dispatch slots used, 35%
+  stalled on the back end; the loop has 116 loads and 108 stores per 64 positions (block records
+  and spilled lane pointers). The 2% of the first variant alone was not worth a kernel-local
+  product; not kept.
+- Gate cases, this branch against main 626819e, 11 rounds, geomean of `tables/<lg>`: Zen 3
+  0.891, Emerald Rapids 0.870, Zen 5 0.880 (lg 10 0.996), Neoverse V2 0.939. Frontend
+  `factorials/<lg>`: Zen 3 0.949, Emerald Rapids 0.915, Zen 5 0.928, Neoverse V2 0.958. Tests
+  pass at -O2 and ASan/UBSan on every target's test machines and the Mac.
+- Open: (1) Neoverse V2's scan is unchanged (0.72); its loop spills block records and lane
+  pointers (above). (2) The inversion (167-236 ns, 30 dependent vector products) and the scalar
+  setup are most of the time below n = 2^10. (3) Zen 5 at n = 1024 gains nothing (0.996).
 
 ## Sources
 
 - lc-opt `lib/poly/factorials.hpp` and its notes (Factorials): the product chains, the scan with
   in-register 8 x 8 transposes, `scan_chunk`. Moved and rewritten here.
 - Montgomery multiplication: modarith (P. Montgomery, Math. Comp. 44, 1985).
-- Finite differences for the pair products g_j: the standard forward-difference table of a
-  polynomial; no source used.
+- Finite differences for the pair (round 1) and quad (round 2) products: the standard
+  forward-difference table of a polynomial; no source used.
