@@ -40,3 +40,118 @@ belongs in `backend/`).
     The loop is latency-bound: each product waits on the one before. lc-opt's chains: about
     0.6 ns per entry (estimate from its notes, #33). The rise from lg 14 to lg 18 is most likely
     page faults on the fresh, zero-filled vectors (guess, not profiled).
+- 2026-10-11: `Polynomial` (#16): the class, `f + g`, `f - g`, `-f`, `f * g`, scalars, compound
+  forms, from the prototype's `polynomial.hpp`. Storage is a `std::vector<std::uint32_t>`.
+  `static_assert(P == 998244353)` as DESIGN.md (Moduli) says, so no product for other primes.
+  - DESIGN.md: its Examples need `1 - x`, `x + c` and `-1 * f`, which its list of operators did
+    not have. Now `f + c`, `c + f`, `f - c`, `c - f` are listed, and a scalar c is any integer
+    type, taken mod P. Conventions: a size past a backend limit throws `std::length_error` (an
+    NTT product past 2^25 coefficients; `ntt::Convolution` throws it), not `std::domain_error`.
+  - Sums, negation and scaling run on the backend's primitives (`detail::lanewise` on
+    `simd::Native` with `modarith::Ops`: `add`, `sub`, Shoup's product), since GCC 15.2 does not
+    vectorize such loops at -O2.
+  - `f * g`, n and m coefficients: a factor with at most one nonzero term (c x^k; constants and
+    zero too) is a shift and scale, O(n + m). Else schoolbook if min(n, m) <= 32 or n m < 2^18
+    (`detail::schoolbook`, 64-bit sums), else `ntt::Convolution`. Schoolbook is here because a
+    short `ntt::Convolution` costs 52 us on `lc-bench` (22 us on `lc-arm`), mostly the first touch
+    of a fresh huge page, against 0.43 us for schoolbook at 32 x 32. Cutoffs measured on
+    `lc-bench`: schoolbook 0.24 ns per term; it wins up to about 450 x 450 (384 x 384: 36 us
+    against 56 us; 512 x 512: 64 against 55) and up to m = 32 at n = 2^14, 2^17, 2^20 (m = 32:
+    136 us against 163 at 2^14; m = 48: 192 against 163). Backend issues: #37 (`small`: a tuned
+    short product and per-target cutoffs), #38 (`ntt`: memory kept across calls, product into
+    caller memory).
+  - Tests (`test_polynomial.cpp`): every member and operator against O(n^2) references, on sizes
+    0, 1, 2^k - 1, 2^k, 2^k + 1 (k <= 10), every pair of them for `f * g`, random inputs with
+    many zeros or all P - 1 (the largest schoolbook sums); shapes at both cutoffs; NTT lengths
+    2^10 .. 2^21 at random points; shifts by c x^k with c = 0, 1, random; aliasing (f += f,
+    f -= f, f *= f); 4 threads; both errors. 10 injected bugs all fail it: schoolbook's reduction
+    cadence and a block bound, the shift's offset and scale, single-term detection, `degree`,
+    negation, `f - c` on an empty f, the residue of a negative c, `truncate`.
+  - Bench (`frontend/bench.cpp`): `multiply/<lg>` is `f * g` for factors of 2^lg / 2 coefficients,
+    `multiply@kernel/<lg>` the same `ntt::Convolution` call by hand (construct, copy in,
+    multiply). Below lg = 10 the API runs schoolbook. Per-round ratio API / kernel, median of 11
+    rounds (IQR in the PR), GCC 15.2, main at 06feb5c (#35) plus this change; `lc-arm` before #35,
+    which did not change its scalar NTT:
+
+    | lg | `lc-bench` (avx2) | `lc-intel` (avx512) | `lc-zen5` (zen5) | `lc-arm` (arm, scalar NTT) |
+    |---:|---:|---:|---:|---:|
+    | 6 | 0.008 (436 ns, 52 us) | 0.008 (404 ns, 51 us) | 0.010 (303 ns, 30 us) | 0.017 (359 ns, 22 us) |
+    | 9 | 0.282 | 0.253 | 0.361 | 0.418 |
+    | 10 | 1.006 | 1.015 | 1.006 | 1.006 |
+    | 12 | 1.008 | 1.023 | 1.009 | 1.003 |
+    | 14 | 1.017 | 1.046 | 1.016 | 1.002 |
+    | 16 | 1.026 | 1.044 | 1.023 | 1.002 |
+    | 18 | 1.031 | 1.028 | 1.021 | 1.002 |
+    | 20 | 1.038 | 1.044 | 1.019 | |
+    | 22 | 1.058 | 1.046 | 1.035 | |
+
+    The API is 1-6% slower than the kernel case from 2^10 on x86. `ntt::Convolution` leaves the
+    product in its own memory, which it unmaps when it dies, so `f * g` must write it elsewhere.
+    That write is the whole gap, and no frontend change can avoid it. Same-run decomposition
+    (`lc-intel`, 2^14; us):
+    - kernel case: 113.4;
+    - plus a copy into one buffer kept across calls: 118.5;
+    - plus a new zeroed vector, no copy: 118.7;
+    - plus a copy into a new vector: 119.1;
+    - the API: 118.9.
+
+    Any write of the product's size after the product costs the same 5 us. The copy alone, timed
+    by itself, takes 1.4 us; guess: the fresh mapping per call (#38) makes it dearer. #38 asks
+    for a product into caller memory.
+
+    Copy destinations tried (`lc-bench`, out of a page-aligned array, 2^12 to 2^16 words):
+    - a 64-byte aligned vector is 4-5x slower (equal page offsets: 4K aliasing);
+    - 16 bytes past a page boundary is 15-20x slower;
+    - `std::vector`'s own offset is as fast as 64 bytes past.
+
+    On `lc-intel` the offset changes memcpy by at most 10%.
+  - Review of #39, round 1 (four findings), and what changed:
+    1. The header now states the cost of `f * g` against the kernel (0.6% to 6% on x86) and the
+       fast path: `fps::ntt::Convolution` itself today, `fps::raw::mul` after #38.
+    2. Element-wise operators. They copied an lvalue f, then ran the stream in place: two
+       passes. Now each writes its result in one pass into new, unwritten memory; `+` and `-`
+       with an rvalue left operand still work in place. `std::vector` cannot allocate without
+       writing, and with a non-initializing allocator GCC 15 copies it word by word (checked in
+       the asm), so the storage is now `detail::Words`: a `unique_ptr<uint32_t[]>` and a size,
+       copied with memcpy. New bench pairs `add`, `sub`, `neg`, `scale` (`f * c`) at lg 10, 14,
+       18, 22; the kernel case is the modarith stream into new memory, as the operator's result.
+    3. Cutoff `n m < 2^18` -> `n m < 3 2^16` (443 x 443, the crossover measured on `lc-bench`).
+       New bench pair `multiply/480x480`, a shape the old cutoff ran schoolbook.
+    4. Scalars are integer types of at most 64 bits (`detail::Integer`); `__int128` no longer
+       compiles (static_assert in the test). DESIGN.md says so.
+  - Bench order (a note from the backend coordinator: cases in one process affect each other).
+    The cases run Factorials first, then the element-wise pairs, then the products, which map
+    fresh memory per call. Every case makes its inputs in its setup, so they live only while it
+    runs.
+  - Tests: copies, moves and self-assignment; the rvalue forms; shapes at the new cutoff
+    (443 x 443, 443 x 444, 3071 x 64, 64 x 3072). `dirty_heap(n)` frees n words of P - 1 before
+    `truncate` and `reverse`, so a word they forget to write shows up: glibc reuses the block (a
+    dropped zero fill in `reverse` fails 31 checks on `lc-amd`); the Mac's allocator zeroes small
+    blocks on free, so there it passes anyway. 10 mutations of the new code: 8 fail the test on
+    the Mac, the `reverse` one fails it on Linux, and the tenth (a cutoff of 4 2^16) is no bug.
+  - API / kernel after these changes, median of 11 rounds, GCC 15.2, main 27905ef plus this PR:
+
+    | case | `lc-bench` (avx2) | `lc-intel` (avx512) | `lc-zen5` (zen5) | `lc-arm` (arm) |
+    |---|---:|---:|---:|---:|
+    | add/10, /14, /18, /22 | 0.77, 0.97, 1.01, 1.02 | 0.99, 0.99, 1.00, 1.00 | 0.60, 0.83, 0.95, 1.03 | 0.87, 0.94, 0.99, 0.98 |
+    | sub | 0.75, 0.97, 1.01, 0.99 | 1.02, 1.03, 1.00, 1.00 | 0.62, 0.84, 0.96, 1.04 | 0.96, 0.97, 1.00, 0.98 |
+    | neg | 0.83, 0.86, 0.92, 0.93 | 0.95, 0.98, 1.00, 1.00 | 0.46, 0.44, 0.69, 0.73 | 0.89, 0.73, 0.90, 0.97 |
+    | scale | 1.00, 1.00, 1.02, 0.97 | 0.98, 0.98, 0.99, 1.00 | 0.98, 0.84, 0.89, 1.08 | 0.99, 1.00, 1.00, 1.00 |
+    | multiply/10, /14, /18, /22 | 1.005, 1.019, 1.027, 1.061 | 1.013, 1.047, 1.030, 1.045 | 1.004, 1.015, 1.017, 1.033 | 0.989, 0.981, 0.985 (/18) |
+    | multiply/480x480 | 1.017 | 1.015 | 1.003 | 0.992 |
+
+    The element-wise pairs run the same modarith ops on the same inputs into the same kind of
+    memory, yet range from 0.44 to 1.08. Placement, not work: on `lc-zen5`, running each kernel
+    case before its API case (sizes 18 and 22 only) moved scale/22 from 1.077 to 0.973 and
+    neg/22 from 0.73 to 0.85, and a second run of avx512 add/10 gave 1.06 against 0.99. So this
+    harness resolves these pairs to about 10% at 2^22 on `lc-zen5` and 5% at small sizes on
+    `lc-intel`. The products keep their gap (it grows with size on x86, and the decomposition
+    above explains it); on `lc-arm` the API now comes out 1-2% faster, again placement.
+  - Review of #39, round 2 (one finding): `+=` and `-=` with a longer g grew the left operand
+    with `Words::resize` (copy and zero fill), then rewrote every word: two passes, which the
+    rvalue `+` and `-` (e.g. `1 - x - x * x`) inherited. Now they build the result the way the
+    `const&` operator does, in one pass. Tests: shorter left operands (0 to 1000 coefficients)
+    for `+=`, `-=` and the rvalue forms, after `dirty_heap`. After #30 no default build selects
+    `ntt::variant::scalar`, so the products bench runs lg 6 to 22 on every target. The header
+    now says that `Words` has no spare capacity (growth one word at a time is O(n^2)) and that
+    copy assignment always allocates; no caller does either on a hot path.

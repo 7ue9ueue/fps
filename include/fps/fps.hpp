@@ -4,3 +4,4 @@
 
 #include "fps/factorials.hpp"
 #include "fps/modular.hpp"
+#include "fps/polynomial.hpp"
