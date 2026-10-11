@@ -4,7 +4,7 @@ Number-theoretic transforms and products modulo P = 998244353. API: `ntt.hpp` (`
 `Transform`, the leaf form). Variants: `scalar.hpp` (every target; the model), `intrinsics.hpp`
 (`intrinsics<S>`, templates on any `backend/simd` struct S), `avx2.hpp` (lc-opt's `lib/ntt`).
 `select.hpp` picks one per op and length: `avx2` on the `avx2` target; on `avx512` and `zen5`
-`intrinsics<Avx512>` from 2^6-2^10 on (per op and CPU) and `avx2` below; `intrinsics<simd::Native>`
+`intrinsics<Avx512>` from 2^6-2^8 on (per op and CPU) and `avx2` below; `intrinsics<simd::Native>`
 on the other targets. `memory.hpp`: `Convolution`'s memory, kept per thread. Tests: `test.cpp`;
 benches: `bench.cpp`.
 Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_product_kernels.hpp`
@@ -82,23 +82,39 @@ the other variants' word for word.
 - Levels with quarters of at least 32 words run on S, one group at a time. The first level of a
   transform takes inputs < 2P (canonical, or after the radix-2 level), so it skips the input
   reductions: 2 of forward4's, 4 of forward4_identity's (and 2 more for canonical inputs).
+- Each butterfly is two stages on a column of 4 vectors (forward: input reductions and x f2,
+  x f3, then the rest; inverse: the sums and y (a - b), z (c - d), then the rest). Groups run
+  them software pipelined (`each2`): the first stage of column j + 1, then the second of column j,
+  unrolled by 2 so no registers are copied. Shorter dependency chains per loop iteration: on L1
+  data, forward and inverse groups 5-8% and 8-9% faster on Neoverse V2, 11% and 7% on Zen 5, 2-4%
+  and 4-5% on Emerald Rapids (Measurements). Identity groups (k = 0) only where that won
+  (`kPipelined`): Neoverse V2 both (1.5%, 8%), Zen 4/5 the inverse (4%); Emerald Rapids lost 1-3%
+  on them.
 - Shoup products go through an empty asm statement (`Arith::whole`). Without it GCC distributes
   x w - q P over the product's uses (a + c -> (a - q P) + x w, a - c -> (a + q P) - x w): 24 adds
   and subtracts per forward radix-4 column instead of 19 on zmm (Log, issue #5).
-- Bottom level (quarters of 8 words, one leaf each): on S up to 8 lanes, one group at a time. On
-  `Avx512` (16 lanes, `WideBottom`): two groups k, k + 1 per step; four `vpermt2d` turn their 64
-  words into vectors [quarter t of group k, quarter t of group k + 1], so the butterflies are
-  lane-wise with twiddles [w_k x 8, w_(k+1) x 8] (two `vpermd` of one 16-word table load each),
-  and four more turn them back.
+- Bottom level (quarters of 8 words, one leaf each): on S up to 8 lanes, one group at a time, its
+  columns two at a time on 4-lane structs (Neon, Sse: bottom forward 10%, inverse 8% faster on
+  Neoverse V2). On `Avx512` (16 lanes, `WideBottom`): two groups k, k + 1 per step; four
+  `vpermt2d` turn their 64 words into vectors [quarter t of group k, quarter t of group k + 1], so
+  the butterflies are lane-wise with twiddles [w_k x 8, w_(k+1) x 8] (two `vpermd` of one 16-word
+  table load each), and four more turn them back.
 - Recursion: depth first; subtrees of at most 256 leaves (8 KiB per array) run level by level.
   Each subtree has its own bottom stage (avx2 now merges sibling subtrees into one tile; not done
   here). Top: a radix-2 level (odd lg - 3) or group 0, with the sparse forms for a factor of at
-  most L/2 coefficients, and the scale fused into the last inverse level (group 0: 4 products per
-  column, as `s (a - b)` and `s z (c - d)` serve two outputs each). Sparse with the radix-2 level:
-  no copy; the upper subtree runs first and its first level reads the lower half (from nv / 2 =
-  16 leaves; below, the first level is the bottom, which works in place, so the half is copied).
-  Sparse with group 0: group 0 reads half the input. No fused radix-8 top: slower everywhere it
-  was tried (Log).
+  most L/2 coefficients. The inverse scale goes into the top groups of the subtrees below the top
+  level (`inverse_group_scaled`: twiddles s x, s y, s z and one product more for the first output,
+  so 5 products per column, and 4 against 1 for k = 0), when those have a group level (16 leaves
+  or more), on Emerald Rapids up to 2^17 (`kFoldMaxLog`; Log); their twiddles come from a
+  compile-time table per length (`kScaledRoots`: s r(i) for i < 8 and quotients; computed per
+  call they cost Zen 5 6% at 2^9). The top level then only adds: per vector of the transform, 0.5
+  products fewer and 1.25 other ops more under a radix-2 top (2 products per pair before), 0.375
+  products fewer under a radix-4 top (4 products per column before, as `s (a - b)` and
+  `s z (c - d)` served two outputs each; that form stays for the shortest lengths). Sparse with
+  the radix-2 level: no copy; the upper subtree runs first and its first level reads the lower
+  half (from nv / 2 = 16 leaves; below, the first level is the bottom, which works in place, so
+  the half is copied). Sparse with group 0: group 0 reads half the input. No fused radix-8 top:
+  slower everywhere it was tried (Log).
 - Products, per bottom group: forward butterflies of a and b, leaf products, inverse butterflies,
   one store. Leaf products: x86 up to 8 lanes (`mul_even`): lc-opt's even/odd form, windows
   [w A, A] in a stack buffer read at offsets 1..9, each b_i broadcast once, 64-bit sums < 8 P^2,
@@ -111,20 +127,25 @@ the other variants' word for word.
   Emerald Rapids, like the `vpermt2d` it replaced), b_i of both halves a broadcast and a masked
   broadcast load (`broadcast_halves`: p0 or p5, where the `vpermd` it replaced is p5 only; the
   leaf products had p5 at 161 uops per pair against p0 at 138), and the twiddles too. Neon: `umull`/`umlal` (+`umull2`/`umlal2`) on
-  the windows, `uzp1` for m, `umlal` for m P, `uzp2`. Scalar: one u64 sum per word.
+  the windows, `uzp1` for m, `umlal` for m P, `uzp2`; two leaves at a time, both words of each
+  (8 independent sums), each b_i broadcast once per leaf. Scalar: one u64 sum per word.
 - Lengths below 2^kWideMinLog run wholly on `Narrow<S>` (S, or `Avx512Vl` for `Avx512`): 2^8 on
   Emerald Rapids, 2^7 on Zen 4/5 (`__znver4__`, `__znver5__`). Before the zmm bottom level, zmm
   levels above ymm bottom stores were 1.25-1.33x slower at 2^7 and 2^8 on Emerald Rapids
   (`ld_blocks.store_forward` 1.8M against 12k: wide loads of narrow stores still in flight).
 - GCC 15 at -O2 kept the fixed 4- and 8-trip loops of the leaf products rolled and did not inline
   the butterfly lambdas of the bottom level; `#pragma GCC unroll` and `[[gnu::always_inline]]`
-  fix both (Log).
+  fix both (Log). A range-for over the 4 vectors of a column also stays rolled, through the
+  stack (the zmm bottom forward had one: 8% of its time on Zen 5), so columns are written out.
+  `Arith`'s ops are `always_inline`: in the bench binary (more instantiations than a probe) GCC
+  left `Arith::mul` out of line once the groups were pipelined, a call per product (Zen 5 1.4x
+  slower; Log).
 - `variant::by_length<lg, Small, Large>` (`select.hpp`): Small below 2^lg. On `avx512`: avx2
-  below 2^9 (forward) and 2^10 (multiply), intrinsics at every length for inverse; on `zen5` avx2
-  below 2^8 for all three. From @avx2 against @intrinsics_avx512 in one binary, 5 rounds,
-  intrinsics/avx2 at 2^6..2^9 (issue #5, after its changes): Emerald Rapids forward 1.05 1.00
-  0.98 0.87, inverse 0.79 0.98 0.89 0.90, multiply 0.96 1.10 1.04 1.04 (0.87 at 2^10); Zen 5
-  forward 1.11 1.09 0.95 0.80, inverse 1.11 0.97 0.79 0.78, multiply 1.39 1.46 0.90 0.83.
+  below 2^8 (forward, multiply), intrinsics at every length for inverse; on `zen5` avx2 below 2^7
+  (forward) and 2^8 (inverse, multiply). From @avx2 against @intrinsics_avx512 in one binary, 5
+  rounds, intrinsics/avx2 at 2^6..2^9 (issue #4 round 2, after its changes): Emerald Rapids forward
+  1.05 1.00 0.84 0.79, inverse 0.84 0.96 0.89 0.85, multiply 0.94 1.07 0.80 0.82; Zen 5 forward
+  1.11 0.88 0.80 0.68, inverse 1.11 1.03 0.78 0.75, multiply 1.15 1.14 0.67 0.64.
 
 ## Measurements
 
@@ -355,6 +376,48 @@ Inverse group: 486 (96%) -> 473. zmm bottom forward, 16 pairs of groups: 932 (84
 Inverse: 715 (86%) -> 630 (95%). Product bottom, 32 pairs: 10200 (79%, already with `whole`) ->
 8990 (90%).
 
+### intrinsics, issue #4 round 2
+
+Against main (2b576e8), paired, 7 rounds, `kernel.py bench --base`, the 80 gated cases, GCC 15.2,
+`tools/kernel.py` flags, 2026-10-11, commit bd8e38d (before the 2^17 limit of the folded scale on
+Emerald Rapids, Log). Geomean new/base: `lc-arm` (Neoverse V2) 0.877, `lc-zen5` (Zen 5) 0.942,
+`lc-intel` (Emerald Rapids) 0.962. New ns per call (new/base):
+
+| lg | V2 forward | V2 inverse | V2 multiply | Zen 5 forward | Zen 5 inverse | Zen 5 multiply | EMR forward | EMR inverse | EMR multiply |
+|---:|---|---|---|---|---|---|---|---|---|
+| 6 | 32 (0.988) | 34 (1.036) | 198 (0.890) | 18 (1.000) | 18 (1.000) | 89 (1.000) | 22 (1.000) | 27 (1.043) | 141 (1.001) |
+| 8 | 162 (0.895) | 172 (0.912) | 885 (0.880) | 60 (0.846) | 62 (0.978) | 233 (0.940) | 89 (0.868) | 97 (0.971) | 380 (0.803) |
+| 10 | 897 (0.884) | 916 (0.894) | 4167 (0.879) | 258 (0.889) | 249 (0.922) | 1010 (0.956) | 429 (0.917) | 461 (0.952) | 1856 (0.991) |
+| 12 | 4611 (0.876) | 4625 (0.889) | 19412 (0.874) | 1228 (0.905) | 1184 (0.915) | 4676 (0.949) | 2211 (0.944) | 2304 (0.969) | 8754 (0.984) |
+| 16 | 1.06e5 (0.870) | 1.06e5 (0.886) | 4.07e5 (0.871) | 27016 (0.903) | 26053 (0.921) | 96260 (0.938) | 53383 (0.953) | 52268 (0.972) | 1.86e5 (0.983) |
+| 20 | 2.26e6 (0.866) | 2.27e6 (0.890) | 8.31e6 (0.871) | 5.65e5 (0.904) | 5.42e5 (0.935) | 1.94e6 (0.936) | 1.21e6 (0.961) | 1.17e6 (0.979) | 4.27e6 (0.970) |
+| 25 | 9.51e7 (0.866) | 9.91e7 (0.886) | 3.38e8 (0.877) | 3.03e7 (0.938) | 2.86e7 (0.970) | 9.69e7 (0.964) | 5.47e7 (0.957) | 5.74e7 (0.952) | 2.01e8 (0.978) |
+
+Cases above 1.005: Zen 5 inverse/7 1.009 (the asm, unchanged); Emerald Rapids inverse/6 1.043
+(IQR 0.996-1.102), multiply/7 1.006 (the asm), and every case at 2^18: inverse 1.037, multiply
+1.054, multiply_dense 1.037, convolution 1.039 (the folded scale; off there from 2^18 now: those
+cases 0.938-0.946 against bd8e38d, 7 rounds, 2^19 inverse 1.016, the rest of 2^16..2^19 within
+0.5%); Neoverse V2 inverse/6 1.036 (one radix-2 level and two bottom groups; not found).
+
+Kernels on L1 data (`micro.cpp` in the exploration folder; 1024 words per array: groups of 4
+quarters of 256 words, 32 bottom groups), main -> this round, the same run, 2 rounds each.
+Neoverse V2, cycles (`perf stat`): forward group 841 -> 770, inverse group 831 -> 762, identity
+groups 665 -> 669 and 673 -> 605, bottom forward 1281 -> 1157, inverse 825 -> 760, product bottom
+8608 -> 7666. Zen 5, ns: 63.6 -> 56.5, 60.9 -> 56.6, 38.0 -> 38.1 and 35.5 -> 34.2, bottom forward
+137 -> 127, inverse 91.3 -> 92.4, product bottom 630 -> 629. Emerald Rapids, cycles: 503 -> 491,
+502 -> 480, 306 -> 306 and 281 -> 283, bottom forward 921 -> 825, inverse 627 -> 652 (the same
+instructions as main, diffed), product bottom 4413 -> 4414. Main's forward group alone moved
+between 790 and 841 cycles on Neoverse V2 across builds of the probe (code placement, a guess).
+
+Neoverse V2 instruction mixes (`v2mix.cpp`, exploration folder): blocks of independent `mul`
+(M, the V0/V2 pipes) and `add` (A, any of V0-V3), instructions per cycle by the order of one
+repeated pattern: A 4.0, M 2.0, MA 4.0, MAAA 4.0, MMAA 4.0, MAA 3.0, AMA 3.0, MMAAAA 3.1, MAAAAA
+3.5, MAAAAAAA 3.6, MMMAAAAA 3.6. So the order alone moves mixed code between 3 and 4 per cycle,
+even with 1 multiply in 8 (guess: pipes chosen at dispatch, and mixed latencies 4 and 2 sharing
+V0/V2 write ports; no simple steering rule fit all patterns). The forward group loop's own
+instruction sequence, with independent registers: 9.9 cycles per column, against 12.4 in the loop
+(main). `str q` takes a V0/V1 uop for its data (LLVM's Neoverse V2 model), and `ld1r` a V uop.
+
 ## Log
 
 2026-10-11, claude (issue #3, round 1): moved lc-opt `lib/ntt` (`ntt.hpp`, `product.hpp`, both
@@ -566,6 +629,64 @@ Measurements above; files and raw output in `~/Documents/hpc_library-explore/ntt
   - The scale folded into the top inverse groups instead of the radix-2 level: +1 product per
     column in group 1, +3 in group 0 (identity), -14 uops per pair at the top: about 2.5 uops per
     vector. Not done.
+
+2026-10-11, claude (issue #4, round 2): faster intrinsics on every target that selects them.
+Measurements above (intrinsics, issue #4 round 2); files and raw output in
+`~/Documents/hpc_library-explore/ntt/intrinsics-r2/`. Kernel cycles from `micro.cpp` on L1 data,
+whole ops from `kernel.py bench --base`, GCC 15.2, `tools/kernel.py` flags.
+- Where the time went on Neoverse V2 (`perf`, main): multiply/16 by function: product bottom 41%,
+  forward groups 38%, inverse groups 18%. The forward group ran 12.4 cycles per column of 4
+  vectors: 31 V uops (12 on the multiply pipes V0/V2) and 4 stores, 2.5 per cycle where its
+  instruction mix with independent registers runs at 9.9 cycles (Measurements); 37% of the
+  dispatch slots stalled on the back end. The product bottom: 1.8 Neon ops per cycle.
+- Won: groups software pipelined (`each2`, Design). L1 kernels above; whole ops in the first
+  bench of the round (with the next two changes): Neoverse V2 0.925, Emerald Rapids 0.981.
+- Won: the bottom level (Neon, Sse) two columns per step: Neoverse V2 bottom forward 1281 -> 1156
+  cycles per 32 groups, inverse 825 -> 759.
+- Won: Neon leaf products two leaves at a time, all words, each b_i broadcast once per leaf
+  (Design). Per 32 groups: 8611 cycles (one leaf and word at a time) -> 7874 (4 leaves, 16 sums:
+  spilled to the stack, the asm showed) -> 2.5% less with 2 leaves (8330 against 8540 in one run;
+  1 leaf: 8500); final run 8608 -> 7666.
+- Won: the inverse scale folded into the top groups of the subtrees (Design). Paired against the
+  same code with the scale at the top level, 5 rounds: Neoverse V2 inverse 0.93-0.99, multiply
+  0.99-1.0; Zen 5 inverse 0.95-0.99, multiply 0.98-1.0 (geomean 0.990); Emerald Rapids 0.995,
+  inverse 0.95-0.98 to 2^17, but 2^18 1.069 (inverse) and 1.055 (multiply), seen in all three runs
+  with the fold, and not in a probe (`micro.cpp` at 2^18: 1.5% faster with it). So the fold stops
+  at 2^17 on Emerald Rapids (`kFoldMaxLog`). The scaled twiddles were first computed per call
+  (`multiply_mod` and `quotient`, 4 factors per group): Zen 5 inverse/9 1.062 against main; from
+  a compile-time table: 0.969.
+- Won: `Arith`'s ops `always_inline`. The first bench of the pipelined groups ran Zen 5 1.38x
+  slower than main (forward/16 47 us against 30) while the probe was faster: `perf record` (cpu-
+  clock) showed `Arith<Avx512>::mul` as its own function, 32% of the time, in the bench binary.
+- Won: the zmm bottom forward's `for (V& v : q) v = canonical(low(v))` written out. GCC kept it
+  rolled, through the stack (since issue #5's code). Zen 5 bottom forward 138 -> 127 ns per 32
+  groups, forward/10 0.94, forward/16 0.985.
+- Won: thresholds (`select.hpp`, Design): Emerald Rapids forward and multiply from 2^8 (were 2^9
+  and 2^10: multiply/8 0.803, multiply/9 0.82 against main), Zen 5 forward from 2^7 (was 2^8).
+- Tried, lost or no gain:
+  - Two columns per loop iteration in the groups (no pipelining): Neoverse V2 fgroup 791 -> 781,
+    igroup 809 -> 788; 4 columns: 813, 821; x86 within 1%.
+  - SVE2 `umulh` unpredicated (inline asm, no `movprfx`): fgroup 790 both; 256 fewer instructions.
+  - GCC flags (only to probe the order sensitivity; the targets' flags are fixed): `-fschedule-insns`
+    product bottom 8590 -> 7400 (`-fsched-pressure` the same), groups unchanged; `-fno-schedule-insns2`
+    groups 10% slower; `-mtune=neoverse-n2`, `cortex-a72`, `generic`, `-fmodulo-sched`, `-funroll-loops`:
+    within 5%, mostly slower.
+  - The other split of the forward butterfly (the sums a + c, a - c, b + d, b - d in the first
+    stage): fgroup 768 -> 846 on Neoverse V2.
+  - Three stages, unrolled by 3 (loads and x products; sums; y, z products and outputs): Neoverse
+    V2 fgroup 4% faster than two stages in a probe, but forward/16 1.014, multiply/16 1.001; Emerald
+    Rapids and Zen 5 within 1% (forward/16 0.995 and 0.994, multiply/12 1.004 and 1.009). Not kept
+    (`src-intrinsics-stages3.hpp` in the exploration folder).
+  - Neon leaf products by element (`umlal` with a lane of b, b in 2 registers per leaf instead of
+    8 `ld1r`): product bottom 7750 -> 11880 cycles (GCC's code, 9000 more instructions per call).
+    Not kept (`src-intrinsics-leaflane.hpp`).
+- Tests: `inverse_group_scaled` against the lane model times s (k < 4, s = P - 1 and random, inputs
+  at the edge of < 2P); the folded scale through every transform and product test, at every lg
+  (both forms on Emerald Rapids). Pass at -O2 and ASan/UBSan on `lc-amd` (scalar, sse, avx2),
+  `lc-intel-test`, `lc-zen5-test`, `lc-arm` and the Mac (scalar, arm); frontend on avx512 and the
+  Mac.
+- Open: small's tuned NTT times (`backend/small/tuned.hpp`, issue #54) were measured before this
+  round; `tools/tune.py small` should run again on arm, avx512 and zen5.
 
 ## Sources
 

@@ -54,13 +54,13 @@ using NativeMultiply = Native;
 #elif defined(__AVX2__)
 using Native = variant::intrinsics<fps::simd::Native>;
 #if defined(__znver4__) || defined(__znver5__)
-using NativeForward = variant::by_length<8, variant::avx2, Native>;  // Zen 5
+using NativeForward = variant::by_length<7, variant::avx2, Native>;  // Zen 5
 using NativeInverse = variant::by_length<8, variant::avx2, Native>;
 using NativeMultiply = variant::by_length<8, variant::avx2, Native>;
 #else
-using NativeForward = variant::by_length<9, variant::avx2, Native>;  // Emerald Rapids
+using NativeForward = variant::by_length<8, variant::avx2, Native>;  // Emerald Rapids
 using NativeInverse = Native;
-using NativeMultiply = variant::by_length<10, variant::avx2, Native>;
+using NativeMultiply = variant::by_length<8, variant::avx2, Native>;
 #endif
 #else
 using Native = variant::intrinsics<fps::simd::Native>;

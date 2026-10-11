@@ -432,6 +432,16 @@ struct IntrinsicsKernels {
                       [&](u32* f) { K::template forward_group<1>(f, q, k, t.r()); }, fm(k));
                 check(name + " inverse_group", q, 1, 2 * u64(P), 2 * u64(P),
                       [&](u32* f) { K::inverse_group(f, q, k, t.ir()); }, im(k));
+                // The top groups that take the scale: k < 4.
+                const u32 s = round == 1 ? P - 1 : 1 + random_below(P - 1);
+                const auto scaled = detail::intrinsics::scaled_block(s);
+                check(name + " inverse_group_scaled", q, 1, 2 * u64(P), 2 * u64(P),
+                      [&](u32* f) { K::inverse_group_scaled(f, q, k % 4, t.ir(), scaled.words); },
+                      [&](const std::array<u32, 4>& f, std::size_t g) {
+                          auto e = im(k % 4)(f, g);
+                          for (u32& x : e) x = mul(x, s);
+                          return e;
+                      });
             }
         }
         for (int round = 0; round < 30; ++round) {
