@@ -20,10 +20,12 @@
 // and allocate nothing, except += and -= with a longer g, which build the result in one pass too.
 //
 // f * g with n and m coefficients: a factor with at most one nonzero term (c x^k) makes it a
-// shift, O(n + m); min(n, m) <= 32 or n m < 3 2^16 runs schoolbook; the rest runs the backend's
-// ntt::Convolution, which needs n + m - 1 <= 2^25 (else std::length_error). The Convolution keeps
-// the product in its own memory, so f * g copies it out: 0.6% to 6% over the kernel on x86 from
-// 2^10 coefficients (frontend/notes.md). The fast path is fps::ntt::Convolution itself, reading
+// shift, O(n + m); a product the backend's small::multiply does faster than the NTT on this target
+// runs it (small::beats_ntt(n, m): on the timed targets min(n, m) up to 38-175 next to a long
+// factor of any length, or n = m up to 25-104); the rest runs ntt::Convolution, which needs
+// n + m - 1 <= 2^25 (else std::length_error). The Convolution keeps the product in its own memory,
+// so f * g copies it out: 0.6% to 6% over the kernel on x86 from 2^10 coefficients
+// (frontend/notes.md). The fast path is fps::ntt::Convolution itself, reading
 // the product from multiply(), or Convolution(n, m, a), which leaves it in the caller's a (backend
 // issue #38; f * g does not use it yet). Later: fps::raw::mul (DESIGN.md, Raw functions).
 #pragma once
@@ -42,6 +44,7 @@
 #include "backend/modarith/modarith.hpp"
 #include "backend/ntt/ntt.hpp"
 #include "backend/simd/select.hpp"
+#include "backend/small/small.hpp"
 #include "fps/modular.hpp"
 #include "fps/words.hpp"
 
@@ -89,36 +92,6 @@ inline std::optional<Term> single_term(std::span<const std::uint32_t> f) {
         t = {i, f[i]};
     }
     return t;
-}
-
-// Whether a product of n and m coefficients runs schoolbook rather than ntt::Convolution. On Zen 3
-// schoolbook costs 0.24 ns per term; a Convolution cost 51 us at any short length (a fresh mapping
-// per call) plus 3 to 4.5 ns per coefficient of its length. They met near 443 x 443 (3 2^16 terms)
-// and, for long factors, between m = 32 and m = 48 (frontend/notes.md). Stale: since backend
-// issue #38 a Convolution keeps its memory per thread and costs about what multiply() costs; the
-// cutoff is issue #37's.
-constexpr bool schoolbook_wins(std::size_t n, std::size_t m) {
-    return std::min(n, m) <= 32 || n * m < 3 * (std::size_t(1) << 16);
-}
-
-// out = a b for out.size() = a.size() + b.size() - 1, in blocks of 64 outputs. 64-bit sums: a
-// reduced sum plus 16 products below P^2 stays below 2^64 for P < 2^30.
-template <std::uint32_t P>
-void schoolbook(std::span<const std::uint32_t> a, std::span<const std::uint32_t> b, std::span<std::uint32_t> out) {
-    constexpr std::size_t kBlock = 64;
-    std::uint64_t sum[kBlock];
-    for (std::size_t lo = 0; lo < out.size(); lo += kBlock) {
-        const std::size_t hi = std::min(out.size(), lo + kBlock);
-        std::fill(sum, sum + (hi - lo), 0);
-        const std::size_t first = lo < a.size() ? 0 : lo - a.size() + 1, last = std::min(b.size(), hi);
-        for (std::size_t j = first; j < last; ++j) {
-            const std::size_t begin = lo > j ? lo - j : 0, end = std::min(a.size(), hi - j);
-            for (std::size_t i = begin; i < end; ++i) sum[i + j - lo] += std::uint64_t(a[i]) * b[j];
-            if ((j - first) % 16 == 15)
-                for (std::size_t k = 0; k < hi - lo; ++k) sum[k] %= P;
-        }
-        for (std::size_t k = 0; k < hi - lo; ++k) out[lo + k] = std::uint32_t(sum[k] % P);
-    }
 }
 
 }  // namespace detail
@@ -255,9 +228,9 @@ public:
         if (f.size() == 0 || g.size() == 0) return {};
         if (const auto t = detail::single_term(g.span())) return shifted(f, *t, g.size());
         if (const auto t = detail::single_term(f.span())) return shifted(g, *t, f.size());
-        if (detail::schoolbook_wins(f.size(), g.size())) {
+        if (small::beats_ntt(f.size(), g.size())) {
             Polynomial h(f.size() + g.size() - 1, kUnwritten);
-            detail::schoolbook<P>(f.span(), g.span(), h.span());
+            small::multiply<P>(f.span(), g.span(), h.span());
             return h;
         }
         return convolution(f, g);

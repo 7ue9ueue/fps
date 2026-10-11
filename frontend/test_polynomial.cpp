@@ -1,5 +1,5 @@
 // Tests of fps/polynomial.hpp against O(n^2) references: the class, the sums and scalings, and
-// f * g on each path (shift, schoolbook, ntt::Convolution), on edge sizes and random inputs.
+// f * g on each path (shift, small::multiply, ntt::Convolution), on edge sizes and random inputs.
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -159,7 +159,7 @@ void test_errors() {
     const Vec bad = {0, 1, 2, P + 1};
     CHECK(throws<std::domain_error>([&] { (void)poly(bad); }));
     // An NTT product past the backend's 2^25 coefficients; the factors are not short.
-    Poly f(std::size_t(1) << 25), g(33);
+    Poly f(std::size_t(1) << 25), g(4096);
     f[0] = f[1] = g[0] = g[1] = 1;
     CHECK(throws<std::length_error>([&] { (void)(f * g); }));
 }
@@ -278,9 +278,11 @@ void check_long_product(std::size_t n, std::size_t m) {
 void test_products() {
     for (const std::size_t n : kSizes)
         for (const std::size_t m : kSizes) check_product(random_vec(n, int(rng() % 4)), random_vec(m, int(rng() % 4)));
-    // Around the schoolbook limits (n m = 3 2^16, min(n, m) = 32); the largest sums on both paths.
+    // Around the cutoffs of small::beats_ntt, which differ per target: both short (16 to 128
+    // each) and one short (4 to 128 against thousands); the largest sums on both paths.
     for (const auto& [n, m] : std::vector<std::pair<std::size_t, std::size_t>>{
-             {443, 443}, {443, 444}, {512, 384}, {512, 511}, {3071, 64}, {64, 3072}, {9000, 32}, {33, 9000}})
+             {24, 24}, {33, 32}, {48, 47}, {64, 64}, {97, 96}, {128, 129}, {3000, 4}, {3000, 16}, {3000, 24},
+             {32, 3000}, {3000, 48}, {3000, 64}, {96, 3000}, {3000, 128}, {9000, 32}, {33, 9000}})
         for (const int kind : {0, 3}) check_product(random_vec(n, kind), random_vec(m, kind));
     // Shifts: a factor with one nonzero term, or none.
     for (const std::size_t n : {std::size_t(1), std::size_t(64), std::size_t(3000)})
@@ -309,6 +311,7 @@ void test_products() {
     }
     check_long_product(1 << 19, 3);
     check_long_product(5, 1 << 18);
+    check_long_product(std::size_t(1) << 25, 2);  // past the NTT's 2^25: small::multiply
 }
 
 void test_threads() {
