@@ -38,6 +38,11 @@ struct by_length {
         if (lg < kFromLog) return Small::multiply(a, b, n, m, lg, roots, inverse_roots);
         Large::multiply(a, b, n, m, lg, roots, inverse_roots);
     }
+
+    static void multiply(const detail::Product& p, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
+        if (p.lg < kFromLog) return Small::multiply(p, roots, inverse_roots);
+        Large::multiply(p, roots, inverse_roots);
+    }
 };
 
 }  // namespace variant

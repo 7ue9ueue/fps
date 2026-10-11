@@ -22,6 +22,8 @@ LATENCY = {'vpmuludq': 3, 'vpmulld': 3, 'vpsrlq': 1, 'vpaddd': 1, 'vpsubd': 1,
 PIPE = {'vpmuludq': 'mul', 'vpmulld': 'mul', 'vpsrlq': 'shift'}
 COMMUTATIVE = {'vpaddd', 'vpaddq', 'vpminud', 'vpmuludq', 'vpmulld'}
 LOADS = {'vmovdqa', 'vmovdqu', 'vbroadcastss'}
+# Bases in the caller's memory, any 4-byte alignment: unaligned loads and stores.
+UNALIGNED = {'s', 'o', 'o2'}
 
 
 class ScheduleError(Exception):
@@ -59,14 +61,16 @@ class Graph:
     """Builds the ops of one butterfly or bottom stage, in source order. Memory operands fold into
     instructions where the encoding allows it; otherwise each is loaded once per graph."""
 
-    def __init__(self, consts, disp=0, array='a', share_broadcasts=True):
+    def __init__(self, consts, disp=0, array='a', share_broadcasts=True, src=None, out=None):
+        """Quarters are read from src and written to out, both array unless given."""
         self.ops, self.c, self.disp, self.array = [], consts, disp, array
+        self.src, self.out = src or array, out or array
         self.share_broadcasts = share_broadcasts
         self.loaded = {}  # memory value (or broadcast address) -> register value
 
     def quarter(self, i, extra=0):
         """Vector i of the four the butterfly reads, extra bytes past it."""
-        return Value('mem', mem=(self.array, i, self.disp + extra))
+        return Value('mem', mem=(self.src, i, self.disp + extra))
 
     def at(self, base, disp, fold=True):
         v = Value('mem', mem=(base, None, disp))
@@ -88,7 +92,8 @@ class Graph:
             return v
         if v not in self.loaded:
             r = Value('reg')
-            self.ops.append(Op('vmovdqa' if v.mem[2] % 32 == 0 else 'vmovdqu', r, [v]))
+            aligned = v.mem[2] % 32 == 0 and v.mem[0] not in UNALIGNED
+            self.ops.append(Op('vmovdqa' if aligned else 'vmovdqu', r, [v]))
             self.loaded[v] = r
         return self.loaded[v]
 
@@ -109,7 +114,7 @@ class Graph:
         self.ops.append(Op('vmovdqa', None, [v], store=(base, index, disp)))
 
     def store_quarter(self, v, i):
-        self.store(v, self.array, i, self.disp)
+        self.store(v, self.out, i, self.disp)
 
     def add(self, x, y):
         return self.op('vpaddd', x, y)
@@ -197,6 +202,19 @@ def forward_top(g):
     z = g.shoup(g.op('vpsubd', g.op('vpaddd', b, c['P']), dd), c['WZ'], c['QZ'])
     g.store_quarter(g.add(ac, bd), 0)
     g.store_quarter(g.diff(ac, bd), 1)
+    g.store_quarter(g.add(amc, z), 2)
+    g.store_quarter(g.diff(amc, z), 3)
+
+
+def forward_top3(g):
+    """forward_top with the last quarter zero, not read: bd = b, z = shoup(b)."""
+    c = g.c
+    a, b, cc = (g.quarter(i) for i in range(3))
+    z = g.shoup(b, c['WZ'], c['QZ'])  # first: it loads b, which the adds below then reuse
+    ac = g.add(a, cc)  # < 2P
+    amc = g.op('vpsubd', g.op('vpaddd', a, c['P']), cc)  # < 2P
+    g.store_quarter(g.add(ac, b), 0)
+    g.store_quarter(g.diff(ac, b), 1)
     g.store_quarter(g.add(amc, z), 2)
     g.store_quarter(g.diff(amc, z), 3)
 
@@ -422,6 +440,16 @@ def schedule(ops, budget, knobs):
     return order
 
 
+def prune(ops):
+    """The ops some store needs, in their order: drops outputs a kernel does not store."""
+    live, kept = set(), []
+    for o in reversed(ops):
+        if o.store is not None or o.dst in live:
+            kept.append(o)
+            live.update(s for s in o.srcs if s.kind == 'reg')
+    return kept[::-1]
+
+
 def allocate(seq, reserved):
     """Linear scan: a register frees at its value's last use and goes to the next new value."""
     last = {}
@@ -469,7 +497,8 @@ def operand(v, reg):
 
 def emit(o, reg):
     if o.store is not None:
-        return f'vmovdqa {operand(o.srcs[0], reg)}, {address(o.store)}'
+        move = 'vmovdqu' if o.store[0] in UNALIGNED else 'vmovdqa'
+        return f'{move} {operand(o.srcs[0], reg)}, {address(o.store)}'
     dst = f'%%ymm{reg[o.dst]}'
     if o.mnemonic in LOADS:
         return f'{o.mnemonic} {operand(o.srcs[0], reg)}, {dst}'
@@ -491,6 +520,7 @@ class Loop:
     twiddles: str          # 'xyz': x, y, z (values on the stack, quotients in ymm11-13); 'z': z only
     pair: bool = False     # one butterfly of a and one of b per iteration (else two of a)
     knobs: Knobs = field(default_factory=Knobs)
+    src: bool = False      # reads the quarters from s (any alignment), writes them to a
     doc: str = ''
 
 
@@ -507,6 +537,11 @@ LOOPS = [
         'forward() for group 0 (x = y = 1); z = y[1]: pass the table start. h even.')),
     Loop('forward_top', forward_top, 'z', doc=(
         'forward_identity() on canonical input: the first level of a transform. h even.')),
+    Loop('forward_top_from', forward_top, 'z', src=True, doc=(
+        'forward_top() from a source: columns j < columns of the quarters, the vectors at\n'
+        's + 8 (j + t h) (any alignment; s may be a), into a[j + t h]. columns even.')),
+    Loop('forward_top3_from', forward_top3, 'z', src=True, doc=(
+        'forward_top_from() with the quarter at s + 24 h zero, not read. columns even.')),
     Loop('inverse_identity', inverse_identity, 'z', doc=(
         'inverse() for group 0; z = y[1]: pass the inverse table start. h even.')),
     Loop('scale_radix2', scale_radix2, 'z', doc=(
@@ -538,7 +573,8 @@ def loop_body(loop):
             reserved.add(11 + i)
     ops = []
     for k in range(2):
-        g = Graph(consts, disp=0 if loop.pair else 32 * k, array='b' if loop.pair and k else 'a')
+        g = Graph(consts, disp=0 if loop.pair else 32 * k, array='b' if loop.pair and k else 'a',
+                  src='s' if loop.src else None)
         loop.graph(g)
         ops += g.ops
     seq = schedule(ops, 16 - len(reserved), loop.knobs)
@@ -578,7 +614,8 @@ def loop_asm(loop):
         for i, (src, disp) in enumerate([('x', 0), ('y', 0), ('y', 4)]):
             head += [f'vbroadcastss {address((src, None, disp))}, %%ymm0', f'vmovdqa %%ymm0, {address(("w", None, 32 * i))}',
                      f'vbroadcastss {address((src, None, disp + 32))}, %%ymm{11 + i}']
-    tail = (['add $32, %[b]'] if loop.pair else []) + [f'add ${32 * step}, %[a]', 'cmp %[end], %[a]', 'jne 1b']
+    tail = (['add $32, %[b]'] if loop.pair else []) + (['add $64, %[s]'] if loop.src else [])
+    tail += [f'add ${32 * step}, %[a]', 'cmp %[end], %[a]', 'jne 1b']
     return head + ['.p2align 5', '1:'] + loop_body(loop) + tail
 
 
@@ -590,8 +627,10 @@ def bottom_asm(part):
 def loop_function(loop):
     body = loop_asm(loop)
     args = "Vec* a, Vec* b, std::size_t h" if loop.pair else "Vec* a, std::size_t h"
+    if loop.src:
+        args = "const std::uint32_t* s, Vec* a, std::size_t columns, std::size_t h"
     twiddle_args = 'const std::uint32_t* x, const std::uint32_t* y' if loop.twiddles == 'xyz' else 'const std::uint32_t* y'
-    outputs = '[a] "+r"(a)' + (', [b] "+r"(b)' if loop.pair else '')
+    outputs = '[a] "+r"(a)' + (', [b] "+r"(b)' if loop.pair else '') + (', [s] "+r"(s)' if loop.src else '')
     inputs = '[end] "r"(end), [h] "r"(32 * h), [h3] "r"(96 * h), [y] "r"(y)'
     if loop.twiddles == 'xyz':
         inputs += ', [x] "r"(x), [w] "r"(w)'
@@ -599,7 +638,7 @@ def loop_function(loop):
     lines += [f'inline void {loop.name}({args}, {twiddle_args}) {{']
     if loop.twiddles == 'xyz':
         lines += ['    alignas(32) Vec w[3];  // twiddle values x, y, z; their quotients stay in ymm11-13']
-    lines += ['    Vec* const end = a + h;', '    asm volatile(']
+    lines += [f'    Vec* const end = a + {"columns" if loop.src else "h"};', '    asm volatile(']
     lines += asm_lines(body)
     lines += [f'        : {outputs}', f'        : {inputs}, [P] "m"(kP), [P2] "m"(k2P)',
               '        : ' + CLOBBERS + ', "cc");', '}']

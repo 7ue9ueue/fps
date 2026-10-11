@@ -1,8 +1,9 @@
 # backend/ntt
 
-Number-theoretic transforms and products modulo P = 998244353. API: `ntt.hpp` (`Convolution`,
-`Transform`, the leaf form). Variants: `scalar.hpp` (every target; the model), `intrinsics.hpp`
-(`intrinsics<S>`, templates on any `backend/simd` struct S), `avx2.hpp` (lc-opt's `lib/ntt`).
+Number-theoretic transforms and products modulo P = 998244353. API: `ntt.hpp` (`multiply`,
+`Convolution`, `Transform`, the leaf form). Variants: `scalar.hpp` (every target; the model),
+`intrinsics.hpp` (`intrinsics<S>`, templates on any `backend/simd` struct S), `avx2.hpp` (lc-opt's
+`lib/ntt`).
 `select.hpp` picks one per op and length: `avx2` on the `avx2` target; on `avx512` and `zen5`
 `intrinsics<Avx512>` from 2^6-2^8 on (per op and CPU) and `avx2` below (Emerald Rapids multiply:
 `avx2` at 2^7 only); `intrinsics<simd::Native>` on the other targets. `memory.hpp`: `Convolution`'s memory, kept per thread. Tests: `test.cpp`;
@@ -34,6 +35,35 @@ Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_produc
 - Variant contract for `multiply(a, b, n, m, lg, ...)`: words [n, L) of a are zero, except that
   the upper half of a factor with n <= L/2 may hold anything (avx2 and intrinsics do not read it;
   scalar zeroes it). Same for b.
+- `multiply(f, g, out)` (issue #38 round 2): a product from caller spans into a tight output,
+  `out = f g mod x^out.size()`; the factors are cut to out.size() first, so a cut product may use
+  a shorter transform. Variant op `multiply(const detail::Product&)`: f (n words) and g (m words)
+  in caller memory, a and b this thread's region, count = min(n + m - 1, out.size()) words to
+  out. Nothing is copied whole: the first level of each transform reads its factor from the
+  caller, and the last inverse level writes out.
+  - First level (`detail::first_level`): its columns span K blocks (K = 2, 4, 8: the radix-2,
+    radix-4 or fused radix-8 top). n = F blocks + c words: columns [0, c0) read F + 1 blocks, the
+    rest F, where c0, c1 are c rounded down and up to the level's step (one or two columns: the
+    asm and `each2` loops run two per iteration). The step of columns holding the factor's last
+    word is staged in a (copied, zero past n) and run in place. Each first level takes the number
+    of blocks read, T, as a template argument: blocks t >= T are zero, not loaded, and the
+    products by them are not computed (avx2 radix-8 for T <= 4 is the old sparse form, the asm
+    `forward_top3_from` for T = 3).
+  - Last level (`detail::last_level`): count = F blocks + c words: columns [0, c0) write F + 1
+    blocks to out, [c0, block) F; the step holding the last word runs in place in a and one copy
+    moves its words of block F. The asm `inverse_top_to<T>` and `inverse_top4_to<T>` write T
+    blocks: the generator drops the ops of the others (`prune`). A product cut to half the
+    transform (out of L/2 words) computes only the outputs of the top level it writes.
+  - The levels pick T with an inlined switch, and each T is its own function. One function for
+    every T (a lambda), with two 64-bit divisions per level, cost a 2^7 product 268 instructions
+    and 72 cycles on Emerald Rapids (3176 -> 3444 instructions).
+  - a and b sit in the region at least 256 bytes from f's, g's and out's page offsets (`place`):
+    the bench's spans 64 bytes past a page, against a at 0 and b at 64, ran Zen 3 1.08-1.11x
+    slower than multiply() at even lg 2^14-2^22, 1.04-1.06x with the placement (4K aliasing:
+    Measurements, Convolution memory).
+  - Products in place (`Convolution`) and `Transform` keep their own top levels and kernels,
+    unchanged. Through the span levels (one implementation for both) they ran 2-4% slower at
+    2^6-2^7 on Emerald Rapids and Zen 5 (Log, issue #38 round 2).
 - `Transform`: tables built once; forward and inverse in place on caller arrays (32-byte aligned,
   16 words of padding: the AVX2 forward kernels read 4 bytes past their last vector).
 
@@ -167,6 +197,13 @@ the other variants' word for word.
   rounds, intrinsics/avx2 at 2^6..2^9 (issue #4 round 2, after its changes): Emerald Rapids forward
   1.05 1.00 0.84 0.79, inverse 0.84 0.96 0.89 0.85, multiply 0.94 1.07 0.80 0.82; Zen 5 forward
   1.11 0.88 0.80 0.68, inverse 1.11 1.03 0.78 0.75, multiply 1.15 1.14 0.67 0.64.
+- Products from spans: the in-place top levels' columns on ranges, `each` and `each2(from, f,
+  q, begin, end)` with kLoad quarters read and kStore written (the defaults, 4 and 4, are the
+  in-place forms). A factor of at most half the length is read straight from the caller by both
+  subtrees' first groups (`Source`: n words, zero past them), as the in-place form reads its
+  lower half; a longer one by the radix-2 level. `prefetchw` covers quarters that are written but
+  not read (zero quarters past the source): without it, Emerald Rapids ran multiply_dense at odd
+  lg from 2^17 2% slower in the unified attempt (Log).
 
 ## Measurements
 
@@ -514,6 +551,60 @@ with the unshifted q too 1919; one group of 64 columns 1810. Inverse: 2055, 2100
 in the bottoms: forward 820 -> 815-827 (p0 + p5 uops 1464 -> 1415), inverse 626-667 -> 598-633,
 products 4430 -> 4377 per 32 groups.
 
+### Products from spans (issue #38, round 2)
+
+`kernel.py bench ntt --base` against main 7f57131, 7 rounds, GCC 15.2, each target's flags,
+2026-10-11, the round's final code; ratios between cases of the new binary, median of the
+per-round ratios. `product/<lg>`: `multiply(f, g, out)`, f and g of 2^lg / 2 words, out of
+2^lg - 1; `product@copy`: a Convolution, f and g copied in, the product copied out (what
+`fps::raw::mul` did); `product@into`: f copied into the caller's a, `Convolution(n, n, a)`, g
+copied in; `multiply`: `Convolution::multiply()` alone, factors already in place; `product_cut`:
+out of 2^lg / 2 words. Spans 64 bytes past a page boundary.
+
+| lg | product / @copy: Zen 3, EMR, Zen 5, V2 | product / @into | product / multiply | product_cut / product |
+|---:|---|---|---|---|
+| 6 | 0.98, 0.95, 1.01, 1.04 | 1.10, 1.00, 1.07, 1.08 | 1.19, 0.94, 1.12, 1.13 | 0.89, 0.91, 0.93, 0.90 |
+| 8 | 1.03, 1.00, 0.98, 0.99 | 1.05, 1.02, 1.01, 1.00 | 1.10, 1.05, 1.04, 1.03 | 0.93, 0.96, 0.96, 0.97 |
+| 9 | 0.99, 1.00, 0.99, 0.98 | 0.99, 1.01, 1.02, 0.99 | 1.04, 1.03, 1.04, 1.01 | 0.98, 0.97, 0.96, 0.98 |
+| 12 | 0.96, 0.97, 0.98, 0.98 | 0.98, 1.00, 1.01, 0.99 | 1.01, 1.02, 1.03, 1.00 | 0.98, 0.98, 0.98, 0.98 |
+| 16 | 0.98, 0.97, 0.98, 0.98 | 1.01, 0.99, 1.03, 0.99 | 1.05, 1.01, 1.06, 1.00 | 0.98, 1.00, 0.98, 0.98 |
+| 20 | 0.96, 0.94, 0.97, 0.97 | 1.00, 1.00, 1.01, 0.99 | 1.03, 1.07, 1.05, 1.00 | 0.98, 0.98, 0.99, 0.99 |
+| 22 | 0.94, 0.95, 0.98, 0.98 | 0.99, 1.01, 1.03, 1.01 | 1.06, 1.07, 1.12, 1.02 | 0.97, 0.98, 0.98, 0.99 |
+
+- From 2^9 to 2^22, against the copy flow: Zen 3 0.93-1.00, Emerald Rapids 0.94-1.00, Zen 5
+  0.95-0.99, Neoverse V2 0.97-0.98. Against the into flow 0.98-1.04, with a result of n + m - 1
+  words instead of length + 16. At 2^6-2^8 up to 1.10 slower than the into flow (Zen 3 2^6).
+  The cut product: 0.96-1.00 of the whole one, 0.89-0.97 at 2^6-2^8.
+- Against multiply() alone, 1.00-1.12: the extra cost is that of the into flow too (both read the
+  factors from separate memory and write it), not of copies. Neoverse V2 1.00-1.02. Guess, not
+  measured: the separate 4 KiB-page lines of f, g and out against the region's huge pages.
+- Placing a and b away from the spans' page offsets (`place`): before it, Zen 3 product /
+  multiply at even lg 2^14-2^22 was 1.08-1.11 (a at offset 0 and out at 64: the inverse level's
+  loads 2 columns after stores 4 KiB apart), after it 1.04-1.06; odd lg and the other machines
+  within 1%.
+
+Gated cases against main, same run (the in-place paths; their code and kernels are main's):
+Zen 3 1.0015, Emerald Rapids 0.9999, Zen 5 0.9987, Neoverse V2 0.9996. Cases above 1.02: Zen 3
+multiply_dense/7 1.025, convolution_into/7 1.021; Emerald Rapids convolution_into/18 1.028; Zen 5
+convolution/7 1.115. In the run before (5 rounds, the same in-place code): Zen 3 multiply/7 1.054,
+multiply_dense/7 1.083, convolution*/7 1.07-1.09; Zen 5 convolution*/7 1.18-1.19. Placement,
+below.
+
+Zen 3 placement at 2^6-2^9 (`probe_small.cpp`, exploration folder, same-run medians of 5):
+main's 2^7 product took 216 ns in one build of the probe and 232 ns in another that only moved
+main() into a noinline function; main's top-level code inside this round's tree ran 212-232 ns
+across builds, the round's first top levels 244-252 ns. Not the stack (an alloca of 0-4032 bytes
+before the run: flat within 1%), not function alignment (`-falign-functions=64`: the gap
+remained), not 4K aliasing (`ld_blocks.address_alias` about 1 per product on Emerald Rapids, the
+same code).
+
+Instruction counts, `perf stat` on `lc-intel`, a 2^7 product (avx2 code) in place through the
+span levels, per product: `-march=x86-64-v4`, main 3176 instructions and 871 cycles, the round's
+first unified levels 3444 and 943 (two 64-bit divisions per level, one function holding every
+block count); `-march=x86-64-v3`, main 3161 and 868, with shifts and one function per count 3241
+and 923. By symbol (cycles), main's unchanged bottom kernels took 54 of the 55 cycles more; front
+end and store forwarding were better than main's (`idq.mite_uops` 116 -> 30 per product).
+
 2026-10-11, claude (issue #3, round 1): moved lc-opt `lib/ntt` (`ntt.hpp`, `product.hpp`, both
 generators and their output) here. Changes: namespaces `fps::ntt`; one `Convolution` picks the
 product path (lc-opt `Product`) when it fits, else the convolution path; one templated `Tree`
@@ -831,6 +922,55 @@ Measurements above (zmm intrinsics, issue #5 round 2); probes and raw output in
   The prefetching paths run in every transform and product test from 2^17 (to 2^25 at -O2, 2^20
   under ASan). Pass at -O2 and ASan/UBSan on `lc-amd` (scalar, sse, avx2), `lc-intel-test`
   (ntt, frontend, small), `lc-zen5-test`, `lc-arm` and the Mac (scalar, arm).
+
+2026-10-11, claude (issue #38, round 2): `multiply(f, g, out)`, a product from caller spans into a
+tight output, `out = f g mod x^out.size()` (what `fps::raw::mul` needs). Measurements above
+(Products from spans); probes and raw output in `~/Documents/hpc_library-explore/ntt/output-r2/`.
+GCC 15.2, `tools/kernel.py` flags.
+- Built: the variant op `multiply(const detail::Product&)` in scalar (copies in and out: the
+  model), intrinsics and avx2; the first level reads the factors from the caller, the last writes
+  out (Design). Generated kernels: `forward_top_from`, `forward_top3_from` (the last quarter zero),
+  `inverse_top_to<T>`, `inverse_top4_to<T>` (T blocks written, the generator's `prune` drops the
+  other outputs' ops: inverse_top_to<1> is 43 vector ops, <8> 154). Bench cases `product/<lg>`,
+  `product_cut/<lg>` (gated from now on), `product@copy`, `product@into`.
+- Fold of the copies (the task's part b): measured against copying the factors into a Convolution
+  in the caller's memory (`product@into`), 0.98-1.04 from 2^9: the fold saves no time over copying
+  in. It stays, since the factors come from the caller's spans either way and the result is
+  n + m - 1 words, not length + 16. Against the copy flow `raw::mul` runs now, 0.93-1.00.
+- Tried first, not kept: `Convolution` and `Transform` through the same top levels (one
+  implementation; `Convolution` padded its factors to 32 words, so no column was staged per
+  product). Against main, 5 rounds: first version Zen 3 1.0106, Emerald Rapids 1.0043, Zen 5
+  1.0057, Neoverse V2 1.0038 geomean. Found and fixed: two 64-bit divisions and one function for
+  every block count per level (2^7: 3176 -> 3444 instructions per product, Measurements); quarters
+  written but no longer read lost their `prefetchw` (Emerald Rapids multiply_dense at odd lg from
+  2^17 2% slower); source and destination as two pointers in place kept a radix-4 level's 8 block
+  pointers partly in xmm registers (Emerald Rapids 2^9 5% slower; one pointer when equal fixed
+  it). After the fixes: Zen 3 1.0105, Emerald Rapids 1.0001, Zen 5 0.9969, Neoverse V2 0.9979;
+  gains there: Zen 3 multiply_dense 2^10-2^16 0.977 (zero blocks not loaded), forward at even lg
+  from 2^16 0.973-0.981; losses: Zen 3 2^6-2^7 1.09-1.34, Emerald Rapids and Zen 5 2^6-2^7 2-4% in
+  probes. Kept instead: the in-place paths with main's top levels and kernels (Design).
+- Zen 3 at 2^6-2^9 swings with placement (Measurements): main's own code moved 216 -> 232 ns at
+  2^7 between two builds of a probe. Not the stack, function alignment or 4K aliasing.
+- Placement of a and b for spans (`place`): Zen 3 even lg 2^14-2^22 1.08-1.11 -> 1.04-1.06 of
+  multiply(); Emerald Rapids unchanged (1.07 at 2^20-2^22, as the into flow).
+- The last level's boundary step: one copy of block F's words, the whole blocks of that step
+  written straight to out (it copied a column piece per block: up to 8 `memmove` calls).
+- Not done: closing the 1-12% to multiply() alone on x86 (the into flow has it too: guess, the
+  caller's memory in 4 KiB pages and separate lines); first and last levels without a staged or
+  in-place boundary step; a variant contract that lets `Convolution` use the span levels without
+  the small-size cost.
+- Tests: `multiply(f, g, out)` per variant against schoolbook (sizes to 24 by 24, out of 0, 1, n, n
+  + m - 1 and past it) and at every lg on 7 shapes (to 2^16, 3 above) with out of the whole product,
+  half, half + 1, a quarter + 3, 9 words and past the product; f, g and out at word offsets in their
+  pages, each allocation ending at its last word (ASan sees any access past them), out full of
+  garbage, f and g checked unchanged; out over f, over the end of f and the start of g, and f = g =
+  out; both avx2 bottoms; each avx2 span level against the in-place level (sources and outputs 4
+  bytes past alignment, n and count around blocks and steps); forward_top3 and forward_top_from
+  against the lane model; the length error, out unchanged. Mutations caught: 9 generic (Mac, arm)
+  and 6 in the avx2 levels (`lc-amd`), e.g. the staged words 1 short (1184 failures), the boundary
+  copy 1 short (848), the radix-8 first level dropping a high block (2613), the radix-8 last level
+  skipping T = 1 (4), a misplaced by 4 bytes (crash). Pass at -O2 and ASan/UBSan on `lc-amd`
+  (scalar, sse, avx2), `lc-intel-test`, `lc-zen5-test`, `lc-arm` and the Mac (scalar, arm).
 
 ## Sources
 

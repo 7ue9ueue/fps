@@ -121,6 +121,15 @@ struct scalar {
         detail::scalar::multiply_leaves(a, b, lg, roots);
         inverse(a, lg, inverse_roots);
     }
+
+    // detail::Product: the factors copied into a and b, zero past them, and the product copied out.
+    static void multiply(const detail::Product& p, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
+        const std::size_t len = std::size_t(1) << p.lg;
+        std::fill(std::copy_n(p.f, p.n, p.a), p.a + len, 0u);
+        std::fill(std::copy_n(p.g, p.m, p.b), p.b + len, 0u);
+        multiply(p.a, p.b, len, len, p.lg, roots, inverse_roots);
+        std::copy_n(p.a, p.count, p.out);
+    }
 };
 
 }  // namespace fps::ntt::variant

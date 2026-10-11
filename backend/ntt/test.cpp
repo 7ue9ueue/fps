@@ -2,16 +2,22 @@
 // computed directly and against the scalar model, products against schoolbook multiplication and,
 // for long ones, evaluation at random points. AVX2: each asm kernel against a scalar model of its
 // butterfly, with inputs at the edges of its lazy ranges. Convolution's memory: kept per thread,
-// the caller's, several threads.
+// the caller's, several threads. multiply(f, g, out): spans of any alignment, cut and padded
+// outputs, overlap.
 #include "backend/ntt/ntt.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
+#include <functional>
+#include <initializer_list>
 #include <new>
 #include <random>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -217,22 +223,113 @@ void test_upper_halves_unread(const char* name, std::size_t n, std::size_t m) {
     expect(std::vector<u32>(c, c + n + m - 1) == schoolbook(a, b), name, n * 100000000 + m);
 }
 
-// count words `offset` words past a 4 KiB boundary, then kPadding words that end the allocation,
-// so ASan sees a read past them.
+// count words `offset` words past a 4 KiB boundary, then `padding` words that end the allocation,
+// so ASan sees an access past them.
 class PageWords {
 public:
-    PageWords(std::size_t count, std::size_t offset)
-        : offset_(offset), words_(static_cast<u32*>(::operator new(bytes(count, offset), std::align_val_t(4096)))) {}
+    PageWords(std::size_t count, std::size_t offset, std::size_t padding = kPadding)
+        : count_(count), offset_(offset),
+          words_(static_cast<u32*>(::operator new((offset + count + padding) * sizeof(u32), std::align_val_t(4096)))) {}
     ~PageWords() { ::operator delete(words_, std::align_val_t(4096)); }
     PageWords(const PageWords&) = delete;
     PageWords& operator=(const PageWords&) = delete;
     u32* begin() { return words_ + offset_; }
+    std::span<u32> span() { return {begin(), count_}; }
 
 private:
-    static std::size_t bytes(std::size_t count, std::size_t offset) { return (offset + count + kPadding) * sizeof(u32); }
-    std::size_t offset_;
+    std::size_t count_, offset_;
     u32* words_;
 };
+
+// The words [0, count) of the product of f and g, zeros past it.
+std::vector<u32> cut(const std::vector<u32>& product, std::size_t count) {
+    std::vector<u32> c(count);
+    std::copy_n(product.begin(), std::min(count, product.size()), c.begin());
+    return c;
+}
+
+// multiply(f, g, out) for out of each count, against `product` (f g): f, g and out each `offset`
+// words or more into a page and ending their allocation (ASan sees any access past them), out full
+// of garbage; f and g unchanged.
+template <class V>
+void test_spans(const char* name, const std::vector<u32>& f, const std::vector<u32>& g,
+                const std::vector<u32>& product, std::initializer_list<std::size_t> counts, std::size_t offset) {
+    PageWords fw(f.size(), offset, 0), gw(g.size(), offset + 5, 0);
+    std::copy(f.begin(), f.end(), fw.begin());
+    std::copy(g.begin(), g.end(), gw.begin());
+    for (const std::size_t count : counts) {
+        PageWords out(count, offset + 3, 0);
+        for (u32& w : out.span()) w = u32(rng());
+        multiply<V>(fw.span(), gw.span(), out.span());
+        bool ok = std::ranges::equal(out.span(), cut(product, count));
+        ok &= std::ranges::equal(fw.span(), f) && std::ranges::equal(gw.span(), g);
+        expect(ok, name, (f.size() * 100000 + g.size()) * 1000 + count % 1000);
+    }
+}
+
+// out in the memory of f, of g, or of both: every variant reads the factors before it writes out.
+template <class V>
+void test_spans_overlap(const char* name, std::size_t n, std::size_t m) {
+    const auto f = random_poly(n, 0), g = random_poly(m, 0), product = schoolbook(f, g);
+    for (const std::size_t count : {n, n + m - 1, n / 2 + 1}) {
+        std::vector<u32> both(n + m + count);
+        std::copy(f.begin(), f.end(), both.begin());  // out at f
+        std::copy(g.begin(), g.end(), both.begin() + n);
+        multiply<V>(std::span(both).first(n), std::span(both).subspan(n, m), std::span(both).first(count));
+        expect(std::ranges::equal(std::span(both).first(count), cut(product, count)), name, 1);
+        std::copy(f.begin(), f.end(), both.begin());  // out over the end of f and the start of g
+        std::copy(g.begin(), g.end(), both.begin() + n);
+        multiply<V>(std::span(both).first(n), std::span(both).subspan(n, m), std::span(both).subspan(n / 2, count));
+        expect(std::ranges::equal(std::span(both).subspan(n / 2, count), cut(product, count)), name, 2);
+    }
+    std::vector<u32> square(f);  // out = f = g
+    multiply<V>(square, square, square);
+    expect(square == cut(schoolbook(f, f), n), name, 3);
+}
+
+// multiply(f, g, out): sizes around each level's blocks, cuts, zero padding, alignments, overlap.
+template <class V>
+void test_multiply_spans(const char* name, int max_lg) {
+    for (std::size_t n = 0; n <= 24; ++n)
+        for (std::size_t m = 0; m <= 24; m += 5) {
+            const auto f = random_poly(n, 1), g = random_poly(m, 1), product = schoolbook(f, g);
+            const std::size_t size = n + m ? n + m - 1 : 0;
+            test_spans<V>(name, f, g, product, {0, 1, n, size, size + 1, size + 9}, n % 4);
+        }
+    using Shapes = std::vector<std::pair<std::size_t, std::size_t>>;
+    for (int lg = kMinLog; lg <= max_lg; ++lg) {
+        const std::size_t len = std::size_t(1) << lg;
+        const bool exact = lg <= 11;
+        const Shapes shapes = lg <= 16 ? Shapes{{len / 2, len / 2}, {len / 2 + 1, len / 2 - 1}, {len - 1, 2},
+                                                {len - len / 4, len / 4 + 1}, {len / 4 + 1, len / 4 + 1},
+                                                {len / 8 + 3, len / 8 - 2}, {len / 2 - 17, len / 4 + 9}}
+                                       : Shapes{{len / 2, len / 2}, {len - len / 4, len / 4 + 1}, {len / 2 - 17, len / 4 + 9}};
+        for (const auto& [n, m] : shapes) {
+            const auto f = random_poly(n, lg % 2), g = random_poly(m, lg % 2);
+            std::vector<u32> product;
+            if (exact) {
+                product = schoolbook(f, g);
+            } else {  // checked against evaluation, then the reference for its cuts
+                Convolution conv(n, m);
+                std::copy(f.begin(), f.end(), conv.a());
+                std::copy(g.begin(), g.end(), conv.b());
+                const u32* c = conv.template multiply<V>();
+                product.assign(c, c + conv.size());
+                bool ok = true;
+                for (int i = 0; i < 2; ++i) {
+                    const u32 x = random_below(P);
+                    ok &= evaluate(product, x) == mul(evaluate(f, x), evaluate(g, x));
+                }
+                expect(ok, name, lg);
+            }
+            const std::size_t size = n + m - 1, offset = lg % 3 == 0 ? 0 : lg % 3 == 1 ? 1 : 16 + lg;
+            if (lg <= 16) test_spans<V>(name, f, g, product, {size, len / 2, len / 2 + 1, len / 4 + 3, 9, size + 3}, offset);
+            else test_spans<V>(name, f, g, product, {size, len / 2 + 7}, offset);
+        }
+    }
+    test_spans_overlap<V>(name, 40, 30);
+    test_spans_overlap<V>(name, 1000, 700);
+}
 
 // a in the caller's memory at offsets of 0 to 1008 words in a page, full of garbage: the product
 // comes back in it, its padding is not written.
@@ -270,6 +367,7 @@ void test_variant(const char* name, int max_lg) {
         test_caller_memory<V>(name, len / 4 + 1, len / 4 + 1);
     }
     test_caller_memory<V>(name, 0, 5);
+    test_multiply_spans<V>(name, max_lg);
 }
 
 // Products on one thread, inputs from its own generator: the number of wrong ones. Lengths cross
@@ -343,6 +441,16 @@ void test_memory() {
         threw = true;
     }
     expect(threw, "memory: product too long");
+    // multiply(f, g, out), factors of 2^(kMaxLog - 1) + 1 words: throws before writing out.
+    std::vector<u32> big((std::size_t(1) << kMaxLog) + 1, 1);
+    const std::span<const u32> half = std::span(big).first(big.size() / 2 + 1);
+    threw = false;
+    try {
+        multiply(half, half, std::span(big));
+    } catch (const std::length_error&) {
+        threw = true;
+    }
+    expect(threw && std::ranges::all_of(big, [](u32 w) { return w == 1; }), "memory: multiply too long");
 }
 
 // Random values below bound, the largest ones in the first words.
@@ -545,6 +653,7 @@ struct avx2_bottom : variant::avx2 {
         const std::size_t len = std::size_t(1) << lg;
         impl::product<Bottom>(a, b, 2 * n <= len, 2 * m <= len, lg, r, ir);
     }
+    static void multiply(const detail::Product& p, const u32* r, const u32* ir) { impl::product<Bottom>(p, r, ir); }
 };
 using avx2_group = avx2_bottom<impl::GroupBottom>;
 using avx2_pair = avx2_bottom<impl::PairBottom>;
@@ -557,6 +666,11 @@ void test_bottoms() {
                                    {len - len / 4, len / 4 + 1}, {len / 4 + 1, len - 1 - len / 4}}) {
             test_product<avx2_group>("avx2 one-group bottom", n, m, 0, exact);
             test_product<avx2_pair>("avx2 two-group bottom", n, m, 0, exact);
+            if (lg <= 12) {  // from spans, against the products above
+                const auto f = random_poly(n, 0), g = random_poly(m, 0), product = schoolbook(f, g);
+                test_spans<avx2_group>("avx2 one-group bottom, spans", f, g, product, {n + m - 1, len / 2 + 3}, 1);
+                test_spans<avx2_pair>("avx2 two-group bottom, spans", f, g, product, {n + m - 1, len / 2 + 3}, 1);
+            }
         }
     }
 }
@@ -596,8 +710,15 @@ void test_loops() {
             test_loop("forward_identity", h, 4 * u64(P), 4 * u64(P),
                       [&](Vec* f, std::size_t n) { k::forward_identity(f, n, t.r()); },
                       [&](const std::array<u32, 4>& f) { return forward_model(f, 1, 1, *t.r(1)); });
-            test_loop("forward_top", h, P, 4 * u64(P), [&](Vec* f, std::size_t n) { k::forward_top(f, n, t.r()); },
+            test_loop("forward_top", h, P, 4 * u64(P),
+                      [&](Vec* f, std::size_t n) { k::forward_top(f, n, t.r()); },
                       [&](const std::array<u32, 4>& f) { return forward_model(f, 1, 1, *t.r(1)); });
+            test_loop("forward_top_from", h, P, 4 * u64(P),
+                      [&](Vec* f, std::size_t n) { k::forward_top_from(reinterpret_cast<u32*>(f), f, n, n, t.r()); },
+                      [&](const std::array<u32, 4>& f) { return forward_model(f, 1, 1, *t.r(1)); });
+            test_loop("forward_top3_from", h, P, 4 * u64(P),
+                      [&](Vec* f, std::size_t n) { k::forward_top3_from(reinterpret_cast<u32*>(f), f, n, n, t.r()); },
+                      [&](std::array<u32, 4> f) { return f[3] = 0, forward_model(f, 1, 1, *t.r(1)); });
             test_loop("inverse_identity", h, 2 * u64(P), 2 * u64(P),
                       [&](Vec* f, std::size_t n) { k::inverse_identity(f, n, t.ir()); },
                       [&](const std::array<u32, 4>& f) { return inverse_model(f, 1, 1, *t.ir(1)); });
@@ -632,6 +753,55 @@ void test_loops() {
             for (std::size_t q = 0; q < 4; ++q) f[q] = top[j + 8 * h * q];
             const auto expected = inverse_model(f, 1, 1, *t.ir(1));
             for (std::size_t q = 0; q < 4; ++q) expect(w.begin()[j + 8 * h * q] == mul(s, expected[q]), "inverse_radix4", j);
+        }
+    }
+}
+
+// A product's first and last levels in caller memory against the same levels in place. First: a
+// source of n words 4 bytes past alignment against its zero-padded copy, equal mod P and < 4P.
+// Last: count words to an output 4 bytes past alignment, ending its allocation, against the
+// in-place output (canonical); inputs < 2P. Block sizes 4 and 16 vectors.
+void test_caller_levels() {
+    Tables t(kTableLog);
+    const u32 s = random_below(P);
+    for (const std::size_t h : {4, 16}) {
+        struct Level {
+            const char* name;
+            std::size_t words;  // the level's span: 2, 4 or 8 blocks of 8h words
+            std::function<void(const u32*, std::size_t, u32*)> first;
+            std::function<void(u32*, u32*, std::size_t)> last;
+        };
+        const Level levels[] = {
+            {"radix-2 level", 16 * h, [&](const u32* f, std::size_t n, u32* to) { impl::forward_radix2_from(f, n, to, h); },
+             [&](u32* f, u32* out, std::size_t count) { impl::scale_radix2_out(f, h, out, count, s); }},
+            {"radix-4 level", 32 * h, [&](const u32* f, std::size_t n, u32* to) { impl::forward_radix4_from(f, n, to, h, t.r()); },
+             [&](u32* f, u32* out, std::size_t count) { impl::inverse_radix4_out(f, h, out, count, t.ir(), s); }},
+            {"radix-8 level", 64 * h, [&](const u32* f, std::size_t n, u32* to) { impl::forward_radix8_from(f, n, to, h, t.r()); },
+             [&](u32* f, u32* out, std::size_t count) { impl::inverse_radix8_out(f, h, out, count, t.ir(), s); }},
+        };
+        for (const Level& level : levels) {
+            const std::size_t w = level.words;
+            const std::size_t sizes[] = {w, w - 1, w - w / 4, w - w / 4 + 5, w / 2, w / 2 - 9, 8 * h + 1, 13, 1};
+            for (const std::size_t n : sizes) {
+                PageWords source(n, 1, 0);
+                fill(source.begin(), n, P);
+                Words padded(w), from(w);
+                std::copy_n(source.begin(), n, padded.begin());
+                level.first(padded.begin(), w, padded.begin());
+                level.first(source.begin(), n, from.begin());
+                for (std::size_t i = 0; i < w; ++i)
+                    expect(from.begin()[i] < 4 * P && from.begin()[i] % P == padded.begin()[i] % P, level.name, n);
+            }
+            Words in(w);
+            fill(in.begin(), w, 2 * u64(P));
+            Words whole = in;
+            level.last(whole.begin(), whole.begin(), w);
+            for (const std::size_t count : {w, w - 1, w - 8, w / 2 + 3, w / 2, 8 * h - 1, std::size_t(9), std::size_t(1)}) {
+                Words work = in;
+                PageWords out(count, 1, 0);
+                level.last(work.begin(), out.begin(), count);
+                expect(std::equal(out.begin(), out.begin() + count, whole.begin()), level.name, count);
+            }
         }
     }
 }
@@ -710,6 +880,7 @@ void test_group_bottom() {
 
 void test_avx2() {
     test_loops();
+    test_caller_levels();
     test_bottom_levels();
     test_group_bottom();
     test_bottoms();

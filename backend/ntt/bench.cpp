@@ -6,6 +6,12 @@
 //   convolution/<lg>             a Convolution of 2^lg / 2 and 2^lg / 2 coefficients constructed,
 //                                multiplied and destroyed, to 2^22: construction against multiply/<lg>.
 //   convolution_into/<lg>        the same with a in the caller's memory, 64 bytes past a page boundary.
+//   product/<lg>                 multiply(f, g, out), f and g of 2^lg / 2 words, out of 2^lg - 1, in
+//                                caller memory 64 bytes past a page boundary, to 2^22.
+//   product_cut/<lg>             the same, out of 2^lg / 2 words: f g mod x^(2^lg / 2).
+//   product@copy/<lg>            what product/<lg> replaces: a Convolution, f and g copied in, the
+//                                product copied out (fps::raw::mul before issue #38 round 2).
+//   product@into/<lg>            f copied into the caller's a, Convolution(n, n, a), g copied in.
 // Tables past 2^16 are built by a thread's first call, then kept (ntt.hpp, Memory). Repeated calls
 // reuse the last output as input, and convolution cases write no factors: the timing does not
 // depend on the values.
@@ -15,9 +21,11 @@
 #include <memory>
 #include <new>
 #include <random>
+#include <span>
 #include <string>
 #include <tuple>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "backend/bench.hpp"
@@ -73,6 +81,53 @@ void add_convolution_cases(bench::Suite& suite) {
         suite.add("convolution_into/" + std::to_string(lg), [n] {
             return [n, a = std::make_shared<CallerWords>(Convolution::length(n, n))] {
                 Convolution conv(n, n, a->begin());
+                bench::keep(*conv.multiply());
+            };
+        }, 2 * n);
+    }
+}
+
+// Factors f and g of n words and an output of count words, each in caller memory.
+struct Spans {
+    Spans(std::size_t n, std::size_t count) : f(n), g(n), out(count), n(n), count(count) {
+        const Words w(n);
+        std::copy_n(w.lines.data()->words, n, f.begin());
+        std::copy_n(w.lines.data()->words, n, g.begin());
+    }
+    std::span<const u32> fs() { return {f.begin(), n}; }
+    std::span<const u32> gs() { return {g.begin(), n}; }
+    std::span<u32> outs() { return {out.begin(), count}; }
+    CallerWords f, g, out;
+    std::size_t n, count;
+};
+
+void add_product_cases(bench::Suite& suite) {
+    for (int lg = kMinLog; lg <= kVariantMaxLog; ++lg) {
+        const std::size_t n = (std::size_t(1) << lg) / 2;
+        const std::string size = "/" + std::to_string(lg);
+        for (const auto& [name, count] : {std::pair{"product", 2 * n - 1}, std::pair{"product_cut", n}}) {
+            suite.add(name + size, [n, count] {
+                return [s = std::make_shared<Spans>(n, count)] {
+                    multiply(s->fs(), s->gs(), s->outs());
+                    bench::keep(s->out.begin()[0]);
+                };
+            }, 2 * n);
+        }
+        suite.add("product@copy" + size, [n] {
+            return [s = std::make_shared<Spans>(n, 2 * n - 1)] {
+                Convolution conv(s->n, s->n);
+                std::ranges::copy(s->fs(), conv.a());
+                std::ranges::copy(s->gs(), conv.b());
+                const u32* c = conv.multiply();
+                std::copy_n(c, conv.size(), s->out.begin());
+                bench::keep(s->out.begin()[0]);
+            };
+        }, 2 * n);
+        suite.add("product@into" + size, [n] {
+            return [s = std::make_shared<Spans>(n, Convolution::length(n, n))] {
+                std::ranges::copy(s->fs(), s->out.begin());
+                Convolution conv(s->n, s->n, s->out.begin());
+                std::ranges::copy(s->gs(), conv.b());
                 bench::keep(*conv.multiply());
             };
         }, 2 * n);
@@ -135,5 +190,6 @@ int main(int argc, char** argv) {
         add_cases<variant::avx2, variant::avx2, variant::avx2>(suite, "@avx2", kVariantMaxLog);
 #endif
     add_convolution_cases(suite);
+    add_product_cases(suite);
     return suite.run();
 }
