@@ -22,7 +22,7 @@ import sys
 import tarfile
 from pathlib import Path
 
-ZONES = {'lc-intel': 'europe-west2-c'}  # every other VM is in europe-west2-b
+ZONES = {'lc-intel': 'europe-west2-c', 'lc-intel2': 'europe-west2-c'}  # every other VM is in europe-west2-b
 ROOT = 'hpc_library'  # relative to the VM user's home
 
 

@@ -54,7 +54,7 @@ TARGETS = {
     'avx512': {
         'flags': '-march=x86-64-v4 -mavx512ifma -mavx512vbmi',
         'needs': ['avx512f', 'avx512bw', 'avx512dq', 'avx512vl', 'avx512ifma', 'avx512vbmi'],
-        'test': ['lc-intel'],
+        'test': ['lc-intel2'],
         'time': 'lc-intel',
     },
 }

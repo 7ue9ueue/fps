@@ -141,13 +141,14 @@ We share lc-opt's VMs. Its `AGENTS.md` (Machines, Instruction sets) is the full 
 | Machine | CPU | Use |
 |---|---|---|
 | Mac | ARM64 (M4 Pro), Apple clang | Edit, `scalar` tests (`kernel.py` runs locally). x86 binaries run under Rosetta; never time them. |
-| `lc-intel` | Xeon 8581C (Emerald Rapids), AVX-512, PMU on | `avx512` tests and timing. Profiling with `perf` (core events, top-down; no L3 events). |
+| `lc-intel` | Xeon 8581C (Emerald Rapids), AVX-512, PMU on | `avx512` timing. Profiling with `perf` (core events, top-down; no L3 events). |
+| `lc-intel2` | Xeon 8581C (Emerald Rapids), AVX-512 | `avx512` builds and tests, so they never wait for or disturb `lc-intel`'s timing. |
 | `lc-amd` | EPYC 7B13 (Zen 3) | `avx2` builds and tests. No hardware counters. |
 | `lc-bench` | EPYC 7B13 (Zen 3) | `avx2` timing only. Build and test elsewhere; `kernel.py` holds the lock for its own builds. |
 | `lc-k68` | EPYC 7B13, Linux 6.8 | Timing of code heavy in page faults or huge pages. Keep it on 6.8. |
 
-- GCP project `project-c73e6eb1-e167-4d7a-a31`, region `europe-west2`. Zones: `lc-intel` is in
-  `europe-west2-c`, the rest in `europe-west2-b`.
+- GCP project `project-c73e6eb1-e167-4d7a-a31`, region `europe-west2`. Zones: `lc-intel` and
+  `lc-intel2` are in `europe-west2-c`, the rest in `europe-west2-b`.
   Connect: `gcloud compute ssh <name> --zone=<zone>`.
 - All run Ubuntu 24.04 with Docker and the `gcc:15.2.0` image. Build with GCC 15.2.
 - Copies of this repo live in `~/hpc_library/<name>` (`tools/vm.py`). Do not touch `~/lc-opt`;
