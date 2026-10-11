@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Test and time backend kernels, per target (see TARGETS and BACKEND.md).
 
-  kernel.py test UNIT [--target T]
-      Build every test*.cpp of the unit for target T at -O2 and with ASan/UBSan; run them all.
+  kernel.py test [UNIT ...] [--target T] [--sde DIR]
+      Build every test*.cpp of the units (default: all) for target T at -O2 and with ASan/UBSan;
+      run them all. If this x86 CPU lacks the target's needs, run them under Intel SDE (the kit
+      in DIR) as the target's `sde` chip; without --sde, fail.
   kernel.py bench UNIT [--target T] [--base DIR] [--rounds N] [--filter RE] [--json FILE]
       Time the unit's bench.cpp. With --base (another checkout, e.g. of main), time both in
       the same run, alternating, and print each case's paired ratio new/base: below 1 is faster.
@@ -12,8 +14,9 @@ include/fps/).
   kernel.py check
       Run every backend/*/gen_*.py --check: generated files match their generators.
 
-On Linux (the VMs) it builds in the pinned GCC 15.2 image with Docker. On the Mac it builds with
-the local clang++ and runs the targets that list 'mac'. Run from the checkout's root.
+On Linux (the VMs, GitHub's runners) it builds in the pinned GCC 15.2 image with Docker. On the
+Mac it builds with the local clang++ and runs the targets that list 'mac'. Run from the checkout's
+root.
 bench holds /tmp/bench.lock and pins one core; on a timing machine every command holds the lock,
 so builds never disturb another agent's timing.
 """
@@ -40,30 +43,35 @@ CXX = ('clang++' if MAC else 'g++') + ' -std=c++23 -Wall -Wextra -I. -Iinclude'
 
 # Targets as in BACKEND.md: compiler flags, the machines that test them ('mac' is the local Mac) and
 # the one that times them (None: never timed). needs: /proc/cpuinfo flags a machine must have.
-# mac_flags: flags for the Mac instead (its M4 has NEON but no SVE).
+# sde: the Intel SDE chip that runs the target's tests on an x86 CPU that lacks them.
+# mac_flags: flags for a Mac instead: M1, the oldest Apple CPU (and GitHub's macOS runners), has NEON but no SVE.
 TARGETS = {
     'scalar': {'flags': '', 'needs': [], 'test': ['lc-amd', 'mac'], 'time': None, 'mac_flags': ''},
     'sse': {
         'flags': '-march=x86-64-v2',
         'needs': ['ssse3', 'sse4_1', 'sse4_2', 'popcnt'],
+        'sde': 'nhm',
         'test': ['lc-amd'],
         'time': None,
     },
     'avx2': {
         'flags': '-march=x86-64-v3',
         'needs': ['avx2', 'bmi2', 'fma'],
+        'sde': 'hsw',
         'test': ['lc-amd'],
         'time': 'lc-bench',
     },
     'avx512': {
         'flags': '-march=x86-64-v4 -mavx512ifma -mavx512vbmi',
         'needs': ['avx512f', 'avx512bw', 'avx512dq', 'avx512vl', 'avx512ifma', 'avx512vbmi'],
+        'sde': 'emr',
         'test': ['lc-intel-test'],
         'time': 'lc-intel',
     },
     'zen5': {
         'flags': '-march=znver5',
         'needs': ['avx512f', 'avx512ifma', 'avx512vbmi', 'avx512_vbmi2', 'avx512_vp2intersect'],
+        'sde': 'emr',  # no SDE chip has all of Zen 5; SDE stops on any instruction its chip lacks
         'test': ['lc-zen5'],
         'time': 'lc-zen5',
     },
@@ -72,7 +80,7 @@ TARGETS = {
         'needs': ['asimd', 'sve2'],
         'test': ['lc-arm', 'mac'],
         'time': 'lc-arm',
-        'mac_flags': '-mcpu=apple-m4',
+        'mac_flags': '-mcpu=apple-m1',
     },
 }
 
@@ -145,16 +153,23 @@ def flags(target: str) -> str:
     return TARGETS[target].get('mac_flags', '') if MAC else TARGETS[target]['flags']
 
 
-def require_cpu(target: str) -> None:
+def require_cpu(target: str, sde: str | None = None) -> str | None:
+    """Exits if this machine cannot run the target. Returns the SDE chip to emulate when this CPU
+    lacks the target's needs and sde, the SDE kit's folder, is given; else None."""
     spec = TARGETS[target]
     if MAC:
         if 'mac' not in spec['test']:
             sys.exit(f'the Mac cannot run target {target}; use {" or ".join(spec["test"])}.')
-        return
+        return None
     missing = [f for f in spec['needs'] if f not in cpu_flags()]
-    if missing:
-        machines = sorted({*spec['test'], spec['time']} - {None, 'mac'})
-        sys.exit(f'this CPU cannot run target {target}: no {" ".join(missing)}. Use {" or ".join(machines)}.')
+    if not missing:
+        return None
+    if sde and 'sde' in spec:
+        print(f'this CPU has no {" ".join(missing)}: running {target} under Intel SDE -{spec["sde"]}', flush=True)
+        return spec['sde']
+    machines = sorted({*spec['test'], spec['time']} - {None, 'mac'})
+    sys.exit(f'this CPU cannot run target {target}: no {" ".join(missing)}. Use {" or ".join(machines)}'
+             + (' or --sde.' if 'sde' in spec else '.'))
 
 
 def cpu_name() -> str:
@@ -171,6 +186,12 @@ def unit_dir(unit: str) -> str:
     return 'frontend' if unit == 'frontend' else f'backend/{unit}'
 
 
+def units() -> list[str]:
+    """Every unit with tests in this checkout."""
+    kernels = sorted({p.parent.name for p in Path('backend').glob('*/test*.cpp')})
+    return kernels + (['frontend'] if any(Path('frontend').glob('test*.cpp')) else [])
+
+
 def build(tree: Path, unit: str, source: str, target: str, sanitize: bool = False) -> Path:
     """Compile <unit folder>/<source> in tree, from relative paths, so the same sources give
     byte-identical binaries in any tree."""
@@ -184,22 +205,23 @@ def build(tree: Path, unit: str, source: str, target: str, sanitize: bool = Fals
 
 
 def test(args) -> int:
-    require_cpu(args.target)
-    tree = Path('.')
-    sources = sorted(p.name for p in Path(unit_dir(args.kernel)).glob('test*.cpp'))
-    if not sources:
-        print(f'FAIL {args.kernel}: no test*.cpp in {unit_dir(args.kernel)}')
-        return 1
-    for source in sources:
-        for sanitize in (False, True):
-            binary = build(tree, args.kernel, source, args.target, sanitize)
-            result = sh({'w': tree}, lambda _: './' + shlex.quote(str(binary.relative_to(tree))))
-            sys.stdout.write(result.stdout + result.stderr)
-            label = f'{source} {"ASan/UBSan" if sanitize else "-O2"}'
-            if result.returncode:
-                print(f'FAIL {args.kernel} {args.target} {label}')
-                return 1
-            print(f'pass {args.kernel} {args.target} {label}')
+    chip = require_cpu(args.target, args.sde)
+    trees = {'w': Path('.')} | ({'sde': Path(args.sde)} if chip else {})
+    for unit in args.units or units():
+        sources = sorted(p.name for p in Path(unit_dir(unit)).glob('test*.cpp'))
+        if not sources:
+            print(f'FAIL {unit}: no test*.cpp in {unit_dir(unit)}')
+            return 1
+        for source in sources:
+            for sanitize in (False, True):
+                binary = './' + shlex.quote(str(build(trees['w'], unit, source, args.target, sanitize)))
+                result = sh(trees, lambda paths: f'{paths["sde"]}/sde64 -{chip} -- {binary}' if chip else binary)
+                sys.stdout.write(result.stdout + result.stderr)
+                label = f'{source} {"ASan/UBSan" if sanitize else "-O2"}'
+                if result.returncode:
+                    print(f'FAIL {unit} {args.target} {label}')
+                    return 1
+                print(f'pass {unit} {args.target} {label}', flush=True)
     return 0
 
 
@@ -271,8 +293,9 @@ def main() -> int:
     sub = parser.add_subparsers(dest='command', required=True)
     default = 'scalar' if MAC else 'avx2'
     p = sub.add_parser('test')
-    p.add_argument('kernel')
+    p.add_argument('units', nargs='*', metavar='unit', help='default: every unit')
     p.add_argument('--target', choices=TARGETS, default=default)
+    p.add_argument('--sde', help="Intel SDE kit's folder, to emulate a CPU that lacks the target's needs")
     p.set_defaults(run=test)
     p = sub.add_parser('bench')
     p.add_argument('kernel')
@@ -285,8 +308,10 @@ def main() -> int:
     p = sub.add_parser('check')
     p.set_defaults(run=check)
     args = parser.parse_args()
-    if args.command != 'check' and not Path(unit_dir(args.kernel)).is_dir():
-        sys.exit(f'no unit {unit_dir(args.kernel)}')
+    named = args.units if args.command == 'test' else [args.kernel] if args.command == 'bench' else []
+    for unit in named:
+        if not Path(unit_dir(unit)).is_dir():
+            sys.exit(f'no unit {unit_dir(unit)}')
     timing_host = socket.gethostname().split('.')[0] in {t['time'] for t in TARGETS.values()}
     with bench_lock() if timing_host or args.command == 'bench' else contextlib.nullcontext():
         return args.run(args)

@@ -1,0 +1,61 @@
+# The merge gate's tests (AGENTS.md, Tools): the generators, and every unit on every target.
+# Timing runs on the VMs from tools/gate.py, which sets the commit status `gate`.
+name: test
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  generators:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 tools/kernel.py check
+
+  # GCC 15.2 in the pinned image, as on the VMs. x86 targets this CPU lacks run under Intel SDE.
+  test:
+    name: test (${{ matrix.target }})
+    runs-on: ${{ matrix.target == 'arm' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [scalar, sse, avx2, avx512, zen5, arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: lscpu
+      - name: Intel SDE 10.13.1
+        if: matrix.target != 'arm'
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/sde.tar.xz" \
+            https://downloadmirror.intel.com/924984/sde-external-10.13.1-2026-07-28-lin.tar.xz
+          echo "94e97d623fec54385686e1e7ba65ebc9941748c05ee451423948334892bf2b50  $RUNNER_TEMP/sde.tar.xz" | sha256sum -c
+          mkdir "$RUNNER_TEMP/sde"
+          tar -xJf "$RUNNER_TEMP/sde.tar.xz" -C "$RUNNER_TEMP/sde" --strip-components=1
+          echo "SDE_ARG=--sde $RUNNER_TEMP/sde" >> "$GITHUB_ENV"
+      - run: python3 tools/kernel.py test --target ${{ matrix.target }} $SDE_ARG
+
+  # The only non-GCC build and the only ARM build without SVE: Apple clang on an M1.
+  mac:
+    name: test (mac)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sysctl -n machdep.cpu.brand_string && clang++ --version
+      - run: python3 tools/kernel.py test --target scalar
+      - run: python3 tools/kernel.py test --target arm

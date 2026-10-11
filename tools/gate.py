@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """Merge gate. Runs on the Mac; needs git, gh and gcloud.
 
-  gate.py PR [--merge]          a pull request, merged into origin/main
-  gate.py REV [--base REV]      a local revision, merged into --base (default origin/main)
+  gate.py PR [--merge]
 
-For every target in tools/kernel.py, on the target's machines:
-  - test: kernel.py check, then kernel.py test for every affected kernel, on each test machine
-    ('mac' is this Mac, with clang);
-  - time, if the target has a timing machine: kernel.py bench against the base, 21 rounds;
-    on a slowdown, 21 more, pooled.
+Tests run in GitHub Actions (.github/workflows/test.yml) on the pull request merged into main:
+the generators, and every unit on every target. This script adds the timing, on the VMs: for
+every target with a timing machine (tools/kernel.py), kernel.py bench of each affected unit
+against main, 21 rounds; on a slowdown, 21 more, pooled.
 Units are the backend kernels and the frontend (see tools/kernel.py). Affected units: those
 changed, those that include them, or all if a shared file changed.
-Passes if every test passes and, per target, the geomean over units of new/base (each unit's
-geomean over its gated cases) is at most 1. Byte-identical bench binaries count as 1.
+The timing passes if, per target, the geomean over units of new/base (each unit's geomean over
+its gated cases) is at most 1. Byte-identical bench binaries count as 1.
 
-For a pull request it posts the report as a comment and sets the commit status `gate` on its
-head, which `main` requires; with --merge it squash-merges on a pass. The last line of the report
-is "Gate: pass" or "Gate: fail".
+It posts the timing and the checks' current results as a comment, and sets the commit status
+`gate` (the timing) on the head. Then it waits for the checks: the gate passes if the timing and
+every check pass. With --merge it first merges main into the branch if it is behind, so the
+checks test what lands; on a pass it squash-merges (auto-merge) and waits until merged. If main
+moves first, it runs again. The last line is "Gate: pass" or "Gate: fail".
 
-The repository is public and the gate runs a pull request's code on the VMs and this Mac, so it
-refuses pull requests by any account but the repository's owner, and pull requests from forks.
+The repository is public and the gate runs a pull request's code on the VMs, so it refuses pull
+requests by any account but the repository's owner, and pull requests from forks.
 """
 from __future__ import annotations
 
@@ -27,11 +27,8 @@ import argparse
 import json
 import math
 import re
-import io
 import subprocess
 import sys
-import tarfile
-import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -40,10 +37,21 @@ from vm import rev_tar, ship, ssh
 
 ROUNDS = 21
 SHARED = re.compile(r'^(backend/[^/]+|tools/kernel\.py)$')  # files outside a kernel folder
+POLL = 30  # seconds between looks at the checks
+WAIT = 90 * 60  # longest wait for the checks to finish, in seconds
+MAIN_MOVED = 'main moved'
 
 
 def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(['git', *args], check=check, capture_output=True, text=True)
+
+
+def gh(*args: str, check: bool = True, input: str | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(['gh', *args], check=check, capture_output=True, text=True, input=input)
+
+
+def gh_json(*args: str) -> dict:
+    return json.loads(gh(*args).stdout)
 
 
 def log(message: str) -> None:
@@ -85,7 +93,7 @@ def bench(vm: str, path: str, base_path: str, kernel: str, target: str) -> dict:
                f'--base $HOME/{base_path} --rounds {ROUNDS} --json gate.json >/dev/null && cat gate.json')
     result = ssh(vm, command, capture=True)
     if result.returncode:
-        raise RuntimeError(f'bench {kernel} on {vm} failed:\n{result.stderr.decode()}')
+        raise RuntimeError(f'bench {kernel} on {vm} failed:\n{result.stderr.decode()[-3000:]}')
     return json.loads(result.stdout)
 
 
@@ -97,56 +105,35 @@ def geomean(values: list[float]) -> float | None:
     return math.exp(sum(map(math.log, values)) / len(values)) if values else None
 
 
-def run_tests(machine: str, name: str, new_tar: bytes, target: str, kernels: list[str]) -> subprocess.CompletedProcess:
-    tests = [f'python3 tools/kernel.py test {k} --target {target}' for k in kernels]
-    if machine == 'mac':  # generators are checked on the VMs
-        with tempfile.TemporaryDirectory() as tree:
-            tarfile.open(fileobj=io.BytesIO(new_tar), mode='r:gz').extractall(tree)
-            return subprocess.run(' && '.join(tests), shell=True, cwd=tree, capture_output=True)
-    path = ship(machine, name, new_tar)
-    result = ssh(machine, f'cd {path} && ' + ' && '.join(['python3 tools/kernel.py check'] + tests), capture=True)
-    ssh(machine, f'rm -rf {path}')
-    return result
-
-
-def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, base: str,
-               kernels: list[str]) -> tuple[bool, str]:
+def time_target(target: str, name: str, new_tar: bytes, base_tar: bytes, base: str,
+                kernels: list[str]) -> tuple[bool, str]:
     spec = TARGETS[target]
-    name = f'gate-{label}-{target}'
-    out = [f'### {target}: `{spec["flags"] or "no flags"}`', '']
-    for machine in spec['test']:
-        log(f'[{target}] testing on {machine}')
-        result = run_tests(machine, name, new_tar, target, kernels)
-        lines = [line for line in result.stdout.decode().splitlines() if line.startswith(('pass', 'FAIL'))]
-        out.append(f'Tests on {machine}: ' + ('pass' if result.returncode == 0 else 'FAIL'))
-        out += [f'- {line}' for line in lines]
-        if result.returncode:
-            out += ['', '```', (result.stdout + result.stderr).decode()[-3000:], '```']
-            return False, '\n'.join(out)
-    if spec['time'] is None:
-        return True, '\n'.join(out + ['', f'{target}: tested, not timed'])
-
+    out = [f'### {target}: `{spec["flags"]}`', '']
     timed = [k for k in kernels if git('cat-file', '-e', f'{base}:{unit_dir(k)}/bench.cpp', check=False).returncode == 0]
     path = ship(spec['time'], name, new_tar)
     base_path = ship(spec['time'], f'{name}.base', base_tar)
     reports = {}
-    for k in timed:
-        log(f'[{target}] timing {k} on {spec["time"]}')
-        reports[k] = bench(spec['time'], path, base_path, k, target)
-        ratio = kernel_ratio(reports[k])
-        if ratio is not None and ratio > 1:
-            log(f'[{target}] {k}: {ratio:.4f}, timing {ROUNDS} more rounds')
-            again = bench(spec['time'], path, base_path, k, target)
-            for case, times in again['cases'].items():
-                for side, values in times.items():
-                    reports[k]['cases'].setdefault(case, {}).setdefault(side, []).extend(values)
-            reports[k]['rounds'] += again['rounds']
-    ssh(spec['time'], f'rm -rf {path} {base_path}')
+    try:
+        for k in timed:
+            log(f'[{target}] timing {k} on {spec["time"]}')
+            reports[k] = bench(spec['time'], path, base_path, k, target)
+            ratio = kernel_ratio(reports[k])
+            if ratio is not None and ratio > 1:
+                log(f'[{target}] {k}: {ratio:.4f}, timing {ROUNDS} more rounds')
+                again = bench(spec['time'], path, base_path, k, target)
+                for case, times in again['cases'].items():
+                    for side, values in times.items():
+                        reports[k]['cases'].setdefault(case, {}).setdefault(side, []).extend(values)
+                reports[k]['rounds'] += again['rounds']
+    except RuntimeError as error:
+        return False, '\n'.join(out + ['```', str(error), '```', f'{target}: FAIL'])
+    finally:
+        ssh(spec['time'], f'rm -rf {path} {base_path}')
 
     ratios = {k: kernel_ratio(r) for k, r in reports.items()}
     overall = geomean([r for r in ratios.values() if r is not None])
     cpu = next(iter(reports.values()))['cpu'] if reports else spec['time']
-    out += ['', f'Timing on {spec["time"]} ({cpu}), new/base, below 1 is faster:']
+    out += [f'Timing on {spec["time"]} ({cpu}), new/base, below 1 is faster:']
     for k in kernels:
         if k not in reports:
             out.append(f'- {k}: no bench in base, not timed')
@@ -163,15 +150,34 @@ def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, base: s
     return passed, '\n'.join(out)
 
 
-def gh_json(*args: str) -> dict:
-    return json.loads(subprocess.run(['gh', *args], check=True, capture_output=True, text=True).stdout)
-
-
-def gate(args) -> tuple[bool, str, str, str]:
-    """Returns (passed, report, the base commit it ran against, the head commit)."""
+def timing(pr: str, head: str) -> tuple[bool, str, str]:
+    """Times the head merged into origin/main. Returns (passed, report, the base commit)."""
     git('fetch', '--quiet', 'origin', 'main')
-    pr = args.target if args.target.isdigit() else None
-    if pr:
+    base = git('rev-parse', 'origin/main').stdout.strip()
+    lines = [f'Gate for #{pr} ({head[:10]}) merged into main ({base[:10]}).', '']
+    merged = git('merge-tree', '--write-tree', base, head, check=False)
+    if merged.returncode:
+        return False, '\n'.join(lines + ['Conflicts with main: rebase first.']), base
+    tree = merged.stdout.split()[0]
+    kernels = affected(base, tree)
+    if not kernels:
+        return True, '\n'.join(lines + ['No unit affected: nothing to time.']), base
+    lines += [f'Units: {", ".join(kernels)}', '']
+    new_tar = subprocess.run(['git', 'archive', '--format=tar.gz', tree], check=True, capture_output=True).stdout
+    base_tar = rev_tar(base)
+    timed = [t for t, spec in TARGETS.items() if spec['time']]
+    with ThreadPoolExecutor(len(timed)) as pool:
+        futures = [pool.submit(time_target, t, f'gate-pr{pr}-{t}', new_tar, base_tar, base, kernels)
+                   for t in timed]
+        results = [f.result() for f in futures]
+    lines += [text + '\n' for _, text in results]
+    return all(ok for ok, _ in results), '\n'.join(lines), base
+
+
+def fetch_head(pr: str, stale: str | None = None) -> str:
+    """The pull request's head, fetched. Refuses pull requests the gate must not run. GitHub can
+    report the old head for a few seconds after a push; with stale, waits until the head moves on."""
+    for _ in range(24):
         info = gh_json('pr', 'view', pr, '--json', 'headRefOid,state,author,isCrossRepository')
         owner = gh_json('repo', 'view', '--json', 'owner')['owner']['login']
         if info['author']['login'] != owner or info['isCrossRepository']:
@@ -180,72 +186,112 @@ def gate(args) -> tuple[bool, str, str, str]:
                      f'Only {owner}\'s own pull requests are gated.')
         if info['state'] != 'OPEN':
             sys.exit(f'pull request {pr} is {info["state"].lower()}')
-        for _ in range(12):  # right after a push, GitHub can report the old head for a few seconds
-            git('fetch', '--quiet', 'origin', f'pull/{pr}/head')
-            head = git('rev-parse', 'FETCH_HEAD').stdout.strip()
-            if head == info['headRefOid']:
-                break
-            time.sleep(5)
-            info = gh_json('pr', 'view', pr, '--json', 'headRefOid,state,author,isCrossRepository')
-        else:
-            sys.exit(f'pull request {pr}: GitHub reports head {info["headRefOid"][:10]}, fetched {head[:10]}')
-        label = f'pr{pr}'
-    else:
-        head = git('rev-parse', args.target).stdout.strip()
-        label = head[:10]
-    base = git('rev-parse', args.base).stdout.strip()
-    merged = git('merge-tree', '--write-tree', base, head, check=False)
-    if merged.returncode:
-        return False, f'Conflicts with {args.base} ({base[:10]}): rebase first.\n\nGate: fail', base, head
-    tree = merged.stdout.split()[0]
+        git('fetch', '--quiet', 'origin', f'pull/{pr}/head')
+        head = git('rev-parse', 'FETCH_HEAD').stdout.strip()
+        if head == info['headRefOid'] and head != stale:
+            return head
+        time.sleep(5)
+    sys.exit(f'pull request {pr}: GitHub reports head {info["headRefOid"][:10]}, fetched {head[:10]}')
 
-    kernels = affected(base, tree)
-    lines = [f'Gate for {label} ({head[:10]}) merged into {args.base} ({base[:10]}).', '']
-    if not kernels:
-        return True, '\n'.join(lines + ['No unit affected.', '', 'Gate: pass']), base, head
-    lines += [f'Units: {", ".join(kernels)}', '']
-    new_tar = subprocess.run(['git', 'archive', '--format=tar.gz', tree], check=True, capture_output=True).stdout
-    base_tar = rev_tar(base)
-    with ThreadPoolExecutor(len(TARGETS)) as pool:
-        futures = [pool.submit(run_target, t, label, new_tar, base_tar, base, kernels) for t in TARGETS]
-        results = [f.result() for f in futures]
-    passed = all(ok for ok, _ in results)
-    lines += [text + '\n' for _, text in results]
-    lines.append('Gate: ' + ('pass' if passed else 'fail'))
-    return passed, '\n'.join(lines), base, head
+
+def contains(head: str, rev: str) -> bool:
+    return git('merge-base', '--is-ancestor', rev, head, check=False).returncode == 0
+
+
+def update_branch(pr: str, head: str) -> str:
+    """Merges main into the pull request's branch if it is behind, so that its checks test what
+    merging lands. Returns the new head."""
+    git('fetch', '--quiet', 'origin', 'main')
+    if contains(head, 'origin/main') or git('merge-tree', '--write-tree', 'origin/main', head, check=False).returncode:
+        return head  # up to date, or conflicts, which the timing reports
+    log(f'merging main into the branch of #{pr}; pull before you push to it again')
+    gh('pr', 'update-branch', pr)
+    return fetch_head(pr, stale=head)
+
+
+def checks(pr: str) -> list[dict]:
+    """The checks on the pull request's head but `gate`: name, bucket (pass, fail, pending,
+    skipping or cancel), link."""
+    result = gh('pr', 'checks', pr, '--json', 'name,bucket,link', check=False)  # exits nonzero unless all pass
+    return [c for c in json.loads(result.stdout or '[]') if c['name'] != 'gate']
+
+
+def checks_report(found: list[dict], head: str) -> str:
+    if not found:
+        return f'Checks on {head[:10]}: none yet.'
+    return '\n'.join([f'Checks on {head[:10]}:'] + [f'- {c["name"]}: {c["bucket"]}'
+                     + ('' if c['bucket'] == 'pass' else f' ({c["link"]})') for c in found])
+
+
+def wait(pr: str, head: str, merge_base: str | None) -> tuple[bool, str]:
+    """Waits until every check on head has finished and, with merge_base (the main the timing ran
+    against), until the pull request is merged. Returns (passed, what happened), or MAIN_MOVED."""
+    start, merging = time.time(), False
+    while time.time() - start < WAIT:
+        info = gh_json('pr', 'view', pr, '--json', 'state,headRefOid')
+        if info['state'] == 'MERGED':
+            return True, f'Merged #{pr}.'
+        if info['state'] != 'OPEN' or info['headRefOid'] != head:
+            return False, f'#{pr} changed while the gate waited ({info["state"].lower()}, head '\
+                          f'{info["headRefOid"][:10]}): run the gate again.'
+        found = checks(pr)
+        failed = [c for c in found if c['bucket'] not in ('pass', 'pending')]
+        if failed:
+            return False, checks_report(failed, head)
+        if not found and time.time() - start > 300:
+            return False, f'No checks on {head[:10]} after 5 minutes: push to the branch to run them.'
+        if found and all(c['bucket'] == 'pass' for c in found):
+            if merge_base is None:
+                return True, checks_report(found, head)
+            git('fetch', '--quiet', 'origin', 'main')
+            main = git('rev-parse', 'origin/main').stdout.strip()
+            if main != merge_base or not contains(head, main):  # the checks or the timing saw another main
+                if merging:
+                    gh('pr', 'merge', pr, '--disable-auto', check=False)
+                return False, MAIN_MOVED
+            if not merging:
+                # Not before every check passed: without branch protection, gh merges at once.
+                result = gh('pr', 'merge', pr, '--auto', '--squash', '--match-head-commit', head, check=False)
+                if result.returncode:  # auto-merge unavailable: every check passed, so merge directly
+                    result = gh('pr', 'merge', pr, '--squash', '--match-head-commit', head, check=False)
+                if result.returncode:
+                    return False, f'gh pr merge failed:\n{result.stderr}'
+                merging = True
+        time.sleep(POLL)
+    return False, f'Gave up after {WAIT // 60} minutes: checks still pending or not merged.'
 
 
 def set_status(head: str, passed: bool, url: str) -> None:
-    """The commit status `gate`, which branch protection on main requires."""
-    repo = gh_json('repo', 'view', '--json', 'nameWithOwner')['nameWithOwner']
-    subprocess.run(['gh', 'api', f'repos/{repo}/statuses/{head}', '-f', f'state={"success" if passed else "failure"}',
-                    '-f', 'context=gate', '-f', f'description=Gate: {"pass" if passed else "fail"}',
-                    '-f', f'target_url={url}'], check=True, capture_output=True)
+    """The commit status `gate`: the timing, which branch protection on main requires."""
+    gh('api', f'repos/{{owner}}/{{repo}}/statuses/{head}', '-f', f'state={"success" if passed else "failure"}',
+       '-f', 'context=gate', '-f', f'description=Timing: {"pass" if passed else "fail"}', '-f', f'target_url={url}')
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('target', help='pull request number or git revision')
-    parser.add_argument('--base', default='origin/main')
+    parser.add_argument('pr', help='pull request number')
     parser.add_argument('--merge', action='store_true', help='squash-merge the pull request on a pass')
     args = parser.parse_args()
-    pr = args.target if args.target.isdigit() else None
     for _ in range(3):
-        passed, report, base, head = gate(args)
-        print(report)
-        if pr:
-            url = subprocess.run(['gh', 'pr', 'comment', pr, '--body-file', '-'], input=report, text=True,
-                                 check=True, capture_output=True).stdout.strip()
-            set_status(head, passed, url)
-        if not (passed and args.merge and pr):
+        head = fetch_head(args.pr)
+        if args.merge:
+            head = update_branch(args.pr, head)
+        passed, report, base = timing(args.pr, head)
+        report += '\n\n' + checks_report(checks(args.pr), head) + f'\n\nTiming: {"pass" if passed else "fail"}'
+        url = gh('pr', 'comment', args.pr, '--body-file', '-', input=report).stdout.strip()
+        set_status(head, passed, url)
+        print(report, flush=True)
+        if not passed:
+            print('\nGate: fail')
+            return 1
+        log('waiting for the checks' + (' and the merge' if args.merge else ''))
+        passed, outcome = wait(args.pr, head, base if args.merge else None)
+        if outcome != MAIN_MOVED:
+            print(f'\n{outcome}\n\nGate: {"pass" if passed else "fail"}')
             return 0 if passed else 1
-        git('fetch', '--quiet', 'origin', 'main')
-        if git('rev-parse', 'origin/main').stdout.strip() != base:
-            log('main moved during the gate: running it again')
-            continue
-        subprocess.run(['gh', 'pr', 'merge', pr, '--squash'], check=True)
-        return 0
+        log('main moved during the gate: running it again')
     log('main kept moving; not merged')
+    print('\nGate: fail')
     return 1
 
 
