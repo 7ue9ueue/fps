@@ -47,6 +47,7 @@ inline Vec multiply(Vec x, const Factor& f) {
     return _mm256_sub_epi32(_mm256_mullo_epi32(x, f.w), _mm256_mullo_epi32(q, broadcast(kP)));
 }
 
+
 inline Vec load(const u32* p) { return _mm256_load_si256(reinterpret_cast<const Vec*>(p)); }
 inline void store(u32* p, Vec x) { _mm256_store_si256(reinterpret_cast<Vec*>(p), x); }
 
@@ -144,14 +145,14 @@ struct PairBottom {
     }
 };
 
+inline constexpr std::size_t kTile = 256;  // vectors
+
 // Depth-first recursion of a product: forward transforms of a and b, leaf products into a,
 // inverse transform. Runs of sibling subtrees of at most kTile vectors in all (8 KiB per array)
 // go level by level as one tile, so one bottom stage pipelines across them.
 template <class Bottom>
 class Tree {
 public:
-    static constexpr std::size_t kTile = 256;
-
     Tree(const u32* roots, const u32* inverse_roots) : r_(roots), ir_(inverse_roots) {}
 
     // The count subtrees of groups first, first + 1, ... with nv vectors each, one after another
@@ -196,7 +197,7 @@ private:
 // Top levels. Inputs of the first level are canonical. If an input's upper half is zero ("sparse"),
 // the first radix-2 level is a copy and the first radix-4 level reads only the lower half.
 
-// f[i] and f[i + h] for i < h -> their sum and difference, < 2P.
+// f[i] and f[i + h] for i < h -> their sum and difference, < 2P: inputs canonical, no reduction.
 inline void forward_radix2(Vec* f, std::size_t h, bool sparse) {
     if (sparse) {
         std::memcpy(f + h, f, h * sizeof(Vec));
@@ -204,8 +205,7 @@ inline void forward_radix2(Vec* f, std::size_t h, bool sparse) {
     }
     for (std::size_t i = 0; i < h; ++i) {
         const Vec x = f[i], y = f[i + h];
-        f[i] = reduce(add(x, y), 2 * kP);
-        f[i + h] = reduce(diff(x, y), 2 * kP);
+        f[i] = add(x, y), f[i + h] = diff_canonical(x, y);
     }
 }
 
@@ -329,53 +329,50 @@ inline void product(u32* a_words, u32* b_words, bool sparse_a, bool sparse_b, in
 
 // Transforms alone. The bottom level (h = 1) has a group per 4 vectors, each with its own twiddles.
 
-// Forward groups [first, first + count) with h = 1, values < 4P in; canonical leaves out.
+// Forward groups [first, first + count) with h = 1, values < 4P in; canonical leaves out. first
+// and count even.
 inline void forward_bottom(Vec* f, std::size_t count, std::size_t first, const u32* r) {
-    for (std::size_t k = first; k < first + count; ++k, f += 4) {
-        const Factor x = entry(r, k), y = entry(r, 2 * k), z = entry(r, 2 * k + 1);
-        const Vec a = reduce(f[0], 2 * kP), b = reduce(f[1], 2 * kP);
-        const Vec c = multiply(f[2], x), d = multiply(f[3], x);
-        const Vec ac = reduce(add(a, c), 2 * kP), amc = reduce(diff(a, c), 2 * kP);
-        const Vec yb = multiply(add(b, d), y), zd = multiply(diff(b, d), z);
-        f[0] = canonical(add(ac, yb)), f[1] = canonical(diff(ac, yb));
-        f[2] = canonical(add(amc, zd)), f[3] = canonical(diff(amc, zd));
-    }
+    for (std::size_t k = first; k < first + count; k += 2, f += 8) kernels::forward_leaves(f, r + slot(k), r + slot(2 * k));
 }
 
-// Inverse groups [first, first + count) with h = 1; values < 2P in and out.
+// Inverse groups [first, first + count) with h = 1; canonical in, < 2P out. first and count even.
 inline void inverse_bottom(Vec* f, std::size_t count, std::size_t first, const u32* ir) {
-    for (std::size_t k = first; k < first + count; ++k, f += 4) {
-        const Factor x = entry(ir, k), y = entry(ir, 2 * k), z = entry(ir, 2 * k + 1);
-        const Vec ab = reduce(add(f[0], f[1]), 2 * kP), cd = reduce(add(f[2], f[3]), 2 * kP);
-        const Vec amb = multiply(diff(f[0], f[1]), y), cmd = multiply(diff(f[2], f[3]), z);
-        f[0] = reduce(add(ab, cd), 2 * kP), f[1] = reduce(add(amb, cmd), 2 * kP);
-        f[2] = multiply(diff(ab, cd), x), f[3] = multiply(diff(amb, cmd), x);
+    for (std::size_t k = first; k < first + count; k += 2, f += 8) kernels::inverse_leaves(f, ir + slot(k), ir + slot(2 * k));
+}
+
+// The count subtrees of groups first, first + 1, ... with nv vectors each (a power of 4), one after
+// another from f; depth first, runs of siblings of at most kTile vectors level by level, as Tree.
+
+inline void forward_trees(Vec* f, std::size_t nv, std::size_t count, std::size_t first, const u32* r) {
+    if (nv > kTile) {
+        for (std::size_t k = first; k < first + count; ++k, f += nv) {
+            forward_group(f, nv / 4, k, r);
+            forward_trees(f, nv / 4, 4, 4 * k, r);
+        }
+        return;
+    }
+    const std::size_t run = std::min(count, kTile / nv), total = run * nv;
+    for (std::size_t k = first; k < first + count; k += run, f += total) {
+        for (std::size_t h = nv / 4; h >= 4; h /= 4)
+            for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) forward_group(f + j, h, g, r);
+        forward_bottom(f, total / 4, k * (nv / 4), r);
     }
 }
 
-// Subtree of group k with nv vectors (a power of 4), depth first; tiles as Tree.
-inline void forward_tree(Vec* f, std::size_t nv, std::size_t k, const u32* r) {
-    if (nv > 256) {
-        const std::size_t h = nv / 4;
-        forward_group(f, h, k, r);
-        for (std::size_t t = 0; t < 4; ++t) forward_tree(f + t * h, h, 4 * k + t, r);
+inline void inverse_trees(Vec* f, std::size_t nv, std::size_t count, std::size_t first, const u32* ir) {
+    if (nv > kTile) {
+        for (std::size_t k = first; k < first + count; ++k, f += nv) {
+            inverse_trees(f, nv / 4, 4, 4 * k, ir);
+            inverse_group(f, nv / 4, k, ir);
+        }
         return;
     }
-    for (std::size_t h = nv / 4; h >= 4; h /= 4)
-        for (std::size_t j = 0, g = k * (nv / (4 * h)); j < nv; j += 4 * h, ++g) forward_group(f + j, h, g, r);
-    forward_bottom(f, nv / 4, k * (nv / 4), r);
-}
-
-inline void inverse_tree(Vec* f, std::size_t nv, std::size_t k, const u32* ir) {
-    if (nv > 256) {
-        const std::size_t h = nv / 4;
-        for (std::size_t t = 0; t < 4; ++t) inverse_tree(f + t * h, h, 4 * k + t, ir);
-        inverse_group(f, h, k, ir);
-        return;
+    const std::size_t run = std::min(count, kTile / nv), total = run * nv;
+    for (std::size_t k = first; k < first + count; k += run, f += total) {
+        inverse_bottom(f, total / 4, k * (nv / 4), ir);
+        for (std::size_t h = 4; h < nv; h *= 4)
+            for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) inverse_group(f + j, h, g, ir);
     }
-    inverse_bottom(f, nv / 4, k * (nv / 4), ir);
-    for (std::size_t h = 4; h < nv; h *= 4)
-        for (std::size_t j = 0, g = k * (nv / (4 * h)); j < nv; j += 4 * h, ++g) inverse_group(f + j, h, g, ir);
 }
 
 // Below this length the radix-2 pass and the asm forward_identity beat forward_radix8_dense (it
@@ -385,33 +382,29 @@ inline constexpr int kDenseRadix8MinLog = 16;
 inline void forward(u32* words, int lg, const u32* r) {
     auto* f = reinterpret_cast<Vec*>(words);
     const std::size_t nv = (std::size_t(1) << lg) / 8;
-    if (!has_radix2(lg)) return forward_tree(f, nv, 0, r);
+    if (!has_radix2(lg)) return forward_trees(f, nv, 1, 0, r);
     if (lg < kDenseRadix8MinLog) {
         forward_radix2(f, nv / 2, false);
-        forward_tree(f, nv / 2, 0, r);
-        return forward_tree(f + nv / 2, nv / 2, 1, r);
+        return forward_trees(f, nv / 2, 2, 0, r);
     }
     const std::size_t q = nv / 8;
     forward_radix8_dense(f, q, r);
-    for (std::size_t c = 0; c < 8; ++c) forward_tree(f + c * q, q, c, r);
+    forward_trees(f, q, 8, 0, r);
 }
 
 inline void inverse(u32* words, int lg, const u32* ir) {
     auto* f = reinterpret_cast<Vec*>(words);
     const std::size_t nv = (std::size_t(1) << lg) / 8;
     if (!has_radix2(lg)) {
-        const std::size_t h = nv / 4;
-        for (std::size_t t = 0; t < 4; ++t) inverse_tree(f + t * h, h, t, ir);
-        return inverse_radix4(f, h, ir, Factor(leaf_scale(lg)));
+        inverse_trees(f, nv / 4, 4, 0, ir);
+        return inverse_radix4(f, nv / 4, ir, Factor(leaf_scale(lg)));
     }
     if (nv == 8) {
-        inverse_tree(f, 4, 0, ir);
-        inverse_tree(f + 4, 4, 1, ir);
+        inverse_trees(f, 4, 2, 0, ir);
         return scale_radix2(f, 4, leaf_scale(lg));
     }
-    const std::size_t q = nv / 8;
-    for (std::size_t c = 0; c < 8; ++c) inverse_tree(f + c * q, q, c, ir);
-    inverse_radix8(f, q, ir, leaf_scale(lg));
+    inverse_trees(f, nv / 8, 8, 0, ir);
+    inverse_radix8(f, nv / 8, ir, leaf_scale(lg));
 }
 
 }  // namespace fps::ntt::detail::avx2

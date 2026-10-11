@@ -343,9 +343,9 @@ void test_loops() {
 void test_bottom_levels() {
     Tables t(kTableLog);
     for (int round = 0; round < 50; ++round) {
-        const std::size_t count = 1 + random_below(4), first = random_below(kGroups - count);
+        const std::size_t count = 2 + 2 * random_below(2), first = 2 * random_below(kGroups / 2 - 2);
         for (int inverse = 0; inverse < 2; ++inverse) {
-            const u64 bound = inverse ? 2 * u64(P) : 4 * u64(P);
+            const u64 bound = inverse ? u64(P) : 4 * u64(P);  // inverse: leaf form in
             Words v(32 * count);
             fill(v.begin(), 32 * count, bound);
             const std::vector<u32> in(v.begin(), v.begin() + 32 * count);
