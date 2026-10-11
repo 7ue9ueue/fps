@@ -145,36 +145,40 @@ struct PairBottom {
 };
 
 // Depth-first recursion of a product: forward transforms of a and b, leaf products into a,
-// inverse transform. Subtrees of at most 256 vectors (8 KiB per array) run level by level ("tiles").
+// inverse transform. Runs of sibling subtrees of at most kTile vectors in all (8 KiB per array)
+// go level by level as one tile, so one bottom stage pipelines across them.
 template <class Bottom>
 class Tree {
 public:
+    static constexpr std::size_t kTile = 256;
+
     Tree(const u32* roots, const u32* inverse_roots) : r_(roots), ir_(inverse_roots) {}
 
-    // The subtree of group k with nv vectors: nv a power of 4, at least Bottom::kMinVectors.
-    void visit(Vec* a, Vec* b, std::size_t nv, std::size_t k) const {
-        switch (nv) {
-        case 4:
-            if constexpr (Bottom::kMinVectors <= 4) return tile<4>(a, b, k);
-            break;
-        case 16: return tile<16>(a, b, k);
-        case 64: return tile<64>(a, b, k);
-        case 256: return tile<256>(a, b, k);
+    // The count subtrees of groups first, first + 1, ... with nv vectors each, one after another
+    // from a and b: nv a power of 4, at least Bottom::kMinVectors.
+    void visit(Vec* a, Vec* b, std::size_t nv, std::size_t count, std::size_t first) const {
+        if (nv <= kTile) {
+            const std::size_t run = std::min(count, kTile / nv);
+            for (std::size_t c = 0; c < count; c += run) tile(a + c * nv, b + c * nv, nv, run * nv, (first + c) * nv);
+            return;
         }
         const std::size_t h = nv / 4;
-        forward_groups(a, b, h, k, r_);
-        for (std::size_t t = 0; t < 4; ++t) visit(a + t * h, b + t * h, h, 4 * k + t);
-        inverse_group(a, h, k, ir_);
+        for (std::size_t k = first; k < first + count; ++k, a += nv, b += nv) {
+            forward_groups(a, b, h, k, r_);
+            visit(a, b, h, 4, 4 * k);
+            inverse_group(a, h, k, ir_);
+        }
     }
 
 private:
-    template <std::size_t NV>
-    [[gnu::noinline]] void tile(Vec* a, Vec* b, std::size_t k) const {
-        for (std::size_t h = NV / 4; h >= 4; h /= 4)
-            for (std::size_t j = 0, g = k * (NV / (4 * h)); j < NV; j += 4 * h, ++g) forward_groups(a + j, b + j, h, g, r_);
-        Bottom::run(a, b, NV, k * (NV / 4), r_, ir_);
-        for (std::size_t h = 4; h < NV; h *= 4)
-            for (std::size_t j = 0, g = k * (NV / (4 * h)); j < NV; j += 4 * h, ++g) inverse_group(a + j, h, g, ir_);
+    // Subtrees of nv vectors each, total vectors from a and b; the first starts at vector `base`
+    // of its level, so the group at a + j with stride h is (base + j) / 4h.
+    [[gnu::noinline]] void tile(Vec* a, Vec* b, std::size_t nv, std::size_t total, std::size_t base) const {
+        for (std::size_t h = nv / 4; h >= 4; h /= 4)
+            for (std::size_t j = 0; j < total; j += 4 * h) forward_groups(a + j, b + j, h, (base + j) / (4 * h), r_);
+        Bottom::run(a, b, total, base / 4, r_, ir_);
+        for (std::size_t h = 4; h < nv; h *= 4)
+            for (std::size_t j = 0; j < total; j += 4 * h) inverse_group(a + j, h, (base + j) / (4 * h), ir_);
     }
 
     const u32 *r_, *ir_;
@@ -297,20 +301,19 @@ inline void convolution(u32* a_words, u32* b_words, std::size_t n, std::size_t m
         const std::size_t h = nv / 4;
         forward_radix4(a, h, sparse_a, r);
         forward_radix4(b, h, sparse_b, r);
-        for (std::size_t t = 0; t < 4; ++t) tree.visit(a + t * h, b + t * h, h, t);
+        tree.visit(a, b, h, 4, 0);
         return inverse_radix4(a, h, ir, Factor(product_scale(lg)));
     }
     if (nv == 8) {  // lg = 6: subtrees of 4 vectors
         forward_radix2(a, 4, sparse_a);
         forward_radix2(b, 4, sparse_b);
-        tree.visit(a, b, 4, 0);
-        tree.visit(a + 4, b + 4, 4, 1);
+        tree.visit(a, b, 4, 2, 0);
         return scale_radix2(a, 4, product_scale(lg));
     }
     const std::size_t q = nv / 8;
     forward_radix8(a, q, sparse_a, r);
     forward_radix8(b, q, sparse_b, r);
-    for (std::size_t c = 0; c < 8; ++c) tree.visit(a + c * q, b + c * q, q, c);
+    tree.visit(a, b, q, 8, 0);
     inverse_radix8(a, q, ir, product_scale(lg));
 }
 
@@ -326,14 +329,14 @@ inline void product(u32* a_words, u32* b_words, int lg, const u32* r, const u32*
         const std::size_t h = nv / 4;
         forward_radix4(a, h, true, r);
         forward_radix4(b, h, true, r);
-        for (std::size_t t = 0; t < 4; ++t) tree.visit(a + t * h, b + t * h, h, t);
+        tree.visit(a, b, h, 4, 0);
         inverse_radix4(a, h, ir, Factor(s));
         return;
     }
     const std::size_t q = nv / 8;
     forward_radix8_sparse(a, q, r);
     forward_radix8_sparse(b, q, r);
-    for (std::size_t c = 0; c < 8; ++c) tree.visit(a + c * q, b + c * q, q, c);
+    tree.visit(a, b, q, 8, 0);
     inverse_radix8(a, q, ir, s);
 }
 
