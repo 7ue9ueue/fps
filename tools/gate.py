@@ -100,6 +100,16 @@ def bench(vm: str, path: str, base_path: str, kernel: str, target: str) -> dict:
     return json.loads(result.stdout)
 
 
+def pool(report: dict, again: dict) -> None:
+    """Add a second bench run's rounds to report. A case holds 'base' and 'new' lists of times
+    per round and an 'items' count."""
+    for case, times in again['cases'].items():
+        entry = report['cases'].setdefault(case, {'items': times.get('items', 0)})
+        for side in ('base', 'new'):
+            entry.setdefault(side, []).extend(times.get(side, []))
+    report['rounds'] += again['rounds']
+
+
 def kernel_ratio(report: dict) -> float | None:
     return 1.0 if report['identical'] else summarize(report['cases'])[1]
 
@@ -148,10 +158,7 @@ def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, base: s
         if ratio is not None and ratio > 1:
             log(f'[{target}] {k}: {ratio:.4f}, timing {ROUNDS} more rounds')
             again = bench(spec['time'], path, base_path, k, target)
-            for case, times in again['cases'].items():
-                for side, values in times.items():
-                    reports[k]['cases'].setdefault(case, {}).setdefault(side, []).extend(values)
-            reports[k]['rounds'] += again['rounds']
+            pool(reports[k], again)
     ssh(spec['time'], f'rm -rf {path} {base_path}')
 
     ratios = {k: kernel_ratio(r) for k, r in reports.items()}
