@@ -139,7 +139,8 @@ std::vector<std::pair<Polynomial, int>> factor(f);   // monic irreducible factor
 
 `Factorials<P> fact(n)`: `fact[i]`, `fact.inverse(i)`, `fact.binomial(n, k)` for i, n < size.
 
-Scalars: `fps::mod_mul<P>(a, b)`, `fps::mod_pow<P>(a, e)`, `fps::mod_inverse<P>(a)`.
+Scalars: `fps::mod_mul<P>(a, b)`, `fps::mod_pow<P>(a, e)`, `fps::mod_inverse<P>(a)`. They work for
+any prime P < 2^32, not only 998244353: they need no kernels.
 
 ## Fraction
 

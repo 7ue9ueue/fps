@@ -14,8 +14,12 @@ changed, those that include them, or all if a shared file changed.
 Passes if every test passes and, per target, the geomean over units of new/base (each unit's
 geomean over its gated cases) is at most 1. Byte-identical bench binaries count as 1.
 
-For a pull request it posts the report as a comment; with --merge it squash-merges on a pass.
-The last line of the report is "Gate: pass" or "Gate: fail".
+For a pull request it posts the report as a comment and sets the commit status `gate` on its
+head, which `main` requires; with --merge it squash-merges on a pass. The last line of the report
+is "Gate: pass" or "Gate: fail".
+
+The repository is public and the gate runs a pull request's code on the VMs and this Mac, so it
+refuses pull requests by any account but the repository's owner, and pull requests from forks.
 """
 from __future__ import annotations
 
@@ -28,6 +32,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from kernel import TARGETS, summarize, table, unit_dir
@@ -158,30 +163,46 @@ def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, base: s
     return passed, '\n'.join(out)
 
 
-def gate(args) -> tuple[bool, str, str]:
-    """Returns (passed, report, the base commit it ran against)."""
+def gh_json(*args: str) -> dict:
+    return json.loads(subprocess.run(['gh', *args], check=True, capture_output=True, text=True).stdout)
+
+
+def gate(args) -> tuple[bool, str, str, str]:
+    """Returns (passed, report, the base commit it ran against, the head commit)."""
     git('fetch', '--quiet', 'origin', 'main')
     pr = args.target if args.target.isdigit() else None
     if pr:
-        info = json.loads(subprocess.run(['gh', 'pr', 'view', pr, '--json', 'headRefOid,state'],
-                                         check=True, capture_output=True, text=True).stdout)
+        info = gh_json('pr', 'view', pr, '--json', 'headRefOid,state,author,isCrossRepository')
+        owner = gh_json('repo', 'view', '--json', 'owner')['owner']['login']
+        if info['author']['login'] != owner or info['isCrossRepository']:
+            sys.exit(f'refusing pull request {pr}: it is by {info["author"]["login"]}'
+                     f'{" from a fork" if info["isCrossRepository"] else ""}, and the gate runs its code. '
+                     f'Only {owner}\'s own pull requests are gated.')
         if info['state'] != 'OPEN':
             sys.exit(f'pull request {pr} is {info["state"].lower()}')
-        git('fetch', '--quiet', 'origin', f'pull/{pr}/head')
-        head, label = info['headRefOid'], f'pr{pr}'
+        for _ in range(12):  # right after a push, GitHub can report the old head for a few seconds
+            git('fetch', '--quiet', 'origin', f'pull/{pr}/head')
+            head = git('rev-parse', 'FETCH_HEAD').stdout.strip()
+            if head == info['headRefOid']:
+                break
+            time.sleep(5)
+            info = gh_json('pr', 'view', pr, '--json', 'headRefOid,state,author,isCrossRepository')
+        else:
+            sys.exit(f'pull request {pr}: GitHub reports head {info["headRefOid"][:10]}, fetched {head[:10]}')
+        label = f'pr{pr}'
     else:
         head = git('rev-parse', args.target).stdout.strip()
         label = head[:10]
     base = git('rev-parse', args.base).stdout.strip()
     merged = git('merge-tree', '--write-tree', base, head, check=False)
     if merged.returncode:
-        return False, f'Conflicts with {args.base} ({base[:10]}): rebase first.\n\nGate: fail', base
+        return False, f'Conflicts with {args.base} ({base[:10]}): rebase first.\n\nGate: fail', base, head
     tree = merged.stdout.split()[0]
 
     kernels = affected(base, tree)
     lines = [f'Gate for {label} ({head[:10]}) merged into {args.base} ({base[:10]}).', '']
     if not kernels:
-        return True, '\n'.join(lines + ['No unit affected.', '', 'Gate: pass']), base
+        return True, '\n'.join(lines + ['No unit affected.', '', 'Gate: pass']), base, head
     lines += [f'Units: {", ".join(kernels)}', '']
     new_tar = subprocess.run(['git', 'archive', '--format=tar.gz', tree], check=True, capture_output=True).stdout
     base_tar = rev_tar(base)
@@ -191,7 +212,15 @@ def gate(args) -> tuple[bool, str, str]:
     passed = all(ok for ok, _ in results)
     lines += [text + '\n' for _, text in results]
     lines.append('Gate: ' + ('pass' if passed else 'fail'))
-    return passed, '\n'.join(lines), base
+    return passed, '\n'.join(lines), base, head
+
+
+def set_status(head: str, passed: bool, url: str) -> None:
+    """The commit status `gate`, which branch protection on main requires."""
+    repo = gh_json('repo', 'view', '--json', 'nameWithOwner')['nameWithOwner']
+    subprocess.run(['gh', 'api', f'repos/{repo}/statuses/{head}', '-f', f'state={"success" if passed else "failure"}',
+                    '-f', 'context=gate', '-f', f'description=Gate: {"pass" if passed else "fail"}',
+                    '-f', f'target_url={url}'], check=True, capture_output=True)
 
 
 def main() -> int:
@@ -202,10 +231,12 @@ def main() -> int:
     args = parser.parse_args()
     pr = args.target if args.target.isdigit() else None
     for _ in range(3):
-        passed, report, base = gate(args)
+        passed, report, base, head = gate(args)
         print(report)
         if pr:
-            subprocess.run(['gh', 'pr', 'comment', pr, '--body-file', '-'], input=report, text=True, check=True)
+            url = subprocess.run(['gh', 'pr', 'comment', pr, '--body-file', '-'], input=report, text=True,
+                                 check=True, capture_output=True).stdout.strip()
+            set_status(head, passed, url)
         if not (passed and args.merge and pr):
             return 0 if passed else 1
         git('fetch', '--quiet', 'origin', 'main')
