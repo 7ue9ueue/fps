@@ -21,6 +21,12 @@
 //   montgomery_as<Montgomery::doubling> Neon: 2 sqdmulh, 2 mul, shsub; signed lanes
 //   shoup_as<Shoup::mulhi>              any S: 1 mulhi, 2 mul_lo (Neon: mul + mls)
 //   shoup_as<Shoup::wide>               x86: 6 mul_even
+//   barrett_as<Barrett::mulhi>          any S: mul_shr, mulhi, 2 mul_lo
+//   barrett_as<Barrett::wide>           x86: 4 mul_even, 2 mul_lo; the quotient from the 64-bit
+//                                       products, without packing them to words in between
+//   barrett_as<Barrett::split>          any S: 2 mulhi, 2 mul_lo, 2 shifts; (a b) >> (bits - 1)
+//                                       from mulhi and mul_lo, so mul_lo(a, b) is shared. For
+//                                       a one-instruction mulhi (SVE2 umulh)
 // Variants with their own contracts (not interchangeable with the above):
 //   shoup_doubling(x, w, q31)  Neon. x < 2^31, q31 = shoup_quotient31(w) -> [0, 2P), = x w;
 //                              3 instructions (sqdmulh, mul, mls)
@@ -99,12 +105,13 @@ struct Ops {
     }
     static V shoup(V x, V w, V q) { return shoup_as<selected_shoup<S>()>(x, w, q); }
 
-    // q = floor(a b / 2^(kBits-1)) m / 2^32 <= a b / P.
-    static V barrett(V a, V b) {
-        const V high = S::template mul_shr<kBits - 1>(a, b);  // < 2P
-        const V q = S::mulhi(high, S::broadcast(kBarrettM));
-        return S::mul_sub(S::mul_lo(a, b), q, S::broadcast(P));
+    template <Barrett variant>
+    static V barrett_as(V a, V b) {
+        if constexpr (variant == Barrett::wide) return barrett_wide(a, b);
+        else if constexpr (variant == Barrett::split) return barrett_split(a, b);
+        else return barrett_mulhi(a, b);
     }
+    static V barrett(V a, V b) { return barrett_as<selected_barrett<S>()>(a, b); }
 
     static V shoup_doubling(V x, V w, V q31)
         requires requires { S::qdmulh(x, x); }
@@ -176,6 +183,34 @@ private:
         const V m = S::mul_lo(S::mul_lo(a, b), S::broadcast(kPinv));
         const V r = S::hsub(S::qdmulh(a, b), S::qdmulh(m, p));
         return S::min(r, S::add(r, p));
+    }
+
+    // q = floor(a b / 2^(kBits-1)) m / 2^32 <= a b / P.
+    static V barrett_mulhi(V a, V b) {
+        const V high = S::template mul_shr<kBits - 1>(a, b);  // < 2P
+        const V q = S::mulhi(high, S::broadcast(kBarrettM));
+        return S::mul_sub(S::mul_lo(a, b), q, S::broadcast(P));
+    }
+
+    // high = (a b) >> (kBits - 1) from its two words; the bits of the two terms do not overlap.
+    static V barrett_split(V a, V b) {
+        const V low = S::mul_lo(a, b);
+        const V high = S::add(S::template shl<33 - kBits>(S::mulhi(a, b)), S::template shr<kBits - 1>(low));
+        const V q = S::mulhi(high, S::broadcast(kBarrettM));
+        return S::mul_sub(low, q, S::broadcast(P));
+    }
+
+    // The same q per 64-bit lane: a b >> (kBits - 1) < 2P fills the low word of the lane, so it
+    // goes into mul_even as it is, and q is the high word of that product.
+    static V barrett_wide(V a, V b)
+        requires requires { S::mul_even(a, b); }
+    {
+        const V m = S::broadcast(kBarrettM);
+        const auto quotient = [m](V x, V y) {
+            return S::mul_even(S::template shr64<kBits - 1>(S::mul_even(x, y)), m);
+        };
+        const V q = S::join_high(quotient(a, b), quotient(S::template shr64<32>(a), S::template shr64<32>(b)));
+        return S::mul_sub(S::mul_lo(a, b), q, S::broadcast(P));
     }
 
     // floor(x q / 2^32) is floor(x w / P) or one less.

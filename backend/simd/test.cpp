@@ -111,6 +111,12 @@ void test_common() {
     check<S>("min", S::min(va, vb), [&](int i) { return std::min(a[i], b[i]); });
     check<S>("mul_lo", S::mul_lo(va, vb), [&](int i) { return a[i] * b[i]; });
     check<S>("mul_sub", S::mul_sub(vc, va, vb), [&](int i) { return c[i] - a[i] * b[i]; });
+    check<S>("shr<1>", S::template shr<1>(va), [&](int i) { return a[i] >> 1; });
+    check<S>("shr<13>", S::template shr<13>(va), [&](int i) { return a[i] >> 13; });
+    check<S>("shr<31>", S::template shr<31>(va), [&](int i) { return a[i] >> 31; });
+    check<S>("shl<1>", S::template shl<1>(va), [&](int i) { return a[i] << 1; });
+    check<S>("shl<13>", S::template shl<13>(va), [&](int i) { return a[i] << 13; });
+    check<S>("shl<31>", S::template shl<31>(va), [&](int i) { return a[i] << 31; });
     check<S>("mulhi", S::mulhi(va, vb), [&](int i) { return u32(u64(a[i]) * b[i] >> 32); });
     test_mul_shr<S, 1>(a, b);
     test_mul_shr<S, 7>(a, b);

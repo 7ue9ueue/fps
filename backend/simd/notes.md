@@ -22,14 +22,18 @@ top). `select.hpp` picks `simd::Native` per target and lists every struct the ta
   Zen 5 1.96x and 2.04x.
 - `mulhi` on AVX-512 joins its halves with one `vpermt2d` instead of `vpsrlq` + blend, except on
   Zen 4/5 (`__znver4__`, `__znver5__`), where Shoup got 5% slower with it (Log).
-- SVE2 is not wrapped: Neoverse V2's SVE vectors are 128-bit like NEON (Arm's guide; not measured).
+- SVE2: `Neon::mulhi` is one SVE2 `umulh` on the low 128 bits of the z registers when
+  `__ARM_FEATURE_SVE2` is set (`arm` target; not the Mac's M4), through the NEON-SVE bridge
+  (`svset_neonq`, `svget_neonq`), so it is right for any SVE vector length. Neoverse V2's SVE
+  vectors are 128-bit, so the bridge costs nothing. `mul_shr` keeps `umull`/`shrn` (Log).
+- `shr<k>`, `shl<k>`: 32-bit lane shifts on every struct (round 2, for modarith's Barrett `split`).
 
 ## Tests
 
 `test.cpp`: every struct the machine can run, 2000 random trials each (words drawn with edge
 values 0, 1, 2^31 - 1, 2^31, 2^32 - 2, 2^32 - 1 one time in eight), every wrapper against lane-wise
 scalar arithmetic: unaligned loads and stores at every offset, `mul_shr<k>` for k = 1, 7, 16, 29,
-31, 32 with products at the 2^(32+k) limit, blends with 6 masks, random permutes, IFMA against
+31, 32 with products at the 2^(32+k) limit, `shr`/`shl` for k = 1, 13, 31, blends with 6 masks, random permutes, IFMA against
 128-bit products, `sqdmulh` saturation. Passes at -O2 and ASan/UBSan on every target's test
 machines (`lc-amd` scalar/sse/avx2, `lc-intel-test` avx512, `lc-zen5`, `lc-arm`, Mac scalar/arm).
 
@@ -67,7 +71,8 @@ Mixed pairs (reciprocal throughput per instruction): `vpmuludq + vpmulld` 0.5 on
 Neoverse V2 (`lc-arm`), 128-bit: add, sub, umin, shsub, uzp1, uzp2, bsl, tbl 2 / 0.25; mul, umull,
 umull2, sqdmulh 4 / 0.5; mla, mls, umlal, umlal2 1.15 / 0.5 (through the accumulator); ushr, shrn
 2 / 0.5. Mixed: mul + umull and mul + sqdmulh 0.5 (shared pipes), mul + add and umull + uzp2 0.33
-(not 0.25).
+(not 0.25). SVE2 `umulh z.s` 4 / 0.5, on the multiply pipes (mul + umulh 0.5, umulh + add 0.33);
+`usra` 1.15 / 0.5 through the accumulator (2026-10-11, round 2).
 
 Per CPU, for the kernels:
 - `vpmulld` costs as much as `vpmuludq` on Zen 3 and 5, twice (2 uops, latency 10-11.5) on Emerald
@@ -84,8 +89,11 @@ vector at the clock above). 2026-10-10, commit f4baa1e, GCC 15.2, `tools/kernel.
 | Case | Zen 3 | Emerald Rapids | Zen 5 | Neoverse V2 |
 |---|---|---|---|---|
 | mul_lo | 0.049 (1.3) | 0.032 (2.2) | 0.022 (1.5) | 0.088 (1.1) |
-| mulhi | 0.075 (2.1) | 0.049 (3.3) | 0.032 (2.1) | 0.097 (1.2) |
+| mulhi | 0.075 (2.1) | 0.049 (3.3) | 0.032 (2.1) | 0.088 (1.05), SVE2 `umulh`; was 0.097 (1.2) |
 | mul_shr<29> | 0.080 (2.2) | 0.063 (4.2) | 0.030 (2.0) | 0.117 (1.4) |
+
+On Neoverse V2 every stream takes at least ~1.05 cycles per vector: 2 loads and 1 store, and the
+loop's 7 instructions. mul_lo and mulhi now sit at that floor.
 
 ## Log
 
@@ -108,9 +116,37 @@ vector at the clock above). 2026-10-10, commit f4baa1e, GCC 15.2, `tools/kernel.
   it. Guess: code or physical-page placement. The gate's median of paired rounds should absorb a
   minority mode, but a 1-2% verdict on these cases is not reliable.
 
+2026-10-11, claude (issue #2, round 2). All paired against main (8230b41) in the same run,
+11 rounds, new/base, GCC 15.2, `tools/kernel.py` flags.
+- SVE2 `umulh` for `Neon::mulhi` (1 instruction instead of `umull`, `umull2`, `uzp2`): `lc-arm`
+  mulhi stream 0.907 (180 against 199 ns per 2048 words), now at the stream floor (Composed).
+  modarith gains more (its notes): Shoup 0.671, Montgomery 0.800 (new selection), Barrett 0.662.
+  x86 bench binaries are byte-identical.
+- `mul_shr` from `umulh` and `mul` (`shl` + `usra` to join): 1.26x slower than `umull`, `umull2`,
+  `shrn`, `shrn2` in the stream (302 against 240 ns): the join adds a 2-op chain. Not kept in
+  simd; modarith's Barrett `split` uses the idea where `mul` is shared.
+- Neoverse V2 add and sub streams at 1.8-2.0 cycles per vector (open item of round 1). Inline-asm
+  loops over the same 2048 words (`neonchain.cpp` in `~/Documents/hpc_library-explore/simd/r2/`,
+  cycles per vector at 2.97 GHz): the current loop 1.74-1.82; the same with two vectors per iteration 1.09; two dependent ops
+  per vector (add, add) 1.05-1.30; three in a line (add, add, add) 1.74; a mul followed by the
+  same add and umin 1.26-1.50; 4 ops, depth 2 after the loads (s = a + b, t = a + (b - P),
+  min) 1.40; compare-and-subtract (add, cmhs, and, sub; depth 4) 1.44. Not the store: without it
+  the loop still ran at the loop-carried accumulator's 2 cycles. So the core does not overlap
+  enough iterations of a chain of three 2-cycle ops when they arrive one per iteration; the
+  ops' count or depth alone does not predict it. Guess: issue-queue steering. A 4-op `add`
+  would win this stream (1.40) but costs 33% more ALU ops in a kernel that interleaves several
+  vectors (an NTT), where the stream's problem goes away (1.09). Not changed; kernels should
+  interleave two or more independent vectors per loop iteration on this core.
+- x86: odd words into the low halves for `mul_even` by `vpshufd` or `vmovshdup` (shuffle ports)
+  instead of `vpsrlq` (zmm shifts run on p0 only on Emerald Rapids), `oddx86.cpp` there, 3
+  runs: Emerald Rapids Montgomery 191 against 193 ns, Shoup 157 against 155, mulhi 105 against
+  99; Zen 3 and Zen 5 within 2% both ways. No gain; not kept.
+
 ## Sources
 
 - Instruction costs: measured here. Pipe names and port layouts from AMD's Zen 3 and Zen 5, Intel's
   and Arm's Neoverse V2 optimization guides; uops.info for the idea of mixed-pair probes. No code
   used.
 - lc-opt's NTT generator (`lib/ntt/gen_kernels.py`) holds the Zen 3 model this one extends.
+- SVE2 `umulh` and the NEON-SVE bridge: Arm's A64 instruction set reference and ACLE
+  (`arm_neon_sve_bridge.h`). No code used.
