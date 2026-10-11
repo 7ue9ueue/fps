@@ -2,7 +2,7 @@
 // faults); items are table positions n (each gives two words).
 //   "tables/<lg>"              the selected variant (gated)
 //   "tables@loop/<lg>"         the scalar model, the frontend's loop before this kernel
-//   "tables@<isa>.<K>.<step>/<lg>"
+//   "tables@<isa>.<K>.<step>[.prefetch]/<lg>"
 //                              each candidate's Chains (select.hpp), at lg 6, 10, 14, 18, 22
 #include <cstddef>
 #include <cstdint>
@@ -36,7 +36,8 @@ template <class V>
 void candidate(bench::Suite& suite) {
     using C = fps::factorials::ChainsOf<V, P>;
     const std::string name = std::string("tables@") + V::Isa::name + "." + std::to_string(V::vectors) + "." +
-                             std::string(fps::factorials::step_name<V>);
+                             std::string(fps::factorials::step_name<V>) +
+                             std::string(fps::factorials::prefetch_name<V>);
     for (int lg : {6, 10, 14, 18, 22})
         add(suite, name, lg, [](u32* fact, u32* inverse, std::size_t n) { C::run(fact, inverse, n); });
 }

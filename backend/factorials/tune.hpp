@@ -5,7 +5,7 @@
 //   factorials::measure(start, budget[, log])  // Choices: per class the fastest variant, else start's
 //   factorials::points(c, count)               // the sizes a dense class is timed at
 //   factorials::text(choices), parse(text)     // wisdom: kSignature, then the variant per class
-//   factorials::variant_names()                // "loop", then "<isa>.<K>.<step>" per candidate
+//   factorials::variant_names()                // "loop", then "<isa>.<K>.<step>[.prefetch]" per candidate
 //
 // Dense part: a class (e, e + w] ending at most 2^dense_lg is timed at `points` sizes:
 // e + j w / points + 1 for 0 < j < points (just past a round size: the most lanes' slack) and e + w
@@ -140,7 +140,7 @@ inline Choices measure(const Choices& start, const Budget& budget, std::vector<C
 inline std::vector<std::string> variant_names() {
     return []<class... V>(Candidates<V...>) {
         return std::vector<std::string>{"loop", (std::string(V::Isa::name) + "." + std::to_string(V::vectors) + "." +
-                                                 std::string(step_name<V>))...};
+                                                 std::string(step_name<V>) + std::string(prefetch_name<V>))...};
     }(Selected{});
 }
 
