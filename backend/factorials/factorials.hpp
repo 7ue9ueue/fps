@@ -3,15 +3,17 @@
 //   fps::factorials::tables<P>(fact, inverse);  // fact[i] = i!, inverse[i] = 1 / i!, i < n
 //
 // fact and inverse are spans of n = fact.size() = inverse.size() words, n <= P (P! = 0 has no
-// inverse); values in [0, P). Any alignment; no checks. The variant per size class is a tuned
-// choice (select.hpp: `variants`, one load per call; backend/factorials/tune.hpp measures it):
+// inverse); values in [0, P). Any alignment; no checks. From n = kPrefaultSize on, fresh tables
+// (never written, e.g. just allocated) are first prefaulted (prefault.hpp: one madvise per table
+// instead of a page fault per page; on warm tables a load, or a load and a mincore). The variant
+// per size class is a tuned choice (select.hpp: `variants`, one load per call; tune.hpp measures it):
 //   model::tables<P>(fact, inverse, n)          the scalar loop (model.hpp), any n <= P
 //   Chains<S, K, P, step, prefetch>::run(fact, inverse, n)
 //                                               n >= Chains::kMinSize; W = K S::lanes lanes;
 //                                               step: the scan's chain product (Step); prefetch:
 //                                               the scan prefetches each lane's next line
 //   run_variant<P>(v, fact, inverse, n)         variant v of select.hpp's list, n >= kMinSizes[v]
-// All are public, as the fast path for callers that pick their own variant.
+// All are public, as the fast path for callers that pick their own variant; they do not prefault.
 //
 // Chains, from lc-opt's product chains (lib/poly/factorials.hpp). Lane s of W covers positions
 // [a_s, a_s + C), C = chunk(n) a multiple of the vector length, a_s = min(h + s C, n - C) with
@@ -38,6 +40,7 @@
 #include <utility>
 
 #include "backend/factorials/model.hpp"
+#include "backend/factorials/prefault.hpp"
 #include "backend/factorials/select.hpp"
 #include "backend/factorials/transpose.hpp"
 #include "backend/modarith/modarith.hpp"
@@ -401,10 +404,16 @@ void run_variant(int v, u32* fact, u32* inverse, std::size_t n) {
     }(Selected{});
 }
 
+// From here tables() prefaults fresh tables: 512 KiB each, past glibc's default mmap threshold
+// (128 KiB). Warm tables that hold data cost one load; warm tables of zeros a mincore, 1.5-4 us,
+// at most 8% of a call here (notes.md).
+inline constexpr std::size_t kPrefaultSize = std::size_t(1) << 17;
+
 // fact[i] = i!, inverse[i] = 1 / i! for i < n = fact.size() = inverse.size() <= P.
 template <u32 P>
 void tables(std::span<u32> fact, std::span<u32> inverse) {
     const std::size_t n = fact.size();
+    if (n >= kPrefaultSize && prefault(fact)) prefault(inverse);  // fact fresh: inverse likely too
     run_variant<P>(n < kFirstClass ? 0 : variants.get()[size_class(n)], fact.data(), inverse.data(), n);
 }
 

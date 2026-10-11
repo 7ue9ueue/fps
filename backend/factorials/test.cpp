@@ -8,8 +8,10 @@
 // up to 2^22. Placements: tables 64-byte aligned, and at word offsets 0-15
 // from it, the same or different for the two. Words before and after the tables must stay
 // untouched. Then the size classes, and tune.hpp: measure() at a small budget, wisdom text and
-// "factorials.variant" through tune::save / load. The sanitizer build runs a subset (kAll). Exits
-// nonzero on a failure.
+// "factorials.variant" through tune::save / load. Then fresh (never written) tables in their own
+// mappings, which `tables` prefaults, and prefault() alone. The sanitizer build runs a subset
+// (kAll). Exits nonzero on a failure.
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -20,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include "backend/factorials/factorials.hpp"
@@ -303,6 +306,79 @@ void tuning() {
     fx::variants.set(fx::kDefaults);
 }
 
+// A table of n words in its own anonymous mapping, `offset` words past a page, between a guard page
+// before and one after; guard words on both sides. Unwritten (fresh) or filled.
+class Mapped {
+public:
+    Mapped(std::size_t n, std::size_t offset, bool fresh) : n_(n) {
+        const auto page = std::size_t(sysconf(_SC_PAGESIZE));
+        bytes_ = ((offset + n) * 4 + page - 1) / page * page + 2 * page;
+        base_ = mmap(nullptr, bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        data_ = reinterpret_cast<u32*>(static_cast<char*>(base_) + page) + offset;
+        for (std::size_t i = 1; i <= kGuardWords; ++i) data_[-std::ptrdiff_t(i)] = kGuard, data_[n - 1 + i] = kGuard;
+        if (!fresh) std::fill_n(data_, n, 1u);
+    }
+    ~Mapped() { munmap(base_, bytes_); }
+    u32* data() { return data_; }
+    bool guarded() const {
+        for (std::size_t i = 1; i <= kGuardWords; ++i)
+            if (data_[n_ - 1 + i] != kGuard || data_[-std::ptrdiff_t(i)] != kGuard) return false;
+        return true;
+    }
+
+private:
+    void* base_;
+    std::size_t bytes_;
+    u32* data_;
+    std::size_t n_;
+};
+
+// Fresh tables (issue #70 round 2), as Factorials' large tables are: `tables` prefaults them
+// (prefault.hpp, Linux). Sizes around kPrefaultSize and larger, at 3 offsets from a page, with fact,
+// inverse, both or neither fresh. Then prefault() alone: on fresh memory true (Linux), every whole
+// page resident and still zero after; false on resident memory, without a whole page, and when
+// a word on the last whole page is nonzero.
+void fresh() {
+    constexpr u32 P = 998244353;
+    const std::size_t page_words = std::size_t(sysconf(_SC_PAGESIZE)) / 4;
+    for (std::size_t n : {fx::kPrefaultSize - 1, fx::kPrefaultSize, fx::kPrefaultSize + 5, 3 * fx::kPrefaultSize + 1,
+                          (std::size_t(1) << 20) + 3}) {
+        std::vector<u32> want_fact(n), want_inverse(n);
+        fx::model::tables<P>(want_fact.data(), want_inverse.data(), n);
+        for (std::size_t offset : {std::size_t(0), std::size_t(5), page_words - 3})
+            for (int which = 0; which < 4; ++which) {  // bit 0: fact fresh, bit 1: inverse fresh
+                Mapped fact(n, offset, which & 1), inverse(n, offset, which & 2);
+                fx::tables<P>(std::span(fact.data(), n), std::span(inverse.data(), n));
+                const std::string where = "fresh tables n=" + std::to_string(n) + " offset " + std::to_string(offset) +
+                                          " which " + std::to_string(which);
+                if (!std::equal(want_fact.begin(), want_fact.end(), fact.data()) ||
+                    !std::equal(want_inverse.begin(), want_inverse.end(), inverse.data()))
+                    fail(where + ": wrong values");
+                if (!fact.guarded() || !inverse.guarded()) fail(where + ": wrote outside the tables");
+            }
+    }
+    const std::size_t n = 64 * page_words;  // 3 words past a page: whole pages 1 .. 63
+    Mapped words(n, 3, true);
+    const std::span<u32> span(words.data(), n);
+    const bool populated = fx::prefault(span);
+#if defined(__linux__) && defined(MADV_POPULATE_WRITE) && !defined(FPS_NO_PREFAULT)
+    if (!populated) fail("prefault: did not populate fresh memory");
+    std::vector<unsigned char> resident(63);
+    mincore(words.data() + page_words - 3, 63 * page_words * 4, resident.data());
+    if (std::ranges::count_if(resident, [](unsigned char r) { return r & 1; }) != 63)
+        fail("prefault: a whole page is not resident");
+#else
+    if (populated) fail("prefault: populated on a system without it");
+#endif
+    if (std::count(span.begin(), span.end(), 0u) != std::ptrdiff_t(n)) fail("prefault: changed the words");
+    if (fx::prefault(span)) fail("prefault: populated resident memory");
+    Mapped small(n, 3, true);
+    if (fx::prefault(std::span(small.data(), page_words - 4))) fail("prefault: populated without a whole page");
+    u32& last = small.data()[63 * page_words - 3];  // on the last whole page
+    last = 5;                                        // holds data: taken as resident
+    if (fx::prefault(std::span(small.data(), n)) || last != 5) fail("prefault: populated written memory");
+}
+
 }  // namespace
 
 int main() {
@@ -327,6 +403,7 @@ int main() {
                                  (std::size_t(5) << 20) + 17};
     for (std::size_t n : large)
         for (std::size_t offset : {0, 4, 7}) check<998244353>("tables", n, selected, offset, offset);
+    fresh();
     std::printf("%s\n", failures ? "FAIL" : "ok");
     return failures ? 1 : 0;
 }

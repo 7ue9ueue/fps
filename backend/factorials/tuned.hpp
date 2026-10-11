@@ -4,13 +4,13 @@
 //   sse: lc-bench (AMD EPYC 7B13), 2026-10-11, commit 47736ca+changes
 //   avx2: lc-bench (AMD EPYC 7B13), 2026-10-11, commit 47736ca+changes
 //   avx512: lc-intel (INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz), 2026-10-11, commit 5ee0324+changes
-//   zen5: lc-zen5 (AMD EPYC 9B45), 2026-10-11, commit 47736ca+changes
+//   zen5: lc-zen5 (AMD EPYC 9B45), 2026-10-11, commit e66ce2f+changes
 //   arm: lc-arm (implementer 0x41 variant 0x0 part 0xd4f revision 1), 2026-10-11, commit 47736ca+changes
 #pragma once
 
 namespace fps::factorials::tuned {
 
-inline constexpr int signature[] = {172163608, 375260846, 2002113749, 1647048625, 994814724, 1635153837};
+inline constexpr int signature[] = {172163608, 375260846, 2002113749, 1647048625, 1647048625, 1635153837};
 
 inline constexpr int variant[][88] = {
     {  // scalar
@@ -34,8 +34,8 @@ inline constexpr int variant[][88] = {
         9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
     },
     {  // zen5
-        1, 1, 1, 1, 1, 1, 2, 2, 1, 2, 2, 2, 5, 5, 5, 5, 5, 8, 8, 8, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
-        5, 5, 5, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+        1, 1, 1, 1, 1, 1, 2, 2, 1, 2, 2, 2, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 8, 8, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 9, 5, 5, 5, 5, 5, 5, 5, 5, 5,
         5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
     },
     {  // arm
