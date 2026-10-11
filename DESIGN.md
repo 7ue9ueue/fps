@@ -1,6 +1,6 @@
 # fps: API design
 
-Status: draft, 2026-10-10. Design only, no code yet.
+Status: draft, 2026-10-11. Design only, no code yet.
 
 Univariate polynomials and power series modulo a prime P, with the speed of `cpp_hpc/lc-opt` and an
 API that reads like math. The code moves here from `lc-opt/lib` (poly, ntt, multimod, mem) and from
@@ -12,19 +12,23 @@ the polynomial problems that still keep code of their own. lc-opt's `AGENTS.md` 
 |---|---|---|
 | Namespace | `fps` (formal power series) | Short; the usual name in contest code |
 | Variables | One (univariate) | Scope |
-| Types | `Polynomial` (coefficients), `Fraction` (the series p/q) and `Values` (value form); no general `Series` type | A series at precision n is a polynomial; laziness was too complex for v1 |
+| Types | `Polynomial` (coefficients), `Fraction` (the series p/q) and `Values` (value form); no general `Series` type | A series at precision n is a polynomial; laziness was too complex for v1. `Fraction`, not `Rational`, which reads as a rational number |
 | Evaluation | Eager | Simple; n is known when a function runs |
 | Precision | Series functions return `f.size()` coefficients unless n is given | The common case; no hidden global state |
 | Huge indices | `Fraction`: `f[k]` for any k (Bostan-Mori); sums, products, prefix sums stay fractions | Covers 1/(1-x), linear recurrences, k up to 2^64 |
 | Coefficients | `std::uint32_t` in [0, P), in and out | Same as lc-opt; no wrapper type |
 | Modulus | Template parameter, known at compile time | Kernels specialize on it |
+| Moduli in v1 | 998244353 only; other primes later | The case lc-opt is tuned for; other moduli are new work |
 | Functions | Free functions: `fps::exp(f)` | Reads like math |
 | Special cases | Detected, not named: `compose(f, x + c)` is a Taylor shift, `f * x^k` a shift | Fewer names to learn |
 | Memory | Owned by the library: huge pages, per-thread scratch | No arenas or scratch sizes in the API |
 | Backend | Codelets per CPU, chosen at compile time where possible, else by tuning (FFTW-style wisdom) | Different CPUs want different kernels |
+| Packaging | Header-only for now | Simple to use. Cost: the ISA is fixed by the compiler flags; no run-time dispatch across CPUs, which would need a compiled library |
+| `Values` layout | The backend picks; `Layout::pointwise` asks for the value-by-value layout | That layout wins when one conversion feeds many products (ABC222 H v2) |
 
-Not in v1: several variables, moduli known only at run time, composite moduli (e.g. 2^64), lazy
-series, series defined by equations (f = 1 + x f^2), D-finite recurrences (see Later).
+Not in v1: several variables, moduli other than 998244353, moduli known only at run time, composite
+moduli (e.g. 2^64), lazy series, series defined by equations (f = 1 + x f^2), D-finite recurrences,
+`Relaxed` (see Later).
 
 ## Types
 
@@ -45,7 +49,8 @@ Users name their modulus once: `using Poly = fps::Polynomial<998244353>;`.
 - `size()` is the stored length, trailing zeros included. The library never trims. `degree()` is
   the index of the last nonzero coefficient, -1 for zero.
 - Precision n means "mod x^n": the first n coefficients. A series function reads only f mod x^n.
-- Defaults: one-argument series functions return `f.size()` coefficients; `*` is the exact product.
+- Defaults: one-argument series functions return `f.size()` coefficients; `compose(f, g)` returns
+  max(`f.size()`, `g.size()`); `*` is the exact product.
   Short closed forms need n: `inverse(1 - x)` has 2 coefficients, `inverse(1 - x, n)` has n.
 - Special inputs are detected at run time and take a faster path, with the same result:
   few nonzero terms (`inverse(1 - x, n)` by recurrence, O(n)), a monomial factor or divisor
@@ -54,8 +59,8 @@ Users name their modulus once: `using Poly = fps::Polynomial<998244353>;`.
 - A broken precondition throws `std::domain_error` (e.g. `inverse` with f[0] = 0). A result that
   may not exist is a `std::optional` (`sqrt`, `inverse_mod`).
 - Thread safety: functions are safe to call from several threads; each thread has its own scratch.
-- Moduli: NTT primes (P = c 2^k + 1, e.g. 998244353) use one NTT; 1000000007 has its own fast
-  path; any other prime P < 2^30 uses the generic multimod path (proposal; see open questions).
+- Moduli: v1 supports P = 998244353 only; any other P fails to compile (`static_assert`). Other
+  primes come later (see Later).
 
 ## Polynomial
 
@@ -113,7 +118,8 @@ Polynomial log(f, n);                     // f[0] == 1
 Polynomial exp(f, n);                     // f[0] == 0
 Polynomial pow(f, std::uint64_t e, n);    // any f, leading zeros included
 std::optional<Polynomial> sqrt(f, n);
-Polynomial compose(f, g, n);              // f(g) mod x^n; linear g: Taylor shift
+Polynomial compose(f, g, n);              // f(g) mod x^n; n defaults to max(f.size(), g.size());
+                                          // linear g: Taylor shift
 Polynomial compositional_inverse(f, n);   // f[0] == 0, f[1] != 0
 
 // Evaluation and interpolation
@@ -197,14 +203,18 @@ public:
 };
 // Also A + B, A - B, A * B, c * A.
 
-Values<P> to_values(f, std::size_t L);    // f.size() <= L; zeros above
+enum class Layout { automatic, pointwise };   // automatic: the backend picks
+
+Values<P> to_values(f, std::size_t L, Layout layout = Layout::automatic);   // f.size() <= L; zeros above
 Polynomial<P> to_coefficients(const Values<P>& A);   // L coefficients: the product mod (x^L - 1)
 ```
 
 - `to_coefficients(A * B)` is a b mod (x^L - 1): coefficient L + i adds onto i. For the exact
   product, L > deg a + deg b. With a smaller L the wrapped terms land low; a middle product keeps
   only the upper part.
-- Operands must have the same L; a mismatch throws.
+- `Layout::pointwise` is the hint for a polynomial used in many products per conversion: the
+  value-by-value layout wins there (ABC222 H v2).
+- Operands must have the same L and layout; a mismatch throws.
 - The contents are opaque: no `operator[]`. The layout depends on the CPU (lc-opt's transform
   ends at blocks of 8 coefficients, not single values), so it is not a DFT. `fps::dft` and
   `fps::idft` give the true values at the roots, in a documented order, for users who need them.
@@ -353,6 +363,9 @@ lc-opt targets 998244353 on Zen 3 AVX2. Other moduli and CPUs are new work.
 
 ## Later
 
+- Other moduli: other NTT primes (P = c 2^k + 1) with one NTT, 1000000007 with its own fast path,
+  then any prime P < 2^30 with the generic multimod path.
+- A compiled library, if run-time dispatch across CPUs is needed.
 - More on `Fraction`:
   - `reduced()`: divide p and q by their gcd, so chains of operations stay small.
   - Termwise product: the series of a_k b_k (e.g. F_k^2, F_k 2^k) is a fraction too; heavier algebra.
@@ -374,11 +387,4 @@ lc-opt targets 998244353 on Zen 3 AVX2. Other moduli and CPUs are new work.
 
 ## Open questions
 
-1. Layout choice for `Values`: the backend picks one, but for many products per conversion the
-   value-by-value layout wins (ABC222 H v2). Expose a hint, e.g. `to_values(f, L, Layout::pointwise)`?
-2. `Relaxed` in v1 or later?
-3. Generic moduli: any prime P < 2^30, or a fixed list?
-4. Packaging: header-only, or a compiled library? Run-time dispatch across CPUs favors compiled.
-5. `compose(f, g)`: n = f.size(), or the larger of f.size() and g.size()?
-6. Name of `Fraction`: `Fraction` (plain English) or `Rational` (the textbook "rational generating
-   function", but easy to read as a rational number)?
+None.
