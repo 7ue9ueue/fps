@@ -143,6 +143,16 @@ void test_x86() {
     check64<S>("shl64<1>", S::template shl64<1>(va), [&](int i) { return pair(a.data(), i) << 1; });
     check64<S>("shl64<32>", S::template shl64<32>(va), [&](int i) { return pair(a.data(), i) << 32; });
     check64<S>("shl64<63>", S::template shl64<63>(va), [&](int i) { return pair(a.data(), i) << 63; });
+    check<S>("join_high", S::join_high(va, vb), [&](int i) { return i % 2 ? b[i] : a[i + 1]; });
+}
+
+template <class S>
+void test_permute2() {
+    const Lanes<S> a = random_lanes<S>(), b = random_lanes<S>();
+    Lanes<S> idx;
+    for (u32& x : idx) x = u32(rng() % (2 * S::lanes));
+    check<S>("permute2", S::permute2(vec<S>(a), vec<S>(idx), vec<S>(b)),
+             [&](int i) { return idx[i] < S::lanes ? a[idx[i]] : b[idx[i] - S::lanes]; });
 }
 
 template <class S>
@@ -194,6 +204,7 @@ void test_isa() {
     for (int trial = 0; trial < 2000; ++trial) {
         test_common<S>();
         if constexpr (requires(typename S::V v) { S::mul_even(v, v); }) test_x86<S>();
+        if constexpr (requires(typename S::V v) { S::permute2(v, v, v); }) test_permute2<S>();
         if constexpr (requires(typename S::V v) { S::madd52lo(v, v, v); }) test_ifma<S>();
         if constexpr (requires(typename S::V v) { S::qdmulh(v, v); }) test_neon<S>();
     }

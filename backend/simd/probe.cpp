@@ -77,7 +77,7 @@ std::vector<Probe> probes() {
         X3("vpaddd", "zmm"), X3("vpaddq", "zmm"), X3("vpminud", "zmm"), X3("vpmulld", "zmm"),
         X3("vpmuludq", "zmm"), XIMM("vpsrlq", "32", "zmm"), XIMM("vpsllq", "32", "zmm"),
         PROBE("vpblendmd zmm", "vpblendmd %%zmm1, %%zmm0, %%zmm0%{%%k1%}", "vpblendmd %%zmm15, %%zmm14, %%zmm\\r%{%%k1%}"),
-        X3("vpermd", "zmm"),
+        X3("vpermd", "zmm"), X3("vpermt2d", "zmm"), X3("vpermt2d", "ymm"),
         MIX("vpmuludq + vpmulld zmm", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r", "vpmulld %%zmm15, %%zmm14, %%zmm\\r"),
         MIX("vpmuludq + vpaddd zmm", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
         MIX("vpmuludq + vpsrlq zmm", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r", "vpsrlq $32, %%zmm15, %%zmm\\r"),

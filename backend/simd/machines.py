@@ -99,9 +99,11 @@ EMERALD_RAPIDS = Machine(
         ('vpermd', 512): (4, 1.0, 'p5'),
         ('vpmadd52luq', 512): (4.2, 0.53, 'p0 p5'),
         ('vpmadd52huq', 512): (4.2, 0.53, 'p0 p5'),
+        ('vpermt2d', 256): (3, 1.0, 'p5'),
+        ('vpermt2d', 512): (4, 1.0, 'p5'),
     }),
     guess=(('vpshufb', 256), ('vpermd', 256), ('vpminud', 256), ('vpermd', 512), ('vpminud', 512),
-           ('vpmadd52luq', 256), ('vpmadd52huq', 256)),
+           ('vpmadd52luq', 256), ('vpmadd52huq', 256), ('vpermt2d', 256), ('vpermt2d', 512)),
     notes=('Simple ops show latency 1.67 (ymm) and 2.5 (zmm) where the guides say 1: measured with '
            'a chain through one register; unexplained. vpmulld is 2 uops on both widths.'),
 )
@@ -122,8 +124,10 @@ ZEN5 = Machine(
         ('vpshufb', 256): (2, 0.5, 'FP1 FP2'),
         ('vpermd', 256): (4, 0.5, 'FP1 FP2'),
         ('vpermd', 512): (5, 0.5, 'FP1 FP2'),
+        ('vpermt2d', 256): (4, 0.5, 'FP1 FP2'),
+        ('vpermt2d', 512): (5, 0.5, 'FP1 FP2'),
     }),
-    guess=(('vpshufb', 256), ('vpermd', 256), ('vpermd', 512)),
+    guess=(('vpshufb', 256), ('vpermd', 256), ('vpermd', 512), ('vpermt2d', 256), ('vpermt2d', 512)),
     notes='vpmulld costs the same as vpmuludq here (unlike Intel). IFMA shares the multiply pipes.',
 )
 

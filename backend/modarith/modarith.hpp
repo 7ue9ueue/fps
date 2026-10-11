@@ -147,7 +147,7 @@ private:
         V odd = S::mul_even(S::template shr64<32>(a), S::template shr64<32>(b));
         even = S::add64(even, S::mul_even(S::mul_even(even, ninv), p));
         odd = S::add64(odd, S::mul_even(S::mul_even(odd, ninv), p));
-        return S::template blend<0xaaaa>(S::template shr64<32>(even), odd);
+        return S::join_high(even, odd);
     }
     static V montgomery_wide(V a, V b)
         requires requires { S::mul_wide_lo(a, b); }

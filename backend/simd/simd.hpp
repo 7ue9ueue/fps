@@ -20,7 +20,8 @@
 //   add, sub, min              lane-wise; min unsigned
 //   mul_lo(a, b)               low 32 bits of a b
 //   mul_sub(c, a, b)           c - a b (low 32 bits); Neon: one mls, x86: mul_lo + sub
-//   mulhi(a, b)                composed: high 32 bits of a b. x86: 6 instructions (2 mul_even),
+//   mulhi(a, b)                composed: high 32 bits of a b. x86: 6 instructions (2 mul_even;
+//                              5 with AVX-512 off Zen),
 //                              Neon: 3 (umull, umull2, uzp2)
 //   mul_shr<k>(a, b)           composed: (a b) >> k, 1 <= k <= 32, valid if it is < 2^32.
 //                              x86: 7 instructions (6 for k = 32), Neon: 4 (3 for k = 32)
@@ -32,6 +33,10 @@
 //   broadcast64(x), add64, sub64
 //                              64-bit lanes
 //   shr64<k>, shl64<k>         64-bit lanes, logical
+//   join_high(e, o)            composed: word 2i = high word of 64-bit lane i of e, word 2i + 1 =
+//                              high word of lane i of o. Sse, Avx2: shr64 + blend; AVX-512: vpermt2d
+// Avx512Vl, Avx512:
+//   permute2(a, idx, b)        lane i = idx[i] < lanes ? a[idx[i]] : b[idx[i] - lanes] (vpermt2d)
 // Avx512Vl, Avx512 with __AVX512IFMA__:
 //   madd52lo(c, a, b), madd52hi(c, a, b)
 //                              64-bit lanes: c + low / high 52 bits of the 104-bit product of
@@ -120,6 +125,7 @@ struct Sse {
                               (mask & 8 ? 0xc0 : 0);
         return _mm_blend_epi16(a, b, words);
     }
+    static V join_high(V e, V o) { return blend<0xa>(shr64<32>(e), o); }
     static V mulhi(V a, V b);
     template <int k>
     static V mul_shr(V a, V b);
@@ -159,6 +165,7 @@ struct Avx2 {
     static V shl64(V a) { return _mm256_slli_epi64(a, k); }
     template <unsigned mask>
     static V blend(V a, V b) { return _mm256_blend_epi32(a, b, int(mask & 0xff)); }
+    static V join_high(V e, V o) { return blend<0xaa>(shr64<32>(e), o); }
     static V mulhi(V a, V b);
     template <int k>
     static V mul_shr(V a, V b);
@@ -178,6 +185,11 @@ struct Avx2 {
 struct Avx512Vl : Avx2 {
     static constexpr int registers = 32;
     static constexpr const char* name = "avx512vl";
+    static V permute2(V a, Index idx, V b) { return _mm256_permutex2var_epi32(a, idx, b); }
+    static V join_high(V e, V o) { return permute2(e, _mm256_setr_epi32(1, 9, 3, 11, 5, 13, 7, 15), o); }
+    static V mulhi(V a, V b);
+    template <int k>
+    static V mul_shr(V a, V b);
 #if defined(__AVX512IFMA__)
     static V madd52lo(V c, V a, V b) { return _mm256_madd52lo_epu64(c, a, b); }
     static V madd52hi(V c, V a, V b) { return _mm256_madd52hi_epu64(c, a, b); }
@@ -210,6 +222,10 @@ struct Avx512 {
     static V shl64(V a) { return _mm512_slli_epi64(a, k); }
     template <unsigned mask>
     static V blend(V a, V b) { return _mm512_mask_blend_epi32(__mmask16(mask & 0xffff), a, b); }
+    static V permute2(V a, __m512i idx, V b) { return _mm512_permutex2var_epi32(a, idx, b); }
+    static V join_high(V e, V o) {
+        return permute2(e, _mm512_setr_epi32(1, 17, 3, 19, 5, 21, 7, 23, 9, 25, 11, 27, 13, 29, 15, 31), o);
+    }
     static V mulhi(V a, V b);
     template <int k>
     static V mul_shr(V a, V b);
@@ -232,11 +248,22 @@ struct Avx512 {
 // them down first. Shifts of a broadcast constant fold at compile time.
 namespace detail {
 
+// mulhi joins its halves by join_high (vpermt2d on AVX-512) except on Zen 4 and 5, where shoup
+// ran 5% slower with it (notes.md, 2026-10-10). -DFPS_SIMD_MULHI_PERMUTE=0 or 1 forces it.
+#if defined(FPS_SIMD_MULHI_PERMUTE)
+inline constexpr bool kMulhiPermute = FPS_SIMD_MULHI_PERMUTE;
+#elif defined(__znver4__) || defined(__znver5__)
+inline constexpr bool kMulhiPermute = false;
+#else
+inline constexpr bool kMulhiPermute = true;
+#endif
+
 template <class S>
 typename S::V x86_mulhi(typename S::V a, typename S::V b) {
-    const auto even = S::template shr64<32>(S::mul_even(a, b));
+    const auto even = S::mul_even(a, b);
     const auto odd = S::mul_even(S::template shr64<32>(a), S::template shr64<32>(b));
-    return S::template blend<0xaaaa>(even, odd);
+    if constexpr (kMulhiPermute) return S::join_high(even, odd);
+    else return S::template blend<0xaaaa>(S::template shr64<32>(even), odd);
 }
 
 template <class S, int k>
@@ -262,6 +289,11 @@ Sse::V Sse::mul_shr(V a, V b) { return detail::x86_mul_shr<Sse, k>(a, b); }
 inline Avx2::V Avx2::mulhi(V a, V b) { return detail::x86_mulhi<Avx2>(a, b); }
 template <int k>
 Avx2::V Avx2::mul_shr(V a, V b) { return detail::x86_mul_shr<Avx2, k>(a, b); }
+#endif
+#if defined(__AVX2__) && defined(__AVX512VL__)
+inline Avx512Vl::V Avx512Vl::mulhi(V a, V b) { return detail::x86_mulhi<Avx512Vl>(a, b); }
+template <int k>
+Avx512Vl::V Avx512Vl::mul_shr(V a, V b) { return detail::x86_mul_shr<Avx512Vl, k>(a, b); }
 #endif
 #if defined(__AVX512F__) && defined(__AVX512BW__)
 inline Avx512::V Avx512::mulhi(V a, V b) { return detail::x86_mulhi<Avx512>(a, b); }
