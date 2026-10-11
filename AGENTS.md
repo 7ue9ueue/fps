@@ -7,7 +7,7 @@ Two parts:
 
 - **Backend**: the kernels (NTT now, more later), tuned per CPU. Agents explore them in rounds;
   see Backend and Process.
-- **Frontend**: the user API in `DESIGN.md`, still in design. Agree on it before writing it.
+- **Frontend**: the user API, planned in `DESIGN.md`. Build it from that plan.
 
 ## Hard rules
 
@@ -15,8 +15,8 @@ Two parts:
   copied. Cite what you used in the module's `notes.md`.
 - Code from `../cpp_hpc/lc-opt` may be moved here. Rewrite it to this repo's standards as you go.
 - No speed claim without passing tests and a measurement.
-- `DESIGN.md` is the plan, not a contract. If you find a better approach, change the design doc
-  first, then build the new approach. Do not follow the doc into a worse result.
+- `DESIGN.md` and `BACKEND.md` are plans, not contracts. If you find a better approach, change the
+  design doc first, then build the new approach. Do not follow the doc into a worse result.
   - Better means measured or proven: numbers, a test, or a short argument in the commit message.
     A guess does not count.
   - Edit the affected rows and sections in place. Do not leave the old text behind.
