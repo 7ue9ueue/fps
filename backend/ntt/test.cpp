@@ -210,33 +210,30 @@ void fill(u32* p, std::size_t count, u64 bound) {
     for (std::size_t i = 0; i < count && i < 4; ++i) p[i] = u32(bound - 1 - i);
 }
 
-// The two product paths of variant avx2, each as a variant of its own.
-struct avx2_convolution : variant::avx2 {
+// Variant avx2 with each bottom stage at every length.
+template <class Bottom>
+struct avx2_bottom : variant::avx2 {
     static void multiply(u32* a, u32* b, std::size_t n, std::size_t m, int lg, const u32* r, const u32* ir) {
-        impl::convolution(a, b, n, m, lg, r, ir);
+        const std::size_t len = std::size_t(1) << lg;
+        impl::product<Bottom>(a, b, 2 * n <= len, 2 * m <= len, lg, r, ir);
     }
 };
+using avx2_group = avx2_bottom<impl::GroupBottom>;
+using avx2_pair = avx2_bottom<impl::PairBottom>;
 
-struct avx2_product : variant::avx2 {
-    static void multiply(u32* a, u32* b, std::size_t, std::size_t, int lg, const u32* r, const u32* ir) {
-        impl::product(a, b, lg, r, ir);
-    }
-};
-
-void test_paths() {
-    for (int lg = 9; lg <= kMaxLog; ++lg) {
+void test_bottoms() {
+    for (int lg = kMinLog; lg <= kMaxLog; ++lg) {
         const std::size_t len = std::size_t(1) << lg;
         const bool exact = lg <= 11;
-        for (const auto& [n, m] : {std::pair{len / 2, len / 2}, {len / 2, std::size_t(2)}, {len / 4 + 1, len / 4 + 1}}) {
-            test_product<avx2_convolution>("avx2 convolution path", n, m, 0, exact);
-            test_product<avx2_product>("avx2 product path", n, m, 0, exact);
+        for (const auto& [n, m] : {std::pair{len / 2, len / 2}, {len / 2, std::size_t(2)}, {len / 4 + 1, len / 4 + 1},
+                                   {len - len / 4, len / 4 + 1}, {len / 4 + 1, len - 1 - len / 4}}) {
+            test_product<avx2_group>("avx2 one-group bottom", n, m, 0, exact);
+            test_product<avx2_pair>("avx2 two-group bottom", n, m, 0, exact);
         }
-        test_product<avx2_convolution>("avx2 convolution path", len - len / 4, len / 4 + 1, 0, exact);
-        test_product<avx2_convolution>("avx2 convolution path", len / 4 + 1, len - 1 - len / 4, 0, exact);
     }
 }
 
-// The product path with garbage in the factors' upper halves, which it must not read.
+// Factors of at most half the length with garbage in their upper halves, which must not be read.
 void test_upper_halves_unread(std::size_t n, std::size_t m) {
     const auto a = random_poly(n, 0), b = random_poly(m, 0);
     Convolution conv(n, m);
@@ -244,8 +241,8 @@ void test_upper_halves_unread(std::size_t n, std::size_t m) {
     std::copy(b.begin(), b.end(), conv.b());
     const std::size_t half = conv.length() / 2;
     for (std::size_t i = half; i < 2 * half; ++i) conv.a()[i] = u32(rng()), conv.b()[i] = u32(rng());
-    const u32* c = conv.multiply<avx2_product>();
-    expect(std::vector<u32>(c, c + n + m - 1) == schoolbook(a, b), "avx2 product path: upper halves unread",
+    const u32* c = conv.multiply<variant::avx2>();
+    expect(std::vector<u32>(c, c + n + m - 1) == schoolbook(a, b), "avx2: upper halves unread",
            n * 100000000 + m);
 }
 
@@ -418,12 +415,12 @@ void test_avx2() {
     test_loops();
     test_bottom_levels();
     test_group_bottom();
-    for (int lg = 9; lg <= 11; ++lg) {
+    for (int lg = kMinLog; lg <= 11; ++lg) {
         const std::size_t len = std::size_t(1) << lg;
         test_upper_halves_unread(len / 2, len / 2);
         test_upper_halves_unread(len / 2 - 3, len / 4 + 9);
     }
-    test_paths();
+    test_bottoms();
     test_variant<variant::avx2>("avx2", kMaxLog);
 }
 

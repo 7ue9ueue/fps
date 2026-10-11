@@ -159,8 +159,7 @@ public:
     void visit(Vec* a, Vec* b, std::size_t nv, std::size_t count, std::size_t first) const {
         switch (nv) {
         case 4:
-            if constexpr (Bottom::kMinVectors <= 4) return tiles<4>(a, b, count, first);
-            break;
+            return tiles<4>(a, b, count, first);
         case 16: return tiles<16>(a, b, count, first);
         case 64: return tiles<64>(a, b, count, first);
         case 256: return tiles<256>(a, b, count, first);
@@ -300,13 +299,14 @@ inline void inverse_radix8(Vec* f, std::size_t q, const u32* ir, u32 s) {
     product_kernels::inverse_top(f, q, w);
 }
 
-// Product path of any a, b: one-group bottom stage, sparse top levels where a factor allows.
-inline void convolution(u32* a_words, u32* b_words, std::size_t n, std::size_t m, int lg, const u32* r, const u32* ir) {
-    const std::size_t len = std::size_t(1) << lg, nv = len / 8;
+// a b mod x^len - 1 into a; the scale is fused into the last inverse level. A sparse factor (upper
+// half zero) has its upper half neither read nor needed: its first levels read the lower half only.
+template <class Bottom>
+inline void product(u32* a_words, u32* b_words, bool sparse_a, bool sparse_b, int lg, const u32* r, const u32* ir) {
+    const std::size_t nv = (std::size_t(1) << lg) / 8;
     auto* a = reinterpret_cast<Vec*>(a_words);
     auto* b = reinterpret_cast<Vec*>(b_words);
-    const Tree<GroupBottom> tree(r, ir);
-    const bool sparse_a = n <= len / 2, sparse_b = m <= len / 2;
+    const Tree<Bottom> tree(r, ir);
     if (!has_radix2(lg)) {
         const std::size_t h = nv / 4;
         forward_radix4(a, h, sparse_a, r);
@@ -325,29 +325,6 @@ inline void convolution(u32* a_words, u32* b_words, std::size_t n, std::size_t m
     forward_radix8(b, q, sparse_b, r);
     tree.visit(a, b, q, 8, 0);
     inverse_radix8(a, q, ir, product_scale(lg));
-}
-
-// Product path of factors of at most len / 2 coefficients, lg >= 9: two-group bottom stage. Does
-// not read words len / 2 and up of a or b.
-inline void product(u32* a_words, u32* b_words, int lg, const u32* r, const u32* ir) {
-    const std::size_t nv = (std::size_t(1) << lg) / 8;
-    auto* a = reinterpret_cast<Vec*>(a_words);
-    auto* b = reinterpret_cast<Vec*>(b_words);
-    const Tree<PairBottom> tree(r, ir);
-    const u32 s = product_scale(lg);
-    if (!has_radix2(lg)) {  // nv = 4^j: sparse radix-4 top level as convolution()
-        const std::size_t h = nv / 4;
-        forward_radix4(a, h, true, r);
-        forward_radix4(b, h, true, r);
-        tree.visit(a, b, h, 4, 0);
-        inverse_radix4(a, h, ir, Factor(s));
-        return;
-    }
-    const std::size_t q = nv / 8;
-    forward_radix8_sparse(a, q, r);
-    forward_radix8_sparse(b, q, r);
-    tree.visit(a, b, q, 8, 0);
-    inverse_radix8(a, q, ir, s);
 }
 
 // Transforms alone. The bottom level (h = 1) has a group per 4 vectors, each with its own twiddles.
@@ -452,12 +429,14 @@ struct avx2 {
         detail::avx2::inverse(f, lg, inverse_roots);
     }
 
-    // The product path for factors of at most half the transform (lg >= 9), else the convolution path.
+    // Two groups per bottom kernel, but one at 2^7 and 2^8, where that was faster (notes.md).
     static void multiply(std::uint32_t* a, std::uint32_t* b, std::size_t n, std::size_t m, int lg,
                          const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
-        if (lg >= 9 && 2 * std::max(n, m) <= std::size_t(1) << lg)
-            return detail::avx2::product(a, b, lg, roots, inverse_roots);
-        detail::avx2::convolution(a, b, n, m, lg, roots, inverse_roots);
+        const std::size_t len = std::size_t(1) << lg;
+        const bool sparse_a = 2 * n <= len, sparse_b = 2 * m <= len;
+        if (lg == 7 || lg == 8)
+            return detail::avx2::product<detail::avx2::GroupBottom>(a, b, sparse_a, sparse_b, lg, roots, inverse_roots);
+        detail::avx2::product<detail::avx2::PairBottom>(a, b, sparse_a, sparse_b, lg, roots, inverse_roots);
     }
 };
 
