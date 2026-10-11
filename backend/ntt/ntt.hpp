@@ -1,6 +1,6 @@
 // Number-theoretic transforms and polynomial products modulo P = 998244353 (backend kernel).
-// Variants: scalar (every target) and avx2 (lc-opt's, asm scheduled for Zen 3); select.hpp picks
-// one per op. Linux or macOS. Design and measurements: notes.md.
+// Variants: scalar (every target), intrinsics<S> (every target, on a backend/simd struct) and avx2
+// (lc-opt's, asm scheduled for Zen 3); select.hpp picks one per op. Linux or macOS. Design and measurements: notes.md.
 //
 //   fps::ntt::Convolution conv(n, m);          // factors of n and m coefficients
 //   std::copy(f, f + n, conv.a());             // coefficients < P

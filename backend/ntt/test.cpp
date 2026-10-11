@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdio>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace {
@@ -199,16 +200,173 @@ void test_variant(const char* name, int max_lg) {
     test_products<V>(name, max_lg);
 }
 
-#ifdef __AVX2__
-
-namespace impl = detail::avx2;
-using Vec = impl::Vec;
-
 // Random values below bound, the largest ones in the first words.
 void fill(u32* p, std::size_t count, u64 bound) {
     for (std::size_t i = 0; i < count; ++i) p[i] = random_below(bound);
     for (std::size_t i = 0; i < count && i < 4; ++i) p[i] = u32(bound - 1 - i);
 }
+
+// Forward butterfly of one lane: a + x c + y (b + x d), ..., mod P.
+std::array<u32, 4> forward_model(const std::array<u32, 4>& f, u32 x, u32 y, u32 z) {
+    const u32 A = add(f[0], mul(x, f[2])), C = sub(f[0], mul(x, f[2]));
+    const u32 B = add(f[1], mul(x, f[3])), D = sub(f[1], mul(x, f[3]));
+    return {add(A, mul(y, B)), sub(A, mul(y, B)), add(C, mul(z, D)), sub(C, mul(z, D))};
+}
+
+std::array<u32, 4> inverse_model(const std::array<u32, 4>& f, u32 x, u32 y, u32 z) {
+    const u32 ab = add(f[0], f[1]), cd = add(f[2], f[3]);
+    const u32 amb = mul(y, sub(f[0], f[1])), cmd = mul(z, sub(f[2], f[3]));
+    return {add(ab, cd), add(amb, cmd), mul(x, sub(ab, cd)), mul(x, sub(amb, cmd))};
+}
+
+// Twiddle tables for transforms of length 2^lg.
+struct Tables {
+    explicit Tables(int lg) : forward_(detail::table_words(lg)), inverse_(detail::table_words(lg)) {
+        Native::build_table(forward_.begin(), (std::size_t(1) << lg) / 16, false);
+        Native::build_table(inverse_.begin(), (std::size_t(1) << lg) / 16, true);
+    }
+    const u32* r(std::size_t k) { return forward_.begin() + detail::slot(k); }  // value; quotient at [8]
+    const u32* ir(std::size_t k) { return inverse_.begin() + detail::slot(k); }
+    const u32* r() { return forward_.begin(); }
+    const u32* ir() { return inverse_.begin(); }
+
+private:
+    Words forward_, inverse_;
+};
+
+constexpr int kTableLog = 12;
+constexpr std::size_t kGroups = (std::size_t(1) << kTableLog) / 32;  // groups k with r(2k + 1) in the table
+
+// intrinsics<S>: each kernel against the lane models, inputs at the edges of their ranges.
+template <class S>
+struct IntrinsicsKernels {
+    using K = detail::intrinsics::Ntt<S>;
+    using Leaf = typename K::Leaf;
+
+    // Runs kernel on count groups of quarters of q words from group first, inputs below in_bound;
+    // checks every lane against model(f, group) and outputs below out_bound.
+    template <class Kernel, class Model>
+    static void check(const std::string& name, std::size_t q, std::size_t count, u64 in_bound, u64 out_bound,
+                      Kernel kernel, Model model) {
+        Words v(4 * q * count);
+        fill(v.begin(), 4 * q * count, in_bound);
+        const std::vector<u32> in(v.begin(), v.begin() + 4 * q * count);
+        kernel(v.begin());
+        for (std::size_t g = 0; g < count; ++g)
+            for (std::size_t j = 0; j < q; ++j) {
+                std::array<u32, 4> f;
+                for (std::size_t t = 0; t < 4; ++t) f[t] = in[4 * q * g + j + q * t];
+                const auto expected = model(f, g);
+                for (std::size_t t = 0; t < 4; ++t) {
+                    const u32 got = v.begin()[4 * q * g + j + q * t];
+                    expect(got < out_bound && got % P == expected[t], name.c_str(), j);
+                }
+            }
+    }
+
+    static void run(const std::string& name) {
+        Tables t(kTableLog);
+        const auto fm = [&](std::size_t k) {
+            return [&t, k](const std::array<u32, 4>& f, std::size_t g) {
+                return forward_model(f, *t.r(k + g), t.r(2 * (k + g))[0], t.r(2 * (k + g))[1]);
+            };
+        };
+        const auto im = [&](std::size_t k) {
+            return [&t, k](const std::array<u32, 4>& f, std::size_t g) {
+                return inverse_model(f, *t.ir(k + g), t.ir(2 * (k + g))[0], t.ir(2 * (k + g))[1]);
+            };
+        };
+        for (std::size_t q : {32, 128}) {
+            for (int round = 0; round < 8; ++round) {
+                const std::size_t k = round == 0 ? 0 : 1 + random_below(kGroups - 1);  // 0: identity groups
+                check(name + " forward_group", q, 1, 4 * u64(P), 4 * u64(P),
+                      [&](u32* f) { K::forward_group(f, q, k, t.r()); }, fm(k));
+                check(name + " inverse_group", q, 1, 2 * u64(P), 2 * u64(P),
+                      [&](u32* f) { K::inverse_group(f, q, k, t.ir()); }, im(k));
+            }
+        }
+        for (int round = 0; round < 30; ++round) {
+            const std::size_t count = 1 + random_below(4), k = round == 0 ? 0 : random_below(kGroups - count);
+            check(name + " forward bottom", 8, count, 4 * u64(P), P,
+                  [&](u32* f) { Leaf::forward(f, count, k, t.r()); }, fm(k));
+            check(name + " inverse bottom", 8, count, 2 * u64(P), 2 * u64(P),
+                  [&](u32* f) { Leaf::inverse(f, count, k, t.ir()); }, im(k));
+        }
+        test_multiply(name + " leaf products", t, 1, [&](u32* a, u32* b, std::size_t count, std::size_t k) {
+            Leaf::multiply(a, b, count, k, t.r(), t.ir());
+        });
+        if constexpr (S::lanes == 16) {  // pairs of groups on S
+            using W = detail::intrinsics::WideBottom<S>;
+            for (int round = 0; round < 30; ++round) {
+                const std::size_t count = 2 + 2 * random_below(2), k = 2 * random_below(kGroups / 2 - 2);
+                check(name + " wide forward bottom", 8, count, 4 * u64(P), P,
+                      [&](u32* f) { W::forward(f, count, k, t.r()); }, fm(k));
+                check(name + " wide inverse bottom", 8, count, 2 * u64(P), 2 * u64(P),
+                      [&](u32* f) { W::inverse(f, count, k, t.ir()); }, im(k));
+            }
+            test_multiply(name + " wide leaf products", t, 2, [&](u32* a, u32* b, std::size_t count, std::size_t k) {
+                W::multiply(a, b, count, k, t.r(), t.ir());
+            });
+        }
+    }
+
+    // run(a, b, count, first): Leaf::multiply or a variant of it on groups of 32 words, count and
+    // first multiples of step: forward butterfly, products of the leaves mod x^8 - w (with the
+    // Montgomery factor 2^-32), inverse butterfly.
+    template <class Run>
+    static void test_multiply(const std::string& name, Tables& t, std::size_t step, Run run) {
+        const u32 r_inverse = power(u32((u64(1) << 32) % P), P - 2);
+        for (int round = 0; round < 50; ++round) {
+            const std::size_t count = step * (1 + random_below(4 / step)), k0 = step * random_below(kGroups / step - 4);
+            Words a(32 * count), b(32 * count);
+            fill(a.begin(), 32 * count, 4 * u64(P));
+            fill(b.begin(), 32 * count, 4 * u64(P));
+            const std::vector<u32> a0(a.begin(), a.begin() + 32 * count), b0(b.begin(), b.begin() + 32 * count);
+            run(a.begin(), b.begin(), count, k0);
+            for (std::size_t j = 0; j < count; ++j) {
+                const std::size_t k = k0 + j;
+                const u32 x = *t.r(k), y = t.r(2 * k)[0], z = t.r(2 * k)[1];
+                const std::array<u32, 4> w{y, P - y, z, P - z};
+                u32 fa[4][8], fb[4][8], c[4][8];
+                for (int l = 0; l < 8; ++l) {
+                    std::array<u32, 4> xa, xb;
+                    for (int s = 0; s < 4; ++s) xa[s] = a0[32 * j + 8 * s + l], xb[s] = b0[32 * j + 8 * s + l];
+                    const auto ya = forward_model(xa, x, y, z), yb = forward_model(xb, x, y, z);
+                    for (int s = 0; s < 4; ++s) fa[s][l] = ya[s], fb[s][l] = yb[s];
+                }
+                for (int s = 0; s < 4; ++s)
+                    for (int l = 0; l < 8; ++l) {
+                        u32 sum = 0;
+                        for (int i = 0; i < 8; ++i)
+                            sum = add(sum, mul(fb[s][i], l >= i ? fa[s][l - i] : mul(w[s], fa[s][l - i + 8])));
+                        c[s][l] = mul(sum, r_inverse);
+                    }
+                for (int l = 0; l < 8; ++l) {
+                    const auto expected = inverse_model({c[0][l], c[1][l], c[2][l], c[3][l]}, *t.ir(k),
+                                                        t.ir(2 * k)[0], t.ir(2 * k)[1]);
+                    for (int s = 0; s < 4; ++s) {
+                        const u32 got = a.begin()[32 * j + 8 * s + l];
+                        expect(got < 2 * P && got % P == expected[s], name.c_str(), 32 * j + 8 * s + l);
+                    }
+                }
+            }
+        }
+    }
+};
+
+// Every simd struct this machine runs; Scalar is slow, so shorter.
+void test_intrinsics() {
+    fps::simd::for_each(fps::simd::All{}, []<class S> {
+        const std::string name = std::string("intrinsics ") + S::name;
+        IntrinsicsKernels<S>::run(name);
+        test_variant<variant::intrinsics<S>>(name.c_str(), S::lanes == 1 ? kScalarMaxLog : kMaxLog);
+    });
+}
+
+#ifdef __AVX2__
+
+namespace impl = detail::avx2;
+using Vec = impl::Vec;
 
 // Variant avx2 with each bottom stage at every length.
 template <class Bottom>
@@ -244,37 +402,6 @@ void test_upper_halves_unread(std::size_t n, std::size_t m) {
     const u32* c = conv.multiply<variant::avx2>();
     expect(std::vector<u32>(c, c + n + m - 1) == schoolbook(a, b), "avx2: upper halves unread",
            n * 100000000 + m);
-}
-
-// Twiddle tables for transforms of length 2^lg.
-struct Tables {
-    explicit Tables(int lg) : forward_(detail::table_words(lg)), inverse_(detail::table_words(lg)) {
-        variant::avx2::build_table(forward_.begin(), (std::size_t(1) << lg) / 16, false);
-        variant::avx2::build_table(inverse_.begin(), (std::size_t(1) << lg) / 16, true);
-    }
-    const u32* r(std::size_t k) { return forward_.begin() + detail::slot(k); }  // value; quotient at [8]
-    const u32* ir(std::size_t k) { return inverse_.begin() + detail::slot(k); }
-    const u32* r() { return forward_.begin(); }
-    const u32* ir() { return inverse_.begin(); }
-
-private:
-    Words forward_, inverse_;
-};
-
-constexpr int kTableLog = 12;
-constexpr std::size_t kGroups = (std::size_t(1) << kTableLog) / 32;  // groups k with r(2k + 1) in the table
-
-// Forward butterfly of one lane: a + x c + y (b + x d), ..., mod P.
-std::array<u32, 4> forward_model(const std::array<u32, 4>& f, u32 x, u32 y, u32 z) {
-    const u32 A = add(f[0], mul(x, f[2])), C = sub(f[0], mul(x, f[2]));
-    const u32 B = add(f[1], mul(x, f[3])), D = sub(f[1], mul(x, f[3]));
-    return {add(A, mul(y, B)), sub(A, mul(y, B)), add(C, mul(z, D)), sub(C, mul(z, D))};
-}
-
-std::array<u32, 4> inverse_model(const std::array<u32, 4>& f, u32 x, u32 y, u32 z) {
-    const u32 ab = add(f[0], f[1]), cd = add(f[2], f[3]);
-    const u32 amb = mul(y, sub(f[0], f[1])), cmd = mul(z, sub(f[2], f[3]));
-    return {add(ab, cd), add(amb, cmd), mul(x, sub(ab, cd)), mul(x, sub(amb, cmd))};
 }
 
 Vec* vec(Words& w) { return reinterpret_cast<Vec*>(w.begin()); }
@@ -443,6 +570,7 @@ void test_avx2() {
 
 int main() {
     test_variant<variant::scalar>("scalar", kScalarMaxLog);
+    test_intrinsics();
 #ifdef __AVX2__
     test_avx2();
 #endif

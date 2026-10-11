@@ -1,8 +1,11 @@
 # backend/ntt
 
 Number-theoretic transforms and products modulo P = 998244353. API: `ntt.hpp` (`Convolution`,
-`Transform`, the leaf form). Variants: `scalar.hpp` (every target; the model), `avx2.hpp`
-(lc-opt's `lib/ntt`). `select.hpp` picks one per op. Tests: `test.cpp`; benches: `bench.cpp`.
+`Transform`, the leaf form). Variants: `scalar.hpp` (every target; the model), `intrinsics.hpp`
+(`intrinsics<S>`, templates on any `backend/simd` struct S), `avx2.hpp` (lc-opt's `lib/ntt`).
+`select.hpp` picks one per op and length: `avx2` on the `avx2` target; on `avx512` and `zen5`
+`intrinsics<Avx512>` from 2^8-2^10 on (per op and CPU) and `avx2` below; `intrinsics<simd::Native>`
+on the other targets. Tests: `test.cpp`; benches: `bench.cpp`.
 Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_product_kernels.hpp`
 (`gen_avx2_product_kernels.py`).
 
@@ -59,6 +62,47 @@ origins). One product, `product<Bottom>` (lc-opt had two paths, `Convolution` an
   (the first level without input reductions: 20 vector ops per column, not 33) and
   `inverse_top4`. Even lg: a radix-2 pass without reductions (canonical inputs) below 2^16,
   `forward_radix8_dense` from 2^16; `inverse_top`.
+
+### intrinsics
+
+`intrinsics<S>` (`intrinsics.hpp`): the algorithm of the avx2 variant, written once on a simd
+struct S and `modarith::Ops<S, P>` (Shoup products by `shoup`, the selected variant). Same
+splitting, twiddle tables (`build_table` extends the static prefix N lanes at a time), lazy ranges
+(forward < 4P, inverse < 2P) and leaf products (Montgomery, factor 2^-32), so its outputs equal
+the other variants' word for word.
+
+- Levels with quarters of at least 32 words run on S, one group at a time.
+- Bottom level (quarters of 8 words, one leaf each): on S up to 8 lanes, one group at a time. On
+  `Avx512` (16 lanes, `WideBottom`): two groups k, k + 1 per step; four `vpermt2d` turn their 64
+  words into vectors [quarter t of group k, quarter t of group k + 1], so the butterflies are
+  lane-wise with twiddles [w_k x 8, w_(k+1) x 8] (two `vpermd` of one 16-word table load each),
+  and four more turn them back.
+- Recursion: depth first; subtrees of at most 256 leaves (8 KiB per array) run level by level.
+  Each subtree has its own bottom stage (avx2 now merges sibling subtrees into one tile; not done
+  here). Top: a radix-2 level (odd lg - 3) or group 0, with the sparse forms for a factor of at
+  most L/2 coefficients (a copy; group 0 reading half the input), and the scale fused into the
+  last inverse level. No fused radix-8 top: slower everywhere it was tried (Log).
+- Products, per bottom group: forward butterflies of a and b, leaf products, inverse butterflies,
+  one store. Leaf products: x86 up to 8 lanes (`mul_even`): lc-opt's even/odd form, windows
+  [w A, A] in a stack buffer read at offsets 1..9, each b_i broadcast once, 64-bit sums < 8 P^2,
+  Montgomery reduction, `join_high`; group g + 1's forward half runs before group g's products,
+  so the windows are not reloaded right after their stores. `Avx512`: the same form in registers
+  for two groups at a time: window offset j of both halves is one `vpermt2d` of w A and A, b_i of
+  both halves one `vpermd` of B; no stack buffer. Neon: `umull`/`umlal` (+`umull2`/`umlal2`) on
+  the windows, `uzp1` for m, `umlal` for m P, `uzp2`. Scalar: one u64 sum per word.
+- Lengths below 2^kWideMinLog run wholly on `Narrow<S>` (S, or `Avx512Vl` for `Avx512`): 2^8 on
+  Emerald Rapids, 2^7 on Zen 4/5 (`__znver4__`, `__znver5__`). Before the zmm bottom level, zmm
+  levels above ymm bottom stores were 1.25-1.33x slower at 2^7 and 2^8 on Emerald Rapids
+  (`ld_blocks.store_forward` 1.8M against 12k: wide loads of narrow stores still in flight).
+- GCC 15 at -O2 kept the fixed 4- and 8-trip loops of the leaf products rolled and did not inline
+  the butterfly lambdas of the bottom level; `#pragma GCC unroll` and `[[gnu::always_inline]]`
+  fix both (Log).
+- `variant::by_length<lg, Small, Large>` (`select.hpp`): Small below 2^lg. On `avx512`: avx2
+  below 2^9 (forward), 2^8 (inverse), 2^10 (multiply); on `zen5` below 2^8 for all three. From
+  @avx2 against @intrinsics_avx512 in one binary, 5 rounds, intrinsics/avx2 at 2^6..2^9:
+  Emerald Rapids forward 1.05 1.07 1.04 0.94, inverse 0.79 1.36 0.95 0.99, multiply 0.98 1.20
+  1.13 1.11 (0.97 at 2^10); Zen 5 forward 1.17 1.09 0.95 0.76, inverse 1.11 1.06 0.79 0.80,
+  multiply 1.08 1.16 0.95 0.90.
 
 ## Measurements
 
@@ -164,6 +208,45 @@ marked:
   vpsrlq + vpminud 0.60, vpaddd + vpminud 0.50. A multiply or shift costs more than its pipe
   count says when mixed with 4-pipe ops; the 4-pipe op count is only a floor.
 
+### intrinsics (issue #4, round 1)
+
+Against main (6a9c91d, with issue #3's round 2 asm), paired, 5 rounds, `kernel.py bench --base`,
+all 80 gated cases, GCC 15.2, `tools/kernel.py` flags, 2026-10-11. Geomean new/base, then new ns
+per call (new/base) by lg:
+
+| Target (machine) | Geomean | forward 10 / 16 / 25 | inverse 10 / 16 / 25 | multiply 10 / 16 / 25 |
+|---|---:|---|---|---|
+| avx2 (`lc-bench`, Zen 3) | 0.999 | 525 (1.000) / 60736 (1.003) / 5.65e7 (1.004) | 498 (1.004) / 57402 (0.996) / 5.59e7 (1.003) | 2152 (1.004) / 2.14e5 (0.997) / 1.91e8 (0.998) |
+| avx512 (`lc-intel`, Emerald Rapids) | 0.894 | 502 (0.873) / 60023 (0.863) / 5.98e7 (0.845) | 511 (0.887) / 56624 (0.831) / 6.24e7 (0.848) | 2207 (0.961) / 2.16e5 (0.896) / 2.22e8 (0.826) |
+| zen5 (`lc-zen5`, EPYC 9B45) | 0.727 | 288 (0.712) / 31621 (0.667) / 3.33e7 (0.762) | 261 (0.658) / 28179 (0.603) / 3.01e7 (0.663) | 1280 (0.769) / 1.18e5 (0.701) / 1.10e8 (0.740) |
+| arm (`lc-arm`, Neoverse V2; lg <= 18) | 0.176 | 1058 (0.169) / 124766 (0.164) / - | 1023 (0.149) / 119537 (0.153) / - | 4855 (0.198) / 4.75e5 (0.180) / - |
+
+avx2: the selected code is unchanged (asm); only the bench binary changed. arm: against the scalar
+variant, which main selected there; absolute times at 2^25 not paired. Cases above 1.01: Zen 3
+multiply/9 and multiply_dense/9 1.020 (asm unchanged; seen in every run: code layout, guess),
+Emerald Rapids inverse/6 1.034 and multiply_dense/6 1.024, Zen 5 inverse/7 1.027 (the asm, called
+through `by_length`).
+
+Variants against the selected ones in the same run (`@` cases, median of 5, ns ratio), lg
+10 / 16 / 22:
+
+| Machine | Variant / selected | forward | inverse | multiply |
+|---|---|---|---|---|
+| Zen 3 | intrinsics_avx2 / avx2 | 1.09 / 1.14 / 1.17 | 1.19 / 1.18 / 1.16 | 1.18 / 1.21 / 1.22 |
+| Emerald Rapids | avx2 / intrinsics_avx512 | 1.14 / 1.16 / 1.09 | 1.14 / 1.20 / 1.17 | 1.04 / 1.12 / 1.12 |
+| Emerald Rapids | intrinsics_avx512vl / intrinsics_avx512 | 1.25 / 1.30 / 1.27 | 1.21 / 1.28 / 1.26 | 1.14 / 1.24 / 1.22 |
+| Zen 5 | avx2 / intrinsics_avx512 | 1.40 / 1.50 / 1.52 | 1.53 / 1.66 / 1.71 | 1.30 / 1.41 / 1.41 |
+| Zen 5 | intrinsics_avx512vl / intrinsics_avx512 | 1.64 / 1.83 / 1.84 | 1.72 / 1.86 / 1.89 | 1.54 / 1.73 / 1.74 |
+
+- zmm against the same code on ymm (32 registers): 1.2-1.3x on Emerald Rapids, 1.5-1.9x on Zen 5
+  (four 512-bit pipes).
+- Zen 3: the intrinsics on Avx2 are 1.06-1.22x slower than the scheduled asm, most in the
+  products (the asm schedules each bottom group as one dataflow graph, and merges tiles).
+- Emerald Rapids, earlier run: Avx512Vl (32 ymm) beat Avx2 (16 ymm) by 5%; on Zen 5 they compile
+  alike. The bench times Avx512Vl only there.
+- Neoverse V2, ns (ns per coefficient): forward/16 124766 (1.90), inverse/16 119537 (1.82),
+  multiply/16 474831 (7.25). Its Shoup products use SVE2 `umulh` (issue #2, round 2).
+
 ## Log
 
 2026-10-11, claude (issue #3, round 1): moved lc-opt `lib/ntt` (`ntt.hpp`, `product.hpp`, both
@@ -237,6 +320,41 @@ against the one before, 7 rounds, paired ratios (`kernel.py bench --base`).
   every other run of the same binary; not reproduced.
 - Generator: VEX shifts take no memory operand; `Graph.op` now loads a shift's source (GAS had
   encoded `vpsrlq $32, mem` as EVEX: illegal instruction on Zen 3). No existing kernel changed.
+
+2026-10-11, claude (issue #4, round 1): variant `intrinsics<S>` (`intrinsics.hpp`), `by_length`,
+selection, tests, benches. Measurements above (intrinsics). Commits on `agent/ntt-all-r1`, squashed.
+- Task: the avx2 variant's algorithm on `simd` and `modarith`; selected on sse, arm and scalar
+  (was scalar), and on avx512 and zen5 with `Avx512` from 2^8-2^10 on (was the AVX2 asm). avx2
+  keeps the asm. Tests: every `intrinsics<S>` for S in `simd::All` through the variant tests
+  (Scalar to 2^20), plus each butterfly, the bottom level, the fused leaf products and the zmm
+  pair bottom against lane models with inputs at the edges of their ranges (< 4P forward, < 2P
+  inverse). Pass at -O2 and ASan/UBSan on `lc-amd` (scalar, sse, avx2), `lc-intel-test`,
+  `lc-zen5`, `lc-arm` and the Mac. Benches: `@intrinsics_<struct>` for the 8- and 16-lane
+  structs (Avx512Vl, not Avx2, on AVX-512) and `@avx2` where not selected everywhere, to 2^22.
+- Tried, lost: a fused radix-8 top (the radix-2 level and both halves' first radix-4 groups in
+  one pass, as avx2's `forward_radix8_dense`, and its inverse with the scale). Against radix-2 tops,
+  paired, 5 rounds, the radix-2 form was faster almost everywhere: Zen 3 Avx2 0.85-0.99, Zen 5
+  zmm 0.81-1.0, Neoverse V2 0.90-0.98, Emerald Rapids zmm 0.78-1.0 except lg 22 (forward 1.035,
+  inverse 1.038). Guess: 8 streams at a power-of-two stride (4K aliasing, set conflicts), and on
+  16 registers spills. Removed.
+- Won: forcing inlining of the butterflies (`[[gnu::always_inline]]`): before it, Zen 3
+  forward/15 and multiply/15 (Avx2) were 1.19x and 1.30x slower.
+- Won: `#pragma GCC unroll 8` on the leaf product loops and `[[gnu::always_inline]]` on the
+  bottom level's butterfly lambdas. `perf` on `lc-intel` had shown the bottom lambda as its own
+  symbol (23% of forward/16) and the leaf product loop rolled (2 dependency chains). Paired, 5
+  rounds: multiply 0.76-0.88 on Emerald Rapids zmm, 0.91-0.95 on Zen 5 zmm, 0.91-0.96 on Neoverse
+  V2; forward 0.79-0.96 on x86 (Neon unchanged); inverse unchanged.
+- Won: the zmm bottom level and zmm leaf products in registers (`WideBottom`, above), against
+  the ymm bottom with stack windows, paired, 5 rounds, `@intrinsics_avx512` at 2^10..2^22:
+  Emerald Rapids forward 0.87-0.97, inverse 0.91-1.00, multiply 0.91-0.94; Zen 5 forward
+  0.81-0.93 (from 2^7), inverse 0.89-0.94, multiply 0.81-0.89. The two steps were not timed
+  apart.
+- Thresholds (kWideMinLog, `by_length`): from same-binary runs above. Against main before issue
+  #3's round 2, intrinsics selected from 2^6 already won (avx512 0.904, zen5 0.780; gate passed
+  twice on PR #30); round 2 made the asm 5-25% faster below 2^10, so the asm stays there.
+- Not done: merged tiles (one bottom stage for sibling subtrees, as avx2 now), zmm for Neon's
+  4-lane equivalent (no two-source permute in `simd::Neon`), a Neon Shoup on x < 2^31 (`sqdmulh`)
+  with values kept < 2P, the asm's tricks (windows P - y A, scale folded into twiddles).
 
 ## Sources
 

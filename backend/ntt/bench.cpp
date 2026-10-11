@@ -2,6 +2,7 @@
 //   forward/<lg>, inverse/<lg>   Transform::forward and inverse, in place, tables built.
 //   multiply/<lg>                Convolution::multiply, factors of 2^lg / 2 coefficients each.
 //   multiply_dense/<lg>          factors of 3 2^lg / 4 and 2^lg / 4 + 1 coefficients.
+//   <op>@<variant>/<lg>          one variant: scalar, intrinsics_<simd struct>, avx2 (if not selected).
 // Each multiply call builds its tables, as a single-use Convolution does. Repeated calls reuse
 // the last output as input: the timing does not depend on the values.
 #include "backend/ntt/ntt.hpp"
@@ -23,6 +24,8 @@ using namespace fps::ntt;
 
 // The scalar variant takes seconds at 2^25; its benches stop here.
 constexpr int kScalarMaxLog = 18;
+// Variants not selected: up to 2^22 (64 MiB for a multiply), to keep the gate's 21 rounds short.
+constexpr int kVariantMaxLog = 22;
 
 struct Words {
     struct alignas(64) Line {
@@ -36,6 +39,10 @@ struct Words {
     u32* begin() { return lines.data()->words; }
     std::vector<Line> lines;
 };
+
+template <class V>
+constexpr bool selected_everywhere =
+    std::is_same_v<V, SelectedForward> && std::is_same_v<V, SelectedInverse> && std::is_same_v<V, SelectedMultiply>;
 
 template <class Forward, class Inverse, class Multiply>
 void add_cases(bench::Suite& suite, const std::string& suffix, int max_lg) {
@@ -74,5 +81,19 @@ int main(int argc, char** argv) {
     const bool native_scalar = std::is_same_v<Native, variant::scalar>;
     add_cases<SelectedForward, SelectedInverse, SelectedMultiply>(suite, "", native_scalar ? kScalarMaxLog : kMaxLog);
     if (!native_scalar) add_cases<variant::scalar, variant::scalar, variant::scalar>(suite, "@scalar", 12);
+    // intrinsics<S> for the vector structs worth timing here (8 lanes and more, or the native one;
+    // not Avx2 where Avx512Vl runs the same code on 32 registers), and avx2, unless selected for
+    // every op.
+    fps::simd::for_each(fps::simd::All{}, [&]<class S> {
+        using V = variant::intrinsics<S>;
+        constexpr bool worth = S::lanes > 1 && (S::lanes >= 8 || std::is_same_v<S, fps::simd::Native>) &&
+                               !(S::lanes == 8 && S::registers < fps::simd::Native::registers);
+        if constexpr (worth && !selected_everywhere<V>)
+            add_cases<V, V, V>(suite, std::string("@intrinsics_") + S::name, kVariantMaxLog);
+    });
+#ifdef __AVX2__
+    if constexpr (!selected_everywhere<variant::avx2>)
+        add_cases<variant::avx2, variant::avx2, variant::avx2>(suite, "@avx2", kVariantMaxLog);
+#endif
     return suite.run();
 }
