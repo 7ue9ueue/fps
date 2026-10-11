@@ -63,21 +63,29 @@ u32 root(u64 k) {
     return r;
 }
 
+// Tables against the definition: built within the static prefix and past it; the static tables.
 template <class V>
 void test_tables(const char* name) {
-    constexpr int lg = 14;
-    const std::size_t count = (std::size_t(1) << lg) / 16;
-    std::vector<Words> t;
-    for (int inverse = 0; inverse < 2; ++inverse) {
-        t.emplace_back(detail::table_words(lg));
-        V::build_table(t.back().begin(), count, detail::kRoots[inverse]);
-    }
-    for (std::size_t k = 0; k < count; ++k) {
-        const u32* e = t[0].begin() + detail::slot(k);
-        const u32* ie = t[1].begin() + detail::slot(k);
-        expect(e[0] == root(k), name, k);
-        expect(mul(e[0], ie[0]) == 1, name, k);
-        for (const u32* x : {e, ie}) expect(x[8] == u32((u64(x[0]) << 32) / P), name, k);
+    for (int lg : {kMinLog, kMinLog + 1, 10, detail::kStaticLog, detail::kStaticLog + 2}) {
+        const std::size_t count = (std::size_t(1) << lg) / 16;
+        std::vector<Words> t;
+        for (int inverse = 0; inverse < 2; ++inverse) {
+            t.emplace_back(detail::table_words(lg));
+            V::build_table(t.back().begin(), count, inverse);
+        }
+        for (std::size_t k = 0; k < count; ++k) {
+            const u32* e = t[0].begin() + detail::slot(k);
+            const u32* ie = t[1].begin() + detail::slot(k);
+            expect(e[0] == root(k), name, k);
+            expect(mul(e[0], ie[0]) == 1, name, k);
+            for (const u32* x : {e, ie}) expect(x[8] == u32((u64(x[0]) << 32) / P), name, k);
+            if (k < detail::kStaticCount) {
+                for (int inverse = 0; inverse < 2; ++inverse)
+                    for (int w : {0, 8})
+                        expect(detail::kStaticTables.words[inverse][detail::slot(k) + w] == t[inverse].begin()[detail::slot(k) + w],
+                               "static tables", k);
+            }
+        }
     }
 }
 
@@ -244,8 +252,8 @@ void test_upper_halves_unread(std::size_t n, std::size_t m) {
 // Twiddle tables for transforms of length 2^lg.
 struct Tables {
     explicit Tables(int lg) : forward_(detail::table_words(lg)), inverse_(detail::table_words(lg)) {
-        variant::avx2::build_table(forward_.begin(), (std::size_t(1) << lg) / 16, detail::kRoots[0]);
-        variant::avx2::build_table(inverse_.begin(), (std::size_t(1) << lg) / 16, detail::kRoots[1]);
+        variant::avx2::build_table(forward_.begin(), (std::size_t(1) << lg) / 16, false);
+        variant::avx2::build_table(inverse_.begin(), (std::size_t(1) << lg) / 16, true);
     }
     const u32* r(std::size_t k) { return forward_.begin() + detail::slot(k); }  // value; quotient at [8]
     const u32* ir(std::size_t k) { return inverse_.begin() + detail::slot(k); }

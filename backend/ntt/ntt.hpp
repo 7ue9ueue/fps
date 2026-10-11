@@ -37,11 +37,12 @@ namespace fps::ntt {
 
 // The product of a of n and b of m coefficients, n + m - 1 <= 2^kMaxLog. Owns its memory: a, b
 // and the twiddle tables in one mapping, 2 MiB aligned, in huge pages where the system allows.
+// Lengths up to 2^detail::kStaticLog use the compile-time tables instead.
 class Convolution {
 public:
     Convolution(std::size_t n, std::size_t m) : n_(n), m_(m), lg_(log_length(n, m)) {
         if (lg_ > kMaxLog) throw std::length_error("fps::ntt::Convolution: product longer than 2^kMaxLog");
-        const std::size_t len = length(), words = 2 * (len + kPadding) + 2 * detail::table_words(lg_);
+        const std::size_t len = length(), words = 2 * (len + kPadding) + 2 * owned_table_words(lg_);
         constexpr std::size_t kHuge = std::size_t(1) << 21;
         bytes_ = (words * sizeof(std::uint32_t) + kHuge - 1) / kHuge * kHuge + kHuge;
         region_ = ::mmap(nullptr, bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -52,8 +53,7 @@ public:
         ::madvise(a_, bytes_ - kHuge, MADV_HUGEPAGE);
 #endif
         b_ = a_ + len + kPadding;  // a different cache set from a at equal offsets
-        roots_ = b_ + len + kPadding;
-        inverse_roots_ = roots_ + detail::table_words(lg_);
+        if (owned_table_words(lg_)) tables_ = b_ + len + kPadding;
     }
 
     ~Convolution() { ::munmap(region_, bytes_); }
@@ -74,9 +74,13 @@ public:
     template <class Variant = SelectedMultiply>
     const std::uint32_t* multiply() {
         if (size() == 0) return a_;
-        Variant::build_table(roots_, length() / 16, detail::kRoots[0]);
-        Variant::build_table(inverse_roots_, length() / 16, detail::kRoots[1]);
-        Variant::multiply(a_, b_, n_, m_, lg_, roots_, inverse_roots_);
+        const std::uint32_t *roots = detail::kStaticTables.words[0], *inverse_roots = detail::kStaticTables.words[1];
+        if (tables_) {
+            roots = tables_, inverse_roots = tables_ + owned_table_words(lg_);
+            Variant::build_table(tables_, length() / 16, false);
+            Variant::build_table(tables_ + owned_table_words(lg_), length() / 16, true);
+        }
+        Variant::multiply(a_, b_, n_, m_, lg_, roots, inverse_roots);
         return a_;
     }
 
@@ -84,20 +88,21 @@ private:
     static int log_length(std::size_t n, std::size_t m) {
         return n && m ? std::max(kMinLog, int(std::bit_width(n + m - 2))) : kMinLog;
     }
+    static std::size_t owned_table_words(int lg) { return lg > detail::kStaticLog ? detail::table_words(lg) : 0; }
 
     std::size_t n_, m_;
     int lg_;
     void* region_;
     std::size_t bytes_;
-    std::uint32_t *a_, *b_, *roots_, *inverse_roots_;
+    std::uint32_t *a_, *b_, *tables_ = nullptr;  // tables_: forward, then inverse; null if static
 };
 
 // Forward and inverse transforms of length 2^lg, kMinLog <= lg <= kMaxLog, with their tables.
 class Transform {
 public:
     explicit Transform(int lg) : lg_(checked(lg)), tables_(new Line[2 * lines(lg)]) {
-        Native::build_table(roots(), length() / 16, detail::kRoots[0]);
-        Native::build_table(inverse_roots(), length() / 16, detail::kRoots[1]);
+        Native::build_table(roots(), length() / 16, false);
+        Native::build_table(inverse_roots(), length() / 16, true);
     }
 
     std::size_t length() const { return std::size_t(1) << lg_; }

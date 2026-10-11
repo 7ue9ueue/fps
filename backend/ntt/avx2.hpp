@@ -50,12 +50,11 @@ inline Vec multiply(Vec x, const Factor& f) {
 inline Vec load(const u32* p) { return _mm256_load_si256(reinterpret_cast<const Vec*>(p)); }
 inline void store(u32* p, Vec x) { _mm256_store_si256(reinterpret_cast<Vec*>(p), x); }
 
-// variant::scalar::build_table, 8 entries at a time from entry 8 on.
-inline void build_table(u32* t, std::size_t count, const Roots& roots) {
-    start_table(t);
-    std::size_t h = 1;
-    for (; h < count && h < 8; h *= 2) extend_table(t, 2 * h, roots);
-    for (; h < count; h *= 2) {
+// variant::scalar::build_table, 8 entries at a time past the static prefix.
+inline void build_table(u32* t, std::size_t count, bool inverse) {
+    static_assert(kStaticCount >= 8);
+    const Roots& roots = kRoots[inverse];
+    for (std::size_t h = copy_static_table(t, count, inverse); h < count; h *= 2) {
         // Quotient of v: (v 2^32 mod P) / -P mod 2^32.
         const Factor by(roots[std::countr_zero(h)]), to_r(kR);
         for (std::size_t j = 0; j < h; j += 8) {
@@ -430,8 +429,8 @@ inline void inverse(u32* words, int lg, const u32* ir) {
 namespace fps::ntt::variant {
 
 struct avx2 {
-    static void build_table(std::uint32_t* t, std::size_t count, const detail::Roots& roots) {
-        detail::avx2::build_table(t, count, roots);
+    static void build_table(std::uint32_t* t, std::size_t count, bool inverse) {
+        detail::avx2::build_table(t, count, inverse);
     }
 
     static void forward(std::uint32_t* f, int lg, const std::uint32_t* roots) { detail::avx2::forward(f, lg, roots); }

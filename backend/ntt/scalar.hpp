@@ -96,9 +96,10 @@ inline void multiply_leaves(u32* a, const u32* b, int lg, const u32* r) {
 namespace fps::ntt::variant {
 
 struct scalar {
-    static void build_table(std::uint32_t* t, std::size_t count, const detail::Roots& roots) {
-        detail::start_table(t);
-        for (std::size_t c = 2; c <= count; c *= 2) detail::extend_table(t, c, roots);
+    // Entries [0, count) of the forward or inverse table.
+    static void build_table(std::uint32_t* t, std::size_t count, bool inverse) {
+        for (std::size_t c = 2 * detail::copy_static_table(t, count, inverse); c <= count; c *= 2)
+            detail::extend_table(t, c, detail::kRoots[inverse]);
     }
 
     static void forward(std::uint32_t* f, int lg, const std::uint32_t* roots) { detail::scalar::forward(f, lg, roots); }

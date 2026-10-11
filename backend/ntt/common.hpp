@@ -1,6 +1,7 @@
 // Shared by every variant of the NTT: the modulus, its roots of unity and the twiddle tables.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -53,7 +54,7 @@ constexpr std::size_t slot(std::size_t k) { return (k >> 3 << 4) | (k & 7); }
 constexpr std::size_t table_words(int lg) { return (std::size_t(1) << lg) / 8 + 16; }
 
 // Entries [count / 2, count) of a table whose entries [0, count / 2) are built; count >= 2.
-inline void extend_table(std::uint32_t* t, std::size_t count, const Roots& roots) {
+constexpr void extend_table(std::uint32_t* t, std::size_t count, const Roots& roots) {
     const std::size_t h = count / 2;
     const std::uint32_t root = roots[std::countr_zero(h)];
     for (std::size_t j = 0; j < h; ++j) {
@@ -63,9 +64,37 @@ inline void extend_table(std::uint32_t* t, std::size_t count, const Roots& roots
     }
 }
 
-inline void start_table(std::uint32_t* t) {
+constexpr void start_table(std::uint32_t* t) {
     t[slot(0)] = 1;
     t[slot(0) + 8] = quotient(1);
+}
+
+// Both tables for lengths up to 2^kStaticLog, built at compile time (2 x 32 KiB). Shorter
+// transforms read them in place; longer ones copy them and extend. Building them per call cost
+// 75 cycles of a 493-cycle product at 2^6 on Zen 3 (notes.md).
+inline constexpr int kStaticLog = 16;
+inline constexpr std::size_t kStaticCount = (std::size_t(1) << kStaticLog) / 16;  // entries per table
+
+struct alignas(64) StaticTables {
+    std::uint32_t words[2][table_words(kStaticLog)];
+};
+
+inline constexpr StaticTables kStaticTables = [] {
+    StaticTables s{};
+    for (int inverse = 0; inverse < 2; ++inverse) {
+        std::uint32_t* t = s.words[inverse];
+        start_table(t);
+        for (std::size_t count = 2; count <= kStaticCount; count *= 2) extend_table(t, count, kRoots[inverse]);
+    }
+    return s;
+}();
+
+// Entries [0, min(count, kStaticCount)) of a table, from kStaticTables.
+inline std::size_t copy_static_table(std::uint32_t* t, std::size_t count, bool inverse) {
+    const std::size_t n = count < kStaticCount ? count : kStaticCount;
+    const std::uint32_t* s = kStaticTables.words[inverse];
+    std::copy(s, s + std::max<std::size_t>(16, 2 * n), t);  // blocks of 8 values and 8 quotients
+    return n;
 }
 
 // nv^-1 mod P for nv = 2^lg / 8 leaves, the gain of a forward and an inverse transform; and
