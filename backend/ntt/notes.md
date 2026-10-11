@@ -4,7 +4,7 @@ Number-theoretic transforms and products modulo P = 998244353. API: `ntt.hpp` (`
 `Transform`, the leaf form). Variants: `scalar.hpp` (every target; the model), `intrinsics.hpp`
 (`intrinsics<S>`, templates on any `backend/simd` struct S), `avx2.hpp` (lc-opt's `lib/ntt`).
 `select.hpp` picks one per op and length: `avx2` on the `avx2` target; on `avx512` and `zen5`
-`intrinsics<Avx512>` from 2^8-2^10 on (per op and CPU) and `avx2` below; `intrinsics<simd::Native>`
+`intrinsics<Avx512>` from 2^6-2^10 on (per op and CPU) and `avx2` below; `intrinsics<simd::Native>`
 on the other targets. `memory.hpp`: `Convolution`'s memory, kept per thread. Tests: `test.cpp`;
 benches: `bench.cpp`.
 Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_product_kernels.hpp`
@@ -79,7 +79,12 @@ splitting, twiddle tables (`build_table` extends the static prefix N lanes at a 
 (forward < 4P, inverse < 2P) and leaf products (Montgomery, factor 2^-32), so its outputs equal
 the other variants' word for word.
 
-- Levels with quarters of at least 32 words run on S, one group at a time.
+- Levels with quarters of at least 32 words run on S, one group at a time. The first level of a
+  transform takes inputs < 2P (canonical, or after the radix-2 level), so it skips the input
+  reductions: 2 of forward4's, 4 of forward4_identity's (and 2 more for canonical inputs).
+- Shoup products go through an empty asm statement (`Arith::whole`). Without it GCC distributes
+  x w - q P over the product's uses (a + c -> (a - q P) + x w, a - c -> (a + q P) - x w): 24 adds
+  and subtracts per forward radix-4 column instead of 19 on zmm (Log, issue #5).
 - Bottom level (quarters of 8 words, one leaf each): on S up to 8 lanes, one group at a time. On
   `Avx512` (16 lanes, `WideBottom`): two groups k, k + 1 per step; four `vpermt2d` turn their 64
   words into vectors [quarter t of group k, quarter t of group k + 1], so the butterflies are
@@ -88,15 +93,24 @@ the other variants' word for word.
 - Recursion: depth first; subtrees of at most 256 leaves (8 KiB per array) run level by level.
   Each subtree has its own bottom stage (avx2 now merges sibling subtrees into one tile; not done
   here). Top: a radix-2 level (odd lg - 3) or group 0, with the sparse forms for a factor of at
-  most L/2 coefficients (a copy; group 0 reading half the input), and the scale fused into the
-  last inverse level. No fused radix-8 top: slower everywhere it was tried (Log).
+  most L/2 coefficients, and the scale fused into the last inverse level (group 0: 4 products per
+  column, as `s (a - b)` and `s z (c - d)` serve two outputs each). Sparse with the radix-2 level:
+  no copy; the upper subtree runs first and its first level reads the lower half (from nv / 2 =
+  16 leaves; below, the first level is the bottom, which works in place, so the half is copied).
+  Sparse with group 0: group 0 reads half the input. No fused radix-8 top: slower everywhere it
+  was tried (Log).
 - Products, per bottom group: forward butterflies of a and b, leaf products, inverse butterflies,
   one store. Leaf products: x86 up to 8 lanes (`mul_even`): lc-opt's even/odd form, windows
   [w A, A] in a stack buffer read at offsets 1..9, each b_i broadcast once, 64-bit sums < 8 P^2,
   Montgomery reduction, `join_high`; group g + 1's forward half runs before group g's products,
-  so the windows are not reloaded right after their stores. `Avx512`: the same form in registers
-  for two groups at a time: window offset j of both halves is one `vpermt2d` of w A and A, b_i of
-  both halves one `vpermd` of B; no stack buffer. Neon: `umull`/`umlal` (+`umull2`/`umlal2`) on
+  so the windows are not reloaded right after their stores. `Avx512`, two groups at a time
+  (`WideBottom::multiply`), in chunks of 4 pairs: one loop of forward halves stores each pair's
+  canonical leaves (rows [w A, A] per half, A, B) in a buffer, then one loop of leaf products and
+  inverse halves (two loops: shorter dependency chains per iteration). Window offset j of both
+  halves is a ymm load and a `vinserti64x4` from the rows (`load_halves`; still a p5 uop on
+  Emerald Rapids, like the `vpermt2d` it replaced), b_i of both halves a broadcast and a masked
+  broadcast load (`broadcast_halves`: p0 or p5, where the `vpermd` it replaced is p5 only; the
+  leaf products had p5 at 161 uops per pair against p0 at 138), and the twiddles too. Neon: `umull`/`umlal` (+`umull2`/`umlal2`) on
   the windows, `uzp1` for m, `umlal` for m P, `uzp2`. Scalar: one u64 sum per word.
 - Lengths below 2^kWideMinLog run wholly on `Narrow<S>` (S, or `Avx512Vl` for `Avx512`): 2^8 on
   Emerald Rapids, 2^7 on Zen 4/5 (`__znver4__`, `__znver5__`). Before the zmm bottom level, zmm
@@ -106,11 +120,11 @@ the other variants' word for word.
   the butterfly lambdas of the bottom level; `#pragma GCC unroll` and `[[gnu::always_inline]]`
   fix both (Log).
 - `variant::by_length<lg, Small, Large>` (`select.hpp`): Small below 2^lg. On `avx512`: avx2
-  below 2^9 (forward), 2^8 (inverse), 2^10 (multiply); on `zen5` below 2^8 for all three. From
-  @avx2 against @intrinsics_avx512 in one binary, 5 rounds, intrinsics/avx2 at 2^6..2^9:
-  Emerald Rapids forward 1.05 1.07 1.04 0.94, inverse 0.79 1.36 0.95 0.99, multiply 0.98 1.20
-  1.13 1.11 (0.97 at 2^10); Zen 5 forward 1.17 1.09 0.95 0.76, inverse 1.11 1.06 0.79 0.80,
-  multiply 1.08 1.16 0.95 0.90.
+  below 2^9 (forward) and 2^10 (multiply), intrinsics at every length for inverse; on `zen5` avx2
+  below 2^8 for all three. From @avx2 against @intrinsics_avx512 in one binary, 5 rounds,
+  intrinsics/avx2 at 2^6..2^9 (issue #5, after its changes): Emerald Rapids forward 1.05 1.00
+  0.98 0.87, inverse 0.79 0.98 0.89 0.90, multiply 0.96 1.10 1.04 1.04 (0.87 at 2^10); Zen 5
+  forward 1.11 1.09 0.95 0.80, inverse 1.11 0.97 0.79 0.78, multiply 1.39 1.46 0.90 0.83.
 
 ## Measurements
 
@@ -312,6 +326,35 @@ fastest:
 - Fast on all four: the destination 64 or 128 bytes before the source, or 256 bytes or more past
   it, a multiple of 64 bytes.
 
+### zmm intrinsics, issue #5 round 1
+
+Against main (03c970b), paired, 5 rounds, `kernel.py bench --base`, the 80 gated cases, GCC 15.2,
+`tools/kernel.py` flags, 2026-10-11. Geomean new/base: `lc-intel` (Emerald Rapids) 0.934, `lc-zen5`
+(Zen 5) 0.934, `lc-arm` 0.984 (two runs: 0.990 with the asm statement on Neon, then 0.993 of that
+without it). New ns per call (new/base):
+
+| lg | EMR forward | EMR inverse | EMR multiply | Zen 5 forward | Zen 5 inverse | Zen 5 multiply |
+|---:|---|---|---|---|---|---|
+| 6 | 22 (1.000) | 26 (0.772) | 140 (0.989) | 18 (1.006) | 18 (1.000) | 89 (1.001) |
+| 8 | 103 (0.999) | 100 (0.955) | 475 (1.000) | 71 (1.022) | 63 (1.006) | 250 (0.748) |
+| 10 | 471 (0.940) | 487 (0.957) | 1868 (0.851) | 292 (1.013) | 268 (1.024) | 1061 (0.832) |
+| 12 | 2342 (0.926) | 2393 (0.953) | 8902 (0.881) | 1346 (0.968) | 1289 (1.011) | 4924 (0.862) |
+| 16 | 55721 (0.932) | 54226 (0.963) | 1.90e5 (0.875) | 29974 (0.956) | 28301 (1.000) | 1.03e5 (0.875) |
+| 20 | 1.27e6 (0.935) | 1.21e6 (0.971) | 4.47e6 (0.904) | 6.28e5 (0.947) | 5.81e5 (0.995) | 2.12e6 (0.904) |
+| 25 | 5.75e7 (0.950) | 6.14e7 (0.973) | 2.12e8 (0.970) | 3.22e7 (0.974) | 2.95e7 (0.987) | 1.01e8 (0.941) |
+
+Below 2^9 (EMR forward), 2^10 (EMR multiply) and 2^8 (Zen 5) the asm runs, unchanged. Cases above
+1.01: Zen 5 forward/8 1.022, forward/9 1.068, forward/10 1.013, inverse/7 1.015, inverse/10 1.024,
+inverse/12 1.011. The inverse code at even lg is the same as main's instruction for instruction
+(diffed): layout, a guess. forward/9: not the input bound of its first level (forward with
+that level's reductions put back: equal, 134 ns both); not found.
+
+Kernels on L1 data, `perf stat` on `lc-intel` (`micro.cpp`): cycles per call and share of the
+p0 + p5 floor ((p0 + p5 uops) / 2). Forward group, 16 columns of 4 vectors: 511 (94%) -> 479.
+Inverse group: 486 (96%) -> 473. zmm bottom forward, 16 pairs of groups: 932 (84%) -> 906 (84%).
+Inverse: 715 (86%) -> 630 (95%). Product bottom, 32 pairs: 10200 (79%, already with `whole`) ->
+8990 (90%).
+
 ## Log
 
 2026-10-11, claude (issue #3, round 1): moved lc-opt `lib/ntt` (`ntt.hpp`, `product.hpp`, both
@@ -469,6 +512,60 @@ longest step of a gate's tests: on `lc-zen5-test` (zen5 flags, GCC 15.2) 156 s a
 capped (-O2: 82 s). The code paths that change with the length switch at 2^16
 (`detail::kStaticLog`: per-thread tables) and below, and regions are whole 2 MiB pages at every
 length, so the ASan run still reaches each path.
+
+2026-10-11, claude (issue #5, round 1): zmm intrinsics on Emerald Rapids (Zen 5 shares the code).
+Measurements above; files and raw output in `~/Documents/hpc_library-explore/ntt/avx512-r1/`.
+- Where the time went (`perf` on `lc-intel`, main): forward/12 ran at 90% of the p0 + p5 floor,
+  forward/16 at 86%, inverse/16 93%, multiply/16 85%. multiply/16 by function: product bottom 40%,
+  forward groups 37%, inverse groups 17%, inverse top 4%, the sparse copy 3%; forward/16: bottom
+  26%. Kernels on L1 data: radix-4 groups at 94-96% of the floor, zmm bottoms 79-86%. The
+  radix-4 column is 55 uops (4 Shoup products of 9, 19 adds and reductions); Shoup on zmm cannot
+  go below 9 (Checked on paper, below).
+- Won: Shoup products kept whole (`Arith::whole`, an empty asm statement). GCC had distributed
+  x w - q P over its uses: 24 adds and subtracts per forward column instead of 19 (asm read).
+  Forward group 511 -> 479 cycles, inverse group 486 -> 473, bottom forward 932 -> 906, inverse
+  715 -> 630, products 5266 -> 5201 (16 pairs). Against main, with the next change: Emerald Rapids
+  0.951, Zen 5 0.948 (5 rounds). On Neon the statement cost 1-2% on products (GCC fuses the adds
+  into mla/mls there): x86 only.
+- Won: the product bottom in two loops per chunk of 4 pairs (forward halves into a buffer, then
+  leaf products and inverse halves): 5203 -> 4660 cycles per 16 pairs (79% -> 88% of the floor).
+  Chunks of 4..32 pairs within 1%. One loop with pair g + 1's forward half before pair g's
+  products: 4835. Three loops (forward, products, inverse; with the memory windows below):
+  4600-4680 against 4620 for two.
+- Won: the first level without input reductions (inputs < 2P or canonical), a sparse factor's
+  upper half not copied (read in place by the upper subtree's first level), and the inverse
+  radix-4 top with 4 products per column. Together, against the previous step: Emerald Rapids
+  0.986, Zen 5 1.003 (forward odd lg 0.97-0.99, inverse even lg 1.02-1.04: unchanged code).
+  Forward with the first level's reductions put back on Zen 5: odd lg 1.015-1.029 slower.
+- Won: leaf windows and b_i from memory. The products loop had p5 at 161 uops per pair and p0 at
+  138 (`vpermd` and `vpermt2d` run on p5 only). Rows [w A, A] stored per half (ymm stores), then
+  windows by `load_halves` and b_i by `broadcast_halves` (masked broadcast loads, p0 or p5): product
+  bottom 9320 -> 8880 cycles per 32 pairs, ports balanced (8104 and 8187). Windows from registers
+  with b_i from memory: 9140-9300 (p5 8410). Twiddles by `broadcast_halves` too: 8990 -> 8830.
+  Against the previous step: Emerald Rapids 0.986, Zen 5 0.981 (multiply 2^8-2^9 0.80).
+- Tried, lost: windows from memory as 64-bit lanes, one leaf per vector (rows of 16 qwords, 8
+  loads per leaf, b_i an embedded 64-bit broadcast): p0 + p5 uops 8240 -> 7370 per 16 pairs, but
+  63 split loads per pair (a zmm load 8 bytes into a line crosses it) kept it at 4630 cycles
+  against 4660. With every window load aligned (wrong results, timing only): 4200.
+- Tried, lost: in the bottom forward and inverse, two pairs per iteration (908 -> 950 and 642 ->
+  803); a software pipeline (x level of pair g + 1, then y and z of pair g): 90% of the floor but
+  85 more p5 uops (register copies), 895 cycles; unrolled by 2 to drop the copies: 964-981; two
+  loops per chunk: 954-976. The bottom's quarter transposes by `load_halves` and `store_half`:
+  forward -2% (within noise), inverse +4-8% (`vinserti64x4` from memory is still a p5 uop).
+- Thresholds (`select.hpp`): inverse on Emerald Rapids now intrinsics at every length (0.79 and
+  0.98 of the asm at 2^6 and 2^7); others unchanged (Design).
+- Checked on paper, not built:
+  - Shoup on zmm: 9 uops (2 `vpmulld` of 2 uops each, 2 `vpmuludq`, shift, join, sub).
+    Montgomery with precomputed twiddles: 10-11. In 64-bit lanes: 12. IFMA on packed words: 9.
+  - IFMA with the data kept in 64-bit lanes for the whole transform: Shoup52 3 uops per 8 lanes,
+    no reductions (values grow 4P per radix-4 level, far below 2^52): 48 uops per 16-lane column
+    against 55, but twice the memory traffic and conversions at both ends. Converting per pass
+    (radix-16 in registers): 6.75 uops per vector and level against 6.9.
+  - 16-coefficient leaves for products: a 16 x 16 leaf product is 91 uops per 16 outputs
+    against 55, the radix-2 level it removes saves about 30: worse.
+  - The scale folded into the top inverse groups instead of the radix-2 level: +1 product per
+    column in group 1, +3 in group 0 (identity), -14 uops per pair at the top: about 2.5 uops per
+    vector. Not done.
 
 ## Sources
 

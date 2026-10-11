@@ -27,6 +27,8 @@ top). `select.hpp` picks `simd::Native` per target and lists every struct the ta
   (`svset_neonq`, `svget_neonq`), so it is right for any SVE vector length. Neoverse V2's SVE
   vectors are 128-bit, so the bridge costs nothing. `mul_shr` keeps `umull`/`shrn` (Log).
 - `shr<k>`, `shl<k>`: 32-bit lane shifts on every struct (round 2, for modarith's Barrett `split`).
+- `Avx512` halves from and to memory: `load_halves`, `store_half<h>`, `broadcast_halves` (ntt
+  issue #5, for the zmm leaf products: two groups per vector, one per half).
 
 ## Tests
 
@@ -170,6 +172,13 @@ unchanged up to c4c56e9). GCC 15.2, `tools/kernel.py` flags unless noted. Files 
   vector, p0 busy 88%. The core ran at 3.7-4.0 GHz in these zmm streams (cycles over reference
   cycles at 2.3 GHz), not the 4.18 GHz of the scalar probe clock: the Emerald Rapids cycle counts
   in Composed products are 5-10% high.
+
+2026-10-11, claude (ntt issue #5, round 1): added `Avx512::load_halves` (ymm load, `vinserti64x4`
+from memory), `store_half<h>` (ymm store, `vextracti64x4` to memory) and `broadcast_halves`
+(`vpbroadcastd`, masked `vpbroadcastd` from memory). Tested against lane-wise copies in `test.cpp`.
+On Emerald Rapids (`perf`, the ntt product bottom): `broadcast_halves` runs on p0 or p5 where the
+`vpermd` it replaced ran on p5 only; `load_halves` still costs a p5 uop, like `vpermt2d`. The
+simd and modarith bench binaries for avx512 are byte-identical to main's.
 
 ## Sources
 

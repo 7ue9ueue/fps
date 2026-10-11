@@ -162,6 +162,18 @@ void test_permute2() {
 }
 
 template <class S>
+void test_halves() {
+    const Lanes<S> a = random_lanes<S>(), b = random_lanes<S>();
+    check<S>("load_halves", S::load_halves(a.data(), b.data() + 8), [&](int i) { return i < 8 ? a[i] : b[i]; });
+    Lanes<S> out = b;
+    S::template store_half<0>(out.data() + 3, vec<S>(a));
+    S::template store_half<1>(out.data(), vec<S>(a));  // overwrites words 3 .. 7 again
+    for (int i = 0; i < S::lanes; ++i)
+        if (out[i] != (i < 8 ? a[8 + i] : i < 11 ? a[i - 3] : b[i])) fail(S::name, "store_half lane " + std::to_string(i));
+    check<S>("broadcast_halves", S::broadcast_halves(&a[3], &b[5]), [&](int i) { return i < 8 ? a[3] : b[5]; });
+}
+
+template <class S>
 void test_ifma() {
     const Lanes<S> a = random_lanes<S>(), b = random_lanes<S>(), c = random_lanes<S>();
     const auto va = vec<S>(a), vb = vec<S>(b), vc = vec<S>(c);
@@ -211,6 +223,7 @@ void test_isa() {
         test_common<S>();
         if constexpr (requires(typename S::V v) { S::mul_even(v, v); }) test_x86<S>();
         if constexpr (requires(typename S::V v) { S::permute2(v, v, v); }) test_permute2<S>();
+        if constexpr (requires(const u32* p) { S::load_halves(p, p); }) test_halves<S>();
         if constexpr (requires(typename S::V v) { S::madd52lo(v, v, v); }) test_ifma<S>();
         if constexpr (requires(typename S::V v) { S::qdmulh(v, v); }) test_neon<S>();
     }
