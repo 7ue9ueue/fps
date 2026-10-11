@@ -47,7 +47,6 @@ inline Vec multiply(Vec x, const Factor& f) {
     return _mm256_sub_epi32(_mm256_mullo_epi32(x, f.w), _mm256_mullo_epi32(q, broadcast(kP)));
 }
 
-
 inline Vec load(const u32* p) { return _mm256_load_si256(reinterpret_cast<const Vec*>(p)); }
 inline void store(u32* p, Vec x) { _mm256_store_si256(reinterpret_cast<Vec*>(p), x); }
 
@@ -103,8 +102,6 @@ struct alignas(64) Leaves {
 
 // One group per kernel; the leaf moduli come in a weight array.
 struct GroupBottom {
-    static constexpr std::size_t kMinVectors = 4;
-
     // Moduli x^8 - w of the four leaves under group k: w = y, -y, z, -z, then their quotients.
     static void weights(const u32* r, std::size_t k, u32* w) {
         const u32* y = r + slot(2 * k);
@@ -128,10 +125,9 @@ struct GroupBottom {
     }
 };
 
-// Two groups per always-inlined kernel; the leaf moduli are the groups' own twiddles. first even.
+// Two groups per always-inlined kernel; the leaf moduli are the groups' own twiddles. first even,
+// nv a multiple of 8.
 struct PairBottom {
-    static constexpr std::size_t kMinVectors = 16;
-
     static void run(Vec* a, Vec* b, std::size_t nv, std::size_t first, const u32* r, const u32* ir) {
         Leaves leaves[2][2];
         product_kernels::bottom_first(a, b, leaves[0], r + slot(first), r + slot(2 * first));
@@ -156,7 +152,7 @@ public:
     Tree(const u32* roots, const u32* inverse_roots) : r_(roots), ir_(inverse_roots) {}
 
     // The count subtrees of groups first, first + 1, ... with nv vectors each, one after another
-    // from a and b: nv a power of 4, at least Bottom::kMinVectors.
+    // from a and b: nv a power of 4, count nv >= 8, first even.
     void visit(Vec* a, Vec* b, std::size_t nv, std::size_t count, std::size_t first) const {
         switch (nv) {
         case 4:
@@ -336,7 +332,6 @@ inline void inverse_bottom(Vec* f, std::size_t count, std::size_t first, const u
 
 // The count subtrees of groups first, first + 1, ... with nv vectors each (a power of 4), one after
 // another from f; depth first, runs of siblings of at most kTile vectors level by level, as Tree.
-
 inline void forward_trees(Vec* f, std::size_t nv, std::size_t count, std::size_t first, const u32* r) {
     if (nv > kTile) {
         for (std::size_t k = first; k < first + count; ++k, f += nv) {
