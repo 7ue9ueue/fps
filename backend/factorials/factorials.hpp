@@ -110,6 +110,11 @@ private:
     static constexpr u32 kR = u32((u64(1) << 32) % P);  // 1 in Montgomery form
     static constexpr u32 kR2 = u32(u64(kR) * kR % P);
     static constexpr u32 kR3 = u32(u64(kR2) * kR % P);
+    static constexpr auto kHalves = [] {  // 2^-t mod P, t < 60
+        std::array<u32, 60> h{1};
+        for (int t = 1; t < 60; ++t) h[t] = model::multiply<P>(h[t - 1], (P + 1) / 2);
+        return h;
+    }();
     // i! and 1 / i! for i < 16 (h < S::lanes <= 16).
     static constexpr auto kSmall = [] {
         std::array<std::array<u32, 16>, 2> t{};
@@ -209,19 +214,30 @@ private:
         });
     }
 
-    // 1 / x for x in [1, P): x^(P - 2) in scalar Montgomery form (shorter chains than x % P).
+    // 1 / x for x in [1, P): binary extended Euclid, without branches but the exit. Invariants:
+    // a, b odd, a 2^t = u x and b 2^t = v x (mod P), |u|, |v| <= 2^t, a b 2^t <= x P < 2^60. A step
+    // keeps min(a, b) and replaces the other by |a - b| / 2^s (s >= 1 trailing zeros); the halving
+    // goes to the other coefficient as a doubling (Pornin's deferral), so u, v stay integers. At
+    // a = b = 1, 1 / x = u 2^-t. 40-50 ns against 85-110 for x^(P - 2) (Log).
     static u32 inverse(u32 x) {
-        constexpr u32 neg_pinv = u32(0) - M::kPinv;
-        const auto times = [](u32 a, u32 b) {  // a b 2^-32 in [0, 2P) for a, b < 2P
-            const u64 t = u64(a) * b;
-            return u32((t + u64(u32(t) * neg_pinv) * P) >> 32);
-        };
-        u32 y = kR;
-        x = times(x, kR2);
-        for (u32 e = P - 2; e; e >>= 1, x = times(x, x))  // y = x^(e's low bits so far); the chains overlap
-            if (e & 1) y = times(y, x);
-        y = times(y, 1);
-        return y >= P ? y - P : y;
+        using i64 = std::int64_t;
+        int t = std::countr_zero(x);
+        u64 a = x >> t, b = P;
+        i64 u = 1, v = 0;
+        for (;;) {
+            const i64 d = i64(a) - i64(b);
+            if (d == 0) break;
+            const int s = std::countr_zero(u64(d));
+            const i64 less = d >> 63;  // all ones if a < b
+            const i64 low = v ^ ((u ^ v) & less);  // min(a, b)'s coefficient
+            b = std::min(a, b);
+            a = u64((d ^ less) - less) >> s;
+            u = ((u - v) ^ less) - less;
+            v = low * (i64(1) << s);
+            t += s;
+        }
+        const i64 r = u % i64(P);
+        return model::multiply<P>(u32(r < 0 ? r + P : r), kHalves[t]);
     }
 
     // first[s] = (a_s)! and down[s] = 1 / (a_s + c - 1)!, from product[s] = (a_s + 1) ... (a_s + c - 1)

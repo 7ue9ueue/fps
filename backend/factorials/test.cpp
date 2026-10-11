@@ -1,8 +1,9 @@
 // Tests the factorials kernel: the model against the definition (fact[i] = fact[i - 1] i,
 // fact[i] inverse[i] = 1), then every Chains variant this machine can run (every simd struct,
-// K = 2, 4, 8) and the selected `tables` against the model.
+// K = 1, 2, 4, 8, both chain products) and the selected `tables` against the model.
 // Sizes: every n up to 1100, powers of two and their neighbours up to 2^20, both sides of every
-// change of the lane length C up to 2^14, random n, and n = P - 1, P for small P. Placements:
+// change of the lane length C up to 2^14 and of every tier, random n, and n = P - 1, P for small
+// P. Placements:
 // tables 64-byte aligned, and at word offsets 0-15 from it, the same or different for the two.
 // Words before and after the tables must stay untouched. Exits nonzero on a failure.
 #include <cstddef>
@@ -165,6 +166,10 @@ int main() {
         fps::factorials::tables<998244353>(std::span(fact, n), std::span(inverse, n));
     };
     for (std::size_t n : sizes(1 << 20, 0)) check<998244353>("tables", n, selected);
+    [&]<class... T>(fps::factorials::Tiers<T...>) {  // both sides of every tier's threshold
+        for (std::size_t from : {T::min_size...})
+            for (std::size_t n : {from - 1, from}) check<998244353>("tables", n, selected);
+    }(fps::factorials::Selected{});
     const auto small = [](u32* fact, u32* inverse, std::size_t n) {
         fps::factorials::tables<4099>(std::span(fact, n), std::span(inverse, n));
     };
