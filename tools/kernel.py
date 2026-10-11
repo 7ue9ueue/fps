@@ -64,7 +64,7 @@ TARGETS = {
     'zen5': {
         'flags': '-march=znver5',
         'needs': ['avx512f', 'avx512ifma', 'avx512vbmi', 'avx512_vbmi2', 'avx512_vp2intersect'],
-        'test': ['lc-zen5'],
+        'test': ['lc-zen5-test'],
         'time': 'lc-zen5',
     },
     'arm': {
@@ -175,7 +175,9 @@ def build(tree: Path, unit: str, source: str, target: str, sanitize: bool = Fals
     """Compile <unit folder>/<source> in tree, from relative paths, so the same sources give
     byte-identical binaries in any tree."""
     out = f'build/{target}/{unit}-{Path(source).stem}{"-san" if sanitize else ""}'
-    opt = '-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all' if sanitize else '-O2'
+    # -g1: line numbers for sanitizer reports, without GCC's variable tracking, which doubled the
+    # slowest builds (factorials test: 190 s with -g, 96 s with -g1).
+    opt = '-O1 -g1 -fsanitize=address,undefined -fno-sanitize-recover=all' if sanitize else '-O2'
     result = sh({'w': tree}, lambda _: f'mkdir -p build/{target}\n'
                 f'{CXX} {opt} {flags(target)} {unit_dir(unit)}/{source} -o {out}')
     if result.returncode:

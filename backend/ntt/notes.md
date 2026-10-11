@@ -463,6 +463,13 @@ into caller memory. Measurements above (Convolution memory). Commits on `agent/n
   that; with this API it copies out of a); copies in fused with the first forward level (what
   is left of "into", 1-7%). Both change the variants' top levels, including the avx2 asm.
 
+2026-10-11, claude (issue #63, gate time): under ASan the vector variants are tested up to 2^20,
+like the scalar ones; -O2 builds still test them up to 2^kMaxLog = 2^25. The ASan run was the
+longest step of a gate's tests: on `lc-zen5-test` (zen5 flags, GCC 15.2) 156 s against 36 s
+capped (-O2: 82 s). The code paths that change with the length switch at 2^16
+(`detail::kStaticLog`: per-thread tables) and below, and regions are whole 2 MiB pages at every
+length, so the ASan run still reaches each path.
+
 ## Sources
 
 - lc-opt `lib/ntt` (ours): the avx2 variant and the generators, moved and renamed. Its sources:

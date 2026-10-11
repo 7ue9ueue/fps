@@ -25,7 +25,7 @@ A target is a set of compiler flags and the machines that test and time it.
 | `sse` | `-march=x86-64-v2` | 16 xmm (128-bit) | `lc-amd` | none |
 | `avx2` | `-march=x86-64-v3` | 16 ymm (256-bit) | `lc-amd` | `lc-bench` (Zen 3) |
 | `avx512` | `-march=x86-64-v4 -mavx512ifma -mavx512vbmi` | 32 zmm, 8 masks | `lc-intel-test` | `lc-intel` (Emerald Rapids) |
-| `zen5` | `-march=znver5` | 32 zmm, 8 masks | `lc-zen5` | `lc-zen5` (EPYC 9B45) |
+| `zen5` | `-march=znver5` | 32 zmm, 8 masks | `lc-zen5-test` | `lc-zen5` (EPYC 9B45) |
 | `arm` | `-mcpu=neoverse-v2` | 32 v (128-bit NEON, SVE2) | `lc-arm`, Mac | `lc-arm` (Axion) |
 
 - `scalar` is the reference and the fallback; `sse` checks the generic code at 4 lanes. Neither is tuned.
@@ -85,6 +85,7 @@ Kernels to start with: `simd` (per-ISA vector wrappers), `modarith`, `ntt`, `mul
 - On a VM, wrap every timing and profiling run in `flock /tmp/bench.lock`. Build and test on the
   test machine, not the timing machine.
 - A change merges only if every target's tests pass and no target gets slower beyond noise
-  (geomean of new/base at most 1.005; `TOLERANCE` in `tools/gate.py`).
+  (geomean of new/base at most 1.005; `TOLERANCE` in `tools/gate.py`). The agent opens the pull
+  request and returns; the coordinator runs the gate and sends failures back (AGENTS.md, Process).
 - A round ends with a comment on its issue: what was tried, the numbers, and a last line that is
   exactly `Result: gain` or `Result: no gain`. An issue stops after 3 rounds, or 2 in a row without gain.

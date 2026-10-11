@@ -7,8 +7,8 @@
 For every target in tools/kernel.py, on the target's machines:
   - test: kernel.py check, then kernel.py test for every affected kernel, on each test machine
     ('mac' is this Mac, with clang);
-  - time, if the target has a timing machine: kernel.py bench against the base, 21 rounds;
-    on a slowdown, 21 more, pooled.
+  - time, if the target has a timing machine: kernel.py bench of the gated cases against the base,
+    21 rounds; on a slowdown, 21 more, pooled. `<op>@<variant>` cases are not timed.
 Units are the backend kernels and the frontend (see tools/kernel.py). Affected units: those
 changed, those that include them, or all if a shared file changed.
 Passes if every test passes and, per target, the geomean over units of new/base (each unit's
@@ -48,6 +48,7 @@ ROUNDS = 21
 RAW = Path.home() / 'Documents' / 'hpc_library-explore' / 'gate'  # raw times, kept on the Mac
 TOLERANCE = 1.005  # new/base per target; above it, ROUNDS more rounds are pooled and judged again
 SHARED = re.compile(r'^(backend/[^/]+|tools/kernel\.py)$')  # files outside a kernel folder
+GATED = '^[^@]*$'  # the cases the verdict uses (kernel.gated); the others took 30-50% of bench time
 
 
 ROOT = Path(__file__).resolve().parent.parent  # paths below are relative to the repository root
@@ -96,7 +97,8 @@ def affected(base: str, tree: str, includes: str | None = None) -> list[str]:
 
 def bench(vm: str, path: str, base_path: str, kernel: str, target: str) -> dict:
     command = (f'cd {path} && python3 tools/kernel.py bench {kernel} --target {target} '
-               f'--base $HOME/{base_path} --rounds {ROUNDS} --json gate.json >/dev/null && cat gate.json')
+               f"--base $HOME/{base_path} --rounds {ROUNDS} --filter '{GATED}' --json gate.json >/dev/null "
+               f'&& cat gate.json')
     result = ssh(vm, command, capture=True)
     if result.returncode:
         raise RuntimeError(f'bench {kernel} on {vm} failed:\n{result.stderr.decode()}')
