@@ -142,6 +142,35 @@ loop's 7 instructions. mul_lo and mulhi now sit at that floor.
   runs: Emerald Rapids Montgomery 191 against 193 ns, Shoup 157 against 155, mulhi 105 against
   99; Zen 3 and Zen 5 within 2% both ways. No gain; not kept.
 
+2026-10-11, claude (issue #2, round 3). No change kept; code at main 7b6d5f2 (simd and modarith
+unchanged up to c4c56e9). GCC 15.2, `tools/kernel.py` flags unless noted. Files and raw output:
+`~/Documents/hpc_library-explore/simd/r3/`. The modarith side of each attempt is in its notes.
+- x86 odd words from an unaligned load one word further on (`load(p + 1)`, lc-opt's NTT trick)
+  instead of `vpsrlq`, in streams (`oddload.cpp`, 2 runs, new/old): mulhi Zen 3 1.32, Emerald
+  Rapids 1.23, Zen 5 2.06. A zmm load at 4 bytes past a 64-byte boundary always splits a cache
+  line; a ymm one, every other time. Slower everywhere; not kept.
+- Avx2 `join_high` by `vshufps` + `vpshufd` (two shuffles, no blend) instead of `vpsrlq` +
+  `vpblendd` (`join.cpp`, then `kernel.py bench` against main, `lc-bench`, 21 rounds): simd mulhi
+  1.0065 (IQR 1.0042-1.0127), modarith 0.993 (Montgomery 0.986, Shoup 0.974), but every latency
+  chain 3-10% slower (Shoup chain 1.100: the shuffles add latency, guess: an int/FP bypass).
+  `vpshufd` + `vpblendd` and `vpshufd` for the odd words changed nothing. With `-march=x86-64-v3`
+  on the other machines: Emerald Rapids mulhi 0.92, Shoup 0.93; Zen 5 Barrett 1.21. On the
+  `avx512` target the simd bench binary changed only in its `@avx2` cases, yet mulhi/2048 (same
+  code) moved 1.0090 (IQR 1.0015-1.0136): binary layout. A 1-3% stream gain against a 3-10%
+  latency loss; not kept.
+- SVE2 `umulh` unpredicated (inline asm `umulh z.s, z.s, z.s`): GCC emits the predicated form,
+  with a `movprfx` where the first source stays live (Montgomery, Shoup). Paired, `lc-arm`, 11
+  rounds: Montgomery 1.0002, Shoup 0.9988, Barrett 1.0023, mulhi 1.0006. `movprfx` costs nothing
+  on Neoverse V2; not kept.
+- AVX-512 mul_shr and mulhi with one or both odd words by `vpshufd` (p5) instead of `vpsrlq` (p0;
+  mul_shr has 4 shifts in 7 uops): Emerald Rapids mul_shr 130.1 / 130.7 / 130.5 ns (shift / both
+  / one), mulhi 96.6 / 100.1 (shift / one); Zen 5 62.1 ns in every form. Not kept.
+- `perf stat` on `lc-intel`, mulhi stream: 5.3 uops per vector on p0 + p5 (5 expected; GCC adds a
+  `vmovdqa32` before the destructive `vpermt2d`, mostly eliminated at rename), 2.93 cycles per
+  vector, p0 busy 88%. The core ran at 3.7-4.0 GHz in these zmm streams (cycles over reference
+  cycles at 2.3 GHz), not the 4.18 GHz of the scalar probe clock: the Emerald Rapids cycle counts
+  in Composed products are 5-10% high.
+
 ## Sources
 
 - Instruction costs: measured here. Pipe names and port layouts from AMD's Zen 3 and Zen 5, Intel's

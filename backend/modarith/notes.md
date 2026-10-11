@@ -110,6 +110,16 @@ Emerald Rapids 8.53 against 8.92, Zen 5 5.83 against 6.07. Raw: `.../simd/r2/out
   the loop is 9 instructions (`perf`: IPC 4.4, 25% backend stall cycles). Round 2 traced it to the
   stream's shape, not the ops: two vectors per loop iteration run at 1.09 (`backend/simd/notes.md`,
   Log). Not changed.
+- Round 3: how far the streams are from their floors. Cycles per vector with 1 and 4 independent
+  vectors per loop iteration (`unroll.cpp`; Neoverse V2: best of 2 and 4), floor in brackets:
+  Zen 3 Montgomery 3.76, 3.58 [3], Shoup 2.39, 2.33 [2], Barrett 3.79, 3.69 [3.25]; Zen 5
+  Montgomery 3.18, 3.15 [3], Shoup 2.51, 2.21 [2], Barrett 3.28, 3.24 [3.25]; Neoverse V2
+  Montgomery 2.49, 2.41 [2], Shoup 2.01, 1.76 [1.5], Barrett 2.41, 2.28 [2]. Emerald Rapids,
+  `perf stat` of the gated streams (per vector, from the instruction count): Montgomery 6.27
+  cycles for 11 uops on p0 + p5 [5.5], Shoup 4.98 for 9 [4.5], Barrett 7.82 for 14 [7]; p0 and
+  p5 are busy 88-90% of the cycles. Unrolling gained at most 3.5% there. So the x86 streams run
+  at 84-100% of their floors, and Neoverse V2 at 83-88% once two or more vectors share an
+  iteration.
 
 ## Log
 
@@ -146,6 +156,35 @@ rounds, new/base, GCC 15.2, `tools/kernel.py` flags.
 - Tests: `barrett@wide`, `barrett@mulhi`, `barrett@split` on every struct and the 8 primes (bounds
   2P and 3P); pass at -O2 and ASan/UBSan on every target's test machines and the Mac (which runs
   the NEON path without SVE2).
+
+2026-10-11, claude (issue #2, round 3). No change kept; code at main 7b6d5f2 (unchanged up to
+c4c56e9). GCC 15.2, `tools/kernel.py` flags. Files and raw output in
+`~/Documents/hpc_library-explore/simd/r3/` (copy in `modarith/r3/`). Floors: Measurements.
+- x86 odd words for `mul_even` from `load(p + 1)` instead of `vpsrlq` (lc-opt's NTT reads f2 and
+  f3 that way), streams over arrays, 2 runs, new/old (`oddload.cpp`): Montgomery Zen 3 0.98,
+  Emerald Rapids 1.07, Zen 5 1.37; Shoup 0.98, 1.005, 1.03; Barrett 1.08, 1.02, 1.29. zmm loads
+  at +4 bytes split a cache line every time. Not kept, and no API for it.
+- Avx2 `join_high` by two shuffles (simd notes): Montgomery 0.986, Shoup 0.974, Barrett 1.001 on
+  Zen 3, but the latency chains 1.03-1.10. Not kept.
+- SVE2 `umulh` without `movprfx` (simd notes): within 0.25% on Neoverse V2. Not kept.
+- Guess refuted: on Zen 3 the any-pipe ops (blend, add) take slots from the 2 multiply pipes.
+  Round 1's probe runs `vpmuludq` + `vpaddd` at 0.25 cycles each, and removing the blend gained
+  Shoup only 2.6%.
+- Checked on paper, not built (uops per vector against the selected form):
+  - Shoup all in 64-bit lanes on Emerald Rapids, avoiding the 2-uop `vpmulld`: 12-13 against 9.
+  - Shoup as a Montgomery product by w'' = w 2^32 mod P, since x w - floor(x q / 2^32) P =
+    (x w'' + (x q mod 2^32) P) / 2^32: 10 against 9 (6 `vpmuludq`, shift, 2 adds, join).
+  - Montgomery with m = mul_lo(mul_lo(a, b), P^-1) for all lanes: still 6 multiplies, 13-14 ops
+    against 12.
+  - P = 119 2^23 + 1 (v1's one modulus): m P by shifts and adds costs more ops than one multiply.
+  - Neon Montgomery by `sqrdmlah`/`sqrdmlsh` (5 ops): the doubled result reaches 3P under the
+    contract a b < 2^32 P and overflows int32 for P > 2^31 / 3; with a b < 2^31 P it fits, but
+    mapping (-P/2, P) into [0, 2P) costs 2 more ops: 7 against `mulhi`'s 6.
+- For kernels: on x86 the composed products are at their port or multiply floors; what is left is
+  doing fewer of them. Sums of products (leaf products) should accumulate `mul_even` / `umlal` in
+  64-bit lanes and reduce once (lc-opt's x86 leaf: 2 multiplies per product vector plus 4 per
+  output vector, against 6 per product vector). modarith has no public reduction of such sums
+  yet; add it when a kernel needs it (the intrinsics NTT, issue #4).
 
 ## Sources
 
