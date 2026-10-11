@@ -1,5 +1,6 @@
 You are building part of the fps frontend, tracked in issue #{issue}.
-You are unattended: the user is offline, so do not ask questions. Decide and act.
+You are unattended: the user is offline. Decide and act. To ask the user (AGENTS.md), comment on
+issue #{issue} with the question and the options, add the `blocked` label, and return.
 
 1. Read `AGENTS.md`, all of `DESIGN.md` (its Conventions apply to every function), issue #{issue}
    with its comments, and `frontend/notes.md`.
@@ -18,7 +19,7 @@ You are unattended: the user is offline, so do not ask questions. Decide and act
      inputs: `<op>/<lg>` through the API and `<op>@kernel/<lg>` calling the backend directly. The
      API must be within noise of the kernel (AGENTS.md, Performance).
    - If DESIGN.md is wrong or unclear, follow AGENTS.md: fix it in the same pull request with the
-     reason. If it is a choice only the user can make, comment on the issue and add `blocked`.
+     reason. If it is a choice only the user can make, ask (above).
 4. Test with `tools/kernel.py test frontend` on the Mac (`scalar`, `arm`) and on the VMs
    (`tools/vm.py`); time with `tools/kernel.py bench frontend`.
 5. Log what you built and the numbers in `frontend/notes.md`. Commit, push, and open a pull request
