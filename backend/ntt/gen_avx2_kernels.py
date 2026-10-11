@@ -94,7 +94,7 @@ class Graph:
 
     def op(self, mnemonic, *srcs, imm=None):
         srcs = [self.materialize(s) if s.kind == 'scalar' else self.loaded.get(s, s) for s in srcs]
-        if mnemonic in ('vpsubd', 'vpblendd'):  # only the second source may be in memory
+        if mnemonic in ('vpsubd', 'vpblendd', 'vpsrlq'):  # first source in a register (VEX shifts take none from memory)
             srcs[0] = self.materialize(srcs[0])
             if srcs[0].kind == 'cmem':
                 raise ScheduleError('constant minuend in memory')
@@ -188,6 +188,19 @@ def forward_identity(g):
     g.store_quarter(g.diff(amc, z), 3)
 
 
+def forward_top(g):
+    """forward_identity on canonical inputs: no reduction before the outputs, which are < 4P."""
+    c = g.c
+    a, b, cc, dd = (g.quarter(i) for i in range(4))
+    ac, bd = g.add(a, cc), g.add(b, dd)  # < 2P
+    amc = g.op('vpsubd', g.op('vpaddd', a, c['P']), cc)  # < 2P
+    z = g.shoup(g.op('vpsubd', g.op('vpaddd', b, c['P']), dd), c['WZ'], c['QZ'])
+    g.store_quarter(g.add(ac, bd), 0)
+    g.store_quarter(g.diff(ac, bd), 1)
+    g.store_quarter(g.add(amc, z), 2)
+    g.store_quarter(g.diff(amc, z), 3)
+
+
 def inverse_identity(g):
     c = g.c
     f0, f1, f2, f3 = (g.quarter(i) for i in range(4))
@@ -269,6 +282,57 @@ def bottom_last(g):
     g.store(g.low(g.add(amb, cmd)), 'out', None, 32)
     g.store(g.shoup(g.diff(ab, cd), tw['WX'], tw['QX']), 'out', None, 64)
     g.store(g.shoup(g.diff(amb, cmd), tw['WX'], tw['QX']), 'out', None, 96)
+
+
+# Bottom level of a transform alone (avx2.hpp, Transform): two radix-4 groups with h = 1, k and
+# k + 1 for an even k, at a. x = r + slot(k) and y = r + slot(2k) hold both groups' twiddles:
+# x_m = x[m], y_m = y[2m], z_m = y[2m + 1], quotients 8 words on.
+
+def leaf_twiddles(g, m):
+    return {'WX': g.scalar('x', 4 * m), 'QX': g.scalar('x', 32 + 4 * m), 'WY': g.scalar('y', 8 * m),
+            'QY': g.scalar('y', 32 + 8 * m), 'WZ': g.scalar('y', 8 * m + 4), 'QZ': g.scalar('y', 36 + 8 * m)}
+
+
+def canonical_difference(g, x, y):  # x, y < 2P -> x - y mod P
+    t = g.low_signed(g.op('vpsubd', x, y))
+    return g.op('vpminud', t, g.op('vpsubd', t, g.c['P']))
+
+
+def forward_leaves(g, groups=2):
+    """Forward butterflies, values < 4P in, canonical leaves out. No odd-lane loads: the inputs
+    were often just stored, and a load across two stores waits for them."""
+    for m in range(groups):
+        tw = leaf_twiddles(g, m)
+        f = [g.at('a', 128 * m + 32 * t) for t in range(4)]
+        a, b = g.low(f[0]), g.low(f[1])
+        cc = g.shoup(f[2], tw['WX'], tw['QX'])
+        dd = g.shoup(f[3], tw['WX'], tw['QX'])
+        ac = g.low(g.add(a, cc))
+        amc = g.low_signed(g.op('vpsubd', a, cc))
+        y = g.shoup(g.add(b, dd), tw['WY'], tw['QY'])
+        z = g.shoup(g.diff(b, dd), tw['WZ'], tw['QZ'])
+        out = [g.canonical(g.add(ac, y)), canonical_difference(g, ac, y),
+               g.canonical(g.add(amc, z)), canonical_difference(g, amc, z)]
+        for t, v in enumerate(out):
+            g.store(v, 'a', None, 128 * m + 32 * t)
+
+
+def inverse_leaves(g, groups=2):
+    """Inverse butterflies, canonical in (the leaf form), < 2P out; inverse twiddles."""
+    c = g.c
+    for m in range(groups):
+        tw = leaf_twiddles(g, m)
+        f = [g.at('a', 128 * m + 32 * t) for t in range(4)]
+        ab, cd = g.add(f[0], f[1]), g.add(f[2], f[3])  # < 2P
+        amb = g.shoup(g.op('vpsubd', g.op('vpaddd', f[0], c['P']), f[1]), tw['WY'], tw['QY'])
+        cmd = g.shoup(g.op('vpsubd', g.op('vpaddd', f[2], c['P']), f[3]), tw['WZ'], tw['QZ'])
+        g.store(g.low(g.add(ab, cd)), 'a', None, 128 * m)
+        g.store(g.low(g.add(amb, cmd)), 'a', None, 128 * m + 32)
+        g.store(g.shoup(g.diff(ab, cd), tw['WX'], tw['QX']), 'a', None, 128 * m + 64)
+        g.store(g.shoup(g.diff(amb, cmd), tw['WX'], tw['QX']), 'a', None, 128 * m + 96)
+
+
+LEAVES = {'forward_leaves': forward_leaves, 'inverse_leaves': inverse_leaves}
 
 
 # ------------------------------------------------------------------------------- scheduling
@@ -441,6 +505,8 @@ LOOPS = [
         'Inverse radix-4 butterflies j < h of one group, values < 2P; inverse twiddles. h even.')),
     Loop('forward_identity', forward_identity, 'z', doc=(
         'forward() for group 0 (x = y = 1); z = y[1]: pass the table start. h even.')),
+    Loop('forward_top', forward_top, 'z', doc=(
+        'forward_identity() on canonical input: the first level of a transform. h even.')),
     Loop('inverse_identity', inverse_identity, 'z', doc=(
         'inverse() for group 0; z = y[1]: pass the inverse table start. h even.')),
     Loop('scale_radix2', scale_radix2, 'z', doc=(
@@ -456,6 +522,7 @@ BOTTOM_KNOBS = {'first': Knobs(window=12),
                 'last': Knobs(seed=7, margin=2, jitter=3.0, window=12),
                 'both': Knobs(seed=540, jitter=3.0, window=12)}
 BOTTOM_SHIFT = -0.05  # 'both': the first stage's ops start this fraction earlier in source order
+LEAVES_KNOBS = {'forward_leaves': Knobs(window=20), 'inverse_leaves': Knobs(window=20)}
 
 
 def loop_body(loop):
@@ -559,6 +626,21 @@ def bottom_function(part):
     return lines
 
 
+def leaves_function(name):
+    g = Graph({'P': Value('creg', reg=15), '2P': Value('creg', reg=14)})
+    LEAVES[name](g)
+    seq = schedule(g.ops, 14, LEAVES_KNOBS[name])
+    reg = allocate(seq, {14, 15})
+    body = ['vpbroadcastd %[P], %%ymm15', 'vpbroadcastd %[P2], %%ymm14'] + [emit(o, reg) for o in seq]
+    doc = LEAVES[name].__doc__.split('.')[0]
+    lines = [f'// Groups k, k + 1 (k even) with h = 1 at a: {doc[0].lower() + doc[1:]}.', '// x = r + slot(k), y = r + slot(2k).',
+             f'inline void {name}(Vec* a, const std::uint32_t* x, const std::uint32_t* y) {{', '    asm volatile(']
+    lines += asm_lines(body)
+    lines += ['        :', '        : [a] "r"(a), [x] "r"(x), [y] "r"(y), [P] "m"(kP), [P2] "m"(k2P)',
+              '        : ' + CLOBBERS + ');', '}']
+    return lines
+
+
 HEADER = '''\
 // Generated by backend/ntt/gen_avx2_kernels.py. Do not edit.
 // AVX2 loops of the NTT as inline assembly, scheduled for Zen 3. Arithmetic and ranges: notes.md.
@@ -589,6 +671,9 @@ def generate():
               '// aligned); w: the four leaf weights, then their quotients.', '']
     for part in ('first', 'last', 'both'):
         lines += bottom_function(part) + ['']
+    lines += ['// Bottom level of a transform alone: leaves out (forward), leaves in (inverse).', '']
+    for name in LEAVES:
+        lines += leaves_function(name) + ['']
     lines += ['}  // namespace fps::ntt::avx2_kernels']
     return '\n'.join(lines) + '\n'
 

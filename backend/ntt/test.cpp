@@ -63,21 +63,29 @@ u32 root(u64 k) {
     return r;
 }
 
+// Tables against the definition: built within the static prefix and past it; the static tables.
 template <class V>
 void test_tables(const char* name) {
-    constexpr int lg = 14;
-    const std::size_t count = (std::size_t(1) << lg) / 16;
-    std::vector<Words> t;
-    for (int inverse = 0; inverse < 2; ++inverse) {
-        t.emplace_back(detail::table_words(lg));
-        V::build_table(t.back().begin(), count, detail::kRoots[inverse]);
-    }
-    for (std::size_t k = 0; k < count; ++k) {
-        const u32* e = t[0].begin() + detail::slot(k);
-        const u32* ie = t[1].begin() + detail::slot(k);
-        expect(e[0] == root(k), name, k);
-        expect(mul(e[0], ie[0]) == 1, name, k);
-        for (const u32* x : {e, ie}) expect(x[8] == u32((u64(x[0]) << 32) / P), name, k);
+    for (int lg : {kMinLog, kMinLog + 1, 10, detail::kStaticLog, detail::kStaticLog + 2}) {
+        const std::size_t count = (std::size_t(1) << lg) / 16;
+        std::vector<Words> t;
+        for (int inverse = 0; inverse < 2; ++inverse) {
+            t.emplace_back(detail::table_words(lg));
+            V::build_table(t.back().begin(), count, inverse);
+        }
+        for (std::size_t k = 0; k < count; ++k) {
+            const u32* e = t[0].begin() + detail::slot(k);
+            const u32* ie = t[1].begin() + detail::slot(k);
+            expect(e[0] == root(k), name, k);
+            expect(mul(e[0], ie[0]) == 1, name, k);
+            for (const u32* x : {e, ie}) expect(x[8] == u32((u64(x[0]) << 32) / P), name, k);
+            if (k < detail::kStaticCount) {
+                for (int inverse = 0; inverse < 2; ++inverse)
+                    for (int w : {0, 8})
+                        expect(detail::kStaticTables.words[inverse][detail::slot(k) + w] == t[inverse].begin()[detail::slot(k) + w],
+                               "static tables", k);
+            }
+        }
     }
 }
 
@@ -202,33 +210,30 @@ void fill(u32* p, std::size_t count, u64 bound) {
     for (std::size_t i = 0; i < count && i < 4; ++i) p[i] = u32(bound - 1 - i);
 }
 
-// The two product paths of variant avx2, each as a variant of its own.
-struct avx2_convolution : variant::avx2 {
+// Variant avx2 with each bottom stage at every length.
+template <class Bottom>
+struct avx2_bottom : variant::avx2 {
     static void multiply(u32* a, u32* b, std::size_t n, std::size_t m, int lg, const u32* r, const u32* ir) {
-        impl::convolution(a, b, n, m, lg, r, ir);
+        const std::size_t len = std::size_t(1) << lg;
+        impl::product<Bottom>(a, b, 2 * n <= len, 2 * m <= len, lg, r, ir);
     }
 };
+using avx2_group = avx2_bottom<impl::GroupBottom>;
+using avx2_pair = avx2_bottom<impl::PairBottom>;
 
-struct avx2_product : variant::avx2 {
-    static void multiply(u32* a, u32* b, std::size_t, std::size_t, int lg, const u32* r, const u32* ir) {
-        impl::product(a, b, lg, r, ir);
-    }
-};
-
-void test_paths() {
-    for (int lg = 9; lg <= kMaxLog; ++lg) {
+void test_bottoms() {
+    for (int lg = kMinLog; lg <= kMaxLog; ++lg) {
         const std::size_t len = std::size_t(1) << lg;
         const bool exact = lg <= 11;
-        for (const auto& [n, m] : {std::pair{len / 2, len / 2}, {len / 2, std::size_t(2)}, {len / 4 + 1, len / 4 + 1}}) {
-            test_product<avx2_convolution>("avx2 convolution path", n, m, 0, exact);
-            test_product<avx2_product>("avx2 product path", n, m, 0, exact);
+        for (const auto& [n, m] : {std::pair{len / 2, len / 2}, {len / 2, std::size_t(2)}, {len / 4 + 1, len / 4 + 1},
+                                   {len - len / 4, len / 4 + 1}, {len / 4 + 1, len - 1 - len / 4}}) {
+            test_product<avx2_group>("avx2 one-group bottom", n, m, 0, exact);
+            test_product<avx2_pair>("avx2 two-group bottom", n, m, 0, exact);
         }
-        test_product<avx2_convolution>("avx2 convolution path", len - len / 4, len / 4 + 1, 0, exact);
-        test_product<avx2_convolution>("avx2 convolution path", len / 4 + 1, len - 1 - len / 4, 0, exact);
     }
 }
 
-// The product path with garbage in the factors' upper halves, which it must not read.
+// Factors of at most half the length with garbage in their upper halves, which must not be read.
 void test_upper_halves_unread(std::size_t n, std::size_t m) {
     const auto a = random_poly(n, 0), b = random_poly(m, 0);
     Convolution conv(n, m);
@@ -236,16 +241,16 @@ void test_upper_halves_unread(std::size_t n, std::size_t m) {
     std::copy(b.begin(), b.end(), conv.b());
     const std::size_t half = conv.length() / 2;
     for (std::size_t i = half; i < 2 * half; ++i) conv.a()[i] = u32(rng()), conv.b()[i] = u32(rng());
-    const u32* c = conv.multiply<avx2_product>();
-    expect(std::vector<u32>(c, c + n + m - 1) == schoolbook(a, b), "avx2 product path: upper halves unread",
+    const u32* c = conv.multiply<variant::avx2>();
+    expect(std::vector<u32>(c, c + n + m - 1) == schoolbook(a, b), "avx2: upper halves unread",
            n * 100000000 + m);
 }
 
 // Twiddle tables for transforms of length 2^lg.
 struct Tables {
     explicit Tables(int lg) : forward_(detail::table_words(lg)), inverse_(detail::table_words(lg)) {
-        variant::avx2::build_table(forward_.begin(), (std::size_t(1) << lg) / 16, detail::kRoots[0]);
-        variant::avx2::build_table(inverse_.begin(), (std::size_t(1) << lg) / 16, detail::kRoots[1]);
+        variant::avx2::build_table(forward_.begin(), (std::size_t(1) << lg) / 16, false);
+        variant::avx2::build_table(inverse_.begin(), (std::size_t(1) << lg) / 16, true);
     }
     const u32* r(std::size_t k) { return forward_.begin() + detail::slot(k); }  // value; quotient at [8]
     const u32* ir(std::size_t k) { return inverse_.begin() + detail::slot(k); }
@@ -307,6 +312,8 @@ void test_loops() {
             test_loop("forward_identity", h, 4 * u64(P), 4 * u64(P),
                       [&](Vec* f, std::size_t n) { k::forward_identity(f, n, t.r()); },
                       [&](const std::array<u32, 4>& f) { return forward_model(f, 1, 1, *t.r(1)); });
+            test_loop("forward_top", h, P, 4 * u64(P), [&](Vec* f, std::size_t n) { k::forward_top(f, n, t.r()); },
+                      [&](const std::array<u32, 4>& f) { return forward_model(f, 1, 1, *t.r(1)); });
             test_loop("inverse_identity", h, 2 * u64(P), 2 * u64(P),
                       [&](Vec* f, std::size_t n) { k::inverse_identity(f, n, t.ir()); },
                       [&](const std::array<u32, 4>& f) { return inverse_model(f, 1, 1, *t.ir(1)); });
@@ -331,6 +338,17 @@ void test_loops() {
             expect(v.begin()[j] == mul(s, add(in[j], in[j + 8 * h])), "scale_radix2 sum", j);
             expect(v.begin()[j + 8 * h] == mul(s, sub(in[j], in[j + 8 * h])), "scale_radix2 difference", j);
         }
+        // inverse_radix4: s inverse_identity(f), canonical.
+        Words w(32 * h);
+        fill(w.begin(), 32 * h, 2 * u64(P));
+        const std::vector<u32> top(w.begin(), w.begin() + 32 * h);
+        impl::inverse_radix4(vec(w), h, t.ir(), s);
+        for (std::size_t j = 0; j < 8 * h; ++j) {
+            std::array<u32, 4> f;
+            for (std::size_t q = 0; q < 4; ++q) f[q] = top[j + 8 * h * q];
+            const auto expected = inverse_model(f, 1, 1, *t.ir(1));
+            for (std::size_t q = 0; q < 4; ++q) expect(w.begin()[j + 8 * h * q] == mul(s, expected[q]), "inverse_radix4", j);
+        }
     }
 }
 
@@ -338,9 +356,9 @@ void test_loops() {
 void test_bottom_levels() {
     Tables t(kTableLog);
     for (int round = 0; round < 50; ++round) {
-        const std::size_t count = 1 + random_below(4), first = random_below(kGroups - count);
+        const std::size_t count = 2 + 2 * random_below(2), first = 2 * random_below(kGroups / 2 - 2);
         for (int inverse = 0; inverse < 2; ++inverse) {
-            const u64 bound = inverse ? 2 * u64(P) : 4 * u64(P);
+            const u64 bound = inverse ? u64(P) : 4 * u64(P);  // inverse: leaf form in
             Words v(32 * count);
             fill(v.begin(), 32 * count, bound);
             const std::vector<u32> in(v.begin(), v.begin() + 32 * count);
@@ -410,12 +428,12 @@ void test_avx2() {
     test_loops();
     test_bottom_levels();
     test_group_bottom();
-    for (int lg = 9; lg <= 11; ++lg) {
+    for (int lg = kMinLog; lg <= 11; ++lg) {
         const std::size_t len = std::size_t(1) << lg;
         test_upper_halves_unread(len / 2, len / 2);
         test_upper_halves_unread(len / 2 - 3, len / 4 + 9);
     }
-    test_paths();
+    test_bottoms();
     test_variant<variant::avx2>("avx2", kMaxLog);
 }
 
