@@ -15,7 +15,21 @@ Two parts:
   copied. Cite what you used in the module's `notes.md`.
 - Code from `../cpp_hpc/lc-opt` may be moved here. Rewrite it to this repo's standards as you go.
 - No speed claim without passing tests and a measurement.
-- Ask before changing an agreed design decision.
+- `DESIGN.md` is the plan, not a contract. If you find a better approach, change the design doc
+  first, then build the new approach. Do not follow the doc into a worse result.
+  - Better means measured or proven: numbers, a test, or a short argument in the commit message.
+    A guess does not count.
+  - Edit the affected rows and sections in place. Do not leave the old text behind.
+  - Say what changed and why in the commit message and in the module's `notes.md`.
+  - Keep the doc and the code in step: no commit where they disagree.
+  - Tell the user in your final report. No need to ask first.
+
+## Design
+
+- Start simple. Build the smallest design that covers today's callers.
+- Add generality (templates, options, extension points, abstractions) only when a real caller needs it.
+  Write down which caller needed it.
+- Simple must not mean slow: the Performance rules below still apply.
 
 ## Performance
 
@@ -110,6 +124,11 @@ Backend work happens in rounds: one subagent per round, started by `/work` and b
 `tools/prompt.md`. Each GitHub issue (`.github/ISSUE_TEMPLATE/kernel.md`) is labeled `ready`,
 `running`, `blocked` (needs the user) or `done`. `/work` reads the `Result:` line each round ends
 with (`BACKEND.md`, Working in parallel).
+
+Agents may open issues and comment on any issue. Open one from the template, labeled `ready`, for
+work found outside your round: a bug, a new kernel, an idea for another target. Search open issues
+first; comment on a match instead of opening a duplicate. Reply to an issue when you have something
+useful for it: an answer, a measurement, a related finding.
 
 ## Machines
 
