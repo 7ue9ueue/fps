@@ -1,9 +1,10 @@
 // The factorials variant per target and size n:
 //   n < kMinChains                 the scalar loop (model.hpp)
-//   kMinChains <= n                Chains<Isa, kVectors, P>, with non-temporal stores from
-//                                  n = kMinStream on (Avx512 only)
-// -DFPS_FACTORIALS_ISA=<struct>, -DFPS_FACTORIALS_VECTORS=<K>, -DFPS_FACTORIALS_MIN_CHAINS=<n> and
-// -DFPS_FACTORIALS_MIN_STREAM=<n> force them. Measurements: notes.md.
+//   kMinChains <= n < kMinLarge    Chains<Isa, kVectors, P>
+//   kMinLarge <= n                 Chains<IsaLarge, kVectorsLarge, P>: fewer lanes, so fewer
+//                                  write streams, where many streams stall on memory
+// -DFPS_FACTORIALS_ISA=<struct>, -DFPS_FACTORIALS_VECTORS=<K> and -DFPS_FACTORIALS_MIN_CHAINS=<n>
+// force them (a forced struct runs at every size). Measurements: notes.md.
 #pragma once
 
 #include <cstddef>
@@ -37,17 +38,21 @@ inline constexpr std::size_t kMinChains = 128;  // Emerald Rapids: 0.90 at 128, 
 inline constexpr std::size_t kMinChains = 64;  // Zen 3: 0.93, Neoverse V2: 0.85 at 64
 #endif
 
-// Non-temporal stores, from the size where the tables (8 n bytes) no longer stay in L2, ns per
-// position against plain stores: Emerald Rapids 0.47 against 0.45-0.59 at 2^19, 0.60-0.73 at
-// 2^20; Zen 5 0.31 against 0.36 at 2^17, 0.28 against 0.32 at 2^16.
-#if defined(FPS_FACTORIALS_MIN_STREAM)
-inline constexpr std::size_t kMinStream = FPS_FACTORIALS_MIN_STREAM;
-#elif defined(__znver5__)
-inline constexpr std::size_t kMinStream = std::size_t(1) << 17;
-#elif defined(__AVX512F__)
-inline constexpr std::size_t kMinStream = std::size_t(1) << 19;
+// zmm with 32 lanes (64 streams) against ymm with 16 lanes, ns per position: Emerald Rapids
+// 0.45-0.49 or 0.71-0.83 (by the tables' placement) from 2^18 on, against 0.54-0.62; Zen 5
+// 0.37-0.47 against 0.50 up to 2^22, 0.55-0.72 against 0.50-0.54 from 5 2^20 on.
+#if !defined(FPS_FACTORIALS_ISA) && defined(__znver5__)
+using IsaLarge = simd::Avx512Vl;
+inline constexpr int kVectorsLarge = 2;
+inline constexpr std::size_t kMinLarge = std::size_t(5) << 20;
+#elif !defined(FPS_FACTORIALS_ISA) && defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+using IsaLarge = simd::Avx512Vl;
+inline constexpr int kVectorsLarge = 2;
+inline constexpr std::size_t kMinLarge = std::size_t(1) << 19;
 #else
-inline constexpr std::size_t kMinStream = std::numeric_limits<std::size_t>::max();
+using IsaLarge = Isa;
+inline constexpr int kVectorsLarge = kVectors;
+inline constexpr std::size_t kMinLarge = std::numeric_limits<std::size_t>::max();
 #endif
 
 }  // namespace fps::factorials

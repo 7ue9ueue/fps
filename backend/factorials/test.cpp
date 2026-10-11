@@ -1,6 +1,6 @@
 // Tests the factorials kernel: the model against the definition (fact[i] = fact[i - 1] i,
 // fact[i] inverse[i] = 1), then every Chains variant this machine can run (every simd struct,
-// K = 2, 4, 8, with and without non-temporal stores) and the selected `tables` against the model.
+// K = 2, 4, 8) and the selected `tables` against the model.
 // Sizes: every n up to 1100, powers of two and their neighbours up to 2^20, both sides of every
 // change of the lane length C up to 2^14, random n, and n = P - 1, P for small P. Placements:
 // tables 64-byte aligned, and at word offsets 0-15 from it, the same or different for the two.
@@ -106,8 +106,8 @@ void chains(std::size_t limit) {
     for (std::size_t m : n) check<P>(name, m, run);
 }
 
-// Placements and non-temporal stores, on fewer sizes: the lane grid starts at h = (16 - offset)
-// % S::lanes and, with stream, the lanes past the end start at an aligned position before a tail.
+// Placements, on fewer sizes: the lane grid starts at h = (16 - offset) % S::lanes words, and
+// positions below h come from constant tables.
 template <class S, int K, u32 P>
 void placements(std::size_t limit) {
     using C = fps::factorials::Chains<S, K, P>;
@@ -120,16 +120,11 @@ void placements(std::size_t limit) {
     for (int t = 0; t < 8; ++t) n.insert(C::kMinSize + rng() % ((1 << 18) - C::kMinSize));
     if (limit == P) n.insert({P - 16, P - 1, P});
     const std::pair<std::size_t, std::size_t> offsets[] = {{1, 1}, {4, 4}, {12, 12}, {15, 15}, {0, 8}, {3, 13}, {9, 2}};
-    for (bool stream : {false, true}) {
-        const std::string name = std::string("Chains<") + S::name + ", " + std::to_string(K) + ">" +
-                                 (stream ? " stream" : "");
-        const auto run = [stream](u32* fact, u32* inverse, std::size_t m) { C::run(fact, inverse, m, stream); };
-        for (std::size_t m : n)
-            if (m <= limit) {
-                if (stream) check<P>(name, m, run);
-                for (auto [f, i] : offsets) check<P>(name, m, run, f, i);
-            }
-    }
+    const std::string name = std::string("Chains<") + S::name + ", " + std::to_string(K) + ">";
+    const auto run = [](u32* fact, u32* inverse, std::size_t m) { C::run(fact, inverse, m); };
+    for (std::size_t m : n)
+        if (m <= limit)
+            for (auto [f, i] : offsets) check<P>(name, m, run, f, i);
 }
 
 template <class S>
