@@ -48,7 +48,10 @@ Speed is the point of this library. The lc-opt kernels are already fast; the API
 - No overhead from wrapping. A call through the public API must run as fast as calling the kernel
   directly: no extra copies, allocations, bounds checks or virtual calls on hot paths.
 - Measure it. For each wrapper, time it against the raw kernel in the same run (see Measuring).
-  A gap beyond noise is a bug.
+  A gap beyond noise is a bug: fix it in the frontend if the frontend adds work (an extra pass,
+  copy or allocation); if only the backend can close it, open a backend issue and say so in the header.
+- Optimize in the backend. Keep the frontend plain: no tuning, cutoffs or micro-optimizations of its
+  own beyond removing its own overhead.
 - If an ergonomic API costs speed, keep the fast path reachable (raw spans, plans, transformed values)
   and say so in the header.
 
