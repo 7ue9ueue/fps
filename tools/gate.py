@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge gate for backend changes. Runs on the Mac; needs git, gh and gcloud.
+"""Merge gate. Runs on the Mac; needs git, gh and gcloud.
 
   gate.py PR [--merge]          a pull request, merged into origin/main
   gate.py REV [--base REV]      a local revision, merged into --base (default origin/main)
@@ -9,8 +9,9 @@ For every target in tools/kernel.py, on the target's machines:
     ('mac' is this Mac, with clang);
   - time, if the target has a timing machine: kernel.py bench against the base, 21 rounds;
     on a slowdown, 21 more, pooled.
-Affected kernels: those changed, those that include them, or all if a shared file changed.
-Passes if every test passes and, per target, the geomean over kernels of new/base (each kernel's
+Units are the backend kernels and the frontend (see tools/kernel.py). Affected units: those
+changed, those that include them, or all if a shared file changed.
+Passes if every test passes and, per target, the geomean over units of new/base (each unit's
 geomean over its gated cases) is at most 1. Byte-identical bench binaries count as 1.
 
 For a pull request it posts the report as a comment; with --merge it squash-merges on a pass.
@@ -29,7 +30,7 @@ import tarfile
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
-from kernel import TARGETS, summarize, table
+from kernel import TARGETS, summarize, table, unit_dir
 from vm import rev_tar, ship, ssh
 
 ROUNDS = 21
@@ -44,22 +45,31 @@ def log(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
-def kernels_in(tree: str) -> list[str]:
+def unit_paths(unit: str) -> list[str]:
+    """Folders whose changes change the unit's code."""
+    return ['frontend/', 'include/'] if unit == 'frontend' else [f'backend/{unit}/']
+
+
+def units_in(tree: str) -> list[str]:
     names = git('ls-tree', '--name-only', tree, 'backend/', check=False).stdout.split()
-    return sorted(n.split('/')[1] for n in names
-                  if git('cat-file', '-e', f'{tree}:{n}/test.cpp', check=False).returncode == 0)
+    units = [n.split('/')[1] for n in names
+             if git('cat-file', '-e', f'{tree}:{n}/test.cpp', check=False).returncode == 0]
+    frontend = git('ls-tree', '--name-only', tree, 'frontend/', check=False).stdout.split()
+    if any(re.fullmatch(r'frontend/test[^/]*\.cpp', n) for n in frontend):
+        units.append('frontend')
+    return sorted(units)
 
 
 def affected(base: str, tree: str) -> list[str]:
-    kernels = kernels_in(tree)
+    units = units_in(tree)
     changed = git('diff', '--name-only', base, tree).stdout.split()
     if any(SHARED.match(path) for path in changed):
-        return kernels
-    hit = {path.split('/')[1] for path in changed if path.startswith('backend/')} & set(kernels)
-    uses = {k: set(git('grep', '-h', '-o', '-E', r'backend/[A-Za-z0-9_]+/', tree, '--',
-                       f'backend/{k}/', check=False).stdout.split()) for k in kernels}
-    while True:  # add kernels that include an affected one, until nothing changes
-        more = {k for k in kernels if k not in hit and any(f'backend/{h}/' in uses[k] for h in hit)}
+        return units
+    hit = {u for u in units if any(path.startswith(tuple(unit_paths(u))) for path in changed)}
+    uses = {u: set(git('grep', '-h', '-o', '-E', r'backend/[A-Za-z0-9_]+/', tree, '--',
+                       *unit_paths(u), check=False).stdout.split()) for u in units}
+    while True:  # add units that include an affected kernel, until nothing changes
+        more = {u for u in units if u not in hit and any(f'backend/{h}/' in uses[u] for h in hit)}
         if not more:
             return sorted(hit)
         hit |= more
@@ -111,7 +121,7 @@ def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, base: s
     if spec['time'] is None:
         return True, '\n'.join(out + ['', f'{target}: tested, not timed'])
 
-    timed = [k for k in kernels if git('cat-file', '-e', f'{base}:backend/{k}/bench.cpp', check=False).returncode == 0]
+    timed = [k for k in kernels if git('cat-file', '-e', f'{base}:{unit_dir(k)}/bench.cpp', check=False).returncode == 0]
     path = ship(spec['time'], name, new_tar)
     base_path = ship(spec['time'], f'{name}.base', base_tar)
     reports = {}
@@ -171,8 +181,8 @@ def gate(args) -> tuple[bool, str, str]:
     kernels = affected(base, tree)
     lines = [f'Gate for {label} ({head[:10]}) merged into {args.base} ({base[:10]}).', '']
     if not kernels:
-        return True, '\n'.join(lines + ['No kernel affected.', '', 'Gate: pass']), base
-    lines += [f'Kernels: {", ".join(kernels)}', '']
+        return True, '\n'.join(lines + ['No unit affected.', '', 'Gate: pass']), base
+    lines += [f'Units: {", ".join(kernels)}', '']
     new_tar = subprocess.run(['git', 'archive', '--format=tar.gz', tree], check=True, capture_output=True).stdout
     base_tar = rev_tar(base)
     with ThreadPoolExecutor(len(TARGETS)) as pool:
