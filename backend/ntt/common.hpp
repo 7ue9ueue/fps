@@ -68,8 +68,19 @@ inline void start_table(std::uint32_t* t) {
     t[slot(0) + 8] = quotient(1);
 }
 
-// nv^-1 mod P for nv = 2^lg / 8 leaves: the gain of a forward and an inverse transform.
-inline std::uint32_t leaf_scale(int lg) { return power(std::uint32_t(1) << (lg - 3), kP - 2); }
+// nv^-1 mod P for nv = 2^lg / 8 leaves, the gain of a forward and an inverse transform; and
+// nv^-1 2^32 mod P, which also undoes the Montgomery factor 2^-32 of the AVX2 leaf products.
+// Tables: a modular power costs about 100 ns per call.
+inline constexpr auto kLeafScales = [] {
+    std::array<std::array<std::uint32_t, kMaxLog + 1>, 2> t{};
+    for (int lg = kMinLog; lg <= kMaxLog; ++lg) {
+        t[0][lg] = power(std::uint32_t(1) << (lg - 3), kP - 2);
+        t[1][lg] = multiply_mod(t[0][lg], kR);
+    }
+    return t;
+}();
+constexpr std::uint32_t leaf_scale(int lg) { return kLeafScales[0][lg]; }
+constexpr std::uint32_t product_scale(int lg) { return kLeafScales[1][lg]; }
 
 // Radix-4 levels run on groups of 4 quarters. nv = 4^j leaves start with one group; nv = 2 * 4^j
 // start with a radix-2 level and two groups.
