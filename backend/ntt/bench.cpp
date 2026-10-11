@@ -3,12 +3,17 @@
 //   multiply/<lg>                Convolution::multiply, factors of 2^lg / 2 coefficients each.
 //   multiply_dense/<lg>          factors of 3 2^lg / 4 and 2^lg / 4 + 1 coefficients.
 //   <op>@<variant>/<lg>          one variant: scalar, intrinsics_<simd struct>, avx2 (if not selected).
-// Each multiply call builds its tables, as a single-use Convolution does. Repeated calls reuse
-// the last output as input: the timing does not depend on the values.
+//   convolution/<lg>             a Convolution of 2^lg / 2 and 2^lg / 2 coefficients constructed,
+//                                multiplied and destroyed, to 2^22: construction against multiply/<lg>.
+//   convolution_into/<lg>        the same with a in the caller's memory, 64 bytes past a page boundary.
+// Tables past 2^16 are built by a thread's first call, then kept (ntt.hpp, Memory). Repeated calls
+// reuse the last output as input, and convolution cases write no factors: the timing does not
+// depend on the values.
 #include "backend/ntt/ntt.hpp"
 
 #include <algorithm>
 #include <memory>
+#include <new>
 #include <random>
 #include <string>
 #include <tuple>
@@ -24,7 +29,8 @@ using namespace fps::ntt;
 
 // The scalar variant takes seconds at 2^25; its benches stop here.
 constexpr int kScalarMaxLog = 18;
-// Variants not selected: up to 2^22 (64 MiB for a multiply), to keep the gate's 21 rounds short.
+// Variants not selected and convolution cases: up to 2^22 (64 MiB for a multiply), to keep the
+// gate's 21 rounds short.
 constexpr int kVariantMaxLog = 22;
 
 struct Words {
@@ -39,6 +45,39 @@ struct Words {
     u32* begin() { return lines.data()->words; }
     std::vector<Line> lines;
 };
+
+// count words 64 bytes past a page boundary, then kPadding words.
+class CallerWords {
+public:
+    explicit CallerWords(std::size_t count)
+        : words_(static_cast<u32*>(::operator new((kOffset + count + kPadding) * sizeof(u32), std::align_val_t(4096)))) {}
+    ~CallerWords() { ::operator delete(words_, std::align_val_t(4096)); }
+    CallerWords(const CallerWords&) = delete;
+    CallerWords& operator=(const CallerWords&) = delete;
+    u32* begin() { return words_ + kOffset; }
+
+private:
+    static constexpr std::size_t kOffset = 16;
+    u32* words_;
+};
+
+void add_convolution_cases(bench::Suite& suite) {
+    for (int lg = kMinLog; lg <= kVariantMaxLog; ++lg) {
+        const std::size_t n = (std::size_t(1) << lg) / 2;
+        suite.add("convolution/" + std::to_string(lg), [n] {
+            return [n] {
+                Convolution conv(n, n);
+                bench::keep(*conv.multiply());
+            };
+        }, 2 * n);
+        suite.add("convolution_into/" + std::to_string(lg), [n] {
+            return [n, a = std::make_shared<CallerWords>(Convolution::length(n, n))] {
+                Convolution conv(n, n, a->begin());
+                bench::keep(*conv.multiply());
+            };
+        }, 2 * n);
+    }
+}
 
 template <class V>
 constexpr bool selected_everywhere =
@@ -95,5 +134,6 @@ int main(int argc, char** argv) {
     if constexpr (!selected_everywhere<variant::avx2>)
         add_cases<variant::avx2, variant::avx2, variant::avx2>(suite, "@avx2", kVariantMaxLog);
 #endif
+    add_convolution_cases(suite);
     return suite.run();
 }

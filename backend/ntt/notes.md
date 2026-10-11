@@ -5,7 +5,8 @@ Number-theoretic transforms and products modulo P = 998244353. API: `ntt.hpp` (`
 (`intrinsics<S>`, templates on any `backend/simd` struct S), `avx2.hpp` (lc-opt's `lib/ntt`).
 `select.hpp` picks one per op and length: `avx2` on the `avx2` target; on `avx512` and `zen5`
 `intrinsics<Avx512>` from 2^8-2^10 on (per op and CPU) and `avx2` below; `intrinsics<simd::Native>`
-on the other targets. Tests: `test.cpp`; benches: `bench.cpp`.
+on the other targets. `memory.hpp`: `Convolution`'s memory, kept per thread. Tests: `test.cpp`;
+benches: `bench.cpp`.
 Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_product_kernels.hpp`
 (`gen_avx2_product_kernels.py`).
 
@@ -23,9 +24,16 @@ Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_produc
   Blocks of 8 values then their 8 Shoup quotients; L/16 entries each way. Entry k does not
   depend on L: both tables for L <= 2^16 are built at compile time (`kStaticTables`, 2 x 32 KiB);
   longer tables copy them and extend.
-- `Convolution`: a, b (and the tables past 2^16) in one mapping, 2 MiB aligned, `MADV_HUGEPAGE`;
-  a and b are L + 16 words apart, so equal offsets fall in different cache sets. Up to 2^16 the
-  tables are the compile-time ones; past it they are built per call.
+- `Convolution` (memory: `memory.hpp`): a and b in one region, 2 MiB aligned, `MADV_HUGEPAGE`,
+  kept per thread across calls (one free region per thread, the largest given back); a and b are
+  L + 16 words apart, so equal offsets fall in different cache sets. With a in the caller's memory
+  (64-byte aligned, L + 16 words), b is in the region at a + L + 16 words modulo 4 KiB: the same
+  layout as far as caches and 4K aliasing see it. The constructor zeroes [n, L/2) of a sparse
+  factor (n <= L/2; its upper half is not read) and [n, L) of a dense one. Up to 2^16 the tables
+  are the compile-time ones; past it, one pair per thread, built for the longest length so far.
+- Variant contract for `multiply(a, b, n, m, lg, ...)`: words [n, L) of a are zero, except that
+  the upper half of a factor with n <= L/2 may hold anything (avx2 and intrinsics do not read it;
+  scalar zeroes it). Same for b.
 - `Transform`: tables built once; forward and inverse in place on caller arrays (32-byte aligned,
   16 words of padding: the AVX2 forward kernels read 4 bytes past their last vector).
 
