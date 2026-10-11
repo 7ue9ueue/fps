@@ -45,6 +45,7 @@ from kernel import TARGETS, summarize, table, unit_dir
 from vm import rev_tar, ship, ssh
 
 ROUNDS = 21
+RAW = Path.home() / 'Documents' / 'hpc_library-explore' / 'gate'  # raw times, kept on the Mac
 TOLERANCE = 1.005  # new/base per target; above it, ROUNDS more rounds are pooled and judged again
 SHARED = re.compile(r'^(backend/[^/]+|tools/kernel\.py)$')  # files outside a kernel folder
 
@@ -162,11 +163,16 @@ def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, base: s
             again = bench(spec['time'], path, base_path, k, target)
             pool(reports[k], again)
     ssh(spec['time'], f'rm -rf {path} {base_path}')
+    for k, report in reports.items():  # every round's times, pooled rounds included
+        out_path = RAW / label / f'{target}-{k}.json'
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(report, indent=1))
 
     ratios = {k: kernel_ratio(r) for k, r in reports.items()}
     overall = geomean([r for r in ratios.values() if r is not None])
     cpu = next(iter(reports.values()))['cpu'] if reports else spec['time']
-    out += ['', f'Timing on {spec["time"]} ({cpu}), new/base, below 1 is faster:']
+    out += ['', f'Timing on {spec["time"]} ({cpu}), new/base, below 1 is faster. '
+            f'Raw times per round: `{RAW / label}/{target}-<unit>.json` on the Mac.']
     for k in kernels:
         if k not in reports:
             out.append(f'- {k}: no bench in base, not timed')
