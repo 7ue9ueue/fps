@@ -4,8 +4,8 @@ Number-theoretic transforms and products modulo P = 998244353. API: `ntt.hpp` (`
 `Transform`, the leaf form). Variants: `scalar.hpp` (every target; the model), `intrinsics.hpp`
 (`intrinsics<S>`, templates on any `backend/simd` struct S), `avx2.hpp` (lc-opt's `lib/ntt`).
 `select.hpp` picks one per op and length: `avx2` on the `avx2` target; on `avx512` and `zen5`
-`intrinsics<Avx512>` from 2^6-2^8 on (per op and CPU) and `avx2` below; `intrinsics<simd::Native>`
-on the other targets. `memory.hpp`: `Convolution`'s memory, kept per thread. Tests: `test.cpp`;
+`intrinsics<Avx512>` from 2^6-2^8 on (per op and CPU) and `avx2` below (Emerald Rapids multiply:
+`avx2` at 2^7 only); `intrinsics<simd::Native>` on the other targets. `memory.hpp`: `Convolution`'s memory, kept per thread. Tests: `test.cpp`;
 benches: `bench.cpp`.
 Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_product_kernels.hpp`
 (`gen_avx2_product_kernels.py`).
@@ -82,6 +82,12 @@ the other variants' word for word.
 - Levels with quarters of at least 32 words run on S, one group at a time. The first level of a
   transform takes inputs < 2P (canonical, or after the radix-2 level), so it skips the input
   reductions: 2 of forward4's, 4 of forward4_identity's (and 2 more for canonical inputs).
+- The levels inside a subtree of at most 256 leaves run one call per level (`forward_groups`,
+  `inverse_groups`), not one per group. Groups of two columns (quarters of 32 words on zmm) run
+  both columns side by side, without the pipeline below. Emerald Rapids, cycles per 64 columns on
+  L1 data against one group of 64 columns (1810): a call per group of two columns 2145, a loop of
+  pipelined groups 2120 (GCC rematerialized constants per group), two columns side by side with
+  the unshifted q below 1919 (Log, issue #5 round 2).
 - Each butterfly is two stages on a column of 4 vectors (forward: input reductions and x f2,
   x f3, then the rest; inverse: the sums and y (a - b), z (c - d), then the rest). Groups run
   them software pipelined (`each2`): the first stage of column j + 1, then the second of column j,
@@ -93,6 +99,19 @@ the other variants' word for word.
 - Shoup products go through an empty asm statement (`Arith::whole`). Without it GCC distributes
   x w - q P over the product's uses (a + c -> (a - q P) + x w, a - c -> (a + q P) - x w): 24 adds
   and subtracts per forward radix-4 column instead of 19 on zmm (Log, issue #5).
+- On x86, `Arith::mul` reads the quotient q unshifted for the odd words (`mul_even` of x >> 32 and
+  q): every factor is a broadcast or a half broadcast, so its words 2i and 2i + 1 are equal. One
+  p0 shift less per product where q is not loop-invariant: the zmm bottoms (3 to 8 per pair of
+  groups) and groups of two columns (3 per group). The join is simd's (`simd::detail::
+  kMulhiPermute`: `vpermt2d`, or shift and blend on Zen 4/5).
+- Software prefetch, Emerald Rapids only (`kPrefetch`): groups on quarters of at least 2^15 words
+  and radix-2 levels on halves of at least 2^20 words prefetch, per column, the line 512 words
+  ahead in each stream (`prefetcht0`), and `prefetchw` the lines a pass writes without reading
+  (the upper subtree's first level reading the lower half; the sparse radix-4 top's quarters 2
+  and 3). In 2 MiB pages, the 4 streams of a group 128 KiB or more apart share an L2 set at each
+  column; one pass over 4 quarters of 2 MiB ran at 0.164 ns per word, 0.149 with the quarters
+  4 KiB apart, 0.134 with the prefetch (Measurements). Smaller quarters lost with it (2^12-2^16
+  1-4%), as did Zen 5 (Log).
 - Bottom level (quarters of 8 words, one leaf each): on S up to 8 lanes, one group at a time, its
   columns two at a time on 4-lane structs (Neon, Sse: bottom forward 10%, inverse 8% faster on
   Neoverse V2). On `Avx512` (16 lanes, `WideBottom`): two groups k, k + 1 per step; four
@@ -141,8 +160,10 @@ the other variants' word for word.
   left `Arith::mul` out of line once the groups were pipelined, a call per product (Zen 5 1.4x
   slower; Log).
 - `variant::by_length<lg, Small, Large>` (`select.hpp`): Small below 2^lg. On `avx512`: avx2
-  below 2^8 (forward, multiply), intrinsics at every length for inverse; on `zen5` avx2 below 2^7
-  (forward) and 2^8 (inverse, multiply). From @avx2 against @intrinsics_avx512 in one binary, 5
+  below 2^8 for forward and at 2^7 only for multiply, intrinsics at every length for inverse; on
+  `zen5` avx2 below 2^7 (forward) and 2^8 (inverse, multiply). Issue #5 round 2, same binary, 11
+  rounds, Emerald Rapids intrinsics/avx2 at 2^6 and 2^7: multiply 0.94 and 1.05, multiply_dense
+  0.91 and 1.02, forward 1.05 and 0.98, inverse 0.82 and 0.98. From @avx2 against @intrinsics_avx512 in one binary, 5
   rounds, intrinsics/avx2 at 2^6..2^9 (issue #4 round 2, after its changes): Emerald Rapids forward
   1.05 1.00 0.84 0.79, inverse 0.84 0.96 0.89 0.85, multiply 0.94 1.07 0.80 0.82; Zen 5 forward
   1.11 0.88 0.80 0.68, inverse 1.11 1.03 0.78 0.75, multiply 1.15 1.14 0.67 0.64.
@@ -418,7 +439,80 @@ V0/V2 write ports; no simple steering rule fit all patterns). The forward group 
 instruction sequence, with independent registers: 9.9 cycles per column, against 12.4 in the loop
 (main). `str q` takes a V0/V1 uop for its data (LLVM's Neoverse V2 model), and `ld1r` a V uop.
 
-## Log
+### zmm intrinsics, issue #5 round 2
+
+Against main (d63b99f), paired, 7 rounds, `kernel.py bench --base`, the 114 gated cases (80 ops
+and 34 convolution cases), GCC 15.2, `tools/kernel.py` flags, 2026-10-11. Geomean new/base:
+`lc-intel` (Emerald Rapids) 0.9628, `lc-arm` (Neoverse V2, 5 rounds) 0.9946, `lc-zen5` (against
+e452c18, whose ntt bench binary is byte-identical to d63b99f's) 0.9923. Emerald Rapids, new ns
+per call (new/base):
+
+| lg | forward | inverse | multiply | multiply_dense |
+|---:|---|---|---|---|
+| 6 | 22 (1.005) | 27 (0.978) | 132 (0.938) | 122 (0.920) |
+| 8 | 86 (0.965) | 95 (0.971) | 375 (0.985) | 384 (0.982) |
+| 10 | 418 (0.973) | 438 (0.948) | 1800 (0.970) | 1828 (0.974) |
+| 12 | 2132 (0.965) | 2214 (0.957) | 8604 (0.986) | 8706 (0.990) |
+| 16 | 51628 (0.973) | 51120 (0.974) | 1.84e5 (0.986) | 1.86e5 (0.987) |
+| 18 | 2.35e5 (0.970) | 2.40e5 (0.983) | 8.46e5 (0.940) | 8.65e5 (0.947) |
+| 20 | 1.17e6 (0.968) | 1.14e6 (0.985) | 4.02e6 (0.940) | 4.10e6 (0.942) |
+| 22 | 5.38e6 (0.971) | 5.21e6 (0.976) | 1.78e7 (0.928) | 1.81e7 (0.928) |
+| 24 | 2.38e7 (0.967) | 2.34e7 (0.984) | 7.94e7 (0.871) | 8.08e7 (0.873) |
+| 25 | 4.85e7 (0.880) | 5.23e7 (0.906) | 1.74e8 (0.864) | 1.74e8 (0.859) |
+
+Cases above 1.0 on Emerald Rapids: forward/6 1.0045 (IQR 0.996-1.027; the asm, unchanged).
+Convolution cases 0.90-0.99 (2^6: 0.90, the intrinsics). Neoverse V2: no case above 1.008;
+forward, inverse, multiply at 2^10 / 2^16 / 2^25 0.99-1.0. Zen 5: inverse 0.95-0.97 from 2^9 to
+2^17 (2^10 0.952, 2^16 0.965), 0.97-1.0 above; forward 0.98-1.0, multiply 0.99-1.0. Zen 5 cases
+above 1.005: multiply/8 and multiply_dense/8 1.008-1.009, multiply/11 and multiply_dense/11 1.009,
+forward/22 1.007, multiply/22 1.008, convolution/8 1.011, convolution/10 1.016,
+convolution_into/10 1.023, convolution/11 and convolution_into/11 1.010-1.011, inverse/7 1.009
+(the asm). In a probe (`micro.cpp`, 5 rounds) this round's code ran multiply and
+construct-and-multiply at 2^8-2^11 as fast as or faster than builds without the unshifted q or
+with a and b interleaved per group: code placement, a guess. A run while another agent built on
+`lc-zen5` had IQRs up to 1.35; not used.
+
+Page size (`pages.cpp`, exploration folder): multiply() with a and b in fresh 4 KiB-page mappings
+(`MADV_NOHUGEPAGE`) against 2 MiB pages, ratio of times, 9 rounds, Emerald Rapids: 2^16 0.998,
+2^17 0.978, 2^18 0.955, 2^19 0.938, 2^20 0.947, 2^21 0.939, 2^22 0.940, 2^23 0.943, 2^24 0.948,
+2^25 0.965 (2^6..2^15 within 1.5%); forward 2^19..2^25 0.94-0.97, inverse 2^20..2^25 0.94-0.99.
+Zen 5: 0.99-1.0 to 2^22, 1.03 from 2^23. The physical layout decides it, and it is not stable:
+`pfn.cpp` (pagemap) on `lc-intel` (1.2 GB free, 12.9 GB page cache) found 31 of 2047 neighbouring
+pages of a fresh 8 MiB mapping physically adjacent, and 11553 of 16383 in a 64 MiB one. In
+`kernel.py bench` with 4 KiB product pages, multiply/18-25 ran 0.94-0.99 but the convolution cases,
+which reuse the 2^25 product's region, 0.99-1.01. `perf stat` at 2^20: L2 misses equal (518k per
+call both), demand data misses 32k against 22k, 18.6M against 17.5M cycles.
+
+L2 sets (`stride.cpp`): one forward radix-4 pass over 4 quarters of Q words, ns per word,
+Emerald Rapids, 11 rounds. Quarters Q apart in 2 MiB pages / Q + 1024 words apart (4 KiB more) /
+4 KiB pages / 2 MiB pages with `prefetcht0` 512 words ahead per quarter:
+
+| Q (words) | apart Q | Q + 1024 | 4 KiB pages | prefetch |
+|---:|---:|---:|---:|---:|
+| 2^17 | 0.148 | 0.139 | 0.147-0.154 | 0.137 |
+| 2^19 | 0.164-0.172 | 0.149-0.150 | 0.150 | 0.134 |
+| 2^21 | 0.168-0.183 | 0.161-0.168 | 0.161-0.182 | 0.134 |
+
+Other spacings at Q = 2^19: Q + 16 words 0.246, Q + 16384 0.156, Q + 32784 0.179. Prefetch 128 to
+1024 words ahead: 0.134-0.138; `prefetcht1` 0.141-0.149; `prefetchw` as `prefetcht0`. So 4
+streams in one L2 set at each column (index bits 6-16 equal: quarters 128 KiB apart or more in
+2 MiB pages) cost 6-13%, and the prefetch more than recovers it. Zen 5: 0.062-0.073 plain; with
+the prefetch 6% slower at Q = 2^15, 8% faster at 2^21.
+
+Whole ops with the prefetch (`micro.cpp`, ns, 3 rounds, Emerald Rapids), from quarters of 2^11,
+2^13, 2^15, 2^17 words: 2^11 cost multiply/14 1% and multiply/16 2.5%; 2^15 gained the most at
+2^19-2^25 (2^17: multiply/20 0.98 against 0.96, /24 0.925 against 0.91). Radix-2 levels from
+halves of 2^19 words against 2^20: inverse/20 1.21 against 1.18 ms, multiply/20 4.17 against
+4.23 ms. Distance
+256 or 1024 words against 512: within 1% (2^25 forward and inverse 2-3% slower at 256).
+`prefetchw` on the write-only streams: multiply/18 -1.5%, /19 -2.8%, /21 -1.5%, /24 -2%, /25 -2.2%.
+
+Kernels on L1 data, `perf stat` cycles, Emerald Rapids, 64 columns of groups of quarters of 32
+words: a call per group 2145, a loop of pipelined groups 2120, two columns side by side 2008,
+with the unshifted q too 1919; one group of 64 columns 1810. Inverse: 2055, 2100, 1946, 1910;
+1840. Quarters of 128 words: 1860 per call, 1873 in a loop (kept: no gain, no loss). Unshifted q
+in the bottoms: forward 820 -> 815-827 (p0 + p5 uops 1464 -> 1415), inverse 626-667 -> 598-633,
+products 4430 -> 4377 per 32 groups.
 
 2026-10-11, claude (issue #3, round 1): moved lc-opt `lib/ntt` (`ntt.hpp`, `product.hpp`, both
 generators and their output) here. Changes: namespaces `fps::ntt`; one `Convolution` picks the
@@ -687,6 +781,56 @@ whole ops from `kernel.py bench --base`, GCC 15.2, `tools/kernel.py` flags.
   Mac.
 - Open: small's tuned NTT times (`backend/small/tuned.hpp`, issue #54) were measured before this
   round; `tools/tune.py small` should run again on arm, avx512 and zen5.
+
+2026-10-11, claude (issue #5, round 2): Emerald Rapids, from the leads of rounds 1 and #38.
+Measurements above (zmm intrinsics, issue #5 round 2); probes and raw output in
+`~/Documents/hpc_library-explore/ntt/avx512-r2/`. GCC 15.2, `tools/kernel.py` flags.
+- Where the time went (`perf record`, `micro.cpp`): forward/12 bottom 37%, levels 45%, radix-2
+  top and the inlined identity group 8%; inverse/12 bottom 28%, the scaled top group 22%;
+  multiply/12 product bottom 51%, multiply/16 40%. Kernels at 89-99% of the p0 + p5 floor on L1
+  data (bottom forward: p5 busy 94% of its cycles). Large lengths (an estimate from the times per
+  length): forward and inverse cost about 0.12 ns per word and radix-4 level in L2, 0.22 in passes
+  over L3 (2^25: 3 of 11 levels).
+- Lead from #38 (multiply 3.7% faster in 4 KiB pages): confirmed in a probe (4-6% from 2^18), and
+  `kHugeProductPages = false` for Emerald Rapids gave multiply/18-25 0.94-0.99 in `kernel.py
+  bench`. Not kept: the gain comes from 4 KiB pages landing on scattered physical pages, which
+  a fresh mapping on a fragmented machine gets and a large or reused one does not (the
+  convolution cases, on the 2^25 product's region, gained nothing; pagemap counts above). Cause
+  found with `stride.cpp`: 4 quarters 128 KiB apart or more share an L2 set at every column in
+  2 MiB pages; 4 KiB more between quarters gave the same 13% as 4 KiB pages. A padded layout for
+  products (not built) would fix it without the page lottery; the prefetch below does better.
+- Won: software prefetch (Design) on groups with quarters of 2^15 words or more, radix-2 levels on
+  halves of 2^20 or more: whole ops above. Against the previous step, 7 rounds: Emerald Rapids
+  0.981 (multiply 2^19-2^25 0.87-0.95, forward 2^19-2^25 0.88-0.97, smaller cases unchanged).
+  Zen 5 without it: unchanged (1.0001).
+- Won: `prefetchw` for streams written but not read (1.5-3% on multiply from 2^18).
+- Won: one call per level inside tiles (`forward_groups`, `inverse_groups`), groups of two
+  columns side by side, and Shoup products with q unshifted for the odd words (Design). Against
+  the previous step, 7 rounds: Emerald Rapids 0.984 (forward and inverse 0.96-0.99 at every
+  length from 2^8, multiply 0.96-0.99), Zen 5 0.992 (inverse 0.94-0.98).
+- Won: multiply at 2^6 by the intrinsics on Emerald Rapids (`select.hpp`): multiply/6 0.94,
+  multiply_dense/6 0.92, convolution/6 0.90.
+- Tried, no gain:
+  - The folded scale from 2^18 again, with the prefetch: multiply/18 still 4% slower (880 against
+    916 us), inverse/19 2% faster, 2^20-2^25 within 1%. `kFoldMaxLog` stays 17.
+  - Transform tiles of 1024 and 4096 leaves (forward and inverse level by level in L1 or L2):
+    2^10-2^17 within 1%.
+  - Bottom forward and inverse with twiddles by `broadcast_halves` instead of `vpermd`: forward
+    820 -> 840 cycles, p5 unchanged (the masked broadcast's merge took p5 instead); inverse equal.
+  - Prefetch on Zen 5 (quarters from 2^15, 2^17, 2^19 words): multiply 2^18-2^25 1-3% slower,
+    forward 1-3% slower; inverse 2^23-2^25 6-11% faster from 2^15 in one run. Then in inverse
+    passes only (groups from 2^15 or 2^17 words, radix-2 from 2^20): inverse/25 0.95, the other
+    inverse lengths 0.99-1.01, multiply 0.99-1.01. Not kept.
+- Not built: radix-16 passes for levels beyond L2 (2 levels per pass): by depth-first counting
+  one L3 pass fewer, only from 2^23; a padded product layout.
+- Units that include ntt, `lc-intel`, 5 rounds against main: frontend 0.986 (multiply/8-22
+  0.93-0.98), small 1.0016 (every case within its IQR). Outside this folder: `Arith::mul` reads
+  `simd::detail::kMulhiPermute`; simd is unchanged.
+- Tests: `forward_groups` and `inverse_groups` against the lane models (1-5 groups from k, k = 0
+  first, quarters of 32 and 128 words); groups on quarters of 2^15 words (the prefetching passes).
+  The prefetching paths run in every transform and product test from 2^17 (to 2^25 at -O2, 2^20
+  under ASan). Pass at -O2 and ASan/UBSan on `lc-amd` (scalar, sse, avx2), `lc-intel-test`
+  (ntt, frontend, small), `lc-zen5-test`, `lc-arm` and the Mac (scalar, arm).
 
 ## Sources
 
