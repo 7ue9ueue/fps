@@ -109,9 +109,13 @@ struct scalar {
         detail::scalar::scale(f, std::size_t(1) << lg, detail::leaf_scale(lg));
     }
 
-    // Every word of a and b is read: n and m only say which are zero.
-    static void multiply(std::uint32_t* a, std::uint32_t* b, std::size_t, std::size_t, int lg,
+    // Words [n, L) of a are zero, but the upper half of a factor of at most L / 2 coefficients may
+    // hold anything: it is zeroed here, as the other variants do not read it. Same for b.
+    static void multiply(std::uint32_t* a, std::uint32_t* b, std::size_t n, std::size_t m, int lg,
                          const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
+        const std::size_t len = std::size_t(1) << lg;
+        if (2 * n <= len) std::fill(a + len / 2, a + len, 0u);
+        if (2 * m <= len) std::fill(b + len / 2, b + len, 0u);
         forward(a, lg, roots);
         forward(b, lg, roots);
         detail::scalar::multiply_leaves(a, b, lg, roots);

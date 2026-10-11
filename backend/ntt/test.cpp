@@ -1,13 +1,17 @@
 // Tests for backend/ntt. Every variant this machine runs: tables, transforms against the leaf form
 // computed directly and against the scalar model, products against schoolbook multiplication and,
 // for long ones, evaluation at random points. AVX2: each asm kernel against a scalar model of its
-// butterfly, with inputs at the edges of its lazy ranges.
+// butterfly, with inputs at the edges of its lazy ranges. Convolution's memory: kept per thread,
+// the caller's, several threads.
 #include "backend/ntt/ntt.hpp"
 
 #include <array>
 #include <cstdio>
+#include <new>
 #include <random>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -193,11 +197,145 @@ void test_products(const char* name, int max_lg) {
     }
 }
 
+// Factors of at most half the length with garbage in their upper halves, which must not matter.
+template <class V>
+void test_upper_halves_unread(const char* name, std::size_t n, std::size_t m) {
+    const auto a = random_poly(n, 0), b = random_poly(m, 0);
+    Convolution conv(n, m);
+    std::copy(a.begin(), a.end(), conv.a());
+    std::copy(b.begin(), b.end(), conv.b());
+    const std::size_t half = conv.length() / 2;
+    for (std::size_t i = half; i < 2 * half; ++i) conv.a()[i] = u32(rng()), conv.b()[i] = u32(rng());
+    const u32* c = conv.template multiply<V>();
+    expect(std::vector<u32>(c, c + n + m - 1) == schoolbook(a, b), name, n * 100000000 + m);
+}
+
+// count words `offset` words past a 4 KiB boundary, then kPadding words that end the allocation,
+// so ASan sees a read past them.
+class PageWords {
+public:
+    PageWords(std::size_t count, std::size_t offset)
+        : offset_(offset), words_(static_cast<u32*>(::operator new(bytes(count, offset), std::align_val_t(4096)))) {}
+    ~PageWords() { ::operator delete(words_, std::align_val_t(4096)); }
+    PageWords(const PageWords&) = delete;
+    PageWords& operator=(const PageWords&) = delete;
+    u32* begin() { return words_ + offset_; }
+
+private:
+    static std::size_t bytes(std::size_t count, std::size_t offset) { return (offset + count + kPadding) * sizeof(u32); }
+    std::size_t offset_;
+    u32* words_;
+};
+
+// a in the caller's memory at offsets of 0 to 1008 words in a page, full of garbage: the product
+// comes back in it, its padding is not written.
+template <class V>
+void test_caller_memory(const char* name, std::size_t n, std::size_t m) {
+    const auto f = random_poly(n, 0), g = random_poly(m, 0);
+    const std::size_t len = Convolution::length(n, m);
+    const auto product = schoolbook(f, g);
+    for (const std::size_t offset : {0, 16, 32, 48, 512, 1008}) {
+        PageWords a(len, offset);
+        for (std::size_t i = 0; i < len + kPadding; ++i) a.begin()[i] = u32(rng());
+        const std::vector<u32> padding(a.begin() + len, a.begin() + len + kPadding);
+        std::copy(f.begin(), f.end(), a.begin());  // before constructing
+        Convolution conv(n, m, a.begin());
+        std::copy(g.begin(), g.end(), conv.b());
+        const u32* c = conv.template multiply<V>();
+        bool ok = c == a.begin() && conv.a() == a.begin() && conv.length() == len;
+        ok &= std::vector<u32>(c, c + conv.size()) == product;
+        ok &= std::vector<u32>(a.begin() + len, a.begin() + len + kPadding) == padding;
+        expect(ok, name, offset * 100000000 + n);
+    }
+}
+
 template <class V>
 void test_variant(const char* name, int max_lg) {
     test_tables<V>(name);
     test_transforms<V>(name, max_lg);
     test_products<V>(name, max_lg);
+    for (int lg = kMinLog; lg <= 11; ++lg) {
+        const std::size_t len = std::size_t(1) << lg;
+        test_upper_halves_unread<V>(name, len / 2, len / 2);
+        test_upper_halves_unread<V>(name, len / 2 - 3, len / 4 + 9);
+        test_caller_memory<V>(name, len / 2, len / 2);
+        test_caller_memory<V>(name, len - 9, 10);
+        test_caller_memory<V>(name, len / 4 + 1, len / 4 + 1);
+    }
+    test_caller_memory<V>(name, 0, 5);
+}
+
+// Products on one thread, inputs from its own generator: the number of wrong ones. Lengths cross
+// 2^kStaticLog, so threads build their own tables at the same time.
+int thread_products(unsigned seed) {
+    std::mt19937_64 local(seed);
+    const auto poly = [&](std::size_t n) {
+        std::vector<u32> p(n);
+        for (u32& x : p) x = u32(local() % P);
+        return p;
+    };
+    int wrong = 0;
+    for (int round = 0; round < 24; ++round) {
+        const bool exact = round % 3 != 2;
+        const std::size_t n = exact ? 1 + local() % 1200 : (std::size_t(1) << 16) + local() % 70000;
+        const std::size_t m = 1 + local() % n;
+        const auto f = poly(n), g = poly(m);
+        Convolution conv(n, m);
+        std::copy(f.begin(), f.end(), conv.a());
+        std::copy(g.begin(), g.end(), conv.b());
+        const u32* c = conv.multiply();
+        const std::vector<u32> h(c, c + conv.size());
+        if (exact) {
+            wrong += h != schoolbook(f, g);
+        } else {
+            const u32 x = u32(local() % P);
+            wrong += evaluate(h, x) != mul(evaluate(f, x), evaluate(g, x));
+        }
+    }
+    return wrong;
+}
+
+// The memory kept per thread: two Convolutions alive at once, shorter tables after longer ones,
+// threads, and the errors. (Every other product test reuses regions of other sizes.)
+void test_memory() {
+    {
+        const auto f = random_poly(300, 0), g = random_poly(200, 0), u = random_poly(40, 0), v = random_poly(50, 0);
+        Convolution outer(300, 200);
+        std::copy(f.begin(), f.end(), outer.a());
+        std::copy(g.begin(), g.end(), outer.b());
+        {
+            Convolution inner(40, 50);
+            std::copy(u.begin(), u.end(), inner.a());
+            std::copy(v.begin(), v.end(), inner.b());
+            const u32* c = inner.multiply();
+            expect(std::vector<u32>(c, c + 89) == schoolbook(u, v), "memory: inner product");
+        }
+        const u32* c = outer.multiply();
+        expect(std::vector<u32>(c, c + 499) == schoolbook(f, g), "memory: outer product");
+    }
+    for (const int lg : {19, 17, 18, 17})
+        test_product<SelectedMultiply>("memory: tables", std::size_t(1) << (lg - 1), 77, 0, false);
+    std::array<int, 4> wrong{};
+    std::vector<std::thread> threads;
+    for (unsigned t = 0; t < wrong.size(); ++t) threads.emplace_back([t, &wrong] { wrong[t] = thread_products(t); });
+    for (auto& thread : threads) thread.join();
+    for (const int w : wrong) expect(w == 0, "memory: threads", u64(w));
+
+    bool threw = false;
+    try {
+        PageWords a(64, 4);  // 16 bytes past a page boundary
+        Convolution conv(10, 10, a.begin());
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    expect(threw, "memory: a not 64-byte aligned");
+    threw = false;
+    try {
+        Convolution conv(std::size_t(1) << kMaxLog, 2);
+    } catch (const std::length_error&) {
+        threw = true;
+    }
+    expect(threw, "memory: product too long");
 }
 
 // Random values below bound, the largest ones in the first words.
@@ -391,19 +529,6 @@ void test_bottoms() {
     }
 }
 
-// Factors of at most half the length with garbage in their upper halves, which must not be read.
-void test_upper_halves_unread(std::size_t n, std::size_t m) {
-    const auto a = random_poly(n, 0), b = random_poly(m, 0);
-    Convolution conv(n, m);
-    std::copy(a.begin(), a.end(), conv.a());
-    std::copy(b.begin(), b.end(), conv.b());
-    const std::size_t half = conv.length() / 2;
-    for (std::size_t i = half; i < 2 * half; ++i) conv.a()[i] = u32(rng()), conv.b()[i] = u32(rng());
-    const u32* c = conv.multiply<variant::avx2>();
-    expect(std::vector<u32>(c, c + n + m - 1) == schoolbook(a, b), "avx2: upper halves unread",
-           n * 100000000 + m);
-}
-
 Vec* vec(Words& w) { return reinterpret_cast<Vec*>(w.begin()); }
 
 // Runs kernel on 4h vectors with inputs below in_bound; checks every lane against model and
@@ -555,11 +680,6 @@ void test_avx2() {
     test_loops();
     test_bottom_levels();
     test_group_bottom();
-    for (int lg = kMinLog; lg <= 11; ++lg) {
-        const std::size_t len = std::size_t(1) << lg;
-        test_upper_halves_unread(len / 2, len / 2);
-        test_upper_halves_unread(len / 2 - 3, len / 4 + 9);
-    }
     test_bottoms();
     test_variant<variant::avx2>("avx2", kMaxLog);
 }
@@ -569,6 +689,7 @@ void test_avx2() {
 }  // namespace
 
 int main() {
+    test_memory();
     test_variant<variant::scalar>("scalar", kScalarMaxLog);
     test_intrinsics();
 #ifdef __AVX2__

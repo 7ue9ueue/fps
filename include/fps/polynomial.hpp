@@ -24,8 +24,8 @@
 // ntt::Convolution, which needs n + m - 1 <= 2^25 (else std::length_error). The Convolution keeps
 // the product in its own memory, so f * g copies it out: 0.6% to 6% over the kernel on x86 from
 // 2^10 coefficients (frontend/notes.md). The fast path is fps::ntt::Convolution itself, reading
-// the product from multiply(); once backend issue #38 lets it write into caller memory, the fast
-// path is fps::raw::mul (DESIGN.md, Raw functions).
+// the product from multiply(), or Convolution(n, m, a), which leaves it in the caller's a (backend
+// issue #38; f * g does not use it yet). Later: fps::raw::mul (DESIGN.md, Raw functions).
 #pragma once
 
 #include <algorithm>
@@ -131,9 +131,11 @@ inline std::optional<Term> single_term(std::span<const std::uint32_t> f) {
 }
 
 // Whether a product of n and m coefficients runs schoolbook rather than ntt::Convolution. On Zen 3
-// schoolbook costs 0.24 ns per term; a Convolution 51 us at any short length (a fresh mapping per
-// call) plus 3 to 4.5 ns per coefficient of its length. They meet near 443 x 443 (3 2^16 terms)
-// and, for long factors, between m = 32 and m = 48 (frontend/notes.md).
+// schoolbook costs 0.24 ns per term; a Convolution cost 51 us at any short length (a fresh mapping
+// per call) plus 3 to 4.5 ns per coefficient of its length. They met near 443 x 443 (3 2^16 terms)
+// and, for long factors, between m = 32 and m = 48 (frontend/notes.md). Stale: since backend
+// issue #38 a Convolution keeps its memory per thread and costs about what multiply() costs; the
+// cutoff is issue #37's.
 constexpr bool schoolbook_wins(std::size_t n, std::size_t m) {
     return std::min(n, m) <= 32 || n * m < 3 * (std::size_t(1) << 16);
 }

@@ -5,7 +5,8 @@ Number-theoretic transforms and products modulo P = 998244353. API: `ntt.hpp` (`
 (`intrinsics<S>`, templates on any `backend/simd` struct S), `avx2.hpp` (lc-opt's `lib/ntt`).
 `select.hpp` picks one per op and length: `avx2` on the `avx2` target; on `avx512` and `zen5`
 `intrinsics<Avx512>` from 2^8-2^10 on (per op and CPU) and `avx2` below; `intrinsics<simd::Native>`
-on the other targets. Tests: `test.cpp`; benches: `bench.cpp`.
+on the other targets. `memory.hpp`: `Convolution`'s memory, kept per thread. Tests: `test.cpp`;
+benches: `bench.cpp`.
 Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_product_kernels.hpp`
 (`gen_avx2_product_kernels.py`).
 
@@ -23,9 +24,16 @@ Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_produc
   Blocks of 8 values then their 8 Shoup quotients; L/16 entries each way. Entry k does not
   depend on L: both tables for L <= 2^16 are built at compile time (`kStaticTables`, 2 x 32 KiB);
   longer tables copy them and extend.
-- `Convolution`: a, b (and the tables past 2^16) in one mapping, 2 MiB aligned, `MADV_HUGEPAGE`;
-  a and b are L + 16 words apart, so equal offsets fall in different cache sets. Up to 2^16 the
-  tables are the compile-time ones; past it they are built per call.
+- `Convolution` (memory: `memory.hpp`): a and b in one region, 2 MiB aligned, `MADV_HUGEPAGE`,
+  kept per thread across calls (one free region per thread, the largest given back); a and b are
+  L + 16 words apart, so equal offsets fall in different cache sets. With a in the caller's memory
+  (64-byte aligned, L + 16 words), b is in the region at a + L + 16 words modulo 4 KiB: the same
+  layout as far as caches and 4K aliasing see it. The constructor zeroes [n, L/2) of a sparse
+  factor (n <= L/2; its upper half is not read) and [n, L) of a dense one. Up to 2^16 the tables
+  are the compile-time ones; past it, one pair per thread, built for the longest length so far.
+- Variant contract for `multiply(a, b, n, m, lg, ...)`: words [n, L) of a are zero, except that
+  the upper half of a factor with n <= L/2 may hold anything (avx2 and intrinsics do not read it;
+  scalar zeroes it). Same for b.
 - `Transform`: tables built once; forward and inverse in place on caller arrays (32-byte aligned,
   16 words of padding: the AVX2 forward kernels read 4 bytes past their last vector).
 
@@ -247,6 +255,63 @@ Variants against the selected ones in the same run (`@` cases, median of 5, ns r
 - Neoverse V2, ns (ns per coefficient): forward/16 124766 (1.90), inverse/16 119537 (1.82),
   multiply/16 474831 (7.25). Its Shoup products use SVE2 `umulh` (issue #2, round 2).
 
+### Convolution memory (issue #38, round 1)
+
+`kernel.py bench --base`, 7 rounds, GCC 15.2, each target's flags, 2026-10-11. Base: main 7544480
+with this round's bench.cpp (its `convolution` case, which maps fresh memory per call there).
+`convolution/<lg>`: construct, multiply and destroy a Convolution of 2^lg / 2 and 2^lg / 2
+coefficients; `multiply/<lg>`: multiply() alone. ns, medians:
+
+| lg | Zen 3: multiply / convolution / main's convolution | Emerald Rapids | Zen 5 | Neoverse V2 |
+|---:|---|---|---|---|
+| 6 | 106 / 109 / 56077 | 142 / 144 / 55626 | 89 / 91 / 32105 | 223 / 231 / 23476 |
+| 8 | 478 / 490 / 56365 | 474 / 478 / 56043 | 330 / 332 / 32346 | 1033 / 1038 / 24101 |
+| 10 | 2141 / 2150 / 57938 | 2207 / 2212 / 60115 | 1278 / 1280 / 34040 | 4841 / 4844 / 28717 |
+| 12 | 9895 / 9934 / 65758 | 10114 / 10136 / 68518 | 5694 / 5705 / 38585 | 22604 / 22611 / 46682 |
+| 14 | 46216 / 46273 / 102850 | 47870 / 47874 / 106343 | 26284 / 26323 / 59385 | 104608 / 104584 / 130249 |
+| 16 | 212962 / 212595 / 270509 | 216431 / 216395 / 283191 | 117797 / 117946 / 150698 | 474581 / 474386 / 504992 |
+| 20 | 4.26e6 / 4.27e6 / 4.56e6 | 4.93e6 / 4.92e6 / 5.37e6 | 2.35e6 / 2.35e6 / 2.52e6 | 9.59e6 / 9.59e6 / 9.98e6 |
+| 22 | 1.88e7 / 1.88e7 / 2.08e7 | 2.19e7 / 2.19e7 / 2.37e7 | 1.05e7 / 1.05e7 / 1.20e7 | 4.26e7 / 4.26e7 / 4.36e7 |
+
+- Construction now costs 2-12 ns (convolution / multiply 1.01-1.04 at 2^6, 1.00-1.015 from
+  2^9), against 23-56 us before: the first touch of a fresh 2 MiB huge page.
+- multiply/<lg> against main: 2^6..2^16 unchanged within noise, except Zen 3 at 2^7 (below);
+  2^17..2^25 faster, tables kept per thread instead of built per call: Zen 3 0.982-0.992,
+  Emerald Rapids 0.959-0.985, Zen 5 0.983-0.990, Neoverse V2 0.987-0.992. multiply_dense alike.
+- Zen 3 at 2^7 moves with the memory's placement, not the code: the same binary with the region
+  reused or mapped fresh per case gave multiply/7 0.93 and multiply_dense/7 1.07 (11 rounds); main
+  against this round gave 1.02-1.04 and 1.05-1.10 in three runs. Round 2 of issue #3 logged the
+  same swings at 2^7 and 2^8 from unrelated changes.
+
+Item 2, the product in caller memory (`explore/probe_memory.cpp`, exploration folder): a product
+of two factors of 2^lg / 2 coefficients as the frontend runs it, from sources 16 bytes past a page
+boundary, 5 rounds, ratio to multiply() alone. "owned": Convolution(n, m), copy f and g in,
+multiply, copy the product out; "into": copy f into the caller's a, Convolution(n, m, a), copy g
+in, multiply.
+
+| lg | Zen 3 owned / into | Emerald Rapids | Zen 5 | Neoverse V2 |
+|---:|---|---|---|---|
+| 6 | 1.138 / 1.071 | 1.065 / 1.004 | 1.105 / 1.044 | 1.062 / 1.030 |
+| 10 | 1.042 / 1.021 | 1.027 / 1.012 | 1.043 / 1.021 | 1.021 / 1.012 |
+| 14 | 1.054 / 1.025 | 1.054 / 1.026 | 1.055 / 1.032 | 1.017 / 1.011 |
+| 18 | 1.063 / 1.018 | 1.121 / 1.050 | 1.048 / 1.017 | 1.027 / 1.017 |
+| 22 | 1.123 / 1.065 | 1.110 / 1.017 | 1.109 / 1.065 | 1.029 / 1.004 |
+
+The copy out (owned against into) cost 1.5-9% on x86, 0.6-3% on Neoverse V2. What remains of
+"into" is the two copies in.
+
+memcpy by destination offset from the source, modulo 4 KiB (same probe, sources 0, 16 and 64
+bytes past a page; 5 rounds). The 4-20x of issue #38 did not reproduce here. Slowest against
+fastest:
+- Zen 3: at most 1.35x (2^10 words, offsets +-16).
+- Emerald Rapids: offsets not a multiple of 64 bytes 1.3-1.55x at 2^10..2^12 words, 1.05-1.1x at
+  2^14..2^16.
+- Zen 5: destination 0 to 128 bytes past the source 1.3-1.7x at 2^14..2^16 words; offsets not a
+  multiple of 64 1.1-1.6x at 2^10..2^12.
+- Neoverse V2: no effect (within 3%).
+- Fast on all four: the destination 64 or 128 bytes before the source, or 256 bytes or more past
+  it, a multiple of 64 bytes.
+
 ## Log
 
 2026-10-11, claude (issue #3, round 1): moved lc-opt `lib/ntt` (`ntt.hpp`, `product.hpp`, both
@@ -355,6 +420,48 @@ selection, tests, benches. Measurements above (intrinsics). Commits on `agent/nt
 - Not done: merged tiles (one bottom stage for sibling subtrees, as avx2 now), zmm for Neon's
   4-lane equivalent (no two-source permute in `simd::Neon`), a Neon Shoup on x < 2^31 (`sqdmulh`)
   with values kept < 2P, the asm's tricks (windows P - y A, scale folded into twiddles).
+
+2026-10-11, claude (issue #38, round 1): `Convolution`'s memory kept per thread, and a product
+into caller memory. Measurements above (Convolution memory). Commits on `agent/ntt-all-r1-memory`.
+- Item 1 (`memory.hpp`): each thread keeps one free region, the largest given back; the
+  constructor takes it if it is large enough, else maps one (as before: 2 MiB aligned,
+  `MADV_HUGEPAGE`); the destructor gives it back. A second Convolution alive on the thread maps
+  its own. Tables past 2^16: one pair per thread, rebuilt only for a longer length (entry k does
+  not depend on L). State is a trivially destructible `thread_local`; a block-scope
+  `thread_local` closer unmaps at thread exit and marks it closed, so Convolutions destroyed after
+  that (static destructors at exit) unmap their regions instead of keeping them.
+- A reused region holds old data, so the constructor zeroes what the variants read past a factor:
+  [n, L/2) of a factor with n <= L/2, [n, L) else. avx2 and intrinsics never read a sparse
+  factor's upper half; scalar did, and now zeroes it itself (its multiply only). Cost: the probe's
+  dense shape (3L/4 and L/4 + 1, L/2 words zeroed) against its multiply() alone, 1.002-1.035 from
+  2^8 (Zen 3 2^7 1.14: placement, above).
+- Item 2: `Convolution(n, m, a)` takes a from the caller (64-byte aligned, `length(n, m)` + 16
+  words; static `length(n, m)` sizes it before constructing; a misaligned a throws
+  `std::invalid_argument`). b goes in the region at a + L + 16 words modulo 4 KiB, the layout
+  a and b have in a Convolution's own region. The constructor zeroes a's tail, so f may be written
+  before or after it. It runs at the speed of the owned form or faster: `convolution_into` against
+  `convolution` 0.99-1.01 on Zen 3 (0.95 at 2^7), 0.95-1.01 on Emerald Rapids (faster from 2^19:
+  4 KiB pages, below).
+- Tests: every product test now runs on reused regions holding the previous products; per
+  variant, garbage in a sparse factor's upper half; a in caller memory at 6 offsets in a page,
+  filled with garbage, with the padding checked unwritten and the allocation ending at the
+  padding (ASan); two Convolutions alive at once; tables at 2^19, then 2^17, 2^18, 2^17; 4
+  threads multiplying at once across 2^16 (each builds its tables); both errors. Mutations
+  caught: no tail zeroing (2240 failures), tables built for half the length (53), scalar not
+  zeroing the sparse upper half (617). Pass at -O2 and ASan/UBSan on `lc-amd` (scalar, sse,
+  avx2), `lc-intel-test`, `lc-zen5`, `lc-arm` and the Mac (scalar, arm).
+- Tried, no gain: the thread's tables 128 bytes past a page boundary (as when they followed a
+  and b in one region; now they start at it, like a). 2^17..2^25, 7 rounds against tables at
+  0: geomean 1.001 on Zen 3, 0.999 on Emerald Rapids (all cases within noise). Not kept.
+- Found, not acted on: on Emerald Rapids multiply() runs 3.7% faster at 2^20 and 2^22 (1.7% at
+  2^18) with a in 4 KiB pages (`operator new`, 64 bytes past a page) than in a huge-page region,
+  at offset 0 or 64 alike (probe, 5 rounds); on Zen 3 within 1.1%. This is why
+  `convolution_into` beat `convolution` by 4-5% from 2^19 there. Guess: power-of-two strides on
+  one huge page share L2 sets; 4 KiB pages scatter them. A lead for issue #5 (avx512): b, or both,
+  in 4 KiB pages at large lengths.
+- Not done: a product into a tight `out` of n + m - 1 words (`fps::raw::mul` in DESIGN.md wants
+  that; with this API it copies out of a); copies in fused with the first forward level (what
+  is left of "into", 1-7%). Both change the variants' top levels, including the avx2 asm.
 
 ## Sources
 
