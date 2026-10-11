@@ -157,10 +157,13 @@ public:
     // The count subtrees of groups first, first + 1, ... with nv vectors each, one after another
     // from a and b: nv a power of 4, at least Bottom::kMinVectors.
     void visit(Vec* a, Vec* b, std::size_t nv, std::size_t count, std::size_t first) const {
-        if (nv <= kTile) {
-            const std::size_t run = std::min(count, kTile / nv);
-            for (std::size_t c = 0; c < count; c += run) tile(a + c * nv, b + c * nv, nv, run * nv, (first + c) * nv);
-            return;
+        switch (nv) {
+        case 4:
+            if constexpr (Bottom::kMinVectors <= 4) return tiles<4>(a, b, count, first);
+            break;
+        case 16: return tiles<16>(a, b, count, first);
+        case 64: return tiles<64>(a, b, count, first);
+        case 256: return tiles<256>(a, b, count, first);
         }
         const std::size_t h = nv / 4;
         for (std::size_t k = first; k < first + count; ++k, a += nv, b += nv) {
@@ -171,14 +174,21 @@ public:
     }
 
 private:
-    // Subtrees of nv vectors each, total vectors from a and b; the first starts at vector `base`
-    // of its level, so the group at a + j with stride h is (base + j) / 4h.
-    [[gnu::noinline]] void tile(Vec* a, Vec* b, std::size_t nv, std::size_t total, std::size_t base) const {
-        for (std::size_t h = nv / 4; h >= 4; h /= 4)
-            for (std::size_t j = 0; j < total; j += 4 * h) forward_groups(a + j, b + j, h, (base + j) / (4 * h), r_);
-        Bottom::run(a, b, total, base / 4, r_, ir_);
-        for (std::size_t h = 4; h < nv; h *= 4)
-            for (std::size_t j = 0; j < total; j += 4 * h) inverse_group(a + j, h, (base + j) / (4 * h), ir_);
+    template <std::size_t NV>
+    void tiles(Vec* a, Vec* b, std::size_t count, std::size_t first) const {
+        const std::size_t run = std::min(count, kTile / NV);
+        for (std::size_t c = 0; c < count; c += run) tile<NV>(a + c * NV, b + c * NV, run * NV, first + c);
+    }
+
+    // Subtrees of NV vectors each, total vectors from a and b; the first is group k of its level,
+    // so the groups with stride h are numbered from k NV / 4h.
+    template <std::size_t NV>
+    [[gnu::noinline]] void tile(Vec* a, Vec* b, std::size_t total, std::size_t k) const {
+        for (std::size_t h = NV / 4; h >= 4; h /= 4)
+            for (std::size_t j = 0, g = k * (NV / (4 * h)); j < total; j += 4 * h, ++g) forward_groups(a + j, b + j, h, g, r_);
+        Bottom::run(a, b, total, k * (NV / 4), r_, ir_);
+        for (std::size_t h = 4; h < NV; h *= 4)
+            for (std::size_t j = 0, g = k * (NV / (4 * h)); j < total; j += 4 * h, ++g) inverse_group(a + j, h, g, ir_);
     }
 
     const u32 *r_, *ir_;
