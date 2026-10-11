@@ -77,7 +77,7 @@ EMERALD_RAPIDS = Machine(
     ops=_ops({
         ('vpaddd', 256): (1.67, 0.333, 'p0 p1 p5'),
         ('vpsubd', 256): (1.67, 0.333, 'p0 p1 p5'),
-        ('vpaddq', 256): (1.67, 0.333, 'p0 p1 p5'),
+        ('vpaddq', 256): (1, 0.333, 'p0 p1 p5'),  # 1.67 in an earlier run
         ('vpblendd', 256): (1.67, 0.333, 'p0 p1 p5'),
         ('vpminud', 256): (2, 0.5, 'p0 p1'),
         ('vpmuludq', 256): (5, 0.5, 'p0 p1'),
@@ -104,8 +104,8 @@ EMERALD_RAPIDS = Machine(
     }),
     guess=(('vpshufb', 256), ('vpermd', 256), ('vpminud', 256), ('vpermd', 512), ('vpminud', 512),
            ('vpmadd52luq', 256), ('vpmadd52huq', 256), ('vpermt2d', 256), ('vpermt2d', 512)),
-    notes=('Simple ops show latency 1.67 (ymm) and 2.5 (zmm) where the guides say 1: measured with '
-           'a chain through one register; unexplained. vpmulld is 2 uops on both widths.'),
+    notes=('Simple ops show latency 1.67 (ymm) and 2.5 (zmm) where the guides say 1, through a chain on '
+           'one register; unexplained (vpaddq ymm: 1.67 in one run, 1 in the next). vpmulld is 2 uops.'),
 )
 
 # AMD Zen 5 (Turin): four 512-bit pipes; simple integer ops have latency 2.
