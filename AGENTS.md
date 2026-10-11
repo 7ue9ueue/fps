@@ -60,7 +60,7 @@ DESIGN.md                  the user API (frontend)
 BACKEND.md                 the kernel plan: targets, variants, exploration order
 backend/bench.hpp          timing harness for kernel benches
 backend/<kernel>/          one kernel: headers (API at the top), test.cpp, bench.cpp, notes.md, gen_*.py
-tools/kernel.py            test and time a kernel, per target (VMs; the Mac for scalar)
+tools/kernel.py            test and time a kernel, per target (VMs; the Mac for scalar and arm)
 tools/vm.py                run a command on a VM in a copy of your checkout
 tools/gate.py              test and time a pull request on every target; merge it if it passes
 tools/prompt.md            brief for one backend round
@@ -69,21 +69,18 @@ tools/prompt.md            brief for one backend round
 
 ## Backend
 
-`BACKEND.md` is the plan: targets, kernels, variant axes, how variants are written and chosen, and
-the exploration order. A kernel is fast inner code with a small API of its own, such as the NTT.
-The frontend calls it.
+`BACKEND.md` is the plan and the working rules: targets, directions to explore, how to write, test
+and time variants, and how agents work in parallel. A kernel lives in `backend/<kernel>/`:
 
-- `test.cpp` checks every variant the machine can run against the kernel's scalar model, and exits
-  nonzero on a failure.
-- `bench.cpp` uses `backend/bench.hpp`. Case `<op>/<size>` times what the library uses on that
-  target; the gate compares these. Case `<op>@<variant>/<size>` times one variant; it is only
-  reported. Pass the items per call (coefficients, vectors) for a per-element unit.
-- Generated code: commit the generator `gen_*.py` and its output. `gen_*.py --check` exits nonzero
-  if they differ.
+- headers, with the kernel's API at the top, and `select.hpp` (the variant per target);
+- `test.cpp`: every variant the machine can run against the scalar model; exits nonzero on a failure;
+- `bench.cpp`, on `backend/bench.hpp`: `<op>/<size>` cases are gated, `<op>@<variant>/<size>` cases
+  are reported. Pass the items per call (coefficients, vectors) for a per-element unit;
+- generated code: the generator `gen_*.py` and its output, both committed; `gen_*.py --check`
+  exits nonzero if they differ;
 - `notes.md`: design, measurements per target, and the attempt log.
-- Targets and their machines are `TARGETS` in `tools/kernel.py`: `scalar` (tested on `lc-amd` and
-  the Mac), `sse` (tested on `lc-amd`), `avx2` and `avx512` (tested and timed). Every kernel builds
-  and passes its tests on every target. To add a target, add it there with a machine for it.
+
+Targets and their machines are `TARGETS` in `tools/kernel.py`, kept in step with `BACKEND.md`.
 
 ## Tools
 
@@ -92,7 +89,7 @@ The Mac drives the VMs. The VMs cannot fetch this private repository: `tools/vm.
 - `python3 tools/vm.py <vm> [--base REV] '<command>'` copies your working tree to
   `~/hpc_library/<branch>` on the VM and runs the command there. With `--base`, REV goes to
   `$BASE` as well.
-- `python3 tools/kernel.py`, on a VM, or on the Mac for `scalar`:
+- `python3 tools/kernel.py`, on a VM, or on the Mac for `scalar` and `arm`:
   - `test <kernel> --target <t>`: -O2 and ASan/UBSan builds.
   - `bench <kernel> --target <t> [--base $BASE]`: same-run paired ratios; below 1 is faster.
   - `check`: generators.
@@ -100,6 +97,7 @@ The Mac drives the VMs. The VMs cannot fetch this private repository: `tools/vm.
   every target, times each against `main` on the target's timing machine, comments the result on
   the PR, and squash-merges if all tests pass and no target is slower (geomean of new/base <= 1).
   `gate.py <rev> --base <rev>` runs the same checks on local commits, without a PR.
+  Issues and pull requests share numbers: pass the pull request's.
 
 ```
 python3 tools/vm.py lc-amd 'python3 tools/kernel.py test ntt --target avx2'
@@ -109,52 +107,34 @@ python3 tools/vm.py lc-bench --base origin/main 'python3 tools/kernel.py bench n
 ## Process
 
 Backend work happens in rounds: one subagent per round, started by `/work` and briefed with
-`tools/prompt.md`. Each GitHub issue is a kernel, a kernel on one target, or a task
-(`.github/ISSUE_TEMPLATE/kernel.md`). An issue gets at most 5 rounds and stops after 2 rounds in a
-row without gain, unless it says otherwise.
-
-What to try: the variant axes in `BACKEND.md`. Start from the floor (pipe or bandwidth bound) and
-the gap to it.
-
-Agents may change any file, including other kernels and the tools, when it helps. The gate re-tests
-everything a change touches. Say in the PR what you changed outside your kernel.
-
-## Working in parallel
-
-- One agent per issue at a time. Two agents may work on the same kernel for different targets.
-- Each agent works in its own git worktree, on a branch `agent/issue<n>-r<round>` from `origin/main`.
-- Read the kernel's `notes.md` first. Do not repeat a logged attempt without a new reason.
-- Log every attempt, win or loss: date, idea, result, numbers (CPU, flags, commit).
-- Keep exploration files: on a VM in `~/explore/hpc_library/<kernel>/`, on the Mac in
-  `~/Documents/hpc_library-explore/<kernel>/<vm>/`. Copy them to the Mac before the round ends.
-
-## Status
-
-- Each issue is labeled `ready`, `running`, `blocked` (needs the user) or `done`.
-- Each round ends with a comment on its issue: what was tried, the numbers, and a last line that
-  is exactly `Result: gain` or `Result: no gain`. `/work` reads that line.
+`tools/prompt.md`. Each GitHub issue (`.github/ISSUE_TEMPLATE/kernel.md`) is labeled `ready`,
+`running`, `blocked` (needs the user) or `done`. `/work` reads the `Result:` line each round ends
+with (`BACKEND.md`, Working in parallel).
 
 ## Machines
 
-We share lc-opt's VMs. Its `AGENTS.md` (Machines, Instruction sets) is the full reference.
+We share lc-opt's VMs and add three for the backend targets (`BACKEND.md`). lc-opt's `AGENTS.md`
+(Machines, Instruction sets) is the full reference.
 
 | Machine | CPU | Use |
 |---|---|---|
-| Mac | ARM64 (M4 Pro), Apple clang | Edit, `scalar` tests (`kernel.py` runs locally). x86 binaries run under Rosetta; never time them. |
+| Mac | ARM64 (M4 Pro), Apple clang | Edit, `scalar` and `arm` tests (`kernel.py` runs locally). x86 binaries run under Rosetta; never time them. |
 | `lc-intel` | Xeon 8581C (Emerald Rapids), AVX-512, PMU on | `avx512` timing. Profiling with `perf` (core events, top-down; no L3 events). |
-| `lc-intel2` | Xeon 8581C (Emerald Rapids), AVX-512 | `avx512` builds and tests, so they never wait for or disturb `lc-intel`'s timing. |
-| `lc-amd` | EPYC 7B13 (Zen 3) | `avx2` builds and tests. No hardware counters. |
-| `lc-bench` | EPYC 7B13 (Zen 3) | `avx2` timing only. Build and test elsewhere; `kernel.py` holds the lock for its own builds. |
+| `lc-amd` | EPYC 7B13 (Zen 3) | `scalar`, `sse` and `avx2` builds and tests. No hardware counters. |
+| `lc-bench` | EPYC 7B13 (Zen 3) | `avx2` timing only. Build and test elsewhere; `kernel.py bench` builds its two binaries here under the lock. |
 | `lc-k68` | EPYC 7B13, Linux 6.8 | Timing of code heavy in page faults or huge pages. Keep it on 6.8. |
+| `lc-intel-test` | Xeon 8581C, AVX-512, no PMU | `avx512` builds and tests. |
+| `lc-zen5` | EPYC 9B45 (Zen 5), AVX-512, no PMU | `zen5` builds, tests and timing. |
+| `lc-arm` | Axion (Neoverse V2), NEON, SVE2, PMU on | `arm` builds, tests and timing; `perf`. |
 
 - GCP project `project-c73e6eb1-e167-4d7a-a31`, region `europe-west2`. Zones: `lc-intel` and
-  `lc-intel2` are in `europe-west2-c`, the rest in `europe-west2-b`.
+  `lc-intel-test` are in `europe-west2-c`, the rest in `europe-west2-b`.
   Connect: `gcloud compute ssh <name> --zone=<zone>`.
 - All run Ubuntu 24.04 with Docker and the `gcc:15.2.0` image. Build with GCC 15.2.
 - Copies of this repo live in `~/hpc_library/<name>` (`tools/vm.py`). Do not touch `~/lc-opt`;
   other agents use it.
-- Flags: `-march=x86-64-v3` (AVX2, no AVX-512) by default. `-march=native` on `lc-intel` lets GCC
-  emit AVX-512 unasked; label such timings.
+- Flags: per target (`TARGETS` in `tools/kernel.py`). `-march=native` on `lc-intel` lets GCC emit
+  AVX-512 unasked; label such timings.
 - Wrap every timing or profiling run in `flock /tmp/bench.lock` (`kernel.py bench` does). On
   `lc-amd`, builds and tests may run in parallel.
 - Keep VMs running; do not stop them. Never delete a VM you did not create.

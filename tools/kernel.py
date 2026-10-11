@@ -10,7 +10,7 @@
       Run every backend/*/gen_*.py --check: generated files match their generators.
 
 On Linux (the VMs) it builds in the pinned GCC 15.2 image with Docker. On the Mac it builds with
-the local clang++ and runs only the scalar target. Run from the checkout's root.
+the local clang++ and runs the targets that list 'mac'. Run from the checkout's root.
 bench holds /tmp/bench.lock and pins one core; on a timing machine every command holds the lock,
 so builds never disturb another agent's timing.
 """
@@ -35,10 +35,11 @@ IMAGE = 'mirror.gcr.io/library/gcc:15.2.0@sha256:3ae15afe768b06d0c0fe088d822ba5f
 MAC = sys.platform == 'darwin'
 CXX = ('clang++' if MAC else 'g++') + ' -std=c++23 -Wall -Wextra -I.'
 
-# A target is a set of compiler flags, the machines that test it ('mac' is the local Mac) and the
-# one that times it (None: never timed). needs: /proc/cpuinfo flags a machine must have to run it.
+# Targets as in BACKEND.md: compiler flags, the machines that test them ('mac' is the local Mac) and
+# the one that times them (None: never timed). needs: /proc/cpuinfo flags a machine must have.
+# mac_flags: flags for the Mac instead (its M4 has NEON but no SVE).
 TARGETS = {
-    'scalar': {'flags': '', 'needs': [], 'test': ['lc-amd', 'mac'], 'time': None},
+    'scalar': {'flags': '', 'needs': [], 'test': ['lc-amd', 'mac'], 'time': None, 'mac_flags': ''},
     'sse': {
         'flags': '-march=x86-64-v2',
         'needs': ['ssse3', 'sse4_1', 'sse4_2', 'popcnt'],
@@ -54,8 +55,21 @@ TARGETS = {
     'avx512': {
         'flags': '-march=x86-64-v4 -mavx512ifma -mavx512vbmi',
         'needs': ['avx512f', 'avx512bw', 'avx512dq', 'avx512vl', 'avx512ifma', 'avx512vbmi'],
-        'test': ['lc-intel2'],
+        'test': ['lc-intel-test'],
         'time': 'lc-intel',
+    },
+    'zen5': {
+        'flags': '-march=znver5',
+        'needs': ['avx512f', 'avx512ifma', 'avx512vbmi', 'avx512_vbmi2', 'avx512_vp2intersect'],
+        'test': ['lc-zen5'],
+        'time': 'lc-zen5',
+    },
+    'arm': {
+        'flags': '-mcpu=neoverse-v2',
+        'needs': ['asimd', 'sve2'],
+        'test': ['lc-arm', 'mac'],
+        'time': 'lc-arm',
+        'mac_flags': '-mcpu=apple-m4',
     },
 }
 
@@ -119,16 +133,20 @@ def sh(trees: dict[str, Path], make_script) -> subprocess.CompletedProcess:
 
 def cpu_flags() -> set[str]:
     for line in Path('/proc/cpuinfo').read_text().splitlines():
-        if line.startswith('flags'):
+        if line.startswith(('flags', 'Features')):  # x86, ARM
             return set(line.split(':', 1)[1].split())
     return set()
+
+
+def flags(target: str) -> str:
+    return TARGETS[target].get('mac_flags', '') if MAC else TARGETS[target]['flags']
 
 
 def require_cpu(target: str) -> None:
     spec = TARGETS[target]
     if MAC:
-        if spec['flags']:
-            sys.exit(f'the Mac runs only targets without x86 flags; {target} needs {" or ".join(spec["test"])}.')
+        if 'mac' not in spec['test']:
+            sys.exit(f'the Mac cannot run target {target}; use {" or ".join(spec["test"])}.')
         return
     missing = [f for f in spec['needs'] if f not in cpu_flags()]
     if missing:
@@ -139,8 +157,9 @@ def require_cpu(target: str) -> None:
 def cpu_name() -> str:
     if MAC:
         return subprocess.run(['sysctl', '-n', 'machdep.cpu.brand_string'], capture_output=True, text=True).stdout.strip()
-    for line in Path('/proc/cpuinfo').read_text().splitlines():
-        if line.startswith('model name'):
+    lscpu = subprocess.run(['lscpu'], capture_output=True, text=True).stdout
+    for line in lscpu.splitlines():
+        if line.startswith('Model name:'):
             return line.split(':', 1)[1].strip()
     return platform.processor()
 
@@ -151,7 +170,7 @@ def build(tree: Path, kernel: str, kind: str, target: str, sanitize: bool = Fals
     out = f'build/{target}/{kernel}-{kind}{"-san" if sanitize else ""}'
     opt = '-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all' if sanitize else '-O2'
     result = sh({'w': tree}, lambda _: f'mkdir -p build/{target}\n'
-                f'{CXX} {opt} {TARGETS[target]["flags"]} backend/{kernel}/{kind}.cpp -o {out}')
+                f'{CXX} {opt} {flags(target)} backend/{kernel}/{kind}.cpp -o {out}')
     if result.returncode:
         sys.exit(f'build failed in {tree}:\n{result.stdout}{result.stderr}')
     return tree / out
@@ -178,7 +197,7 @@ def bench(args) -> int:
     if args.base:
         trees['base'] = Path(args.base)
     binaries = {name: build(tree, args.kernel, 'bench', args.target) for name, tree in trees.items()}
-    report = {'kernel': args.kernel, 'target': args.target, 'flags': TARGETS[args.target]['flags'],
+    report = {'kernel': args.kernel, 'target': args.target, 'flags': flags(args.target),
               'cpu': cpu_name(), 'compiler': 'clang++' if MAC else IMAGE, 'rounds': args.rounds,
               'identical': False, 'cases': {}}
     digests = {hashlib.sha256(b.read_bytes()).hexdigest() for b in binaries.values()}
