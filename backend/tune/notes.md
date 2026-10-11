@@ -16,9 +16,10 @@ Converted choices: small's NTT times behind `small::beats_ntt` ("small.ntt",
   reader holding a reference while another thread sets stays valid (copies are few: one per
   `set()`; they stay reachable, so LeakSanitizer reports nothing).
 - Compiled defaults per target: `tools/tune.py <kernel>` builds `backend/<kernel>/tune.cpp` on each
-  target's timing machine (lc-bench for the untimed `scalar` and `sse`), runs it on the last core
-  under `/tmp/bench.lock`, and writes `tuned.json` (values as printed, machine, CPU, date, commit)
-  and `tuned.hpp` (one array per field, one row per target in `tune::Target` order). The kernel's
+  target's timing machine (lc-bench for the untimed `scalar` and `sse`), runs a cp copy of it on
+  the last core under `/tmp/bench.lock` (Log: Zen 5 and page frames), and writes `tuned.json`
+  (values as printed, machine, CPU, date, commit) and `tuned.hpp` (one array per field, one row
+  per target in `tune::Target` order). The kernel's
   `select.hpp` takes row `int(tune::kTarget)`. `tune::kTarget` comes from the same macros as
   `select.hpp` used (`__znver5__`, `__AVX512F__ && __AVX512BW__`, `__AVX2__`, `__ARM_NEON &&
   __aarch64__`, `__SSE4_1__`); the Mac's builds get the `arm` row. `tune.py --check` (in
@@ -400,6 +401,20 @@ function added to `frontend/bench.cpp` (no kernel changed), 11 rounds: Zen 3 `mu
   9.46 ms). Pin the base by its hash. After a rebase onto e66ce2f and a third `tune.py` run, the
   frontend is 0.993-1.004 (above). Zen 3's `multiply/6`-`/7` (1.076, 1.060) are layout: main
   against main with one unused function reads 1.075 and 0.973 there.
+
+2026-10-11, claude (issue #70 round 2, factorials): Zen 5 and page frames. Details and numbers in
+`backend/factorials/notes.md` (Log, issue #70 round 2).
+- Round 1's factorials tune binary ran zmm K = 1 Shoup 1.2-2.3x slow at n <= 2048 on Zen 5. Rerun
+  from its own file it still did; a cp copy of the same file did not; evicted from the page cache
+  and read back, another variant (zmm K = 2 Montgomery) ran 1.4-2.3x slow instead. The linker
+  leaves a binary on scattered 4 KiB page-cache frames; cp writes 64 KiB folios (contiguous
+  frames). Of 6 copies written 4 KiB at a time, 2 had a variant 17-20% slow at some sizes; of 6
+  cp copies, none. On Zen 5 the speed of the same code depends on its physical frames (the
+  mechanism is a guess), fixed for as long as the file stays cached.
+- `tools/tune.py --measure` now runs a cp copy of the tune binary. Zen 5's factorials table from
+  two such runs differed in 1 of 88 classes.
+- Not changed: `tools/kernel.py` (benches, the gate) still runs freshly linked binaries, so Zen 5
+  bench numbers keep a bias per binary (e.g. PR #73's frontend `factorials/10` at 1.294).
 
 ## Sources
 

@@ -132,7 +132,13 @@ def measure(kernel: str, target: str) -> int:
     pin = f'taskset -c {os.cpu_count() - 1} '
     with bench_lock():  # the build too: this is a timing machine
         binary = build(tree, kernel, 'tune.cpp', target)
-        result = sh({'w': tree}, lambda _: pin + './' + str(binary.relative_to(tree)))
+        # Run a copy: the linker leaves the code on scattered 4 KiB page-cache frames, and on Zen 5
+        # that made variants 1.1-2.3x slow in one binary file and not in a copy of it; cp writes
+        # 64 KiB folios (backend/factorials/notes.md, issue #70).
+        copy = binary.with_name(binary.name + '-copy')
+        copy.unlink(missing_ok=True)
+        subprocess.run(['cp', str(binary), str(copy)], check=True)
+        result = sh({'w': tree}, lambda _: pin + './' + str(copy.relative_to(tree)))
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)
     return result.returncode

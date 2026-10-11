@@ -53,12 +53,7 @@ struct Candidates {};
 #define FPS_FACTORIALS_MIN_CHAINS 64
 #endif
 using Selected = Candidates<Variant<simd::FPS_FACTORIALS_ISA, FPS_FACTORIALS_VECTORS, Step::FPS_FACTORIALS_STEP>>;
-#elif defined(__znver5__)  // zen5 (tune::kTarget): no prefetching variant yet (notes.md, issue #70)
-using Selected = Candidates<Variant<simd::Sse, 1, Step::shoup>, Variant<simd::Avx512Vl, 1, Step::shoup>,
-                            Variant<simd::Avx512Vl, 1, Step::montgomery>, Variant<simd::Avx512Vl, 2, Step::montgomery>,
-                            Variant<simd::Avx512, 1, Step::shoup>, Variant<simd::Avx512, 1, Step::montgomery>,
-                            Variant<simd::Avx512, 2, Step::shoup>, Variant<simd::Avx512, 2, Step::montgomery>>;
-#elif defined(__AVX512F__) && defined(__AVX512BW__)  // avx512
+#elif defined(__AVX512F__) && defined(__AVX512BW__)  // avx512 and zen5
 using Selected = Candidates<Variant<simd::Sse, 1, Step::shoup>, Variant<simd::Avx512Vl, 1, Step::shoup>,
                             Variant<simd::Avx512Vl, 1, Step::montgomery>, Variant<simd::Avx512Vl, 2, Step::montgomery>,
                             Variant<simd::Avx512, 1, Step::shoup>, Variant<simd::Avx512, 1, Step::montgomery>,
