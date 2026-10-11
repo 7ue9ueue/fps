@@ -10,7 +10,8 @@
 A unit is a backend kernel (folder backend/<kernel>/) or `frontend` (folder frontend/, headers in
 include/fps/).
   kernel.py check
-      Run every backend/*/gen_*.py --check: generated files match their generators.
+      Run every backend/*/gen_*.py --check: generated files match their generators; and
+      tools/tune.py --check: tuned tables (backend/*/tuned.hpp) match their measurements.
 
 On Linux (the VMs) it builds in the pinned GCC 15.2 image with Docker. On the Mac it builds with
 the local clang++ and runs the targets that list 'mac'. Run from the checkout's root.
@@ -261,7 +262,7 @@ def bench(args) -> int:
 
 def check(_) -> int:
     failed = 0
-    for generator in sorted(Path('backend').glob('*/gen_*.py')):
+    for generator in [*sorted(Path('backend').glob('*/gen_*.py')), Path('tools/tune.py')]:
         result = subprocess.run([sys.executable, str(generator), '--check'])
         print(f'{"pass" if result.returncode == 0 else "FAIL"} {generator} --check')
         failed |= result.returncode != 0
