@@ -56,8 +56,9 @@ Users name their modulus once: `using Poly = fps::Polynomial<998244353>;`.
   few nonzero terms (`inverse(1 - x, n)` by recurrence, O(n)), a monomial factor or divisor
   (`f * x^k`, `f / x^k`, `f % x^k`, O(n)), a linear inner function (`compose(f, x + c)`,
   `compose(f, c x)`).
-- A broken precondition throws `std::domain_error` (e.g. `inverse` with f[0] = 0). A result that
-  may not exist is a `std::optional` (`sqrt`, `inverse_mod`).
+- A broken precondition throws `std::domain_error` (e.g. `inverse` with f[0] = 0); a size past a
+  backend limit throws `std::length_error` (e.g. an NTT product past 2^25 coefficients). A result
+  that may not exist is a `std::optional` (`sqrt`, `inverse_mod`).
 - Thread safety: functions are safe to call from several threads; each thread has its own scratch.
 - Moduli: v1 supports P = 998244353 only; any other P fails to compile (`static_assert`). Other
   primes come later (see Later).
@@ -89,8 +90,9 @@ public:
 };
 ```
 
-Arithmetic, all exact: `f + g`, `f - g`, `-f`, `f * g`, `f * c`, `c * f`, `f / g` (quotient),
-`f % g` (remainder), and the compound forms (`+=`, `*=`, ...). With `x = Poly::x()`:
+Arithmetic, all exact: `f + g`, `f - g`, `-f`, `f * g`, `f / g` (quotient), `f % g` (remainder);
+with a scalar c, any integer type taken mod P: `f + c`, `c + f`, `f - c`, `c - f`, `f * c`,
+`c * f`; and the compound forms (`+=`, `*=`, ...). With `x = Poly::x()`:
 
 | Code | Meaning |
 |---|---|
