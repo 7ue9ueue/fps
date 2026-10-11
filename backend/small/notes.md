@@ -110,6 +110,13 @@ Where beats_ntt picks small (`cutoffs.py` there):
 The NTT's length doubles when n + m - 1 passes a power of two, so the cutoff jumps there: n = 2^k
 with any m > 1 pays for 2^(k+1).
 
+Past the sweep, measured against the model's choice (`validate-<target>.txt` there): 2^20 x m
+for m = 128, 160, 200, 256, (2^20 - m) x m for m = 48, 64, 96, 128, 2^22 x m for m = 150, 200,
+260, (2^22 - m) x m for m = 64, 128. The model picks the faster one in all 13 shapes on Zen 3,
+Zen 5 and Neoverse V2, and in 12 on Emerald Rapids: 2^20 x 256 runs small at 11.0 ms against
+10.1 ms for the NTT (model cutoff 266, measured between 200 and 256). Zen 3 at 2^20 x m: small
+8.8 / 11.0 ms, NTT 9.3 / 9.4 ms for m = 160 / 200 (model cutoff 174).
+
 ## Log
 
 2026-10-11, claude (issue #37, round 1): new kernel; the frontend's `f * g` calls it.

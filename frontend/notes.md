@@ -194,3 +194,30 @@ belongs in `backend/`).
     and 0.92 (Neoverse V2) ns per entry (`backend/factorials/notes.md`), against 4.49, 2.27, 1.53 and
     2.88 into fresh ones. Only memory the library keeps or maps in huge pages (DESIGN.md, Memory)
     can close that; not tried here.
+- 2026-10-11: `f * g` short products on the backend kernel `small` (issue #37,
+  `backend/small/notes.md`). `detail::schoolbook` (scalar, 0.24 ns per term on Zen 3) and
+  `detail::schoolbook_wins` (`min(n, m) <= 32 || n m < 3 2^16`, set when a Convolution cost 51 us)
+  are gone: `f * g` calls `small::multiply` where `small::beats_ntt(n, m)` says it is faster than
+  the NTT on this target (a cost model in the backend), else `convolution()` as before.
+  - Behaviour: a short factor next to one past the NTT's 2^25 now gets its product from
+    `small::multiply` where that beats the NTT's extrapolated time, instead of
+    `std::length_error`. The error test now multiplies 2^25 by 4096 coefficients (was 33), and
+    2^25 x 2 is checked at random points.
+  - Tests: shapes around the cutoffs, which differ per target (24 x 24 to 128 x 129, 3000 x 4 to
+    3000 x 128, both orders), random and all P - 1. Pass at -O2 and ASan/UBSan on every target's
+    test machines and the Mac.
+  - Bench: new pairs `multiply/<n>x<m>` (16x16, 4096x4, 4096x16) against `small::multiply` into
+    new memory (`multiply@kernel/<n>x<m>`). `lc-bench`, 5 rounds: 85 against 80 ns (the scans for
+    a single term and the cutoff), 1737 against 1729, 4538 against 4535.
+  - `multiply/<lg>` against main (e754d90), 5 rounds, median of paired new/base ratios:
+
+    | lg (n x n) | `lc-bench` | `lc-intel` | `lc-zen5` | `lc-arm` |
+    |---|---:|---:|---:|---:|
+    | 6 (32 x 32) | 0.336 (436 -> 147 ns, NTT) | 0.313 (NTT) | 0.245 (76 ns, small) | 0.745 (NTT) |
+    | 7 (64 x 64) | 0.202 | 0.190 | 0.183 | 0.427 |
+    | 8 (128 x 128) | 0.125 | 0.126 | 0.110 | 0.277 |
+    | 9 (256 x 256) | 0.075 | 0.080 | 0.066 | 0.168 |
+    | 10 to 22, 480x480 (NTT, code unchanged) | 0.981-1.007 | 0.975-1.013 | 0.999-1.007 | 0.999-1.002 |
+
+    Below lg 10 main ran the scalar loop up to 443 x 443; with the Convolution of issue #38 the NTT
+    wins there from about 32 x 32 (Zen 3, Neoverse V2) to 104 x 104 (Zen 5).
