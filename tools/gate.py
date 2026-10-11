@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from kernel import TARGETS, summarize, table, unit_dir
@@ -179,8 +180,16 @@ def gate(args) -> tuple[bool, str, str, str]:
                      f'Only {owner}\'s own pull requests are gated.')
         if info['state'] != 'OPEN':
             sys.exit(f'pull request {pr} is {info["state"].lower()}')
-        git('fetch', '--quiet', 'origin', f'pull/{pr}/head')
-        head, label = info['headRefOid'], f'pr{pr}'
+        for _ in range(12):  # right after a push, GitHub can report the old head for a few seconds
+            git('fetch', '--quiet', 'origin', f'pull/{pr}/head')
+            head = git('rev-parse', 'FETCH_HEAD').stdout.strip()
+            if head == info['headRefOid']:
+                break
+            time.sleep(5)
+            info = gh_json('pr', 'view', pr, '--json', 'headRefOid,state,author,isCrossRepository')
+        else:
+            sys.exit(f'pull request {pr}: GitHub reports head {info["headRefOid"][:10]}, fetched {head[:10]}')
+        label = f'pr{pr}'
     else:
         head = git('rev-parse', args.target).stdout.strip()
         label = head[:10]
