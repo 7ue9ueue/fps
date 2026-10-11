@@ -138,15 +138,19 @@ private:
     // lane `lane`. The first r = factors % 4 factors one per step, then four per step:
     // x <- montgomery(x, g) with g the Montgomery form of G = w (w + 1)(w + 2)(w + 3) for
     // w = a + r + 1 + 4j, stepped by its forward differences d1, d2, d3 (d4 = 4! 4^4). The start
-    // values from G = z (z + 2), z = w (w + 3), and z(w + 4) = z(w) + 8w + 28.
+    // values from G = z (z + 2), z = w (w + 3), and z(w + 4) = z(w) + 8w + 28. From 16 four-factor
+    // steps on and for K <= 2, two accumulators take them in turn (x plain, y in Montgomery form):
+    // the product chain is half as long. Fewer steps lose the final product's latency, K = 4
+    // runs out of registers (Log).
     [[gnu::flatten]] static u32 lane_products(const Lanes& start, const Lanes& up_base, std::size_t factors,
                                               std::size_t capture, std::size_t lane, Lanes& product) {
         const std::size_t r = factors % 4;
         const auto c = [](u32 i) { return S::broadcast(montgomery_form(i)); };
         const auto times = [](V a, V b) { return M::template reduce<P>(M::montgomery(a, b)); };
-        V x[K], w[K], g[K], d1[K], d2[K], d3[K];
+        V x[K], y[K], w[K], g[K], d1[K], d2[K], d3[K];
         load(w, up_base.data());
         for (V& v : x) v = S::broadcast(1);
+        for (V& v : y) v = S::broadcast(kR);
         for (std::size_t i = 0; i < r; ++i)
             detail::unrolled<K>([&](auto v) { x[v] = M::montgomery(x[v], w[v]), w[v] = M::add(w[v], c(1)); });
         detail::unrolled<K>([&](auto v) {
@@ -163,23 +167,35 @@ private:
             d3[v] = M::sub(M::sub(M::sub(G[3], G[2]), M::sub(G[2], G[1])), d2[v]);
         });
         const V d4 = c(6144);
+        const auto step = [&](V (&acc)[K]) {
+            detail::unrolled<K>([&](auto v) {
+                acc[v] = M::montgomery(acc[v], g[v]);
+                g[v] = M::add(g[v], d1[v]), d1[v] = M::add(d1[v], d2[v]);
+                d2[v] = M::add(d2[v], d3[v]), d3[v] = M::add(d3[v], d4);
+            });
+        };
+        const bool two = K <= 2 && (factors - r) / 4 >= 16;
         const auto steps = [&](std::size_t count) {
-            for (std::size_t j = 0; j < count; ++j)
-                detail::unrolled<K>([&](auto v) {
-                    x[v] = M::montgomery(x[v], g[v]);
-                    g[v] = M::add(g[v], d1[v]), d1[v] = M::add(d1[v], d2[v]);
-                    d2[v] = M::add(d2[v], d3[v]), d3[v] = M::add(d3[v], d4);
-                });
+            if (two) {
+                for (std::size_t j = 0; j + 1 < count; j += 2) step(x), step(y);
+                if (count % 2) step(x);
+            } else {
+                for (std::size_t j = 0; j < count; ++j) step(x);
+            }
+        };
+        const auto store_product = [&] {
+            if (two) detail::unrolled<K>([&](auto v) { x[v] = M::montgomery(x[v], y[v]), y[v] = S::broadcast(kR); });
+            store(product, x);
         };
         // The capture: whole steps, then up to 3 factors for the one lane.
         const std::size_t whole = capture > r ? (capture - r) / 4 : 0;
         steps(whole);
-        store(product, x);
+        store_product();
         u32 partial = capture > r ? product[lane] : 1;
         for (std::size_t i = capture > r ? r + 4 * whole : 0; i < capture; ++i)
             partial = model::multiply<P>(partial, u32((start[lane] + i + 1) % P));
         steps((factors - r) / 4 - whole);
-        store(product, x);
+        store_product();
         return partial;
     }
 
