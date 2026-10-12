@@ -14,7 +14,7 @@ For every target in tools/kernel.py, all at once, on the target's machines:
     do not depend on the pull request being gated, so tools/sanitize.py runs them for every unit
     on every target apart from the gate;
   - time, if the target has a timing machine: kernel.py bench of the gated cases against the base,
-    21 rounds; on a slowdown, a second run of 21, pooled with the first. If the two runs disagree
+    9 rounds; on a slowdown, a second run of 9, pooled with the first. If the two runs disagree
     (a case's new/base moved by more than SHIFT and out of both runs' IQRs: a state of the run,
     not of the code, as in PR 99's zen5 ntt), the report says so, a third run is timed, and the
     verdict pools the pair of runs that disagrees least. `<op>@<variant>` cases are not timed.
@@ -71,7 +71,7 @@ from pathlib import Path
 from kernel import TARGETS, gated, summarize, table, unit_dir
 from vm import rev_tar, ship, ssh
 
-ROUNDS = 21
+ROUNDS = 9  # was 21: the same units were flagged slow in 232 saved runs (see PR), at 43% of the time
 RAW = Path.home() / 'Documents' / 'hpc_library-explore' / 'gate'  # raw times, kept on the Mac
 TOLERANCE = 1.005  # new/base per target; above it, ROUNDS more rounds are pooled and judged again
 SHIFT = 1.05  # a case's new/base moving by more than this between two runs (and out of both IQRs): they disagree
