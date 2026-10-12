@@ -254,8 +254,8 @@ void test_dft() {
     const u32 w4 = power(3, (P - 1) / 4);
     CHECK(fps::dft(Poly{1, 2, 3}, 4) == (Vec{6, horner({1, 2, 3}, w4), 2, horner({1, 2, 3}, mul(w4, mul(w4, w4)))}));
     CHECK(fps::dft(Poly{1, 2, 3}, 0).empty() && fps::idft<P>(Vec{}).size() == 0);
-    // Large: 2^17 and 119 2^10, round trips and a few values.
-    for (std::size_t L : {std::size_t(1) << 17, std::size_t(119) << 10}) {
+    // Large: 2^17, 119 2^10 and 2^23 (the longest power of two), round trips and a few values.
+    for (std::size_t L : {std::size_t(1) << 17, std::size_t(119) << 10, std::size_t(1) << 23}) {
         const Vec f = random_vec(L);
         const Vec v = fps::dft(poly(f), L);
         CHECK(vec(fps::idft<P>(v)) == f, L);
@@ -313,7 +313,7 @@ void test_errors() {
     CHECK(throws<domain_error>([] { (void)fps::extrapolate<P>(Vec{1, P}, 5, 3); }));
     CHECK(fps::extrapolate<P>(Vec{}, 5, 3) == Vec(3, 0) && fps::extrapolate<P>(Vec{4}, 5, 2) == (Vec{4, 4}));
     CHECK(fps::extrapolate<P>(Vec{1, 2}, 5, 0).empty());
-    for (std::size_t L : {3, 5, 9, 239, 1 << 24}) {
+    for (std::size_t L : {3, 5, 9, 239, 1 << 24, 1 << 25}) {
         CHECK(throws<domain_error>([&] { (void)fps::dft(f, L); }), L);
         if (L < 1000) CHECK(throws<domain_error>([&] { (void)fps::idft<P>(Vec(L)); }), L);
     }
@@ -345,11 +345,19 @@ void test_errors() {
             CHECK(throws<domain_error>([&] { (void)fps::extrapolate<P>(big, 0, 1); }));
             const std::size_t m = (std::size_t(1) << 25) + 1;
             CHECK(throws<std::length_error>([&] { (void)fps::interpolate<P>(fps::geometric(2, 3, m), big.first(m)); }));
+            // idft: 2^24 and 2^25 have no roots, 7 2^22 divides P - 1 but needs 2L - 1 > 2^25 words.
+            for (std::size_t L : {std::size_t(1) << 24, std::size_t(1) << 25})
+                CHECK(throws<domain_error>([&] { (void)fps::idft<P>(big.first(L)); }), L);
+            CHECK(throws<std::length_error>([&] { (void)fps::idft<P>(big.first(std::size_t(7) << 22)); }));
             munmap(map, bytes);
         }
     }
     // The middle product past 2^25 words: 2 coefficients at 2^25 points.
     CHECK(throws<std::length_error>([] { (void)fps::evaluate(Poly{1, 2}, fps::geometric(2, 3, std::size_t(1) << 25)); }));
+    // dft: divisors of P - 1 past the middle product's 2^25 words, checked before the L-word result.
+    CHECK(throws<std::length_error>([] { (void)fps::dft(Poly{1, 2}, std::size_t(17) << 21); }));
+    CHECK(throws<std::length_error>([] { (void)fps::dft(Poly((std::size_t(1) << 22) + 2), std::size_t(7) << 22); }));
+    CHECK(fps::dft(Poly{5}, std::size_t(17) << 21).size() == std::size_t(17) << 21);  // one coefficient: no product
 }
 
 }  // namespace

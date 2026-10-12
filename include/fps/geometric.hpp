@@ -13,13 +13,18 @@
 // w = 3^((P - 1) / L), a primitive L-th root of unity (3 generates the units mod P). The order is
 // natural: dft(f, L)[i] = f(w^i), for any f.size(), so it is the DFT of f mod (x^L - 1), and
 // idft(dft(f, L)) is f mod (x^L - 1). L is 0 (no values) or divides P - 1 = 2^23 7 17: powers of
-// two and others alike.
+// two and others alike. So among powers of two they stop at 2^23, while to_values and the
+// products go on to 2^25: the NTT stops at leaves x^8 - w, whose w need only order L / 8; true
+// values at 2^24 or 2^25 points would need roots of unity that do not exist mod P.
+// Lengths: dft needs f.size() + L - 1 <= 2^25 (or f.size() <= 1), idft L <= 2^24; past that,
+// std::length_error before anything is allocated (e.g. dft at L = 17 2^21, idft at 7 2^22).
 //
 // Points, values, a, r and c are canonical, in [0, P); one >= P throws std::domain_error. evaluate
 // takes any a and r (0 included; repeated points too). interpolate needs as many values as points,
 // and distinct points (a != 0 for m >= 2, r != 0 for m >= 3, r^k != 1 for 0 < k < m); else
 // std::domain_error. extrapolate needs n <= P (std::domain_error); any c, and c + i wraps mod P.
-// idft needs L = values.size() to be 0 or a divisor of P - 1, as dft its L (std::domain_error).
+// idft needs L = values.size() to be 0 or a divisor of P - 1, as dft its L (std::domain_error:
+// L = 2^24 and 2^25 too).
 //
 // Paths: the backend's chirp kernels (backend/chirp), one call each, into the result's memory.
 // - evaluate, dft: chirp::evaluate_geometric, one ntt::middle_product of n + m - 1 by n words.
@@ -125,6 +130,12 @@ std::uint32_t root(std::size_t L, bool inverse, const char* what) {
     return kRoots<P>.w[inverse][i][odd % 7 == 0][odd % 17 == 0];
 }
 
+// The chirp's middle product of n + m - 1 by n words (n coefficients, m points; Horner for
+// n <= 1), checked against the NTT's limit before the result is allocated. For a, r != 0.
+inline void check_chirp(std::size_t n, std::size_t m, const char* what) {
+    if (n > 1 && m > 0 && n + m - 1 > std::size_t(1) << ntt::kMaxLog) throw std::length_error(what);
+}
+
 }  // namespace detail::geometric
 
 template <std::uint32_t P>
@@ -165,6 +176,7 @@ std::vector<std::uint32_t> extrapolate(std::span<const std::uint32_t> values, st
 template <std::uint32_t P>
 std::vector<std::uint32_t> dft(const Polynomial<P>& f, std::size_t L) {
     const std::uint32_t w = detail::geometric::root<P>(L, false, "fps::dft: L does not divide P - 1");
+    detail::geometric::check_chirp(f.size(), L, "fps::dft: f.size() + L - 1 > 2^25");
     std::vector<std::uint32_t> values(L);
     chirp::evaluate_geometric(f.span(), 1, w, values);
     return values;
@@ -174,6 +186,7 @@ template <std::uint32_t P>
 Polynomial<P> idft(std::span<const std::uint32_t> values) {
     const std::size_t L = values.size();
     const std::uint32_t w_inverse = detail::geometric::root<P>(L, true, "fps::idft: values.size() does not divide P - 1");
+    detail::geometric::check_chirp(L, L, "fps::idft: L > 2^24");
     detail::geometric::check_canonical<P>(values, "fps::idft: value >= P");
     // f_j = (1 / L) sum_i values[i] w^(-i j): the values as coefficients, at the points w^-j.
     Polynomial<P> f = detail::unwritten_polynomial<P>(L);
