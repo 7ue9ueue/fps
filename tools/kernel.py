@@ -2,8 +2,9 @@
 """Test and time backend kernels, per target (see TARGETS and BACKEND.md).
 
   kernel.py test UNIT... [--target T] [-j N]
-      Build every test*.cpp of the units for target T at -O2 and with ASan/UBSan, N at a time
-      (default: every core); run each as soon as it is built, one run at a time, in order.
+      Build every test*.cpp of the units for target T at -O2 and with ASan/UBSan, at most N at a
+      time (default: every core), fewer if the machine is busy (build_slots); run each as soon as
+      it is built, one run at a time, in order.
   kernel.py bench UNIT [--target T] [--base DIR] [--rounds N] [--filter RE] [--json FILE]
       Time the unit's bench*.cpp, each its own binary (e.g. frontend/bench_values.cpp, whose
       code changes how GCC compiles bench.cpp's). Case names must be unique across a unit's
@@ -196,6 +197,17 @@ def build(tree: Path, unit: str, source: str, target: str, sanitize: bool = Fals
     return binary
 
 
+def build_slots() -> int:
+    """Builds this machine has room for now: its idle cores, and 2 GiB of available memory each
+    (a test build peaked at 0.94 GiB: factorials, ASan/UBSan, GCC 13). The VMs are shared."""
+    slots = (os.cpu_count() or 1) - int(os.getloadavg()[0])
+    if not MAC:
+        meminfo = Path('/proc/meminfo').read_text()
+        available_kib = int(next(line for line in meminfo.splitlines() if line.startswith('MemAvailable')).split()[1])
+        slots = min(slots, available_kib >> 21)
+    return max(1, slots)
+
+
 def test(args) -> int:
     require_cpu(args.target)
     tree = Path('.')
@@ -207,7 +219,7 @@ def test(args) -> int:
             return 1
         jobs += [(unit, source, sanitize) for source in sources for sanitize in (False, True)]
     # Runs stay one at a time, in order: some tests time their kernel (tune.hpp).
-    with ThreadPoolExecutor(args.jobs) as pool:
+    with ThreadPoolExecutor(max(1, min(args.jobs, build_slots()))) as pool:
         builds = [pool.submit(compile_, tree, unit, source, args.target, sanitize) for unit, source, sanitize in jobs]
         for (unit, source, sanitize), built in zip(jobs, builds):
             binary, error = built.result()
@@ -306,7 +318,7 @@ def main() -> int:
     p = sub.add_parser('test')
     p.add_argument('kernel', nargs='+')
     p.add_argument('--target', choices=TARGETS, default=default)
-    p.add_argument('-j', '--jobs', type=int, default=os.cpu_count(), help='builds at a time')
+    p.add_argument('-j', '--jobs', type=int, default=os.cpu_count(), help='builds at a time, at most')
     p.set_defaults(run=test)
     p = sub.add_parser('bench')
     p.add_argument('kernel')

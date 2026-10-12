@@ -142,6 +142,8 @@ def run_tests(machine: str, name: str, new_tar: bytes, target: str, units: list[
         with tempfile.TemporaryDirectory() as tree:
             tarfile.open(fileobj=io.BytesIO(new_tar), mode='r:gz').extractall(tree)
             return subprocess.run(command, shell=True, cwd=tree, capture_output=True)
+    share = sum(machine in spec['test'] for spec in TARGETS.values())  # targets testing here share its cores
+    command += f' -j $(( ($(nproc) + {share - 1}) / {share} ))'
     path = ship(machine, name, new_tar)
     result = ssh(machine, f'cd {path} && {command}', capture=True)
     ssh(machine, f'rm -rf {path}')
