@@ -6,4 +6,5 @@
 #include "fps/modular.hpp"
 #include "fps/polynomial.hpp"
 #include "fps/products.hpp"
+#include "fps/tune.hpp"
 #include "fps/values.hpp"

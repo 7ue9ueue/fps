@@ -263,14 +263,26 @@ Each function documents whether `out` may overlap an input.
 Not part of the user API, except for tuning:
 
 ```cpp
-fps::tune();                     // measure the codelets on this machine (seconds)
-fps::save_wisdom(path);
-fps::load_wisdom(path);          // without wisdom: compile-time and hardware-fact choices
+fps::tune_all();                 // measure the backend's choices on this machine (about 0.1 s)
+bool fps::save_wisdom(const std::string& path);   // false if path cannot be written
+bool fps::load_wisdom(const std::string& path);   // false, setting nothing, if path is missing,
+                                                  // malformed, or from another CPU or target
 ```
 
 Choices are made in this order: compile time (the ISA from compiler macros), hardware facts at
 run time (cache sizes, CPU features), then measurement (wisdom). Every variant stays testable by a
 flag that forces it.
+
+- Explicit only: nothing tunes on first use, so a call costs the same every time. Without wisdom,
+  every call uses the compiled defaults, measured per target on our machines.
+- `tune_all()` runs once per process; it measures from the compiled defaults and replaces what
+  `load_wisdom` set. Choices change speed, never results.
+- Wisdom records the CPU and the target; a file from another CPU or target, a malformed file and
+  a missing one change nothing. Neither function throws on a bad path.
+- `-DFPS_NO_TUNER` (single-file contest bundles) compiles the defaults in as constants: `tune_all`
+  does nothing, and `save_wisdom` and `load_wisdom` touch no file and return false.
+- The name is `tune_all`, not `tune`: `fps::tune` is the backend tuner's namespace
+  (`backend/tune/`), and a function cannot share its name.
 
 ## Examples
 
