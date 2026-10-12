@@ -46,7 +46,7 @@ Run from the checkout's root. Each script's `--help` has the details.
 | `tools/kernel.py bench <unit> [--base DIR]` | timing VM | Times each `bench*.cpp` (one binary each); with `--base`, old and new in the same run, as paired ratios (below 1 is faster). Holds the bench lock. |
 | `tools/kernel.py check` | anywhere | Generators and tuned tables match what is committed. |
 | `tools/tune.py <kernel>` | Mac | Measures a kernel's tuned choices on each target's timing machine; writes `tuned.json` and `tuned.hpp`. |
-| `tools/gate.py <pr> --merge` | Mac | Tests every affected unit on every target, times it against `main`, comments the report on the PR, and squash-merges on a pass. Always runs `origin/main`'s copy of `tools/`; one gate at a time, the others wait. |
+| `tools/gate.py <pr> --merge` | Mac | Tests every affected unit on every target, times it against `main`, comments the report on the PR, and squash-merges on a pass. Always runs `origin/main`'s copy of `tools/`; one gate at a time, the others wait (a pull request that affects no unit takes no lock). |
 
 ```
 python3 tools/vm.py lc-amd 'python3 tools/kernel.py test ntt --target avx2'

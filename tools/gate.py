@@ -27,11 +27,14 @@ head moved). The full report is kept with the raw times; the comment drops the c
 would pass GitHub's limit. The last line of the report is "Gate: pass" or "Gate: fail".
 
 One gate runs at a time on this Mac: a gate waits for the lock, then holds it from its first look
-at main to the merge. Since main changes only through the gate, main cannot move under a running
-gate, and gates do not slow each other down on the VMs (PR 83: 44 minutes beside PR 82's gate; PR
-77, alone: at most 21). If main moved anyway (a merge by hand), the gate runs again only when the
-new commits on main touch a unit this pull request affects (with the same include closure) or a
-shared file; otherwise the result still holds and it merges.
+at main to the merge, and gates do not slow each other down on the VMs (PR 83: 44 minutes beside PR
+82's gate; PR 77, alone: at most 21). A pull request that affects no unit (notes, tools/gate.py,
+...) or conflicts with main takes no lock: nothing runs for it, so it is settled and merged at
+once, even while another gate runs (PR 115 waited 28 min for a gate that took 0.0). Main changes
+only through the gate, so it cannot move under a running gate, apart from such merges, which touch
+no unit. If main moved anyway, the gate runs again only when the new commits on main touch a
+unit this pull request affects (with the same include closure) or a shared file; otherwise the
+result still holds and it merges.
 
 It runs as origin/main's copy of tools/ (gate.py, kernel.py, vm.py), whatever the checkout it is
 started from: a coordinator's checkout can lag main by hours, and the gate's rules are main's.
@@ -308,8 +311,10 @@ def gh_json(*args: str) -> dict:
     return json.loads(subprocess.run(['gh', *args], check=True, capture_output=True, text=True).stdout)
 
 
-def gate(args) -> tuple[bool, str, str, str, list[str]]:
-    """Returns (passed, report, the base commit it ran against, the head commit, affected units)."""
+def gate(args, locked: bool) -> tuple[bool, str, str, str, list[str]] | None:
+    """Returns (passed, report, the base commit it ran against, the head commit, affected units).
+    Without the lock it only looks at the diff: it returns None if a unit is affected (the tests
+    and timing need the lock), and the verdict if none is (nothing runs, so nothing to protect)."""
     git('fetch', '--quiet', 'origin', 'main')
     pr = args.target if args.target.isdigit() else None
     if pr:
@@ -337,6 +342,8 @@ def gate(args) -> tuple[bool, str, str, str, list[str]]:
     lines = [f'Gate for {label} ({head[:10]}) merged into {args.base} ({base[:10]}).', '']
     if not kernels:
         return True, '\n'.join(lines + ['No unit affected.', '', 'Gate: pass']), base, head, []
+    if not locked:
+        return None
     lines += [f'Units: {", ".join(kernels)}', '']
     new_tar = subprocess.run(['git', 'archive', '--format=tar.gz', tree], check=True, capture_output=True).stdout
     base_tar = rev_tar(base)
@@ -429,14 +436,21 @@ def main() -> int:
     args = parser.parse_args()
     pr = args.target if args.target.isdigit() else None
     start = time.monotonic()
-    lock = gate_lock(f'pr{pr}' if pr else args.target)  # held until this process exits
-    waited = minutes(start)
+    result = gate(args, locked=False)  # a conflict or no affected unit is settled without the lock
+    waited = None  # None: no lock taken
+    if result is None:
+        lock = gate_lock(f'pr{pr}' if pr else args.target)  # held until this process exits
+        waited = minutes(start)
     for _ in range(3):
-        start = time.monotonic()
-        passed, report, base, head, units = gate(args)
+        if result is None:
+            start = time.monotonic()
+            result = gate(args, locked=True)
+        passed, report, base, head, units = result
+        result = None
         before, _, verdict = report.rpartition('\nGate: ')
-        report = f'{before}\nRan in {minutes(start):.1f} min, after {waited:.1f} min waiting for the gate lock.\n' \
-                 f'\nGate: {verdict}'
+        took = f'Ran in {minutes(start):.1f} min, ' + ('no unit affected, so no gate lock.' if waited is None else
+                                                      f'after {waited:.1f} min waiting for the gate lock.')
+        report = f'{before}\n{took}\n\nGate: {verdict}'
         waited = 0.0
         print(report)
         if pr:
@@ -446,7 +460,8 @@ def main() -> int:
         if not (passed and args.merge and pr):
             return 0 if passed else 1
         # main moves only through the gate, and this gate holds the lock: tip == base, unless
-        # someone merged by hand or a gate from before the queue merged.
+        # someone merged by hand, a gate from before the queue merged, or a pull request that
+        # affects no unit merged without the lock (which stale() lets pass).
         git('fetch', '--quiet', 'origin', 'main')
         tip = git('rev-parse', 'origin/main').stdout.strip()
         if tip != base:

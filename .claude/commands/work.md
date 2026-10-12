@@ -20,8 +20,9 @@ For each round:
 3. When it returns, read the issue's newest `Result:` line. If the round left none, comment what
    happened, ending with `Result: no gain`.
 4. Gate the round's pull request, if it opened one. Agents never run the gate; you do:
-   `python3 tools/gate.py <pr> --merge`, in the background, one gate at a time, while you keep
-   running rounds. On a fail (a test, a slowdown, or a conflict with main), start a fix agent in
+   `python3 tools/gate.py <pr> --merge`, in the background, while you keep running rounds (gates
+   queue on a lock, so start each as its round returns; one that affects no unit merges at once).
+   On a fail (a test, a slowdown, or a conflict with main), start a fix agent in
    its own worktree on the pull request's branch, briefed: read `AGENTS.md`; make pull request
    <pr> pass the gate, whose report is <the gate's comment>; rebase on `origin/main` if it
    conflicts; push and return without running the gate. Then gate again. After 2 failed fixes,
