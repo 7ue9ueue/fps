@@ -48,7 +48,8 @@ bool throws(F f) {
 
 std::mt19937_64 rng(24);
 
-// 0, 1, powers of two and their neighbours (the leaves hold 32 points).
+// 0, 1, powers of two and their neighbours (the kernel's direct paths end at 32 and 64 points;
+// its trees put point 8 k + l in slot k of lane l, at least 17 slots).
 const std::vector<std::size_t> kSizes = {0,  1,  2,  3,   4,   5,   7,   8,   9,   15,  16,  17,  31,  32,  33,
                                          63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 513, 1023, 1024, 1025};
 
@@ -263,9 +264,9 @@ void test_errors() {
     CHECK(throws<std::domain_error>([] { (void)fps::interpolate<P>(Vec{}, Vec{3}); }));
     CHECK(throws<std::domain_error>([] { (void)fps::interpolate<P>(Vec{1, P}, Vec{3, 4}); }));
     CHECK(throws<std::domain_error>([] { (void)fps::interpolate<P>(Vec{1, 2}, Vec{3, P}); }));
-    // Repeats: next to each other, in one leaf, in different leaves, and all equal.
+    // Repeats: next to each other, on the direct path, in one lane, in different lanes, all equal.
     for (const auto [m, i, j] : {std::tuple<std::size_t, std::size_t, std::size_t>{2, 0, 1}, {32, 3, 30},
-                                 {1000, 5, 6}, {1000, 0, 999}, {5000, 17, 4000}}) {
+                                 {1000, 5, 6}, {1000, 8, 16}, {1000, 0, 999}, {5000, 17, 4000}}) {
         Vec x = distinct_points(m);
         x[j] = x[i];
         CHECK(throws<std::domain_error>([&] { (void)fps::interpolate<P>(x, random_vec(m)); }), m, i, j);
@@ -279,9 +280,15 @@ void test_errors() {
     CHECK(fps::to_newton_basis(Poly(), Vec{}).size() == 0);
     CHECK(fps::interpolate<P>(Vec{}, Vec{}).size() == 0);
     CHECK(fps::evaluate(Poly(), Vec{1, 2}) == (Vec{0, 0}) && fps::evaluate(f, Vec{}).empty());
-    // 2^25 points: the root's product would have 2^25 + 1 coefficients.
-    const Vec x(std::size_t(1) << 25, 3);
-    CHECK(throws<std::length_error>([&] { (void)fps::evaluate(f, x); }));
+    // 2^25 points or coefficients: interpolate and to_newton_basis throw before any work (a repeat
+    // and missing points are not reached). evaluate has no limit: the kernel runs chunks of 2^24
+    // points (#139); a linear f keeps it cheap, Horner's rule on every target.
+    Vec x(std::size_t(1) << 25, 3);
+    CHECK(throws<std::length_error>([&] { (void)fps::interpolate<P>(x, x); }));
+    CHECK(throws<std::length_error>([] { (void)fps::to_newton_basis(Poly(std::size_t(1) << 25), Vec{}); }));
+    x.push_back(5);
+    const Vec v = fps::evaluate(Poly{7, 2}, x);
+    CHECK(v.size() == x.size() && v.back() == 17 && std::all_of(v.begin(), v.end() - 1, [](u32 a) { return a == 13; }));
 }
 
 }  // namespace
