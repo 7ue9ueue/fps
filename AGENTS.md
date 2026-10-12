@@ -18,7 +18,9 @@ DESIGN.md, BACKEND.md      the plans (frontend, backend); change them when you f
 include/fps/               the frontend headers, API at the top of each
 frontend/                  its tests (test_<area>.cpp), bench*.cpp, notes.md, notes/
 backend/<kernel>/          one kernel: headers (API at the top), select.hpp (variant per target),
-                           test.cpp, bench.cpp, notes.md, notes/, gen_*.py and their generated output
+                           test*.cpp (a new feature adds its own test_<area>.cpp; shared helpers in
+                           test_util.hpp where there is one), bench.cpp, notes.md, notes/, gen_*.py and
+                           their generated output
 backend/bench.hpp          the timing harness every bench.cpp uses
 backend/tune/              run-time tuning of kernels' choices; compiled defaults in tuned.hpp
 backend/simd/              per-ISA vector wrappers; probe.cpp and machines.py: measured
