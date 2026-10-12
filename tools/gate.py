@@ -8,9 +8,12 @@ For every target in tools/kernel.py, all at once, on the target's machines:
   - test: kernel.py test of every affected unit on each test machine, at once ('mac' is this Mac,
     with clang); kernel.py check once, on the first target's first test machine;
   - time, if the target has a timing machine: kernel.py bench of the gated cases against the base,
-    21 rounds; on a slowdown, 21 more, pooled. `<op>@<variant>` cases are not timed. Timing runs
-    alongside the tests unless the timing machine also tests the target (its bench lock would
-    queue the two anyway); it stops at the next unit once any test has failed.
+    21 rounds; on a slowdown, a second run of 21, pooled with the first. If the two runs disagree
+    (a case's new/base moved by more than SHIFT and out of both runs' IQRs: a state of the run,
+    not of the code, as in PR 99's zen5 ntt), the report says so, a third run is timed, and the
+    verdict pools the pair of runs that disagrees least. `<op>@<variant>` cases are not timed.
+    Timing runs alongside the tests unless the timing machine also tests the target (its bench
+    lock would queue the two anyway); it stops at the next unit once any test has failed.
 Units are the backend kernels and the frontend (see tools/kernel.py). Affected units: those
 changed, those that #include them ("backend/<kernel>/..."), or all if a shared file changed.
 Changes to .md files (notes) affect no unit: no build reads them.
@@ -56,12 +59,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from kernel import TARGETS, summarize, table, unit_dir
+from kernel import TARGETS, gated, summarize, table, unit_dir
 from vm import rev_tar, ship, ssh
 
 ROUNDS = 21
 RAW = Path.home() / 'Documents' / 'hpc_library-explore' / 'gate'  # raw times, kept on the Mac
 TOLERANCE = 1.005  # new/base per target; above it, ROUNDS more rounds are pooled and judged again
+SHIFT = 1.05  # a case's new/base moving by more than this between two runs (and out of both IQRs): they disagree
 SHARED = re.compile(r'^(backend/[^/]+|tools/kernel\.py)$')  # files outside a kernel folder
 INCLUDE = re.compile(r'#include\s*"(backend/[A-Za-z0-9_]+/)')  # how one unit uses another
 GATED = '^[^@]*$'  # the cases the verdict uses (kernel.gated); the others took 30-50% of bench time
@@ -134,6 +138,47 @@ def pool(report: dict, again: dict) -> None:
     report['rounds'] += again['rounds']
 
 
+def pooled(runs: list[dict]) -> dict:
+    report = {**runs[0], 'cases': {}, 'rounds': 0}
+    for run in runs:
+        pool(report, run)
+    return report
+
+
+def disagreements(a: dict, b: dict) -> list[str]:
+    """Gated cases whose new/base moved between bench runs a and b by more than SHIFT, each run's
+    ratio outside the other's IQR. Both sides moving together does not count: the pairing cancels
+    it (PR 82, zen5 frontend: both sides 5-7% slower at 2^22 in run 2, the ratios within 1.4%)."""
+    x, y = ({r['case']: r for r in summarize(run['cases'])[0] if gated(r['case'])} for run in (a, b))
+    return [case for case, r in x.items() if case in y
+            and max(r['ratio'], y[case]['ratio']) > SHIFT * min(r['ratio'], y[case]['ratio'])
+            and not r['q1'] <= y[case]['ratio'] <= r['q3'] and not y[case]['q1'] <= r['ratio'] <= y[case]['q3']]
+
+
+def judged(runs: list[dict]) -> list[int]:
+    """The runs the verdict uses: all of one or two; of three, the pair that disagrees least
+    (on a tie, the later pair)."""
+    if len(runs) < 3:
+        return list(range(len(runs)))
+    pairs = [[1, 2], [0, 2], [0, 1]]
+    return min(pairs, key=lambda p: len(disagreements(runs[p[0]], runs[p[1]])))
+
+
+def disagreement_note(k: str, runs: list[dict], use: list[int]) -> list[str]:
+    """Report lines for runs 1 and 2 of unit k disagreeing: the cases, each run's medians."""
+    found = disagreements(runs[0], runs[1])
+    if not found:
+        return []
+    rows = [{r['case']: r for r in summarize(run['cases'])[0]} for run in runs]
+    cell = lambda r: f"{r['new_ns']:.0f} / {r['base_ns']:.0f} = {r['ratio']:.4f}" if r else ''
+    return [f'- {k}: runs 1 and 2 disagree on {len(found)} cases (new/base moved by more than {SHIFT - 1:.0%}, '
+            f'outside both IQRs); judged on runs {" and ".join(str(i + 1) for i in use)}', '',
+            '<details><summary>disagreeing cases: new ns / base ns = new/base, per run</summary>', '',
+            '| case | ' + ' | '.join(f'run {i + 1}' for i in range(len(runs))) + ' |', '|---|' + '---:|' * len(runs),
+            *[f'| {case} | ' + ' | '.join(cell(r.get(case)) for r in rows) + ' |' for case in found],
+            '', '</details>', '']
+
+
 def kernel_ratio(report: dict) -> float | None:
     return 1.0 if report['identical'] else summarize(report['cases'])[1]
 
@@ -163,8 +208,8 @@ def run_tests(machine: str, name: str, new_tar: bytes, target: str, units: list[
 
 
 def time_units(vm: str, name: str, new_tar: bytes, base_tar: bytes, target: str, units: list[str],
-               failed: threading.Event) -> dict:
-    """Bench reports per unit, one unit at a time; stops before the next unit once a test failed."""
+               failed: threading.Event) -> dict[str, list[dict]]:
+    """Bench runs per unit, one unit at a time; stops before the next unit once a test failed."""
     reports = {}
     if not units or failed.is_set():
         return reports
@@ -175,11 +220,14 @@ def time_units(vm: str, name: str, new_tar: bytes, base_tar: bytes, target: str,
             if failed.is_set():
                 break
             log(f'[{target}] timing {k} on {vm}')
-            reports[k] = bench(vm, path, base_path, k, target)
-            ratio = kernel_ratio(reports[k])
+            runs = reports[k] = [bench(vm, path, base_path, k, target)]
+            ratio = kernel_ratio(runs[0])
             if ratio is not None and ratio > TOLERANCE and not failed.is_set():
                 log(f'[{target}] {k}: {ratio:.4f}, timing {ROUNDS} more rounds')
-                pool(reports[k], bench(vm, path, base_path, k, target))
+                runs.append(bench(vm, path, base_path, k, target))
+                if disagreements(*runs) and not failed.is_set():
+                    log(f'[{target}] {k}: the two runs disagree, timing {ROUNDS} more rounds')
+                    runs.append(bench(vm, path, base_path, k, target))
     finally:
         ssh(vm, f'rm -rf {path} {base_path}')
     return reports
@@ -206,7 +254,7 @@ def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, units: 
             for future in tests.values():
                 future.result()
         start = time.monotonic()
-        reports = time_units(vm, name, new_tar, base_tar, target, timed, failed) if vm else {}
+        runs = time_units(vm, name, new_tar, base_tar, target, timed, failed) if vm else {}
         timing_minutes = minutes(start)
         results = {m: future.result() for m, future in tests.items()}
 
@@ -227,10 +275,14 @@ def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, units: 
     if failed.is_set():
         return True, '\n'.join(out + ['', f'{target}: timing stopped, a test failed'])
 
-    for k, report in reports.items():  # every round's times, pooled rounds included
+    reports, notes = {}, {}
+    for k, unit_runs in runs.items():  # raw: every run's rounds, in order, and the runs judged
+        use = judged(unit_runs)
+        reports[k] = pooled([unit_runs[i] for i in use])
+        notes[k] = disagreement_note(k, unit_runs, use)
         out_path = RAW / label / f'{target}-{k}.json'
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(report, indent=1))
+        out_path.write_text(json.dumps({**pooled(unit_runs), 'run_rounds': ROUNDS, 'judged': use}, indent=1))
     ratios = {k: kernel_ratio(r) for k, r in reports.items()}
     overall = geomean([r for r in ratios.values() if r is not None])
     cpu = next(iter(reports.values()))['cpu'] if reports else vm
@@ -245,7 +297,7 @@ def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, units: 
             rows, ratio = summarize(reports[k]['cases'])
             value = f'{ratio:.4f}' if ratio is not None else 'no gated cases'
             out += [f'- {k}: **{value}** ({reports[k]["rounds"]} rounds)', '',
-                    '<details><summary>cases</summary>', '', table(rows), '', '</details>', '']
+                    '<details><summary>cases</summary>', '', table(rows), '', '</details>', '', *notes[k]]
     passed = overall is None or overall <= TOLERANCE
     out.append(f'{target}: ' + ('no timed kernels' if overall is None else f'{overall:.4f}')
                + ('' if passed else f' SLOWER (limit {TOLERANCE})'))

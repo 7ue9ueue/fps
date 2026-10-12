@@ -11,7 +11,7 @@ machine by `tools/tune.py`, and run-time tuning (explicit, FFTW-style wisdom) ca
 ## Starting point
 
 lc-opt's kernels (`lib/ntt`, `lib/poly`, `lib/multimod`) are AVX2 only, tuned for Zen 3, with no
-fallback and no other ISA. Their `notes.md` files hold the measurements and lessons (register
+fallback and no other ISA. Their notes hold the measurements and lessons (register
 pressure, spills, aliasing, Zen 3 instruction costs). Read them before exploring a kernel they cover.
 
 v1 serves one modulus, P = 998244353 (DESIGN.md). Kernels for other moduli (`multimod`, `crt`)
@@ -84,9 +84,10 @@ Kernels to start with: `simd` (per-ISA vector wrappers), `modarith`, `ntt`, `mul
 - One agent per issue. An issue is a kernel, a kernel on one target, or a task. Two agents may work
   on the same kernel for different targets.
 - Each agent has its own git worktree and branch, `agent/<kernel>-<target>-r<round>`.
-- Read the kernel's `notes.md` first. Do not repeat a logged attempt without a new reason.
+- Read the kernel's `notes.md` and skim its `notes/` entries first. Do not repeat a logged attempt without a new reason.
 - Agents may change any file. Say in the pull request what you changed outside your kernel.
-- Log every attempt, win or loss, in `notes.md`: date, idea, result, numbers, CPU, flags, commit.
+- Log every attempt, win or loss, in a new file `notes/<issue>-r<round>.md` (AGENTS.md): date, idea,
+  result, numbers, CPU, flags, commit.
 - Delete losing variants from the repo once logged; keep their files in the exploration folder
   (VM: `~/explore/hpc_library/<kernel>/`; Mac: `~/Documents/hpc_library-explore/<kernel>/<vm>/`).
   Copy VM folders to the Mac before the round ends.
