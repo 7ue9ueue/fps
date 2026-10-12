@@ -213,7 +213,7 @@ void sparse() {
             Vec f(a + 1, 0), g(b + 1, 0), expect(std::gcd(a, b) + 1, 0);
             f[0] = g[0] = expect[0] = P - 1, f[a] = g[b] = expect.back() = 1;
             const std::string what = "x^" + std::to_string(a) + " - 1, x^" + std::to_string(b) + " - 1";
-            check_gcd(f, g, expect, direct, false, what);
+            check_gcd(f, g, expect, direct, direct == 2, what);
             if (std::gcd(a, b) > 1) check_inverse(f, g, direct, true, 0, what);
             // x^a - 1 + x^c terms: random sparse pairs, against Euclid where it is cheap.
             if (a <= 5000) {

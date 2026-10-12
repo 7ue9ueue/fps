@@ -713,12 +713,12 @@ inline std::size_t trimmed(Span a) {
     return n;
 }
 
-// Stack words of jumps on polynomials of degree <= n: 56 N for N = bit_ceil(n) (lc-opt: 48 N, plus
-// the fused ops' work arrays), and per level of the recursion the arrays' gaps.
+// Stack words of jumps on polynomials of degree <= n: 48 N for N = bit_ceil(n) (lc-opt's bound),
+// and per level of the recursion the arrays' gaps. Random inputs used 31-34 N from 2^12 on (notes.md).
 inline std::size_t half_gcd_words(std::size_t n) {
     const std::size_t len = std::max(kMinLength, std::bit_ceil(std::max<std::size_t>(n, 1)));
     const std::size_t levels = 2 * std::size_t(std::bit_width(len)) + 4;
-    return 56 * len + levels * 48 * footprint(0) + 4096;
+    return 48 * len + levels * 32 * footprint(0) + 4096;
 }
 
 inline std::size_t gcd_words(std::size_t nf, std::size_t ng) {  // trimmed sizes, both > 0, nf >= ng
