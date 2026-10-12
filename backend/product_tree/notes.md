@@ -117,7 +117,7 @@ lc-opt (issue #56): lane tree 14.4 ms and top tree 5.7 ms for 500000 factors on 
   - Products near 2^25 coefficients (2^22 linear factors; 4 of degree 2^23; 2^24 and 2^20
     quadratics) checked at random points on the Mac, `lc-amd` avx2 and scalar; one more linear
     factor throws std::length_error.
-- Next: ntt's `forward_upper` (the subtree of group 1) and an inverse out of place
+- Next (issue #91): ntt's `forward_upper` (the subtree of group 1) and an inverse out of place
   would remove the twist pass and the product pass's copy (Zen 3: about 0.35 ns per word per
   node, 1.4 ms of 10.4 at 2^18); one twiddle table for all of ntt's `Transform` lengths (memory);
   slot loads (0.87 ms) by gathers or wider loads; the top tree's 8 forwards of the lane products
