@@ -19,6 +19,7 @@ namespace {
 
 constexpr std::uint32_t P = 998244353;
 using Poly = fps::Polynomial<P>;
+constexpr std::uint64_t kExponent = 0x9e3779b97f4a7c15;
 
 // n random coefficients with f[0] = c.
 Poly random_poly(std::size_t n, std::uint32_t c, unsigned seed) {
@@ -43,8 +44,8 @@ void calculus(bench::Suite& suite) {
     }
 }
 
-// inverse, log and exp of n = 2^(lg-1) random coefficients, as mul/<lg> in bench.cpp; raw_exp
-// into a kept out.
+// inverse, log, exp, pow (e a random 64-bit exponent) and sqrt of n = 2^(lg-1) random
+// coefficients, as mul/<lg> in bench.cpp; raw_exp into a kept out.
 void newton(bench::Suite& suite) {
     for (int lg : {11, 14, 18, 22}) {
         const std::size_t n = std::size_t(1) << (lg - 1);
@@ -59,6 +60,12 @@ void newton(bench::Suite& suite) {
         suite.add("exp" + size, [n, seed] {
             return [f = random_poly(n, 0, seed)] { bench::keep(fps::exp(f)); };
         }, n);
+        suite.add("pow" + size, [n, seed] {
+            return [f = random_poly(n, 5, seed)] { bench::keep(fps::pow(f, kExponent)); };
+        }, n);
+        suite.add("sqrt" + size, [n, seed] {
+            return [f = random_poly(n, 4, seed)] { bench::keep(fps::sqrt(f)); };
+        }, n);
         if (lg == 14 || lg == 18)
             suite.add("raw_exp" + size, [n, seed] {
                 return [f = random_poly(n, 0, seed), out = Poly(n)]() mutable {
@@ -70,7 +77,7 @@ void newton(bench::Suite& suite) {
 }
 
 // The recurrences, on 2^lg coefficients: inverse(1 - x - x^2), log(1 - x - x^2), exp(x + x^2 / 2
-// + 3 x^5).
+// + 3 x^5), pow(1 - x - x^2, e), sqrt(1 - x - x^2).
 void sparse(bench::Suite& suite) {
     const Poly x = Poly::x();
     const Poly q = 1 - x - x * x, e = x + fps::mod_inverse<P>(2) * x * x + 3 * Poly::x(5);
@@ -80,6 +87,8 @@ void sparse(bench::Suite& suite) {
         suite.add("inverse_sparse" + size, [n, q] { return [n, q] { bench::keep(fps::inverse(q, n)); }; }, n);
         suite.add("log_sparse" + size, [n, q] { return [n, q] { bench::keep(fps::log(q, n)); }; }, n);
         suite.add("exp_sparse" + size, [n, e] { return [n, e] { bench::keep(fps::exp(e, n)); }; }, n);
+        suite.add("pow_sparse" + size, [n, q] { return [n, q] { bench::keep(fps::pow(q, kExponent, n)); }; }, n);
+        suite.add("sqrt_sparse" + size, [n, q] { return [n, q] { bench::keep(fps::sqrt(q, n)); }; }, n);
     }
 }
 

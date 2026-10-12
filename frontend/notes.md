@@ -752,3 +752,59 @@ belongs in `backend/`).
     rip-relative offsets of constants (32 bytes later in .rodata); the instruction addresses are
     the same. Clang's assembly of `bench.cpp` is identical. `mul@kernel/<lg>` against main in the
     same runs: 0.999-1.005.
+- 2026-10-12: series (#22): `pow(f, e, n)` (any f, any e < 2^64, 0^0 = 1), `sqrt(f, n)` (a
+  `std::optional`), n defaulting to `f.size()`, and `raw::pow`, `raw::sqrt` in
+  `include/fps/series.hpp`; `detail::mod_sqrt<P>` (Tonelli-Shanks, the smaller root) in
+  `modular.hpp`. From the prototype's `series.hpp` and `modular.hpp`; its kernels (lc-opt's
+  `pow.hpp`, `sqrt.hpp`) stay there, and the algorithms here are plain, on #20's `detail::series`.
+  - pow: f mod x^n = x^z u, u[0] != 0, gives x^(z e) u[0]^e (u / u[0])^e; 0 when z e >= n (checked
+    as z > (n - 1) / e, so z e never overflows). (u / u[0])^e = exp(e log(u / u[0])), in place in
+    the result: only e mod P counts below x^P, so pow needs n <= P, as log and exp
+    (`std::domain_error`). u[0]^e takes the whole e.
+  - sqrt: Newton, g[k, 2k) = h (u - g^2)[k, 2k) / 2 with h = 1 / g carried across the steps (one
+    inverse step on h, a square by `raw::mul`, a product): about the cost of `inverse` (below), not
+    exp(log / 2) (log + exp, 3.6x more).
+  - Few terms: u with at most 16 terms past u[0] solves u g' = e u' g, two tap sums per
+    coefficient: g[i] = (sum (e + 1) d a_d g[i - d]) / i - sum a_d g[i - d], a_d = u[d] / u[0];
+    sqrt is e = 1/2 with g[0] the root. Monomials (no taps) skip the reciprocals. sqrt's
+    recurrence runs only for s of at most P coefficients (it divides by i); past that, Newton
+    (which throws `std::length_error` past 2^25).
+  - DESIGN.md: which root `sqrt` returns. g^2 = f mod x^n leaves the top k coefficients of g free
+    for f = x^(2k) u, and the sign: now the root of the polynomial f mod x^n (as the prototype),
+    with the smaller square root of u[0] in [0, P), so `sqrt(1 - 4x)` starts with 1 (the Catalan
+    example needs that) and results are deterministic. Also pow's n <= P and why, and
+    `raw::pow`, `raw::sqrt` (out apart from f; `raw::sqrt` returns false without writing out).
+  - Tests (`test_pow_sqrt.cpp`): `mod_sqrt` against every residue of 3, 5, 17, 97, 7681 and random
+    squares and non-squares of P and 2^32 - 5; pow against the ODE recurrence on sizes 0, 1, 2^k
+    +- 1 (k <= 10) for f of n - 1, n, n + 2 coefficients with 0, 1, 2, 5 leading zeros, random,
+    mostly zero, all P - 1 and 1 to 20 terms, e from 0, 1, 2, 3, 7, P - 1, P, P + 1, 2P + 3,
+    2^63, 2^64 - 1 and random; against repeated squaring (no reasoning on e mod P) up to 65
+    coefficients and every e of that list; z e at n - 1, n, n + 1 and past 2^64; monomials;
+    sqrt against the root's O(n^2) recurrence with 0, 1, 2, 4, 7 leading zeros, non-square
+    leads, squared back; 0 to 18 terms around the cutoff; (1 + x)^e, f^P, f^(P + 1), f^(2P + 2)
+    and the Catalan numbers from sqrt(1 - 4x) at large n; pow(pow(f, a), b), f^2, f^3, sqrt(g^2)
+    with leading zeros at 2^14 +- 1, 2^17, 300001; the recurrence at 200000; outputs pre-filled
+    with P - 1; 4 threads; every error (overlaps, n > P on 4 GB of unwritten memory). 18 mutations
+    all fail it (one by timeout: the dropped n > P check runs pow over 4 GB). Pass at -O2 and
+    ASan/UBSan on the Mac (scalar, arm), `lc-amd` (scalar, sse, avx2), `lc-intel-test`,
+    `lc-zen5-test` and `lc-arm`.
+  - Bench (`bench_series.cpp`): `pow/<lg>` (e = 0x9e3779b97f4a7c15), `sqrt/<lg>` on n = 2^(lg-1)
+    random coefficients, as #20's cases; `pow_sparse`, `sqrt_sparse` ((1 - x - x^2)^e, its root;
+    n = 2^lg). No `@kernel` pairs: the backend has no series kernel (#87). Instead, each case over
+    `mul@kernel/<lg>` (`ntt::multiply` of two factors of n into n words, bench.cpp) from the same
+    run, medians of 11 rounds, GCC 15.2, origin/main ad1e1b4 plus this change, lg 11 / 14 / 18 / 22:
+
+    | case | `lc-bench` (avx2) | `lc-intel` (avx512) | `lc-zen5` (zen5) | `lc-arm` (arm) |
+    |---|---|---|---|---|
+    | pow | 16.1 / 13.6 / 12.5 / 12.7 | 16.5 / 13.9 / 12.6 / 12.7 | 22.2 / 15.3 / 13.5 / 12.1 | 12.7 / 12.2 / 12.0 / 11.9 |
+    | sqrt | 4.00 / 3.37 / 3.23 / 3.37 | 3.94 / 3.36 / 3.21 / 3.42 | 5.37 / 3.64 / 3.39 / 3.05 | 3.27 / 3.19 / 3.20 / 3.22 |
+    | inverse (same run) | 3.01 / 2.78 / 2.74 / 2.84 | 3.11 / 2.82 / 2.77 / 2.89 | 3.83 / 2.88 / 2.80 / 2.60 | 2.73 / 2.75 / 2.78 / 2.81 |
+
+    ns per coefficient at lg 22 (n = 2^21), pow / sqrt: `lc-bench` 116.6 / 30.9, `lc-intel`
+    115.7 / 31.2, `lc-zen5` 58.2 / 14.7, `lc-arm` 206.8 / 56.0. pow is log + exp plus three
+    passes. lc-opt's power (exp's steps on e x f'/f from log's division, no integral) and sqrt
+    (h kept at half precision, transforms of length m, a split last step: about 9.5 T + 4.5 LP,
+    against inverse's 10 T + 4 LP) would be about 4.6 and 1.6 products (guess, from
+    `lib/poly/notes.md`): added to backend issue #87, as the coordinator asked, rather than a new
+    issue. Recurrences: pow_sparse and sqrt_sparse (2 taps) 10.5 / 9.7 / 8.0 / 13.1 ns per
+    coefficient (flat in n), against exp_sparse's 3 taps at 9.3 on `lc-bench` (#20).

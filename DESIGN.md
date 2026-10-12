@@ -120,8 +120,8 @@ Polynomial integral(f);                   // constant term 0, f.size() + 1 coeff
 Polynomial inverse(f, n);                 // 1/f; f[0] != 0
 Polynomial log(f, n);                     // f[0] == 1; n <= P
 Polynomial exp(f, n);                     // f[0] == 0; n <= P
-Polynomial pow(f, std::uint64_t e, n);    // any f, leading zeros included
-std::optional<Polynomial> sqrt(f, n);
+Polynomial pow(f, std::uint64_t e, n);    // any f, leading zeros included; 0^0 = 1; n <= P
+std::optional<Polynomial> sqrt(f, n);     // g with g^2 = f mod x^n (below), or nullopt
 Polynomial compose(f, g, n);              // f(g) mod x^n; n defaults to max(f.size(), g.size());
                                           // linear g: Taylor shift
 Polynomial compositional_inverse(f, n);   // f[0] == 0, f[1] != 0
@@ -152,6 +152,13 @@ time in lanes, one transform of each length per node); it also takes a `std::vec
 coefficients and r has d (f's, then zeros, if `f.size()` <= d), so `f / x^k` drops the lowest k
 coefficients and `f % x^k` is `f.truncate(k)`; neither is trimmed. g = 0, of any size, throws
 `std::domain_error`. `f / g` computes no remainder.
+
+`sqrt(f, n)` is the root of the polynomial f mod x^n = x^(2k) u, u[0] != 0: x^k s with s^2 = u
+mod x^(n - k) and s[0] the smaller of the two square roots of u[0] in [0, P) (`sqrt(1 - 4x)` starts
+with 1). Its top k coefficients are free in g^2 = f mod x^n; this fixes them as if f had no terms
+past x^(n - 1). The zero polynomial for f mod x^n = 0; nullopt if the lowest nonzero term has an
+odd index or a coefficient that is not a square. `pow` needs n <= P, as `log` and `exp`: it runs
+(u / u[0])^e as exp(e log(u / u[0])), where only e mod P counts below x^P.
 
 `Factorials<P> fact(n)`, n <= P: `fact[i]` = i!, `fact.inverse(i)` = 1/i!, `fact.binomial(n, k)`
 = C(n, k) (0 for k > n), for i, n < `fact.size()`. n > P throws: P! = 0 has no inverse. Indices
@@ -256,6 +263,8 @@ a copy of A there); n is `out.size()`. For hot loops, and for code that keeps it
 fps::raw::exp<P>(std::span<const std::uint32_t> f, std::span<std::uint32_t> out);  // out may be f, else apart
 fps::raw::inverse<P>(f, out);                                                      // out apart from f
 fps::raw::log<P>(f, out);                                                          // out may overlap f
+fps::raw::pow<P>(f, std::uint64_t e, out);                                         // out apart from f
+bool fps::raw::sqrt<P>(f, out);           // out apart from f; false, out not written, if no root
 fps::raw::mul<P>(a, b, out);                                                       // out apart from a, b
 fps::raw::to_values<P>(std::span<const std::uint32_t> f, Values<P>& A);            // into an existing A
 fps::raw::to_coefficients<P>(const Values<P>& A, std::span<std::uint32_t> out, std::size_t offset);
