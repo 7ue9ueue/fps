@@ -22,6 +22,10 @@ runs again only when the new commits on main touch a unit this pull request affe
 include closure) or a shared file; otherwise the result still holds and it merges. The last line of the report
 is "Gate: pass" or "Gate: fail".
 
+It runs as origin/main's copy of tools/ (gate.py, kernel.py, vm.py), whatever the checkout it is
+started from: a coordinator's checkout can lag main by hours, and the gate's rules are main's.
+FPS_GATE_HERE=1 runs this checkout's copy instead, to try a change to the gate.
+
 The repository is public and the gate runs a pull request's code on the VMs and this Mac, so it
 refuses pull requests by any account but the repository's owner, and pull requests from forks.
 """
@@ -29,10 +33,12 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import io
 import json
 import math
+import os
 import re
-import io
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -51,7 +57,8 @@ SHARED = re.compile(r'^(backend/[^/]+|tools/kernel\.py)$')  # files outside a ke
 GATED = '^[^@]*$'  # the cases the verdict uses (kernel.gated); the others took 30-50% of bench time
 
 
-ROOT = Path(__file__).resolve().parent.parent  # paths below are relative to the repository root
+# paths below are relative to the repository root; FPS_GATE_ROOT: set by run_from_main
+ROOT = Path(os.environ.get('FPS_GATE_ROOT') or Path(__file__).resolve().parent.parent)
 
 
 def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -243,6 +250,28 @@ def gate(args) -> tuple[bool, str, str, str, list[str]]:
     return passed, '\n'.join(lines), base, head, kernels
 
 
+def run_from_main() -> None:
+    """Replace this process with origin/main's tools/gate.py, extracted once per commit."""
+    if os.environ.get('FPS_GATE_HERE'):
+        return
+    git('fetch', '--quiet', 'origin', 'main')
+    main = git('rev-parse', 'origin/main').stdout.strip()
+    tools = Path.home() / '.cache' / 'fps' / 'gate' / main
+    if not tools.is_dir():
+        tools.parent.mkdir(parents=True, exist_ok=True)
+        tmp = tempfile.mkdtemp(dir=tools.parent)
+        archive = subprocess.run(['git', 'archive', main, 'tools/'], check=True, capture_output=True, cwd=ROOT)
+        subprocess.run(['tar', '-xf', '-', '-C', tmp], input=archive.stdout, check=True)
+        try:
+            os.rename(tmp, tools)
+        except OSError:  # another gate extracted it first
+            shutil.rmtree(tmp)
+    log(f'running tools/gate.py of origin/main ({main[:10]})')
+    os.chdir(ROOT)
+    os.execve(sys.executable, [sys.executable, str(tools / 'tools' / 'gate.py'), *sys.argv[1:]],
+              {**os.environ, 'FPS_GATE_HERE': '1', 'FPS_GATE_ROOT': str(ROOT)})
+
+
 def set_status(head: str, passed: bool, url: str) -> None:
     """The commit status `gate`, which branch protection on main requires."""
     repo = gh_json('repo', 'view', '--json', 'nameWithOwner')['nameWithOwner']
@@ -267,6 +296,7 @@ def stale(base: str, tip: str, merged: str, units: list[str]) -> bool:
 
 
 def main() -> int:
+    run_from_main()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('target', help='pull request number or git revision')
     parser.add_argument('--base', default='origin/main')
