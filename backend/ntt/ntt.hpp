@@ -33,6 +33,7 @@
 //   t.inverse(F, out, Form::leaves, {.offset = k, .add = true});   // out[i] += coefficient k + i
 //   t.forward(f, Form::values);                // f -> values form (L <= 2^23); inverse(F, Form::values),
 //                                              // inverse(F, out, Form::values) undo it
+//   t.forward_upper(h, Form::values);          // the upper half of p's values form (doubling)
 //
 //   // Fused ops for Newton steps: sources and outputs in caller memory, one pass each.
 //   t.forward(std::span(g), G);                // G = leaf form of g (g.size() <= L, zero past it)
@@ -366,6 +367,18 @@ public:
     void forward_upper(std::uint32_t* h) const {
         if (lg_ == kMinLog) throw std::length_error("fps::ntt::Transform::forward_upper: needs lg > kMinLog");
         Variant::forward_upper(h, lg_ - 1, roots());
+    }
+
+    // forward_upper(h), then (Form::values) those leaves on to their values: the upper half of p's
+    // values form, so a values form doubles too (backend/gcd). The split is intrinsics'
+    // (Values<Native>; its words are every variant's). Throws std::length_error past 2^kValuesMaxLog.
+    template <class Variant = SelectedForward>
+    void forward_upper(std::uint32_t* h, Form form) const {
+        if (form == Form::leaves) return forward_upper<Variant>(h);
+        const std::uint32_t* rows = checked_rows();
+        forward_upper<Variant>(h);
+        const std::size_t blocks = length() / 128;  // of 64 words in each half
+        detail::intrinsics::Values<detail::intrinsics::Ntt<simd::Native>::N>::split(h, h, blocks, blocks, rows);
     }
 
     // forward_upper undone: h (length() / 2 words, 32-byte aligned, kPadding after), leaves L / 16
