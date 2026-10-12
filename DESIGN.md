@@ -135,10 +135,13 @@ std::vector<std::uint32_t> extrapolate(values, std::uint32_t c, std::size_t m);
 Polynomial to_newton_basis(f, points);
 
 // Algebra
-Polynomial gcd(f, g);                     // monic
-std::optional<Polynomial> inverse_mod(f, m);   // f^-1 mod m
-std::vector<std::uint32_t> roots(f);      // distinct roots in [0, P)
-std::vector<std::pair<Polynomial, int>> factor(f);   // monic irreducible factors, multiplicities
+Polynomial gcd(f, g);                     // monic, deg + 1 coefficients; gcd(0, 0) = 0 (none)
+std::optional<Polynomial> inverse_mod(f, m);   // f^-1 mod m: deg m coefficients, nullopt if
+                                          // gcd(f, m) != 1; m != 0; a constant m gives 0
+std::vector<std::uint32_t> roots(f);      // distinct roots in [0, P), increasing; f != 0
+std::vector<std::pair<Polynomial, int>> factor(f);   // monic irreducible factors, multiplicities;
+                                          // f != 0, deg f < P; by degree, then coefficients
+                                          // from the constant term; a constant f gives none
 ```
 
 `middle_product(f, g)`, for n = `f.size()` >= m = `g.size()` >= 1 (else `std::domain_error`):
