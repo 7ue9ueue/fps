@@ -7,7 +7,7 @@
 //   fps::series::exp(f, out);        // out = exp f mod x^n; f[0] = 0, n <= P; out may overlap f
 //
 //   // The same in the caller's scratch, of inverse_scratch(n) (log_scratch, exp_scratch) words,
-//   // any alignment, instead of this thread's memory:
+//   // any alignment, instead of this thread's memory (a shorter one: std::invalid_argument):
 //   fps::series::inverse(f, out, scratch);
 //
 // f: words < P, of which f mod x^n is read (a shorter f has zeros past its end). The preconditions
@@ -27,9 +27,14 @@
 // - exp: m -> 2m keeping h = 1 / g mod x^(m/2) and H = T_m(h), q = x f' (lc-opt's step, notes.md);
 //   8 transforms and 3.5 leaf products of 2m a step. The upper half of T_2m(a), a of m words, is
 //   T_m of a twisted copy (detail::twist). A last step to n <= 3m/2 runs at length m: 7 T(m).
+//   inverse's last step to n <= 3k/2 also runs at length k: 7 T(k) + 3 LP(k), not 5 T(2k) + 2 LP(2k).
+// Measured from 2^13 on, in units of ntt::multiply of two factors of n into n words, on the four
+// timed targets: inverse 1.6-2.1, log 2.0-2.9, exp 2.7-3.7 (the frontend's Newton on products
+// before: 2.6-2.9, 4.1-4.8, 7.6-9.8).
 //
-// Memory: this thread's region of the NTT (ntt::detail::take_region, kept across calls); about
-// 2 n words for inverse, 6.5 n for log and 8 n for exp. The transforms' tables: one ntt::Transform
+// Memory: this thread's region of the NTT (ntt::detail::take_region, kept across calls), or the
+// caller's scratch: with N = bit_ceil(n), 2 N words for inverse, about 2 n + 2 B (n / 2 + 80)
+// for log (B <= 4 blocks) and 2 n + 4.5 N for exp. The transforms' tables: one ntt::Transform
 // per length, kept per thread, 2^lg bytes each.
 #pragma once
 
