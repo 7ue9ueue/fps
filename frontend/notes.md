@@ -637,3 +637,20 @@ belongs in `backend/`).
       faster (`square`, `raw_mul`, `mul`, `multiply` /11: 0.82-0.83) with `series.hpp` in
       bench.cpp's program; codegen, as #81 (guess, not inspected). Elsewhere 0.955 (`add/22`,
       `lc-arm`) to 1.035 (`neg/22`, `lc-arm`): placement, as in earlier entries.
+- 2026-10-12: `square` and `middle_product` on the backend's new kernels (backend issue #55,
+  `backend/ntt/notes.md`). `detail::Products::square`: as `multiply(a, a, 2n - 1)` (shift,
+  `small::multiply`), with `ntt::square` (one forward transform) on the NTT path.
+  `detail::Products::middle`: `ntt::middle_product` into the result on the NTT path, a cyclic
+  product of length >= n with the result at word 0: no move, no spare words; the
+  `small::multiply` path keeps its move. The NTT path now takes f up to 2^25 words, so the length
+  error test uses 2^25 + 1. `bench.cpp`: `square@kernel` and `middle_product@kernel` call the new
+  kernels into new memory (`ntt_square`, `ntt_middle`). Against main a536462, 7 rounds, GCC 15.2,
+  new/base at lg 11, 14, 18, 22 (f of 2^(lg-1); g of 2^(lg-2)):
+
+  | case | `lc-bench` (avx2) | `lc-intel` (avx512) | `lc-zen5` (zen5) | `lc-arm` (arm) |
+  |---|---:|---:|---:|---:|
+  | square | 0.786, 0.749, 0.730, 0.709 | 0.799, 0.780, 0.731, 0.724 | 0.821, 0.791, 0.756, 0.700 | 0.772, 0.756, 0.735, 0.725 |
+  | middle_product | 0.502, 0.490, 0.481, 0.494 | 0.501, 0.484, 0.456, 0.492 | 0.524, 0.491, 0.495, 0.451 | 0.482, 0.484, 0.484, 0.484 |
+
+  API / kernel (same runs, new medians): square 0.99-1.01 (`lc-intel` /22 0.96: the kernel case
+  the slower), middle_product 0.99-1.01, on all four.
