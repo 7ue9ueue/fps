@@ -50,6 +50,9 @@
 
 namespace fps {
 
+template <std::uint32_t P>
+class Polynomial;
+
 namespace detail {
 
 // A scalar for the operators: an integer type of at most 64 bits, so residue() is exact.
@@ -93,6 +96,10 @@ inline std::optional<Term> single_term(std::span<const std::uint32_t> f) {
     }
     return t;
 }
+
+// n coefficients, unwritten: for the library's functions that write all of them.
+template <std::uint32_t P>
+Polynomial<P> unwritten_polynomial(std::size_t n);
 
 }  // namespace detail
 
@@ -280,6 +287,9 @@ private:
     using Word = Ops<simd::Scalar>;
     static constexpr detail::Words::Unwritten kUnwritten{};
 
+    template <std::uint32_t Q>
+    friend Polynomial<Q> detail::unwritten_polynomial(std::size_t n);
+
     Polynomial(std::size_t n, detail::Words::Unwritten u) : c_(n, u) {}
 
     std::uint32_t* data() { return c_.data(); }
@@ -330,5 +340,10 @@ private:
 
     detail::Words c_;
 };
+
+template <std::uint32_t P>
+Polynomial<P> detail::unwritten_polynomial(std::size_t n) {
+    return Polynomial<P>(n, Polynomial<P>::kUnwritten);
+}
 
 }  // namespace fps

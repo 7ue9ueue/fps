@@ -196,19 +196,21 @@ A polynomial in value form. A product of two `Values` is value by value, O(L), s
 used in many products is converted once and reused. A sum of products needs one conversion back.
 
 ```cpp
+enum class Layout { automatic, pointwise };   // automatic: the backend picks
+
 template <std::uint32_t P>
 class Values {
 public:
+    Values();                             // empty (L = 0), for containers; assign before use
+    explicit Values(std::size_t L, Layout layout = Layout::automatic);   // zero
     std::size_t size() const;             // L, a power of two
     Values& operator+=(const Values&);
     Values& operator-=(const Values&);
     Values& operator*=(const Values&);    // value by value
-    Values& operator*=(std::uint32_t c);
-    void multiply_add(const Values& a, const Values& b);   // *this += a b
+    Values& operator*=(c);                // c an integer of at most 64 bits, taken mod P
+    void multiply_add(const Values& a, const Values& b);   // *this += a b; a or b may be *this
 };
-// Also A + B, A - B, A * B, c * A.
-
-enum class Layout { automatic, pointwise };   // automatic: the backend picks
+// Also A + B, A - B, A * B, c * A, A * c.
 
 Values<P> to_values(f, std::size_t L, Layout layout = Layout::automatic);   // f.size() <= L; zeros above
 Polynomial<P> to_coefficients(const Values<P>& A);   // L coefficients: the product mod (x^L - 1)
@@ -216,18 +218,25 @@ Polynomial<P> to_coefficients(const Values<P>& A);   // L coefficients: the prod
 
 - `to_coefficients(A * B)` is a b mod (x^L - 1): coefficient L + i adds onto i. For the exact
   product, L > deg a + deg b. With a smaller L the wrapped terms land low; a middle product keeps
-  only the upper part.
+  only the upper part. On an rvalue, as there, the inverse transform runs in A's own memory.
 - `Layout::pointwise` is the hint for a polynomial used in many products per conversion: the
-  value-by-value layout wins there (ABC222 H v2).
-- Operands must have the same L and layout; a mismatch throws.
+  value-by-value layout wins there (ABC222 H v2). L above 2^23 has no such values (P - 1 =
+  119 2^23 has no larger power-of-two roots of unity) and keeps the automatic layout.
+- `Values(L, layout)` is the zero polynomial: the start of a sum of products (`multiply_add`) and
+  the buffer that `raw::to_values` fills.
+- Operands must have the same L and layout; a mismatch throws `std::domain_error`, as do L not a
+  power of two and f.size() > L. L > 2^25 throws `std::length_error` (the backend's longest
+  transform).
 - The contents are opaque: no `operator[]`. The layout depends on the CPU (lc-opt's transform
   ends at blocks of 8 coefficients, not single values), so it is not a DFT. `fps::dft` and
   `fps::idft` give the true values at the roots, in a documented order, for users who need them.
 
 ## Raw functions
 
-Same names in `fps::raw`, on spans. They write into the caller's memory and never allocate;
-n is `out.size()`. For hot loops, and for code that keeps its own buffers.
+Same names in `fps::raw`, on spans. They write into the caller's memory and never allocate,
+except for a per-thread scratch that grows to the longest length a thread uses and is then
+reused (`raw::to_coefficients` and `raw::add_coefficients` transform a copy of A there); n is
+`out.size()`. For hot loops, and for code that keeps its own buffers.
 
 ```cpp
 fps::raw::exp<P>(std::span<const std::uint32_t> f, std::span<std::uint32_t> out);  // out may be f
@@ -237,6 +246,7 @@ fps::raw::to_coefficients<P>(const Values<P>& A, std::span<std::uint32_t> out, s
                                           // out[i] = coefficient offset + i
 fps::raw::add_coefficients<P>(const Values<P>& A, std::span<std::uint32_t> out, std::size_t offset);
                                           // out[i] += coefficient offset + i
+                                          // offset + out.size() <= L, else std::domain_error
 ```
 
 Each function documents whether `out` may overlap an input.

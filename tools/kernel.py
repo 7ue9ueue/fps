@@ -4,8 +4,11 @@
   kernel.py test UNIT [--target T]
       Build every test*.cpp of the unit for target T at -O2 and with ASan/UBSan; run them all.
   kernel.py bench UNIT [--target T] [--base DIR] [--rounds N] [--filter RE] [--json FILE]
-      Time the unit's bench.cpp. With --base (another checkout, e.g. of main), time both in
-      the same run, alternating, and print each case's paired ratio new/base: below 1 is faster.
+      Time the unit's bench*.cpp, each its own binary (e.g. frontend/bench_values.cpp, whose
+      code changes how GCC compiles bench.cpp's). Case names must be unique across a unit's
+      bench files: a duplicate within one round is an error. With --base (another checkout,
+      e.g. of main), time both in the same run, alternating, and print each case's paired
+      ratio new/base: below 1 is faster.
 
 A unit is a backend kernel (folder backend/<kernel>/) or `frontend` (folder frontend/, headers in
 include/fps/).
@@ -211,11 +214,14 @@ def bench(args) -> int:
     trees = {'new': Path('.')}
     if args.base:
         trees['base'] = Path(args.base)
-    binaries = {name: build(tree, args.kernel, 'bench.cpp', args.target) for name, tree in trees.items()}
+    sources = sorted(p.name for p in Path(unit_dir(args.kernel)).glob('bench*.cpp'))
+    binaries = {name: [build(tree, args.kernel, source, args.target) for source in sources
+                       if (tree / unit_dir(args.kernel) / source).exists()]
+                for name, tree in trees.items()}
     report = {'kernel': args.kernel, 'target': args.target, 'flags': flags(args.target),
               'cpu': cpu_name(), 'compiler': 'clang++' if MAC else IMAGE, 'rounds': args.rounds,
               'identical': False, 'cases': {}}
-    digests = {hashlib.sha256(b.read_bytes()).hexdigest() for b in binaries.values()}
+    digests = {tuple(hashlib.sha256(b.read_bytes()).hexdigest() for b in bs) for bs in binaries.values()}
     if args.base and len(digests) == 1:
         report['identical'] = True
         print('base and new bench binaries are byte-identical: nothing to time.')
@@ -227,19 +233,25 @@ def bench(args) -> int:
             lines = []
             for r in range(args.rounds):
                 for name in (names if r % 2 == 0 else names[::-1]):
-                    binary = f'{paths[name]}/{binaries[name].relative_to(trees[name])}'
-                    lines.append(f'echo "## {name}"; {pin}{binary} {shlex.quote(args.filter)}')
+                    for b in binaries[name]:
+                        binary = f'{paths[name]}/{b.relative_to(trees[name])}'
+                        run = f'{pin}{binary} {shlex.quote(args.filter)}'
+                        lines.append(f'echo "## {name} {r}"; {run}')
             return '\n'.join(lines)
 
         result = sh(trees, script)
         if result.returncode:
             sys.exit(f'bench failed:\n{result.stdout}{result.stderr}')
-        current = None
+        current, round_, seen = None, None, set()
         for line in result.stdout.splitlines():
             if line.startswith('## '):
-                current = line[3:]
+                current, round_ = line[3:].split()
             elif '\t' in line:
                 case, ns, *rest = line.split('\t')  # older benches print no items
+                if (current, round_, case) in seen:
+                    sys.exit(f'bench case {case} appears twice in one round of {current}: '
+                             'case names must be unique across the bench*.cpp files')
+                seen.add((current, round_, case))
                 entry = report['cases'].setdefault(case, {'items': 0})
                 entry.setdefault(current, []).append(float(ns))
                 if current == 'new' and rest:
