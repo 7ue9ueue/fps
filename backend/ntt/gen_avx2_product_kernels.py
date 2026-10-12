@@ -19,6 +19,12 @@ inverse_top_to and inverse_top4_to (products from spans) write the first T outpu
 the ops of the other outputs are dropped (a product cut to fewer words than the transform).
 bottom_square_*: the same bottom stage for a square, a times a: no forward butterflies of b, and
 the leaf products broadcast the coefficients of A from the window rows' second halves.
+bottom_stored_*: the same for b given as leaves (Transform's fused ops): no forward butterflies of
+b, the leaf products broadcast its coefficients from memory (bs, the two batches' 8 leaves).
+bottom_leaves_*: the same with a given as leaves too: the windows are filled from a's canonical
+leaves, no forward butterflies (the inverse of a leaf product, Transform::inverse_product).
+bottom_leaves2_*, bottom_leaves3_*: the sum of 2 or 3 such products (a, a1, a2 times bs, bs1,
+bs2), each reduced, then added; the leaf buffers of term k from 2 k LEAVES bytes on.
 
 Usage: gen_avx2_product_kernels.py [--check]   (--check: exit 1 if avx2_product_kernels.hpp differs)
 """
@@ -41,9 +47,29 @@ SHIFT = -0.05  # 'both': the first stage's ops start this fraction earlier in so
 # window 12 and shift -0.05 or -0.1 (notes.md, issue #55).
 SQUARE_KNOBS = dict(KNOBS, both=gk.Knobs(window=16))
 SQUARE_SHIFT = 0.0
+# Leaves 'both': window 14 and more deadlock (register budget); 12 does not.
+LEAVES_KNOBS = dict(SQUARE_KNOBS, both=gk.Knobs(window=12))
+# Sums 'both': windows from 8 deadlock (register budget); 6 (2 terms) and 4 (3 terms) with shift -0.05 do not.
+TERMS_KNOBS = {'leaves2': dict(LEAVES_KNOBS, both=gk.Knobs(window=6)), 'leaves3': dict(LEAVES_KNOBS, both=gk.Knobs(window=4))}
+TERMS_SHIFT = -0.05
 ARGS = {'first': ['a', 'b', 'buf', 'x', 'y'], 'last': ['out', 'cur', 'ix', 'iy'],
         'both': ['a', 'b', 'buf', 'x', 'y', 'out', 'cur', 'ix', 'iy']}
 SQUARE_ARGS = {part: [a for a in args if a != 'b'] for part, args in ARGS.items()}
+STORED_ARGS = {'first': SQUARE_ARGS['first'], 'last': ['out', 'cur', 'bs', 'ix', 'iy'],
+               'both': SQUARE_ARGS['first'] + ['out', 'cur', 'bs', 'ix', 'iy']}
+TERMS = {'leaves2': 2, 'leaves3': 3}  # sums of leaf products
+
+
+def term_args(terms):
+    a = ['a'] + [f'a{k}' for k in range(1, terms)]
+    bs = ['bs'] + [f'bs{k}' for k in range(1, terms)]
+    first = a + ['buf', 'x', 'y']
+    last = ['out', 'cur'] + bs + ['ix', 'iy']
+    return {'first': first, 'last': last, 'both': first + last}
+
+
+def term_name(base, k):
+    return base if k == 0 else f'{base}{k}'
 DOC = {
     'first': 'Forward half of the bottom stage for the two batches at a, b; fills buf.',
     'last': 'Leaf products from cur and the inverse butterflies; writes the two batches at out.',
@@ -71,8 +97,14 @@ class Batch(gk.Graph):
 def first(g, square=False):
     """Forward butterflies of a and b; leaf buffer rows [w_t A_t, A_t] and B_t, all in [0, P].
     square: a alone; B_t is A_t, the rows' second halves."""
-    for t, v in enumerate(gk.forward_h1(g, 'a', 'x', 'y')):
-        a = g.canonical(v)
+    if square in TERMS:
+        for k in range(TERMS[square]):
+            first_rows(g, [g.materialize(g.at(term_name('a', k), 32 * t)) for t in range(4)], 2 * LEAVES * k)
+        return
+    leaves = square == 'leaves'
+    values = [g.materialize(g.at('a', 32 * t)) for t in range(4)] if leaves else gk.forward_h1(g, 'a', 'x', 'y')
+    for t, v in enumerate(values):
+        a = v if leaves else g.canonical(v)
         g.store(a, 'buf', None, 64 * t + 32)
         w, q = (0, 32) if t < 2 else (4, 36)  # y or z and its quotient
         wa = g.shoup(a, g.scalar('y', w), g.scalar('y', q))
@@ -86,16 +118,46 @@ def first(g, square=False):
         g.store(g.canonical(v), 'buf', None, 256 + 32 * t)
 
 
-def last(g, square=False):
+def first_rows(g, values, at):
+    """Rows [w_t A_t, A_t] of canonical leaves A_t into buf from byte at (first() for leaves)."""
+    for t, a in enumerate(values):
+        g.store(a, 'buf', None, at + 64 * t + 32)
+        w, q = (0, 32) if t < 2 else (4, 36)
+        wa = g.shoup(a, g.scalar('y', w), g.scalar('y', q))
+        wa = g.op('vpminud', wa, g.op('vpsubd', wa, g.c['P']))
+        if t % 2:
+            wa = g.op('vpsubd', g.c['P'], wa)
+        g.store(wa, 'buf', None, at + 64 * t)
+
+
+def leaf_sum(g, t, bs, at):
+    """Leaf t's product from the windows at cur + at and b_j from bs: reduced, < 2P."""
+    c = g.c
+    e = o = None
+    for j in range(8):
+        b = g.materialize(g.scalar(bs, 32 * t + 4 * j))
+        pe = g.op('vpmuludq', g.at('cur', at + 64 * t + 4 * (8 - j)), b)
+        po = g.op('vpmuludq', g.at('cur', at + 64 * t + 4 * (9 - j)), b)
+        e = pe if e is None else g.op('vpaddq', e, pe)
+        o = po if o is None else g.op('vpaddq', o, po)
+    e = g.op('vpaddq', e, g.op('vpmuludq', g.op('vpmuludq', e, c['NI']), c['P']))
+    o = g.op('vpaddq', o, g.op('vpmuludq', g.op('vpmuludq', o, c['NI']), c['P']))
+    return g.low(g.op('vpblendd', g.op('vpsrlq', e, imm=32), o, imm=0xAA))
+
+
+def last(g, square=False):  # square: True, or 'stored' (b_j from bs)
     """Leaf t: e (even lanes) and o (odd lanes) sum b_j times the window 8 - j and 9 - j words in;
     sums < 8 P^2, then Montgomery reduction and the inverse butterfly as gen_kernels.bottom_last.
     square: b_j from A_t, words 8 + j of window t."""
     c = g.c
     leaves = []
-    for t in range(4):
+    for t in range(4 if square not in TERMS else 0):
         e = o = None
         for j in range(8):
-            b = g.materialize(g.scalar('cur', 64 * t + 32 + 4 * j if square else 256 + 32 * t + 4 * j))
+            if square in ('stored', 'leaves'):
+                b = g.materialize(g.scalar('bs', 32 * t + 4 * j))
+            else:
+                b = g.materialize(g.scalar('cur', 64 * t + 32 + 4 * j if square else 256 + 32 * t + 4 * j))
             pe = g.op('vpmuludq', g.at('cur', 64 * t + 4 * (8 - j)), b)
             po = g.op('vpmuludq', g.at('cur', 64 * t + 4 * (9 - j)), b)
             e = pe if e is None else g.op('vpaddq', e, pe)
@@ -103,6 +165,13 @@ def last(g, square=False):
         e = g.op('vpaddq', e, g.op('vpmuludq', g.op('vpmuludq', e, c['NI']), c['P']))
         o = g.op('vpaddq', o, g.op('vpmuludq', g.op('vpmuludq', o, c['NI']), c['P']))
         leaves.append(g.low(g.op('vpblendd', g.op('vpsrlq', e, imm=32), o, imm=0xAA)))
+    if square in TERMS:
+        for t in range(4):
+            leaf = None
+            for k in range(TERMS[square]):
+                x = leaf_sum(g, t, term_name('bs', k), 2 * LEAVES * k)
+                leaf = x if leaf is None else g.low(g.add(leaf, x))
+            leaves.append(leaf)
     tw = {'WX': g.scalar('ix', 0), 'QX': g.scalar('ix', 32), 'WY': g.scalar('iy', 0), 'QY': g.scalar('iy', 32),
           'WZ': g.scalar('iy', 4), 'QZ': g.scalar('iy', 36)}
     r = leaves
@@ -119,30 +188,38 @@ def body(part, square=False):
     g = Batch({'P': gk.Value('creg', reg=15), '2P': gk.Value('creg', reg=14), 'NI': gk.Value('creg', reg=13)})
     if part in ('last', 'both'):
         for m in range(BATCHES):
-            g.offset = {'cur': LEAVES * m, 'out': 128 * m, 'ix': 4 * m, 'iy': 8 * m}
+            g.offset = {'cur': LEAVES * m, 'out': 128 * m, 'bs': 128 * m, 'bs1': 128 * m, 'bs2': 128 * m,
+                        'ix': 4 * m, 'iy': 8 * m}
             last(g, square)
     split = len(g.ops)
     if part in ('first', 'both'):
         for m in range(BATCHES):
-            g.offset = {'a': 128 * m, 'b': 128 * m, 'buf': LEAVES * m, 'x': 4 * m, 'y': 8 * m}
+            g.offset = {'a': 128 * m, 'a1': 128 * m, 'a2': 128 * m, 'b': 128 * m, 'buf': LEAVES * m, 'x': 4 * m,
+                        'y': 8 * m}
             first(g, square)
     ops = g.ops
     if part == 'both':  # interleave the two stages' source orders proportionally
         older, newer = ops[:split], ops[split:]
         keyed = [(i / len(older), 0, i, o) for i, o in enumerate(older)]
-        keyed += [(j / len(newer) + (SQUARE_SHIFT if square else SHIFT), 1, j, o) for j, o in enumerate(newer)]
+        shift = TERMS_SHIFT if square in TERMS else SQUARE_SHIFT if square else SHIFT
+        keyed += [(j / len(newer) + shift, 1, j, o) for j, o in enumerate(newer)]
         ops = [o for *_, o in sorted(keyed, key=lambda t: t[:3])]
-    seq = gk.schedule(ops, 13, (SQUARE_KNOBS if square else KNOBS)[part])
+    knobs = TERMS_KNOBS[square] if square in TERMS else LEAVES_KNOBS if square == 'leaves' else SQUARE_KNOBS if square else KNOBS
+    seq = gk.schedule(ops, 13, knobs[part])
     reg = gk.allocate(seq, {13, 14, 15})
     head = ['vpbroadcastd %[P], %%ymm15', 'vpbroadcastd %[P2], %%ymm14', 'vpbroadcastd %[NI], %%ymm13']
     return head + [gk.emit(o, reg) for o in seq]
 
 
 def function(part, square=False):
-    args = SQUARE_ARGS[part] if square else ARGS[part]
+    stored = square in ('stored', 'leaves') or square in TERMS
+    args = (term_args(TERMS[square])[part] if square in TERMS else STORED_ARGS[part] if stored
+            else SQUARE_ARGS[part] if square else ARGS[part])
     params = ', '.join(f'{"void*" if a in ("buf", "out") else "const void*"} {a}' for a in args)
-    doc = DOC[part] + (' Square: a times a.' if square else '')
-    name = f'bottom_square_{part}' if square else f'bottom_{part}'
+    doc = DOC[part] + (f' Leaves: the sum of {TERMS[square]} products of leaves (a.. times bs..).' if square in TERMS else
+                       ' Leaves: a and b as leaves (a at a, b at bs).' if square == 'leaves' else
+                       ' Stored: b as leaves at bs.' if stored else ' Square: a times a.' if square else '')
+    name = f'bottom_{square}_{part}' if stored else f'bottom_square_{part}' if square else f'bottom_{part}'
     lines = [f'// {doc}', f'[[gnu::always_inline]] inline void {name}({params}) {{', '    asm volatile(']
     lines += gk.asm_lines(body(part, square))
     lines += ['        :', '        : ' + ', '.join(f'[{a}] "r"({a})' for a in args) + ',',
@@ -160,7 +237,7 @@ def function(part, square=False):
 TOP_TWIDDLES = ['S', 'SZ0', 'SY1', 'SZ1', 'SX1', 'X1']
 
 
-def top_column(ga, gb, blocks):
+def top_column(ga, gb, blocks, upper=False):
     c = ga.c
     shoup = lambda g, x, name: g.shoup(x, c['W' + name], c['Q' + name])
     f = [ga.quarter(i) for i in range(4)]
@@ -174,14 +251,19 @@ def top_column(ga, gb, blocks):
     v = [shoup(gb, gb.add(ab, cd), 'S'), gb.low(gb.add(amb, cmd)),
          shoup(gb, gb.diff(ab, cd), 'SX1'), shoup(gb, gb.diff(amb, cmd), 'X1')]
     for t in range(4):
+        if upper:
+            if t < blocks:
+                ga.store_quarter(ga.canonical(ga.diff(u[t], v[t])), t)
+            continue
         if t < blocks:
             ga.store_quarter(ga.canonical(ga.add(u[t], v[t])), t)
         if 4 + t < blocks:
             gb.store_quarter(gb.canonical(gb.diff(u[t], v[t])), t)
 
 
-def top_body(blocks=8, to=False):
-    """to: the first `blocks` output blocks to o (o2 for blocks 4..7), else all 8 in place."""
+def top_body(blocks=8, to=False, upper=False):
+    """to: the first `blocks` output blocks to o (o2 for blocks 4..7), else all 8 in place.
+    upper: the first `blocks` of output blocks 4..7 to o."""
     consts = {'P': gk.Value('creg', reg=15), '2P': gk.Value('creg', reg=14)}
     for i, name in enumerate(TOP_TWIDDLES):  # w[2i] value, w[2i + 1] quotient, broadcast
         consts['W' + name] = gk.Value('cmem', mem=64 * i)
@@ -189,13 +271,13 @@ def top_body(blocks=8, to=False):
     ga = gk.Graph(consts, array='a', out='o' if to else None)
     gb = gk.Graph(consts, array='b', out='o2' if to else None)
     gb.ops = ga.ops  # one column: two address bases, one op list
-    top_column(ga, gb, blocks)
+    top_column(ga, gb, blocks, upper)
     seq = gk.schedule(gk.prune(ga.ops), 14, gk.Knobs())
     reg = gk.allocate(seq, {14, 15})
     head = ['vpbroadcastd %[P], %%ymm15', 'vpbroadcastd %[P2], %%ymm14', '.p2align 5', '1:']
     tail = ['add $32, %[a]', 'add $32, %[b]']
     if to:
-        tail += ['add $32, %[o]'] + (['add $32, %[o2]'] if blocks > 4 else [])
+        tail += ['add $32, %[o]'] + (['add $32, %[o2]'] if blocks > 4 and not upper else [])
     tail += ['cmp %[end], %[a]', 'jne 1b']
     return head + [gk.emit(o, reg) for o in seq] + tail
 
@@ -228,16 +310,18 @@ void inverse_top_to(const Vec* a, std::uint32_t* o, std::size_t columns, std::si
 '''
 
 
-def top_to_function(blocks):
+def top_to_function(blocks, upper=False):
+    name = 'inverse_top_upper_to' if upper else 'inverse_top_to'
     lines = ['template <>',
-             f'inline void inverse_top_to<{blocks}>(const Vec* a, std::uint32_t* o, std::size_t columns, std::size_t q,',
+             f'inline void {name}<{blocks}>(const Vec* a, std::uint32_t* o, std::size_t columns, std::size_t q,',
              '                                  const Vec* w) {',
              '    const Vec* b = a + 4 * q;']
-    if blocks > 4:
+    two = blocks > 4 and not upper
+    if two:
         lines += ['    std::uint32_t* o2 = o + 32 * q;']
     lines += ['    const Vec* const end = a + columns;', '    asm volatile(']
-    lines += gk.asm_lines(top_body(blocks, True))
-    lines += ['        : [a] "+r"(a), [b] "+r"(b), [o] "+r"(o)' + (', [o2] "+r"(o2)' if blocks > 4 else ''),
+    lines += gk.asm_lines(top_body(blocks, True, upper))
+    lines += ['        : [a] "+r"(a), [b] "+r"(b), [o] "+r"(o)' + (', [o2] "+r"(o2)' if two else ''),
               '        : [end] "r"(end), [h] "r"(32 * q), [h3] "r"(96 * q), [w] "r"(w), [P] "m"(kP), [P2] "m"(k2P)',
               '        : ' + gk.CLOBBERS + ', "cc");', '}']
     return lines
@@ -262,7 +346,7 @@ void inverse_top4_to(const Vec* a, std::uint32_t* o, std::size_t columns, std::s
 '''
 
 
-def top4_column(g, blocks):
+def top4_column(g, blocks, upper=False):
     c = g.c
     shoup = lambda x, name: g.shoup(x, c['W' + name], c['Q' + name])
     f = [g.quarter(i) for i in range(4)]
@@ -271,11 +355,11 @@ def top4_column(g, blocks):
     outputs = [lambda: g.canonical(g.add(sab, scd)), lambda: g.canonical(g.add(samb, scmd)),
                lambda: gk.canonical_difference(g, sab, scd), lambda: gk.canonical_difference(g, samb, scmd)]
     for t in range(blocks):
-        g.store_quarter(outputs[t](), t)
+        g.store_quarter(outputs[2 + t if upper else t](), t)
 
 
-def top4_body(blocks=4, to=False):
-    """to: the first `blocks` output quarters to o, else all 4 in place."""
+def top4_body(blocks=4, to=False, upper=False):
+    """to: the first `blocks` output quarters to o, else all 4 in place. upper: of quarters 2, 3."""
     consts = {'P': gk.Value('creg', reg=15), '2P': gk.Value('creg', reg=14)}
     for i, name in enumerate(['S', 'SZ']):  # w[2i] value, w[2i + 1] quotient, broadcast
         consts['W' + name] = gk.Value('cmem', mem=64 * i)
@@ -283,7 +367,7 @@ def top4_body(blocks=4, to=False):
     ops = []
     for k in range(2):
         g = gk.Graph(consts, disp=32 * k, out='o' if to else None)
-        top4_column(g, blocks)
+        top4_column(g, blocks, upper)
         ops += g.ops
     seq = gk.schedule(gk.prune(ops), 14, TOP4_KNOBS)
     reg = gk.allocate(seq, {14, 15})
@@ -300,12 +384,13 @@ def top4_function():
     return lines
 
 
-def top4_to_function(blocks):
+def top4_to_function(blocks, upper=False):
+    name = 'inverse_top4_upper_to' if upper else 'inverse_top4_to'
     lines = ['template <>',
-             f'inline void inverse_top4_to<{blocks}>(const Vec* a, std::uint32_t* o, std::size_t columns, std::size_t q,',
+             f'inline void {name}<{blocks}>(const Vec* a, std::uint32_t* o, std::size_t columns, std::size_t q,',
              '                                   const Vec* w) {',
              '    const Vec* const end = a + columns;', '    asm volatile(']
-    body = top4_body(blocks, True)
+    body = top4_body(blocks, True, upper)
     lines += gk.asm_lines(body)
     lines += ['        : [a] "+r"(a), [o] "+r"(o)',
               '        : [end] "r"(end), [h] "r"(32 * q), [h3] "r"(96 * q), [w] "r"(w), [P] "m"(kP), [P2] "m"(k2P)',
@@ -314,6 +399,20 @@ def top4_to_function(blocks):
 
 
 TOP4_KNOBS = gk.Knobs()
+
+TOP_UPPER_TO_DOC = '''\
+// inverse_top_to() for the upper half of the result (Transform's fused ops): columns j < columns of
+// its blocks 4 + t, t < T, to the vectors at o + 8 (tq + j), any alignment.
+template <int T>
+void inverse_top_upper_to(const Vec* a, std::uint32_t* o, std::size_t columns, std::size_t q, const Vec* w);
+'''
+
+TOP4_UPPER_TO_DOC = '''\
+// inverse_top4_to() for the upper half of the result: columns j < columns of its quarters 2 + t,
+// t < T, to the vectors at o + 8 (tq + j), any alignment. columns even.
+template <int T>
+void inverse_top4_upper_to(const Vec* a, std::uint32_t* o, std::size_t columns, std::size_t q, const Vec* w);
+'''
 
 
 HEADER = '''\
@@ -341,7 +440,7 @@ using avx2_kernels::Vec;
 
 def generate():
     lines = HEADER.split('\n')
-    for square in (False, True):
+    for square in (False, True, 'stored', 'leaves', 'leaves2', 'leaves3'):
         for part in ('first', 'last', 'both'):
             lines += function(part, square) + ['']
     lines += top_function() + [''] + top4_function() + ['']
@@ -351,6 +450,12 @@ def generate():
     lines += TOP4_TO_DOC.split('\n')
     for blocks in range(1, 5):
         lines += top4_to_function(blocks) + ['']
+    lines += TOP_UPPER_TO_DOC.split('\n')
+    for blocks in range(1, 5):
+        lines += top_to_function(blocks, True) + ['']
+    lines += TOP4_UPPER_TO_DOC.split('\n')
+    for blocks in range(1, 3):
+        lines += top4_to_function(blocks, True) + ['']
     lines += ['}  // namespace fps::ntt::avx2_product_kernels']
     return '\n'.join(lines) + '\n'
 

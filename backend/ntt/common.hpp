@@ -192,6 +192,17 @@ struct Product {
     int lg;
 };
 
+// A term of a leaf form computed from stored ones (Transform::inverse_product, cyclic_product): the
+// leaf products of a and b, or a alone if b is null. a, b: leaf forms of the transform's length.
+struct LeafTerm {
+    const std::uint32_t* a;
+    const std::uint32_t* b;
+};
+inline constexpr int kMaxTerms = 4;
+// The output of the fused ops: bits of `output`. kUpperHalf: coefficients from 2^lg / 2 on (the
+// count words written are those of the upper half); kNegated: their negatives.
+inline constexpr unsigned kUpperHalf = 1, kNegated = 2;
+
 // f(std::integral_constant<int, t>{}) for t in [0, K]: a block count known at run time as a
 // template argument.
 template <int K, class F>

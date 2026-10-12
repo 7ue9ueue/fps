@@ -135,6 +135,19 @@ inline void multiply_leaves(const u32* a, const u32* b, u32* out, int lg, const 
 }
 inline void multiply_leaves(u32* a, const u32* b, int lg, const u32* r) { multiply_leaves(a, b, a, lg, r); }
 
+// f = the sum of the terms' leaf products (a alone where b is null; common.hpp, LeafTerm). The
+// first term's a or b may be f.
+inline void leaf_terms(const LeafTerm* terms, int n, u32* f, int lg, const u32* r) {
+    const std::size_t len = std::size_t(1) << lg;
+    for (int i = 0; i < n; ++i) {
+        const LeafTerm& t = terms[i];
+        if (t.b) multiply_leaves(t.a, t.b, f, lg, r, i > 0);
+        else if (i > 0)
+            for (std::size_t j = 0; j < len; ++j) f[j] = add(f[j], t.a[j]);
+        else if (t.a != f) std::copy_n(t.a, len, f);
+    }
+}
+
 // The values form (common.hpp) of the leaf form at `from`, into `to` (may be from); rows:
 // build_value_rows(lg).
 inline void split(const u32* from, u32* to, int lg, const u32* rows) {
@@ -258,6 +271,41 @@ struct scalar {
         else if (from != f) std::copy_n(from, std::size_t(1) << lg, f);
         inverse(f, lg, inverse_roots);
         if (out != f) std::copy_n(f, count, out);
+    }
+
+    // Fused leaf-form ops (ntt.hpp, Transform), step by step: in copied into f, zero past n.
+    static void forward_from(const std::uint32_t* in, std::size_t n, std::uint32_t* f, int lg, const std::uint32_t* roots) {
+        std::fill(std::copy_n(in, n, f), f + (std::size_t(1) << lg), 0u);
+        forward(f, lg, roots);
+    }
+
+    static void forward_product(const std::uint32_t* in, std::size_t n, const std::uint32_t* b, std::uint32_t* f, int lg,
+                                const std::uint32_t* roots) {
+        forward_from(in, n, f, lg, roots);
+        detail::scalar::multiply_leaves(f, b, f, lg, roots);
+    }
+
+    static void forward_upper_from(const std::uint32_t* in, std::size_t n, std::uint32_t* f, int lg,
+                                   const std::uint32_t* roots) {
+        std::fill(std::copy_n(in, n, f), f + (std::size_t(1) << lg), 0u);
+        forward_upper(f, lg, roots);
+    }
+
+    static void cyclic_product(const std::uint32_t* in, std::size_t n, const std::uint32_t* b, std::uint32_t* f,
+                               std::uint32_t* out, std::size_t count, int lg, const std::uint32_t* roots,
+                               const std::uint32_t* inverse_roots, unsigned output) {
+        forward_from(in, n, f, lg, roots);
+        const detail::LeafTerm term{f, b};
+        inverse_product(&term, 1, f, out, count, lg, roots, inverse_roots, output);
+    }
+
+    static void inverse_product(const detail::LeafTerm* terms, int n, std::uint32_t* f, std::uint32_t* out,
+                                std::size_t count, int lg, const std::uint32_t* roots, const std::uint32_t* inverse_roots,
+                                unsigned output) {
+        detail::scalar::leaf_terms(terms, n, f, lg, roots);
+        inverse(f, lg, inverse_roots);
+        const std::uint32_t* from = f + (output & detail::kUpperHalf ? (std::size_t(1) << lg) / 2 : 0);
+        for (std::size_t i = 0; i < count; ++i) out[i] = output & detail::kNegated ? detail::scalar::sub(0, from[i]) : from[i];
     }
 };
 

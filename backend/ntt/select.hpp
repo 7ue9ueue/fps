@@ -177,6 +177,43 @@ template <class... V>
     (void)((i++ == v && (V::inverse(from, f, out, count, lg, ir, rows), true)) || ...);
 }
 
+// Transform's fused ops (ntt.hpp): forwards from caller memory by the forward's choice, cyclic
+// products by the product's, inverses of leaf products by the inverse's.
+template <class... V>
+[[gnu::always_inline]] inline void run_forward_from(Candidates<V...>, int v, const std::uint32_t* in, std::size_t n,
+                                                    std::uint32_t* f, int lg, const std::uint32_t* r) {
+    int i = 0;
+    (void)((i++ == v && (V::forward_from(in, n, f, lg, r), true)) || ...);
+}
+template <class... V>
+[[gnu::always_inline]] inline void run_forward_product(Candidates<V...>, int v, const std::uint32_t* in, std::size_t n,
+                                                       const std::uint32_t* b, std::uint32_t* f, int lg,
+                                                       const std::uint32_t* r) {
+    int i = 0;
+    (void)((i++ == v && (V::forward_product(in, n, b, f, lg, r), true)) || ...);
+}
+template <class... V>
+[[gnu::always_inline]] inline void run_forward_upper_from(Candidates<V...>, int v, const std::uint32_t* in, std::size_t n,
+                                                          std::uint32_t* f, int lg, const std::uint32_t* r) {
+    int i = 0;
+    (void)((i++ == v && (V::forward_upper_from(in, n, f, lg, r), true)) || ...);
+}
+template <class... V>
+[[gnu::always_inline]] inline void run_cyclic_product(Candidates<V...>, int v, const std::uint32_t* in, std::size_t n,
+                                                      const std::uint32_t* b, std::uint32_t* f, std::uint32_t* out,
+                                                      std::size_t count, int lg, const std::uint32_t* r,
+                                                      const std::uint32_t* ir, unsigned output) {
+    int i = 0;
+    (void)((i++ == v && (V::cyclic_product(in, n, b, f, out, count, lg, r, ir, output), true)) || ...);
+}
+template <class... V>
+[[gnu::always_inline]] inline void run_inverse_product(Candidates<V...>, int v, const LeafTerm* terms, int n,
+                                                       std::uint32_t* f, std::uint32_t* out, std::size_t count, int lg,
+                                                       const std::uint32_t* r, const std::uint32_t* ir, unsigned output) {
+    int i = 0;
+    (void)((i++ == v && (V::inverse_product(terms, n, f, out, count, lg, r, ir, output), true)) || ...);
+}
+
 }  // namespace detail
 
 namespace variant {
@@ -230,6 +267,36 @@ struct tuned {
     static void inverse(const std::uint32_t* from, std::uint32_t* f, std::uint32_t* out, std::size_t count, int lg,
                         const std::uint32_t* inverse_roots, const std::uint32_t* rows) {
         detail::run_inverse_from(Selected{}, choice(kInverse, lg), from, f, out, count, lg, inverse_roots, rows);
+    }
+
+    // Transform's fused ops.
+    static void forward_from(const std::uint32_t* in, std::size_t n, std::uint32_t* f, int lg, const std::uint32_t* roots) {
+        detail::run_forward_from(Selected{}, choice(kForward, lg), in, n, f, lg, roots);
+    }
+
+    static void forward_product(const std::uint32_t* in, std::size_t n, const std::uint32_t* b, std::uint32_t* f, int lg,
+                                const std::uint32_t* roots) {
+        detail::run_forward_product(Selected{}, choice(kForward, lg), in, n, b, f, lg, roots);
+    }
+
+    // The forward's candidate at the length it runs, 2^lg (as forward_upper).
+    static void forward_upper_from(const std::uint32_t* in, std::size_t n, std::uint32_t* f, int lg,
+                                   const std::uint32_t* roots) {
+        detail::run_forward_upper_from(Selected{}, choice(kForward, lg), in, n, f, lg, roots);
+    }
+
+    static void cyclic_product(const std::uint32_t* in, std::size_t n, const std::uint32_t* b, std::uint32_t* f,
+                               std::uint32_t* out, std::size_t count, int lg, const std::uint32_t* roots,
+                               const std::uint32_t* inverse_roots, unsigned output) {
+        detail::run_cyclic_product(Selected{}, choice(kProduct, lg), in, n, b, f, out, count, lg, roots, inverse_roots,
+                                   output);
+    }
+
+    static void inverse_product(const detail::LeafTerm* terms, int n, std::uint32_t* f, std::uint32_t* out,
+                                std::size_t count, int lg, const std::uint32_t* roots, const std::uint32_t* inverse_roots,
+                                unsigned output) {
+        detail::run_inverse_product(Selected{}, choice(kInverse, lg), terms, n, f, out, count, lg, roots, inverse_roots,
+                                    output);
     }
 };
 
