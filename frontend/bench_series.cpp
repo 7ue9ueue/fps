@@ -1,10 +1,9 @@
 // Times fps/series.hpp modulo P = 998244353; tools/kernel.py runs it, a binary of its own. Items
 // are coefficients of the result.
-//   "<op>/<lg>"   through the API (gated)
-// The backend has no series kernel yet, so there are no "<op>@kernel" pairs: the Newton paths
-// run on ntt::multiply (raw::mul), whose own pair is mul / mul@kernel in bench.cpp, and the
-// recurrences and calculus are frontend loops. frontend/notes.md gives each case in units of
-// mul@kernel/<lg> (ntt::multiply of two factors of n into n words) from the same run.
+//   "<op>/<lg>"          through the API (gated)
+//   "<op>@kernel/<lg>"   inverse, log, exp: backend/series on the same input into a kept out
+// The recurrences and calculus are frontend loops. frontend/notes.md gives the Newton cases in
+// units of mul@kernel/<lg> (ntt::multiply of two factors of n into n words) from the same run.
 #include <cstddef>
 #include <cstdint>
 #include <random>
@@ -66,6 +65,17 @@ void newton(bench::Suite& suite) {
         suite.add("sqrt" + size, [n, seed] {
             return [f = random_poly(n, 4, seed)] { bench::keep(fps::sqrt(f)); };
         }, n);
+        const auto kernel = [&suite, n, seed, size](const std::string& op, std::uint32_t c, auto call) {
+            suite.add(op + "@kernel" + size, [n, seed, c, call] {
+                return [f = random_poly(n, c, seed), out = Poly(n), call]() mutable {
+                    call(f.span(), out.span());
+                    bench::keep(out);
+                };
+            }, n);
+        };
+        kernel("inverse", 5, [](std::span<const std::uint32_t> f, std::span<std::uint32_t> o) { fps::series::inverse(f, o); });
+        kernel("log", 1, [](std::span<const std::uint32_t> f, std::span<std::uint32_t> o) { fps::series::log(f, o); });
+        kernel("exp", 0, [](std::span<const std::uint32_t> f, std::span<std::uint32_t> o) { fps::series::exp(f, o); });
         if (lg == 14 || lg == 18)
             suite.add("raw_exp" + size, [n, seed] {
                 return [f = random_poly(n, 0, seed), out = Poly(n)]() mutable {
