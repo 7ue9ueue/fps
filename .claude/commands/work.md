@@ -18,7 +18,9 @@ For each round:
    `Target:` lines. For a task issue (`Area:`, no `Kernel:`), `{kernel}` is a one-word name for
    the area and `{target}` is `all`.
 3. When it returns, read the issue's newest `Result:` line. If the round left none, comment what
-   happened, ending with `Result: no gain`.
+   happened, ending with `Result: no gain`. If lc-opt has the operation (the issue's `lc-opt:`
+   line, or BACKEND.md) and the comment has no same-run fps / lc-opt table, send the agent back
+   for it before gating.
 4. Gate the round's pull request, if it opened one. Agents never run the gate; you do:
    `python3 tools/gate.py <pr> --merge`, in the background, while you keep running rounds (gates
    queue on a lock, so start each as its round returns; one that affects no unit merges at once).

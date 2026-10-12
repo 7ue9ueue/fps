@@ -74,6 +74,11 @@ Kernels to start with: `simd` (per-ISA vector wrappers), `modarith`, `ntt`, `mul
   variant (reported). Sizes 2^6..2^25, to see L1, L2, L3 and memory.
 - Before optimizing, estimate the floor: multiply uops over multiply pipes, or bytes over
   bandwidth. Report the time next to it.
+- Where lc-opt has the operation (`../cpp_hpc/lc-opt`, `~/lc-opt` on the VMs; read-only), lc-opt
+  is the bar: time it against ours in the same run on `lc-bench` (Zen 3, the machine it was tuned
+  for), same compiler and flags, outputs checked equal, at several sizes, and report fps / lc-opt.
+  The gate only compares against `main`, so this is the only check that a move kept lc-opt's
+  speed. Keep the harness in the exploration folder (`<kernel>/issue<n>/`) for the next round.
 - Measure instruction costs you rely on (`perf` on `lc-intel` and `lc-arm`; probes elsewhere).
   Model rankings (`llvm-mca`) did not predict the hardware in lc-opt.
 - Test every variant the machine can run, not only the selected one: ragged sizes (0, 1, powers of
