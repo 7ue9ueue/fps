@@ -123,8 +123,8 @@ Polynomial exp(f, n);                     // f[0] == 0; n <= P
 Polynomial pow(f, std::uint64_t e, n);    // any f, leading zeros included; 0^0 = 1; n <= P
 std::optional<Polynomial> sqrt(f, n);     // g with g^2 = f mod x^n (below), or nullopt
 Polynomial compose(f, g, n);              // f(g) mod x^n; n defaults to max(f.size(), g.size());
-                                          // linear g: Taylor shift
-Polynomial compositional_inverse(f, n);   // f[0] == 0, f[1] != 0
+                                          // any f, g; constant g: f(g[0]); linear g: Taylor shift
+Polynomial compositional_inverse(f, n);   // f[0] == 0 (n >= 1), f[1] != 0 (n >= 2); n <= P
 
 // Evaluation and interpolation
 std::vector<std::uint32_t> evaluate(f, points);          // points: a span, or geometric(...)

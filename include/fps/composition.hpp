@@ -22,17 +22,18 @@
 // Q_l (ceil(n / 2^l) rows in x, y-degree 2^l); Q_l(0, y) = 1. Going up, level l needs only
 // the y-window [m - 2^l, m) of f_rev / Q_l: the window of level l + 1 times Q_l(-x, y), a
 // product truncated in x and a middle product in y. At the bottom the window is f reversed.
-// Power projection is Bostan and Mori's [x^N] P / Q with y carried along. Each step is a product
-// of Kronecker-packed bivariates (x^i y^j at word i Y + j) on raw::mul: about 3 n words for
-// compose, up to 3 n words for the power projection, cut to that, so a transform of about 8 n.
-// Both throw std::length_error, before any work, if a level's product passes 2^25 words: up to
-// about 6 n words for compose (3 n for n a power of two: n = 2^23 runs, 2^23 + 1 throws), 3 n for
-// compositional_inverse (n = 2^23 runs, 2^24 throws).
-// The tuned versions are backend issues: #105 (Kinoshita and Li, lc-opt's), #118 (Taylor
+// Power projection is Bostan and Mori's [x^N] P / Q with y carried along, P = 1. Each step is a
+// product of Kronecker-packed bivariates (x^i y^j at word i Y + j) on raw::mul, cut to its rows:
+// for n a power of two, 2 n to 3 n words in compose's levels and 3 n in the power projection's
+// first step (fewer after), so transforms of 8 n. A product past 2^25 words throws
+// std::length_error; both functions check every level's size before any work: up to about 6 n
+// words for compose (3 n for n a power of two, so 2^23 passes and 2^23 + 1 throws), 3 n for
+// compositional_inverse (2^23 passes, 2^24 throws).
+// The tuned versions are backend issues: #105 (Kinoshita and Li, lc-opt's), #124 (Taylor
 // shift). Times against ntt::multiply: frontend/notes/26.md.
 //
-// Memory: compose keeps every level's Q_l, about n log2 n words (2^20: 84 MB); the products use
-// the backend's per-thread memory; compositional_inverse keeps O(n) words.
+// Memory: compose keeps every level's Q_l, about (log2 n + 2) n words (2^20: 92 MB), and
+// compositional_inverse O(n) words; the products use the backend's per-thread memory.
 #pragma once
 
 #include <algorithm>
