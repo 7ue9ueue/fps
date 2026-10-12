@@ -164,6 +164,15 @@ returns c of `f.size()` = n coefficients with f = sum_k c_k prod_(i < k) (x - x_
 first n - 1 points, any of them (fewer throws `std::domain_error`). Points and values >= P throw
 `std::domain_error`; 2^25 or more points (n >= 2^25) throw `std::length_error`.
 
+On geometric points (fps/geometric.hpp, the backend's chirp kernels): `evaluate(f,
+geometric(a, r, m))` returns m values for any a, r (repeats too); `interpolate<P>(geometric(a, r,
+m), values)` returns m coefficients and needs m values and distinct points (a != 0 for m >= 2,
+r != 0 for m >= 3, r^k != 1 for 0 < k < m; else `std::domain_error`). `extrapolate<P>(values, c,
+m)` reads f of degree < n = `values.size()` <= P from f(0 .. n - 1) and returns f(c + i) for i < m,
+c + i taken mod P. a, r, c and values >= P throw `std::domain_error`. `Geometric`'s constructor is
+explicit, so a braced list such as `{1, 2, 3}` stays a list of points. The NTT behind them throws
+`std::length_error` past 2^25 words (interpolate: m > 2^25, checked first).
+
 `sqrt(f, n)` is the root of the polynomial f mod x^n = x^(2k) u, u[0] != 0: x^k s with s^2 = u
 mod x^(n - k) and s[0] the smaller of the two square roots of u[0] in [0, P) (`sqrt(1 - 4x)` starts
 with 1). Its top k coefficients are free in g^2 = f mod x^n; this fixes them as if f had no terms
@@ -262,6 +271,12 @@ Polynomial<P> to_coefficients(const Values<P>& A);   // L coefficients: the prod
 - The contents are opaque: no `operator[]`. The layout depends on the CPU (lc-opt's transform
   ends at blocks of 8 coefficients, not single values), so it is not a DFT. `fps::dft` and
   `fps::idft` give the true values at the roots, in a documented order, for users who need them.
+- `fps::dft(f, L)` returns f(w^i) for i < L, natural order, with w = 3^((P - 1) / L) (3
+  generates the units mod P): the DFT of f mod (x^L - 1), any `f.size()`. `fps::idft<P>(values)`
+  returns the f of L = `values.size()` coefficients with f(w^i) = values[i]. L is 0 or any divisor
+  of P - 1, not only a power of two (else `std::domain_error`): both run a chirp z-transform
+  (fps/geometric.hpp), one middle product of transforms of length about 2L, slower than
+  `to_values` for powers of two.
 
 ## Raw functions
 
