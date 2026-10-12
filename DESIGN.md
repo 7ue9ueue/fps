@@ -48,7 +48,8 @@ Users name their modulus once: `using Poly = fps::Polynomial<998244353>;`.
 - Values are canonical: every coefficient is in [0, P), in and out.
 - `size()` is the stored length, trailing zeros included. The library never trims. `degree()` is
   the index of the last nonzero coefficient, -1 for zero.
-- Precision n means "mod x^n": the first n coefficients. A series function reads only f mod x^n.
+- Precision n means "mod x^n": the first n coefficients. A series function reads only f mod x^n,
+  so its precondition on f[0] applies for n > 0 only (`inverse(f, 0)` is empty for any f).
 - Defaults: one-argument series functions return `f.size()` coefficients; `compose(f, g)` returns
   max(`f.size()`, `g.size()`); `*` is the exact product.
   Short closed forms need n: `inverse(1 - x)` has 2 coefficients, `inverse(1 - x, n)` has n.
@@ -112,13 +113,13 @@ Polynomial middle_product(f, g);          // coefficients m - 1 .. n - 1 of f g 
 
 // Division and calculus
 std::pair<Polynomial, Polynomial> divmod(f, g);       // quotient, remainder
-Polynomial derivative(f);
-Polynomial integral(f);                   // constant term 0
+Polynomial derivative(f);                 // f.size() - 1 coefficients (0 for an empty f)
+Polynomial integral(f);                   // constant term 0, f.size() + 1 coefficients; f.size() < P
 
 // Series: n defaults to f.size()
 Polynomial inverse(f, n);                 // 1/f; f[0] != 0
-Polynomial log(f, n);                     // f[0] == 1
-Polynomial exp(f, n);                     // f[0] == 0
+Polynomial log(f, n);                     // f[0] == 1; n <= P
+Polynomial exp(f, n);                     // f[0] == 0; n <= P
 Polynomial pow(f, std::uint64_t e, n);    // any f, leading zeros included
 std::optional<Polynomial> sqrt(f, n);
 Polynomial compose(f, g, n);              // f(g) mod x^n; n defaults to max(f.size(), g.size());
@@ -143,8 +144,8 @@ std::vector<std::pair<Polynomial, int>> factor(f);   // monic irreducible factor
 `middle_product(f, g)`, for n = `f.size()` >= m = `g.size()` >= 1 (else `std::domain_error`):
 the n - m + 1 coefficients m - 1 .. n - 1 of f g, h[i] = sum over j < m of f[i + j] g[m - 1 - j].
 They are the coefficients whose sums meet all of g. With g reversed it is the transposed product,
-sum over j of f[i + j] g[j]. `product(fs)` splits fs where the sums of sizes come closest to
-halves; it also takes a `std::vector`.
+sum over j of f[i + j] g[j]. `product(fs)` runs the backend's product tree (small factors 8 at a
+time in lanes, one transform of each length per node); it also takes a `std::vector`.
 
 `Factorials<P> fact(n)`, n <= P: `fact[i]` = i!, `fact.inverse(i)` = 1/i!, `fact.binomial(n, k)`
 = C(n, k) (0 for k > n), for i, n < `fact.size()`. n > P throws: P! = 0 has no inverse. Indices
@@ -246,7 +247,9 @@ reused (`raw::mul` multiplies there; `raw::to_coefficients` and `raw::add_coeffi
 a copy of A there); n is `out.size()`. For hot loops, and for code that keeps its own buffers.
 
 ```cpp
-fps::raw::exp<P>(std::span<const std::uint32_t> f, std::span<std::uint32_t> out);  // out may be f
+fps::raw::exp<P>(std::span<const std::uint32_t> f, std::span<std::uint32_t> out);  // out may be f, else apart
+fps::raw::inverse<P>(f, out);                                                      // out apart from f
+fps::raw::log<P>(f, out);                                                          // out may overlap f
 fps::raw::mul<P>(a, b, out);                                                       // out apart from a, b
 fps::raw::to_values<P>(std::span<const std::uint32_t> f, Values<P>& A);            // into an existing A
 fps::raw::to_coefficients<P>(const Values<P>& A, std::span<std::uint32_t> out, std::size_t offset);

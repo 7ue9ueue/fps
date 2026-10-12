@@ -97,4 +97,5 @@ Kernels to start with: `simd` (per-ISA vector wrappers), `modarith`, `ntt`, `mul
   request and returns; the coordinator runs the gate and sends failures back (AGENTS.md, How work
   flows).
 - A round ends with a comment on its issue: what was tried, the numbers, and a last line that is
-  exactly `Result: gain` or `Result: no gain`. An issue stops after 3 rounds, or 2 in a row without gain.
+  exactly `Result: gain` or `Result: no gain`. Speed work stops after 3 rounds, or 2 in a row
+  without gain; a feature (a new API, a move, a fix) gets 1 round.

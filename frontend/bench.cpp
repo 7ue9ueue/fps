@@ -220,15 +220,30 @@ void short_raw_products(bench::Suite& suite) {
     }
 }
 
-// product(fs) of 2^lg factors x - r_i: a tree of f * g, no single backend call, so no @kernel pair.
+// product(fs) of 2^lg factors x - r_i, against product_tree::product on spans of the same factors
+// (built in the setup) into new memory, as the API's result holds it.
 void product(bench::Suite& suite) {
     for (int lg : {10, 14, 18}) {
         const std::size_t count = std::size_t(1) << lg;
-        suite.add("product/" + std::to_string(lg), [count, lg] {
+        const auto factors = [count, lg] {
             std::mt19937 rng{unsigned(lg)};
             std::vector<Poly> fs;
             for (std::size_t i = 0; i < count; ++i) fs.push_back(Poly{std::uint32_t(rng() % P), 1});
-            return [fs] { bench::keep(fps::product(fs)); };
+            return fs;
+        };
+        suite.add("product/" + std::to_string(lg), [factors] {
+            return [fs = factors()] { bench::keep(fps::product(fs)); };
+        }, count);
+        suite.add("product@kernel/" + std::to_string(lg), [factors] {
+            const std::vector<Poly> fs = factors();
+            std::vector<std::span<const std::uint32_t>> spans(fs.size());
+            for (std::size_t i = 0; i < fs.size(); ++i) spans[i] = fs[i].span();
+            return [fs, spans] {
+                const std::size_t size = fps::product_tree::size(spans);
+                fps::detail::Words out(size, fps::detail::Words::Unwritten{});
+                fps::product_tree::product(spans, {out.data(), size});
+                bench::keep(out);
+            };
         }, count);
     }
 }
