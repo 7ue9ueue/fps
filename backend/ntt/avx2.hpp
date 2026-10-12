@@ -145,8 +145,10 @@ struct PairBottom {
     }
 };
 
-// Bottom stages of a square, a times a (Tree skips b). PairSquareBottom: PairBottom's kernels
-// without b's forward half; the leaf products read A's coefficients from the windows.
+// The bottom stage of a square, a times a (Tree skips b): PairBottom's kernels without b's forward
+// half; the leaf products read A's coefficients from the windows. At every length: at 2^8 it took
+// 0.93 of the time of GroupBottom with b = a (a's forward half twice), at 2^7 0.96, inside the
+// spread of code layout there (notes.md, issue #55).
 struct PairSquareBottom {
     static constexpr bool kSquare = true;
 
@@ -160,16 +162,6 @@ struct PairSquareBottom {
             product_kernels::bottom_square_both(a + j + 8, leaves[next], r + slot(k + 2), r + slot(2 * k + 4), a + j,
                                                 leaves[cur], ix, iy);
         }
-    }
-};
-
-// GroupBottom with b = a: its kernels read both batches before they write a, and compute a's
-// forward half twice.
-struct GroupSquareBottom {
-    static constexpr bool kSquare = true;
-
-    static void run(Vec* a, Vec*, std::size_t nv, std::size_t first, const u32* r, const u32* ir) {
-        GroupBottom::run(a, a, nv, first, r, ir);
     }
 };
 
@@ -700,7 +692,6 @@ struct avx2 {
     }
 
     static void square(const detail::Product& p, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
-        if (p.lg == 7 || p.lg == 8) return detail::avx2::square<detail::avx2::GroupSquareBottom>(p, roots, inverse_roots);
         detail::avx2::square<detail::avx2::PairSquareBottom>(p, roots, inverse_roots);
     }
 };

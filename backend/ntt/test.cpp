@@ -859,13 +859,6 @@ struct avx2_bottom : variant::avx2 {
 using avx2_group = avx2_bottom<impl::GroupBottom>;
 using avx2_pair = avx2_bottom<impl::PairBottom>;
 
-// Variant avx2 with each square bottom stage at every length.
-template <class Bottom>
-struct avx2_square_bottom : variant::avx2 {
-    static void square(const detail::Product& p, const u32* r, const u32* ir) { impl::square<Bottom>(p, r, ir); }
-};
-using avx2_group_square = avx2_square_bottom<impl::GroupSquareBottom>;
-using avx2_pair_square = avx2_square_bottom<impl::PairSquareBottom>;
 
 void test_bottoms() {
     for (int lg = kMinLog; lg <= kMaxLog; ++lg) {
@@ -880,13 +873,6 @@ void test_bottoms() {
                 test_spans<avx2_group>("avx2 one-group bottom, spans", f, g, product, {n + m - 1, len / 2 + 3}, 1);
                 test_spans<avx2_pair>("avx2 two-group bottom, spans", f, g, product, {n + m - 1, len / 2 + 3}, 1);
             }
-        }
-        for (const std::size_t n : {len / 2, len / 4 + 1, len / 2 - 3}) {
-            if (lg > 20) break;
-            const auto f = random_poly(n, 0);
-            const auto product = lg <= 12 ? schoolbook(f, f) : reference_product<variant::avx2>("avx2 square", f, f);
-            test_square<avx2_group_square>("avx2 one-group square bottom", f, product, {2 * n - 1, len / 2 + 3}, 1);
-            test_square<avx2_pair_square>("avx2 two-group square bottom", f, product, {2 * n - 1, len / 2 + 3}, 1);
         }
     }
 }
@@ -1094,7 +1080,20 @@ void test_group_bottom() {
     }
 }
 
+// PairBottom and PairSquareBottom on pairs of groups, as the intrinsics bottoms (test_multiply).
+void test_pair_bottoms() {
+    Tables t(kTableLog);
+    using K = IntrinsicsKernels<fps::simd::Scalar>;
+    K::test_multiply("avx2 pair bottom", t, 2, [&](u32* a, u32* b, std::size_t count, std::size_t k) {
+        impl::PairBottom::run(reinterpret_cast<Vec*>(a), reinterpret_cast<Vec*>(b), 4 * count, k, t.r(), t.ir());
+    });
+    K::test_multiply("avx2 pair square bottom", t, 2, [&](u32* a, u32* b, std::size_t count, std::size_t k) {
+        impl::PairSquareBottom::run(reinterpret_cast<Vec*>(a), reinterpret_cast<Vec*>(b), 4 * count, k, t.r(), t.ir());
+    }, true);
+}
+
 void test_avx2() {
+    test_pair_bottoms();
     test_loops();
     test_caller_levels();
     test_bottom_levels();
