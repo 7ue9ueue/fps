@@ -3,7 +3,7 @@
 //   "<op>@kernel/<size>"   the backend calls the API makes, by hand, on the same inputs
 // a * b and a + b are products of polynomials, so they have kernel pairs: ntt::multiply into new
 // memory, as the results hold them. [k] and take(n) run many products (Bostan-Mori; inverse and
-// mul), with no kernel of their own yet; frontend/notes.md gives them in units of the products'
+// mul), with no kernel of their own yet; frontend/notes/23.md gives them in units of the products'
 // pairs (multiply@kernel, mul@kernel in bench.cpp) from the same run. Sizes stop at 2^18 (and
 // d = 10^5 for [k], DESIGN.md's cost example) to keep a gate's run short.
 #include <cstddef>

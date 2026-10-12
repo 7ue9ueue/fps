@@ -21,7 +21,7 @@
 // (fps/polynomial.hpp), so sizes add and nothing is reduced (fib + fib has denominator q^2).
 // a + b and a - b cost three products, a * b and a / b two, a / f and f * a one, derivative(a)
 // three (one a square); -a and c * a are O(d) streams. a * b and a + b run within 2% of the same
-// ntt::multiply calls by hand from 2^10 coefficients (frontend/notes.md).
+// ntt::multiply calls by hand from 2^10 coefficients (frontend/notes/23.md).
 //
 // a[k], Bostan and Mori: with p(x) q(-x) = U_0(x^2) + x U_1(x^2) and q(x) q(-x) = V(x^2),
 // [x^k] p / q = [x^(k / 2)] U_(k mod 2) / V. Each step halves k and keeps the sizes at most about
