@@ -124,8 +124,9 @@
 // product runs the forward transform of in, the leaf products with B in each subtree's bottom stage
 // (registers, not a pass of their own) and the inverse transform depth first, so each subtree is
 // in cache once; inverse_product does the same for an inverse of leaf products. Their top level
-// writes only the half asked for, negated through its scale. Against forward, multiply and inverse
-// in place with copies around them: Newton steps 1.0x-1.2x faster (notes/112-r1.md).
+// writes only the half asked for, negated through its scale. Zen 3, bench_fused.cpp: a cyclic
+// product took 0.83-0.89 of the time of the steps it replaces (copy in, forward, multiply, inverse
+// in place, copy out) from 2^12 on, 0.98 at 2^8 (notes/112-r1.md).
 #pragma once
 
 #include <algorithm>
