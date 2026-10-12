@@ -1,6 +1,8 @@
 // Number-theoretic transforms and polynomial products modulo P = 998244353 (backend kernel).
 // Variants: scalar (every target), intrinsics<S> (every target, on a backend/simd struct) and avx2
-// (lc-opt's, asm scheduled for Zen 3); select.hpp picks one per op. Linux or macOS. Design and measurements: notes.md.
+// (lc-opt's, asm scheduled for Zen 3). select.hpp picks one per op and length from a tuned table
+// (one table read per call; backend/ntt/tune.hpp measures it, tune::run() and wisdom keep it); the
+// ops' Variant template argument calls one directly. Linux or macOS. Design and measurements: notes.md.
 //
 //   fps::ntt::multiply(f, g, out);             // out = f g mod x^out.size(); spans of words < P
 //

@@ -4,10 +4,11 @@ Number-theoretic transforms and products modulo P = 998244353. API: `ntt.hpp` (`
 `Convolution`, `Transform`, the leaf form). Variants: `scalar.hpp` (every target; the model),
 `intrinsics.hpp` (`intrinsics<S>`, templates on any `backend/simd` struct S), `avx2.hpp` (lc-opt's
 `lib/ntt`).
-`select.hpp` picks one per op and length: `avx2` on the `avx2` target; on `avx512` and `zen5`
-`intrinsics<Avx512>` from 2^6-2^8 on (per op and CPU) and `avx2` below (Emerald Rapids multiply:
-`avx2` at 2^7 only); `intrinsics<simd::Native>` on the other targets. `memory.hpp`: `Convolution`'s memory, kept per thread. Tests: `test.cpp`;
-benches: `bench.cpp`.
+`select.hpp`: the variant per op and length, a tuned choice ("ntt.variant", issue #78): per target
+a list of candidates and a table of one per op (forward, inverse, multiply, product) and lg, with
+compiled defaults in `tuned.hpp` (`tools/tune.py ntt`, `tune.cpp`); `tune.hpp` measures it at run
+time. `memory.hpp`: `Convolution`'s memory, kept per thread. Tests: `test.cpp`,
+`test_no_tuner.cpp`; benches: `bench.cpp`.
 Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_product_kernels.hpp`
 (`gen_avx2_product_kernels.py`).
 
@@ -178,10 +179,12 @@ the other variants' word for word.
   leaf products had p5 at 161 uops per pair against p0 at 138), and the twiddles too. Neon: `umull`/`umlal` (+`umull2`/`umlal2`) on
   the windows, `uzp1` for m, `umlal` for m P, `uzp2`; two leaves at a time, both words of each
   (8 independent sums), each b_i broadcast once per leaf. Scalar: one u64 sum per word.
-- Lengths below 2^kWideMinLog run wholly on `Narrow<S>` (S, or `Avx512Vl` for `Avx512`): 2^8 on
-  Emerald Rapids, 2^7 on Zen 4/5 (`__znver4__`, `__znver5__`). Before the zmm bottom level, zmm
-  levels above ymm bottom stores were 1.25-1.33x slower at 2^7 and 2^8 on Emerald Rapids
-  (`ld_blocks.store_forward` 1.8M against 12k: wide loads of narrow stores still in flight).
+- `intrinsics<Avx512>` runs zmm at every length. Narrow lengths are the tuned table's choice of
+  `intrinsics<Avx512Vl>` (issue #78; before it, `kWideMinLog` sent lengths below 2^8 on Emerald
+  Rapids and 2^7 on Zen 4/5 to `Narrow<S>` by `__znver4__`/`__znver5__`, so the avx512 build ran
+  Emerald Rapids' threshold on Zen 5). Before the zmm bottom level, zmm levels above ymm bottom
+  stores were 1.25-1.33x slower at 2^7 and 2^8 on Emerald Rapids (`ld_blocks.store_forward` 1.8M
+  against 12k: wide loads of narrow stores still in flight).
 - GCC 15 at -O2 kept the fixed 4- and 8-trip loops of the leaf products rolled and did not inline
   the butterfly lambdas of the bottom level; `#pragma GCC unroll` and `[[gnu::always_inline]]`
   fix both (Log). A range-for over the 4 vectors of a column also stays rolled, through the
@@ -189,14 +192,6 @@ the other variants' word for word.
   `Arith`'s ops are `always_inline`: in the bench binary (more instantiations than a probe) GCC
   left `Arith::mul` out of line once the groups were pipelined, a call per product (Zen 5 1.4x
   slower; Log).
-- `variant::by_length<lg, Small, Large>` (`select.hpp`): Small below 2^lg. On `avx512`: avx2
-  below 2^8 for forward and at 2^7 only for multiply, intrinsics at every length for inverse; on
-  `zen5` avx2 below 2^7 (forward) and 2^8 (inverse, multiply). Issue #5 round 2, same binary, 11
-  rounds, Emerald Rapids intrinsics/avx2 at 2^6 and 2^7: multiply 0.94 and 1.05, multiply_dense
-  0.91 and 1.02, forward 1.05 and 0.98, inverse 0.82 and 0.98. From @avx2 against @intrinsics_avx512 in one binary, 5
-  rounds, intrinsics/avx2 at 2^6..2^9 (issue #4 round 2, after its changes): Emerald Rapids forward
-  1.05 1.00 0.84 0.79, inverse 0.84 0.96 0.89 0.85, multiply 0.94 1.07 0.80 0.82; Zen 5 forward
-  1.11 0.88 0.80 0.68, inverse 1.11 1.03 0.78 0.75, multiply 1.15 1.14 0.67 0.64.
 - Products from spans: the in-place top levels' columns on ranges, `each` and `each2(from, f,
   q, begin, end)` with kLoad quarters read and kStore written (the defaults, 4 and 4, are the
   in-place forms). A factor of at most half the length is read straight from the caller by both
@@ -204,6 +199,38 @@ the other variants' word for word.
   lower half; a longer one by the radix-2 level. `prefetchw` covers quarters that are written but
   not read (zero quarters past the source): without it, Emerald Rapids ran multiply_dense at odd
   lg from 2^17 2% slower in the unified attempt (Log).
+
+### Variant selection (issue #78)
+
+A tuned choice, "ntt.variant" (`backend/tune`): per target a list of candidates (`select.hpp`,
+`Selected`) and a table of one candidate per op and lg 6..25 (`Choices`, 80 bytes).
+
+- Candidates: avx512 and zen5 {avx2, intrinsics<Avx512Vl>, intrinsics<Avx512>}; avx2 {avx2,
+  intrinsics<Avx2>}; arm, sse, scalar intrinsics<Native> alone (no table read: `choice()` is a
+  constant 0). Each is fastest somewhere on our machines (Log, issue #78).
+- Ops: forward and inverse (`Transform`), multiply (`Convolution::multiply`) and product
+  (`multiply(f, g, out)`). The two products have their own rows: their top levels differ (from
+  spans: `forward_top_from` and `inverse_top_to<T>` in the asm, `forward_radix4_from` and
+  `inverse_radix4_out` in the intrinsics), and those levels are a large share of the time at
+  2^6-2^7, where the candidates cross. Emerald Rapids at 2^6: the ymm intrinsics beat the asm by
+  9-12% on multiply but by 1-3% on product (tune.cpp, 3 runs). The frontend calls all four.
+- Dispatch (`variant::tuned`, which `SelectedForward`, `SelectedInverse` and `SelectedMultiply`
+  name): one table read per call (`tune::Table::get()`, an acquire load), then a chain of
+  compares on the index inlined into the op (`detail::run_forward` and siblings), as small's
+  `run_candidate`. `tuned::build_table` is `Native`'s; every variant builds the same tables.
+- `intrinsics<Avx512>` runs zmm at every length; before this, `kWideMinLog` sent lengths below
+  2^8 (Emerald Rapids) or 2^7 (`__znver4__`, `__znver5__`) to its ymm form inside the variant.
+  That ymm form is the candidate intrinsics<Avx512Vl> now, so the table also decides narrow
+  against wide, per CPU at run time (the avx512 build on Zen 5 had Emerald Rapids' threshold).
+- `tune.hpp` (`measure`) times the candidates as the library runs them: Transform on an array
+  kept across calls, one Convolution (this thread's kept region), multiply(f, g, out) from
+  std::vectors; products at factors (L/2, L/2) and (3L/4, L/4 + 1). The least geometric mean of
+  time / fastest wins unless the current candidate is within the margin. Run time (`kRunTime`):
+  lengths to 2^12, 5 samples of 100 us, 3%; longer lengths keep the table unless the choice at
+  2^12 changed. `tune.cpp` (`tools/tune.py ntt`): every length, 7 samples of 1 ms, 1%.
+- Before (`by_length`, by hand from the bench's @ cases): avx512 asm below 2^8 for forward and
+  at 2^7 for multiply, ymm intrinsics below 2^8 for inverse; zen5 asm below 2^7 (forward) and 2^8
+  (inverse, multiply). The data behind it: issue #5 round 2 and issue #4 round 2 (Log).
 
 ## Measurements
 
@@ -605,6 +632,40 @@ block count); `-march=x86-64-v3`, main 3161 and 868, with shifts and one functio
 and 923. By symbol (cycles), main's unchanged bottom kernels took 54 of the 55 cycles more; front
 end and store forwarding were better than main's (`idq.mite_uops` 116 -> 30 per product).
 
+### Tuned selection (issue #78)
+
+The compiled tables (`tools/tune.py ntt`, 7 samples of 1 ms per candidate and point, 1% margin
+from main's choices), 2026-10-12. Lengths where a candidate other than zmm is chosen; zmm
+(intrinsics<Avx512>) everywhere else. tune.cpp's geometric mean of time / fastest at those
+lengths in brackets (asm, ymm intrinsics, zmm):
+
+| Op | Emerald Rapids (lc-intel) | Zen 5 (lc-zen5) |
+|---|---|---|
+| forward | 2^6 asm (1.000, 1.022, 2.06); 2^7 zmm (1.177, 1.072, 1.000) | 2^6 asm (1.000, 1.117, 1.272) |
+| inverse | 2^6 ymm (1.249, 1.000, 1.328); 2^7 asm (1.000, 1.068, 1.251) | 2^6 asm (1.000, 1.109, 1.278) |
+| multiply | 2^6 ymm (1.089, 1.000, 1.137); 2^7 asm (1.000, 1.089, 1.203) | 2^6-2^7 asm (2^7: 1.000, 1.160, 1.117) |
+| product | 2^6 ymm (1.017, 1.000, 1.135); 2^7 asm (1.000, 1.060, 1.156) | 2^6-2^7 asm (2^7: 1.000, 1.163, 1.127) |
+
+Against main's `by_length`: Emerald Rapids forward/7 zmm (was the asm), inverse/7 the asm (was
+ymm); Zen 5 inverse/7 zmm (was the asm). avx2, sse, scalar and arm have one candidate each.
+
+`kernel.py bench --base` against main bfd491b, 11 rounds, the final code: geomean of the gated
+cases, new/main.
+
+| Unit | Zen 3 | Emerald Rapids | Zen 5 | Neoverse V2 |
+|---|---:|---:|---:|---:|
+| ntt | 1.0004 | 1.0002 | 0.9996 | 0.9996 |
+| frontend | 0.9991 | 1.0011 | 0.9978 | 1.0013 |
+| small | 1.0001 | 1.0004 | 0.9996 | 0.9975 |
+
+(frontend and small on Emerald Rapids, Zen 5 and Neoverse V2: one commit earlier, with the same
+code for those targets.) Cases past 1.5%: Emerald Rapids forward/7 0.896 (the gain), inverse/7
+1.027 (Log, Open), forward/8, inverse/8, multiply/8, multiply_dense/8 1.015-1.024 (zmm in both),
+convolution_into/7 1.025; Zen 3 forward/9, multiply/7, convolution/7-8 1.018-1.026, product_cut/7
+0.919 (the asm in both: placement); Zen 5 inverse/25 1.052 (zmm in both; 0.99-1.01 in the run
+before), convolution/10 1.019, convolution/11 0.978. The frontend's NTT shapes on Emerald Rapids
+multiply/7 and /8 1.036 and 1.029 (the variant is main's at both).
+
 2026-10-11, claude (issue #3, round 1): moved lc-opt `lib/ntt` (`ntt.hpp`, `product.hpp`, both
 generators and their output) here. Changes: namespaces `fps::ntt`; one `Convolution` picks the
 product path (lc-opt `Product`) when it fits, else the convolution path; one templated `Tree`
@@ -971,6 +1032,48 @@ GCC 15.2, `tools/kernel.py` flags.
   copy 1 short (848), the radix-8 first level dropping a high block (2613), the radix-8 last level
   skipping T = 1 (4), a misplaced by 4 bytes (crash). Pass at -O2 and ASan/UBSan on `lc-amd`
   (scalar, sse, avx2), `lc-intel-test`, `lc-zen5-test`, `lc-arm` and the Mac (scalar, arm).
+
+2026-10-12, claude (issue #78, round 1): the variant per op and length is a tuned choice (Design,
+Variant selection; Measurements, Tuned selection; the tuning side in `backend/tune/notes.md`,
+ntt.variant). Probes and raw output in `~/Documents/hpc_library-explore/tune/ntt-r1/`. GCC 15.2,
+`tools/kernel.py` flags, main bfd491b.
+- Built: `select.hpp`'s candidate lists, the table and `variant::tuned`; `tune.hpp` ("ntt.variant",
+  `measure`, wisdom text); `tune.cpp` for `tools/tune.py ntt`; `tuned.json` and `tuned.hpp` from
+  it (avx512 and zen5 measured on lc-intel and lc-zen5; the one-candidate targets record zeros).
+  `tuned.json` names commits 1e867c9 and 6658dfc: work-in-progress commits of this round, squashed
+  into its one commit; the kernels and tune.cpp did not change after them.
+  `by_length` and `kWideMinLog` are gone. `backend/small/tune.hpp` includes `tune.hpp`, so
+  "ntt.variant" registers before "small.ntt".
+- Exploration (`probe.cpp`, every variant at every op and lg 6-25, 7 samples of 1 ms): with AVX-512,
+  zmm wins from 2^8 everywhere (1.2-1.8x over the rest) and from 2^7 for forward on both machines;
+  below, the asm or the ymm intrinsics, per op and CPU. zmm at 2^6 runs 1.1-2.1x slower than the
+  best. With AVX2 alone the asm wins nearly everywhere on Zen 3 and Zen 5; on Emerald Rapids
+  intrinsics<Avx2> wins forward and inverse at most lengths by 1-4%.
+- Found by the table: Emerald Rapids forward/7 on zmm (`kWideMinLog` = 8 had kept zmm out of 2^7
+  there): 0.896 of main in the bench. Zen 5 inverse/7 moved from the asm to zmm (1.000).
+- Tried, not kept: intrinsics<Avx2> as a second candidate on avx2. It won forward/8 on Zen 3
+  (0.973 in the bench) and up to 0.3% in avx2 builds on Emerald Rapids and Zen 5 (validation), but
+  the frontend's f * g at 2^6 on Zen 3 went from 134 to 176 ns (gate build; 163 ns with the asm
+  forced and intrinsics<Avx2> only instantiated, never called: code placement, not the dispatch).
+  With the asm alone the tuned dispatch reads no table there and f * g/6 is 134 ns again.
+- Tried, not kept: the dispatch always inlined into its callers, or never: within noise on Emerald
+  Rapids and Zen 5, worse on Zen 3 (f * g/6 185 and 183 ns against 176).
+- Open: Emerald Rapids inverse/7 is the asm in the compiled table because tune.cpp's binary runs it
+  5.6-9.7% faster than ymm intrinsics (3 runs), where the bench binary, a probe and the validation
+  binary run it 1.8-5.8% slower: the bench reads 1.027. Run-time tuning moves it back. The other
+  hand-picked per-CPU constants in `intrinsics.hpp` (`kPipelined`, `kFoldMaxLog`, `kPrefetch`) are
+  compile-time choices by `__znver4__`/`__znver5__`; as candidates they would let the avx512 build
+  tune them on Zen 5 too.
+- Tests: `variant::tuned` with each candidate in every entry (transforms, products, products from
+  spans to 2^10) and with a mixed table to 2^17 (tables past 2^16 built by `tuned::build_table`);
+  `measure` at a small budget (valid; past max_lg as specified; a huge margin keeps the start);
+  the wisdom text (round trip, another signature, a value short, no such candidate); "ntt.variant"
+  through `tune::save` and `load`; `tune::run()`; `test_no_tuner.cpp` (`-DFPS_NO_TUNER`: the
+  table is constant; products and transforms through it). A mutation (inverse dispatch off by one)
+  failed 92 checks. ntt, small, frontend and tune pass at -O2 and ASan/UBSan on `lc-amd` (scalar,
+  sse, avx2), `lc-intel-test`, `lc-zen5-test`, `lc-arm` and the Mac (scalar, arm). `kernel.py test
+  ntt` takes 260 s on `lc-zen5-test` against main's 231 (builds included; `test_no_tuner.cpp` is
+  two builds more).
 
 2026-10-12, claude (issue #81, round 1): `f * g` at 32 x 32 (`multiply/6`) ran 1.13-1.25x slower
 on Zen 3 in a program that also calls `Transform` (`Values`). Not the NTT's inlining; code layout.
