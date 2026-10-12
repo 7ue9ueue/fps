@@ -17,6 +17,8 @@ inverse_top fuses avx2_kernels.hpp's inverse_identity, inverse (group 1) and sca
 pass, with the scale folded into the twiddles: 5 more Shoup products per column instead of 8.
 inverse_top_to and inverse_top4_to (products from spans) write the first T output blocks to o:
 the ops of the other outputs are dropped (a product cut to fewer words than the transform).
+bottom_square_*: the same bottom stage for a square, a times a: no forward butterflies of b, and
+the leaf products broadcast the coefficients of A from the window rows' second halves.
 
 Usage: gen_avx2_product_kernels.py [--check]   (--check: exit 1 if avx2_product_kernels.hpp differs)
 """
@@ -35,8 +37,13 @@ KNOBS = {'first': gk.Knobs(window=12),
          'last': gk.Knobs(seed=7, margin=2, jitter=3.0, window=12),
          'both': gk.Knobs(window=20)}
 SHIFT = -0.05  # 'both': the first stage's ops start this fraction earlier in source order
+# Square 'both': the knobs above deadlock the scheduler (register budget); these did not, with
+# window 12 and shift -0.05 or -0.1 (notes.md, issue #55).
+SQUARE_KNOBS = dict(KNOBS, both=gk.Knobs(window=16))
+SQUARE_SHIFT = 0.0
 ARGS = {'first': ['a', 'b', 'buf', 'x', 'y'], 'last': ['out', 'cur', 'ix', 'iy'],
         'both': ['a', 'b', 'buf', 'x', 'y', 'out', 'cur', 'ix', 'iy']}
+SQUARE_ARGS = {part: [a for a in args if a != 'b'] for part, args in ARGS.items()}
 DOC = {
     'first': 'Forward half of the bottom stage for the two batches at a, b; fills buf.',
     'last': 'Leaf products from cur and the inverse butterflies; writes the two batches at out.',
@@ -61,8 +68,9 @@ class Batch(gk.Graph):
         super().store(v, base, index, disp + self.offset.get(base, 0))
 
 
-def first(g):
-    """Forward butterflies of a and b; leaf buffer rows [w_t A_t, A_t] and B_t, all in [0, P]."""
+def first(g, square=False):
+    """Forward butterflies of a and b; leaf buffer rows [w_t A_t, A_t] and B_t, all in [0, P].
+    square: a alone; B_t is A_t, the rows' second halves."""
     for t, v in enumerate(gk.forward_h1(g, 'a', 'x', 'y')):
         a = g.canonical(v)
         g.store(a, 'buf', None, 64 * t + 32)
@@ -72,19 +80,22 @@ def first(g):
         if t % 2:
             wa = g.op('vpsubd', g.c['P'], wa)  # (P - w) A = P - w A
         g.store(wa, 'buf', None, 64 * t)
+    if square:
+        return
     for t, v in enumerate(gk.forward_h1(g, 'b', 'x', 'y')):
         g.store(g.canonical(v), 'buf', None, 256 + 32 * t)
 
 
-def last(g):
+def last(g, square=False):
     """Leaf t: e (even lanes) and o (odd lanes) sum b_j times the window 8 - j and 9 - j words in;
-    sums < 8 P^2, then Montgomery reduction and the inverse butterfly as gen_kernels.bottom_last."""
+    sums < 8 P^2, then Montgomery reduction and the inverse butterfly as gen_kernels.bottom_last.
+    square: b_j from A_t, words 8 + j of window t."""
     c = g.c
     leaves = []
     for t in range(4):
         e = o = None
         for j in range(8):
-            b = g.materialize(g.scalar('cur', 256 + 32 * t + 4 * j))
+            b = g.materialize(g.scalar('cur', 64 * t + 32 + 4 * j if square else 256 + 32 * t + 4 * j))
             pe = g.op('vpmuludq', g.at('cur', 64 * t + 4 * (8 - j)), b)
             po = g.op('vpmuludq', g.at('cur', 64 * t + 4 * (9 - j)), b)
             e = pe if e is None else g.op('vpaddq', e, pe)
@@ -104,35 +115,36 @@ def last(g):
     g.store(g.shoup(g.diff(amb, cmd), tw['WX'], tw['QX']), 'out', None, 96)
 
 
-def body(part):
+def body(part, square=False):
     g = Batch({'P': gk.Value('creg', reg=15), '2P': gk.Value('creg', reg=14), 'NI': gk.Value('creg', reg=13)})
     if part in ('last', 'both'):
         for m in range(BATCHES):
             g.offset = {'cur': LEAVES * m, 'out': 128 * m, 'ix': 4 * m, 'iy': 8 * m}
-            last(g)
+            last(g, square)
     split = len(g.ops)
     if part in ('first', 'both'):
         for m in range(BATCHES):
             g.offset = {'a': 128 * m, 'b': 128 * m, 'buf': LEAVES * m, 'x': 4 * m, 'y': 8 * m}
-            first(g)
+            first(g, square)
     ops = g.ops
     if part == 'both':  # interleave the two stages' source orders proportionally
         older, newer = ops[:split], ops[split:]
         keyed = [(i / len(older), 0, i, o) for i, o in enumerate(older)]
-        keyed += [(j / len(newer) + SHIFT, 1, j, o) for j, o in enumerate(newer)]
+        keyed += [(j / len(newer) + (SQUARE_SHIFT if square else SHIFT), 1, j, o) for j, o in enumerate(newer)]
         ops = [o for *_, o in sorted(keyed, key=lambda t: t[:3])]
-    seq = gk.schedule(ops, 13, KNOBS[part])
+    seq = gk.schedule(ops, 13, (SQUARE_KNOBS if square else KNOBS)[part])
     reg = gk.allocate(seq, {13, 14, 15})
     head = ['vpbroadcastd %[P], %%ymm15', 'vpbroadcastd %[P2], %%ymm14', 'vpbroadcastd %[NI], %%ymm13']
     return head + [gk.emit(o, reg) for o in seq]
 
 
-def function(part):
-    args = ARGS[part]
+def function(part, square=False):
+    args = SQUARE_ARGS[part] if square else ARGS[part]
     params = ', '.join(f'{"void*" if a in ("buf", "out") else "const void*"} {a}' for a in args)
-    lines = [f'// {DOC[part]}', f'[[gnu::always_inline]] inline void bottom_{part}({params}) {{',
-             '    asm volatile(']
-    lines += gk.asm_lines(body(part))
+    doc = DOC[part] + (' Square: a times a.' if square else '')
+    name = f'bottom_square_{part}' if square else f'bottom_{part}'
+    lines = [f'// {doc}', f'[[gnu::always_inline]] inline void {name}({params}) {{', '    asm volatile(']
+    lines += gk.asm_lines(body(part, square))
     lines += ['        :', '        : ' + ', '.join(f'[{a}] "r"({a})' for a in args) + ',',
               '          [P] "m"(kP), [P2] "m"(k2P), [NI] "m"(kNI)',
               '        : ' + gk.CLOBBERS + ');', '}']
@@ -329,8 +341,9 @@ using avx2_kernels::Vec;
 
 def generate():
     lines = HEADER.split('\n')
-    for part in ('first', 'last', 'both'):
-        lines += function(part) + ['']
+    for square in (False, True):
+        for part in ('first', 'last', 'both'):
+            lines += function(part, square) + ['']
     lines += top_function() + [''] + top4_function() + ['']
     lines += TOP_TO_DOC.split('\n')
     for blocks in range(1, 9):

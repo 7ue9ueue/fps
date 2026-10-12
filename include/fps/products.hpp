@@ -8,8 +8,8 @@
 //
 // mul, square, middle_product, product and raw::mul run the paths of f * g (fps/polynomial.hpp):
 // a shift for a factor with one nonzero term, small::multiply where small::beats_ntt says it is
-// faster, else ntt::multiply, which reads the factors and writes the product cut to the output's
-// size in the caller's memory. Nothing is copied in or out. The NTT path throws std::length_error
+// faster, else ntt::multiply (ntt::square, ntt::middle_product), which reads the factors and writes
+// the product cut to the output's size in the caller's memory. Nothing is copied in or out. The NTT path throws std::length_error
 // past 2^25 coefficients (factors cut to n for mul); a short factor next to a longer one runs
 // small::multiply and does not throw.
 //
@@ -17,15 +17,15 @@
 // small::multiply writes all of the cut product, so on that path the result keeps up to 2 n - 1
 // words (fps/words.hpp); a copy is tight.
 //
-// square(f) costs what f * f costs: the backend has no squaring kernel yet, which would save one of
-// the three transforms (backend issue #55).
+// square(f): ntt::square on the NTT path, one forward transform instead of two (backend issue
+// #55; backend/ntt/notes.md has its time against f * f).
 //
 // middle_product(f, g)[i] = sum_{j < m} f[i + j] g[m - 1 - j] for i <= n - m: the coefficients of
 // f g whose sums use all of g. With g reversed it is the transposed product, sum_j f[i + j] g[j].
-// It throws std::domain_error unless n >= m >= 1. It computes f g mod x^n, then moves the
-// n - m + 1 coefficients down: 0.3% to 2.3% over the kernel call on the NTT path
-// (frontend/notes.md). A cyclic product of length >= n, with the result at out[0], would need a
-// transform of length n, not n + m - 1, and no move (backend issue #55).
+// It throws std::domain_error unless n >= m >= 1. On the NTT path ntt::middle_product writes the
+// result: a cyclic product of length >= n, not n + m - 1 (backend issue #55); on small::multiply's,
+// all of f g, then the n - m + 1 coefficients moved down. The NTT path throws std::length_error
+// past n = 2^25.
 //
 // product(fs) runs the backend's product_tree::product into the result's memory (a tree with one
 // transform of each length per node; small factors 8 at a time in lanes). An empty factor makes
@@ -57,7 +57,7 @@ Polynomial<P> mul(const Polynomial<P>& f, const Polynomial<P>& g, std::size_t n)
 
 template <std::uint32_t P>
 Polynomial<P> square(const Polynomial<P>& f) {
-    return detail::Products<P>::multiply(f.span(), f.span(), f.size() ? 2 * f.size() - 1 : 0);
+    return detail::Products<P>::square(f.span());
 }
 
 template <std::uint32_t P>

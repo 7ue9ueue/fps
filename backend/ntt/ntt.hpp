@@ -5,8 +5,10 @@
 // ops' Variant template argument calls one directly. Linux or macOS. Design and measurements: notes.md.
 //
 //   fps::ntt::multiply(f, g, out);             // out = f g mod x^out.size(); spans of words < P
+//   fps::ntt::square(f, out);                  // out = f^2 mod x^out.size()
+//   fps::ntt::middle_product(f, g, out);       // out[i] = (f g)[g.size() - 1 + i]
 //
-//   fps::ntt::Convolution conv(n, m);          // factors of n and m coefficients
+//   fps::ntt::Convolution conv(n, m);         // factors of n and m coefficients
 //   std::copy(f, f + n, conv.a());             // all n coefficients, each < P
 //   std::copy(g, g + m, conv.b());
 //   const std::uint32_t* c = conv.multiply();  // the n + m - 1 coefficients of f g, in conv.a()
@@ -34,6 +36,16 @@
 // length + kPadding; against Convolution::multiply() alone, 1.00-1.12. At 2^6-2^8 up to 10% slower
 // than the copying forms. out of half the transform length (f g mod x^n for factors of n words):
 // 0.96-1.00 of the time of the whole product, 0.89-0.97 at 2^6-2^8.
+//
+// square(f, out): multiply(f, f, out) with one forward transform, not two. Same contract.
+//
+// middle_product(f, g, out): out[i] = (f g)[m - 1 + i] = sum_{j < m} f[i + j] g[m - 1 - j] for
+// n = f.size() >= m = g.size() >= 1 and out.size() <= n - m + 1 (else std::invalid_argument), the
+// sums that use all of g. Reads f[0, m - 1 + out.size()) only. A cyclic product of length 2^lg >=
+// m - 1 + out.size(), not >= n + m - 1: its wrapped terms land below word m - 1. g is copied into
+// this thread's region turned by x^-(m - 1) (zeros between), so the result starts at word 0 and
+// the last level writes it to out. out may overlap f or g. Throws std::length_error, before
+// writing out, past 2^kMaxLog.
 //
 // Memory of a product: each thread keeps the largest region a product of it used and hands it to
 // the next one. Constructing, multiplying and destroying a 32 x 32 Convolution takes 110 ns on Zen
@@ -123,6 +135,50 @@ void multiply(std::span<const std::uint32_t> f, std::span<const std::uint32_t> g
         detail::give_region(region);
     }
     std::fill(out.begin() + count, out.end(), 0u);
+}
+
+// out = f^2 mod x^out.size(), from and into the caller's memory (above). f: words < P.
+template <class Variant = SelectedMultiply>
+void square(std::span<const std::uint32_t> f, std::span<std::uint32_t> out) {
+    const std::size_t n = std::min(f.size(), out.size());
+    const std::size_t count = n ? std::min(2 * n - 1, out.size()) : 0;
+    if (count) {
+        const int lg = detail::log_length(n, n);
+        if (lg > kMaxLog) throw std::length_error("fps::ntt::square: square longer than 2^kMaxLog");
+        const auto [roots, inverse_roots] = detail::tables<Variant>(lg);
+        const detail::Region region = detail::take_region(detail::region_bytes(lg));
+        const std::size_t span = (std::size_t(1) << lg) + kPadding;
+        auto* a = reinterpret_cast<std::uint32_t*>(
+            region.start + detail::place(f.data(), f.data(), out.data(), span * sizeof(std::uint32_t)));
+        Variant::square(detail::Product{f.data(), n, f.data(), n, a, a, out.data(), count, lg}, roots, inverse_roots);
+        detail::give_region(region);
+    }
+    std::fill(out.begin() + count, out.end(), 0u);
+}
+
+// out[i] = (f g)[g.size() - 1 + i], the middle product (above). f, g: words < P.
+template <class Variant = SelectedMultiply>
+void middle_product(std::span<const std::uint32_t> f, std::span<const std::uint32_t> g, std::span<std::uint32_t> out) {
+    const std::size_t m = g.size(), count = out.size();
+    if (m == 0 || m > f.size() || count > f.size() - m + 1)
+        throw std::invalid_argument("fps::ntt::middle_product: needs f.size() >= g.size() >= 1, out.size() <= "
+                                    "f.size() - g.size() + 1");
+    if (count == 0) return;
+    const std::size_t n = m - 1 + count;  // the words of f read
+    const int lg = std::max(kMinLog, int(std::bit_width(n - 1)));
+    if (lg > kMaxLog) throw std::length_error("fps::ntt::middle_product: longer than 2^kMaxLog");
+    const auto [roots, inverse_roots] = detail::tables<Variant>(lg);
+    const detail::Region region = detail::take_region(detail::region_bytes(lg));
+    const std::size_t len = std::size_t(1) << lg, span = len + kPadding;
+    auto* a = reinterpret_cast<std::uint32_t*>(
+        region.start + detail::place(f.data(), g.data(), out.data(), span * sizeof(std::uint32_t)));
+    std::uint32_t* b = a + span;
+    // b = g x^-(m - 1) mod x^len - 1: g[m - 1] at word 0, g[0, m - 1) at the top, zeros between.
+    b[0] = g[m - 1];
+    std::fill(b + 1, b + len - (m - 1), 0u);
+    std::copy_n(g.data(), m - 1, b + len - (m - 1));
+    Variant::multiply(detail::Product{f.data(), n, b, len, a, b, out.data(), count, lg}, roots, inverse_roots);
+    detail::give_region(region);
 }
 
 // The product of a of n and b of m coefficients, n + m - 1 <= 2^kMaxLog. a and b: length() +

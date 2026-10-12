@@ -102,6 +102,8 @@ struct alignas(64) Leaves {
 
 // One group per kernel; the leaf moduli come in a weight array.
 struct GroupBottom {
+    static constexpr bool kSquare = false;
+
     // Moduli x^8 - w of the four leaves under group k: w = y, -y, z, -z, then their quotients.
     static void weights(const u32* r, std::size_t k, u32* w) {
         const u32* y = r + slot(2 * k);
@@ -128,6 +130,8 @@ struct GroupBottom {
 // Two groups per always-inlined kernel; the leaf moduli are the groups' own twiddles. first even,
 // nv a multiple of 8.
 struct PairBottom {
+    static constexpr bool kSquare = false;
+
     static void run(Vec* a, Vec* b, std::size_t nv, std::size_t first, const u32* r, const u32* ir) {
         Leaves leaves[2][2];
         product_kernels::bottom_first(a, b, leaves[0], r + slot(first), r + slot(2 * first));
@@ -141,10 +145,45 @@ struct PairBottom {
     }
 };
 
+// Bottom stages of a square, a times a (Tree skips b). PairSquareBottom: PairBottom's kernels
+// without b's forward half; the leaf products read A's coefficients from the windows.
+struct PairSquareBottom {
+    static constexpr bool kSquare = true;
+
+    static void run(Vec* a, Vec*, std::size_t nv, std::size_t first, const u32* r, const u32* ir) {
+        Leaves leaves[2][2];
+        product_kernels::bottom_square_first(a, leaves[0], r + slot(first), r + slot(2 * first));
+        for (std::size_t j = 0, k = first;; j += 8, k += 2) {
+            const std::size_t cur = j / 8 % 2, next = cur ^ 1;
+            const u32 *ix = ir + slot(k), *iy = ir + slot(2 * k);
+            if (j + 8 == nv) return product_kernels::bottom_square_last(a + j, leaves[cur], ix, iy);
+            product_kernels::bottom_square_both(a + j + 8, leaves[next], r + slot(k + 2), r + slot(2 * k + 4), a + j,
+                                                leaves[cur], ix, iy);
+        }
+    }
+};
+
+// GroupBottom with b = a: its kernels read both batches before they write a, and compute a's
+// forward half twice.
+struct GroupSquareBottom {
+    static constexpr bool kSquare = true;
+
+    static void run(Vec* a, Vec*, std::size_t nv, std::size_t first, const u32* r, const u32* ir) {
+        GroupBottom::run(a, a, nv, first, r, ir);
+    }
+};
+
 inline constexpr std::size_t kTile = 256;  // vectors
 
-// Depth-first recursion of a product: forward transforms of a and b, leaf products into a,
-// inverse transform. Runs of sibling subtrees of at most kTile vectors in all (8 KiB per array)
+// forward_groups(), of a alone for a square.
+template <bool kSquare>
+inline void forward_factors(Vec* a, Vec* b, std::size_t h, std::size_t k, const u32* r) {
+    if constexpr (kSquare) forward_group(a, h, k, r);
+    else forward_groups(a, b, h, k, r);
+}
+
+// Depth-first recursion of a product: forward transforms of a and b (of a alone if
+// Bottom::kSquare), leaf products into a, inverse transform. Runs of sibling subtrees of at most kTile vectors in all (8 KiB per array)
 // go level by level as one tile, so one bottom stage pipelines across them.
 template <class Bottom>
 class Tree {
@@ -163,7 +202,7 @@ public:
         }
         const std::size_t h = nv / 4;
         for (std::size_t k = first; k < first + count; ++k, a += nv, b += nv) {
-            forward_groups(a, b, h, k, r_);
+            forward_factors<Bottom::kSquare>(a, b, h, k, r_);
             visit(a, b, h, 4, 4 * k);
             inverse_group(a, h, k, ir_);
         }
@@ -181,7 +220,8 @@ private:
     template <std::size_t NV>
     [[gnu::noinline]] void tile(Vec* a, Vec* b, std::size_t total, std::size_t k) const {
         for (std::size_t h = NV / 4; h >= 4; h /= 4)
-            for (std::size_t j = 0, g = k * (NV / (4 * h)); j < total; j += 4 * h, ++g) forward_groups(a + j, b + j, h, g, r_);
+            for (std::size_t j = 0, g = k * (NV / (4 * h)); j < total; j += 4 * h, ++g)
+                forward_factors<Bottom::kSquare>(a + j, b + j, h, g, r_);
         Bottom::run(a, b, total, k * (NV / 4), r_, ir_);
         for (std::size_t h = 4; h < NV; h *= 4)
             for (std::size_t j = 0, g = k * (NV / (4 * h)); j < total; j += 4 * h, ++g) inverse_group(a + j, h, g, ir_);
@@ -523,6 +563,30 @@ inline void product(const Product& p, const u32* r, const u32* ir) {
     inverse_radix8_out(p.a, q, p.out, p.count, ir, product_scale(p.lg));
 }
 
+// The square of p.f (detail::Product; g, m and b unused): product() with one forward transform.
+template <class Bottom>
+inline void square(const Product& p, const u32* r, const u32* ir) {
+    static_assert(Bottom::kSquare);
+    const std::size_t nv = (std::size_t(1) << p.lg) / 8;
+    auto* a = reinterpret_cast<Vec*>(p.a);
+    const Tree<Bottom> tree(r, ir);
+    if (!has_radix2(p.lg)) {
+        const std::size_t h = nv / 4;
+        forward_radix4_from(p.f, p.n, p.a, h, r);
+        tree.visit(a, a, h, 4, 0);
+        return inverse_radix4_out(p.a, h, p.out, p.count, ir, product_scale(p.lg));
+    }
+    if (nv == 8) {
+        forward_radix2_from(p.f, p.n, p.a, 4);
+        tree.visit(a, a, 4, 2, 0);
+        return scale_radix2_out(p.a, 4, p.out, p.count, product_scale(p.lg));
+    }
+    const std::size_t q = nv / 8;
+    forward_radix8_from(p.f, p.n, p.a, q, r);
+    tree.visit(a, a, q, 8, 0);
+    inverse_radix8_out(p.a, q, p.out, p.count, ir, product_scale(p.lg));
+}
+
 // Transforms alone. The bottom level (h = 1) has a group per 4 vectors, each with its own twiddles.
 
 // Forward groups [first, first + count) with h = 1, values < 4P in; canonical leaves out. first
@@ -633,6 +697,11 @@ struct avx2 {
     static void multiply(const detail::Product& p, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
         if (p.lg == 7 || p.lg == 8) return detail::avx2::product<detail::avx2::GroupBottom>(p, roots, inverse_roots);
         detail::avx2::product<detail::avx2::PairBottom>(p, roots, inverse_roots);
+    }
+
+    static void square(const detail::Product& p, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
+        if (p.lg == 7 || p.lg == 8) return detail::avx2::square<detail::avx2::GroupSquareBottom>(p, roots, inverse_roots);
+        detail::avx2::square<detail::avx2::PairSquareBottom>(p, roots, inverse_roots);
     }
 };
 

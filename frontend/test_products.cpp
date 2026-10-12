@@ -298,7 +298,9 @@ void test_errors() {
     Poly big(std::size_t(1) << 25), g(4096);
     big[0] = big[1] = g[0] = g[1] = 1;
     CHECK(throws<std::length_error>([&] { (void)fps::mul(big, g, big.size()); }));
+    big.resize((std::size_t(1) << 25) + 1);  // the middle product's cyclic length is >= f.size()
     CHECK(throws<std::length_error>([&] { (void)fps::middle_product(big, g); }));
+    big.resize(std::size_t(1) << 25);
     CHECK(throws<std::length_error>([&] {
         Vec out(1 << 25);
         fps::raw::mul<P>(big.span(), g.span(), out);

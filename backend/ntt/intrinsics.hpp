@@ -495,8 +495,10 @@ struct Bottom : Butterflies<L> {
         u32 b[4][8];
     };
 
-    // Forward butterflies of group k of a and b into leaves. The moduli x^8 - w_t of leaves
-    // 4k + t: w_t = y, -y, z, -z (quotient(P - w) = ~quotient(w)).
+    // Forward butterflies of group k of a and b into leaves (of a alone if kSquare: its rows are
+    // both factors). The moduli x^8 - w_t of leaves 4k + t: w_t = y, -y, z, -z (quotient(P - w) =
+    // ~quotient(w)).
+    template <bool kSquare>
     [[gnu::always_inline]] static void forward_leaves(const u32* a, const u32* b, Leaves& out, std::size_t k, const u32* r) {
         const F x = B::entry(r, k), y = B::entry(r, 2 * k), z = B::entry(r, 2 * k + 1);
         const u32* yz = r + slot(2 * k);
@@ -512,6 +514,7 @@ struct Bottom : Butterflies<L> {
                 L::store(out.window[t] + 8 + j, v);
                 L::store(out.window[t] + j, canonical(B::mul(v, w[t])));
             }
+            if constexpr (kSquare) continue;
             Column g;
             B::load(b + j, 8, g), B::forward4(g, x, y, z);
             #pragma GCC unroll 8
@@ -550,7 +553,13 @@ struct Bottom : Butterflies<L> {
     // leaves at once, all their words (umull/umlal and their high forms), each b_i broadcast once
     // for both words, so 8 independent sums: bottom multiply 11% faster on Neoverse V2 than one
     // leaf and word at a time; 4 leaves at once spilled the 16 sums (notes.md).
+    // kSquare: B_t is A_t, the second half of window row t.
     static constexpr int kWords = 8 / L::lanes;
+    template <bool kSquare>
+    [[gnu::always_inline]] static const u32* factor_b(const Leaves& in, int t) {
+        return kSquare ? in.window[t] + 8 : in.b[t];
+    }
+    template <bool kSquare>
     [[gnu::always_inline]] static void leaf_products(const Leaves& in, V (&c)[kWords][4]) {
         if constexpr (requires(V v) { L::mul_wide_lo(v, v); }) {
             using W = decltype(L::mul_wide_lo(V{}, V{}));
@@ -563,7 +572,7 @@ struct Bottom : Butterflies<L> {
                 for (int i = 0; i < 8; ++i) {
                     #pragma GCC unroll 8
                     for (int b = 0; b < kBlock; ++b) {
-                        const V bi = L::broadcast(in.b[t0 + b][i]);
+                        const V bi = L::broadcast(factor_b<kSquare>(in, t0 + b)[i]);
                         #pragma GCC unroll 8
                         for (int u = 0; u < kWords; ++u) {
                             const V x = L::load(in.window[t0 + b] + 8 - i + u * L::lanes);
@@ -586,29 +595,33 @@ struct Bottom : Butterflies<L> {
             #pragma GCC unroll 8
             for (int u = 0; u < kWords; ++u) {
                 #pragma GCC unroll 8
-                for (int t = 0; t < 4; ++t) c[u][t] = leaf_product(in.window[t], in.b[t], u * L::lanes);
+                for (int t = 0; t < 4; ++t) c[u][t] = leaf_product(in.window[t], factor_b<kSquare>(in, t), u * L::lanes);
             }
         }
     }
 
     // Leaf products of one group into a, then its inverse butterflies; out < 2P.
+    template <bool kSquare>
     [[gnu::always_inline]] static void multiply_leaves(u32* a, const Leaves& in, std::size_t k, const u32* ir) {
         const F x = B::entry(ir, k), y = B::entry(ir, 2 * k), z = B::entry(ir, 2 * k + 1);
         V c[kWords][4];
-        leaf_products(in, c);
+        leaf_products<kSquare>(in, c);
         #pragma GCC unroll 8
         for (int u = 0; u < kWords; ++u) B::inverse4(c[u], x, y, z), B::store(a + u * L::lanes, 8, c[u]);
     }
 
     // Groups [first, first + count) of a and b, in < 4P: forward butterflies, leaf products into
     // a, inverse butterflies; out < 2P. Group g + 1's forward half runs before group g's
-    // products, so the leaf rows are not loaded right after their stores.
+    // products, so the leaf rows are not loaded right after their stores. kSquare: a times a, b
+    // not read.
+    template <bool kSquare = false>
     static void multiply(u32* a, const u32* b, std::size_t count, std::size_t first, const u32* r, const u32* ir) {
         Leaves leaves[2];
-        forward_leaves(a, b, leaves[0], first, r);
+        forward_leaves<kSquare>(a, b, leaves[0], first, r);
         for (std::size_t g = 0; g < count; ++g) {
-            if (g + 1 < count) forward_leaves(a + 32 * (g + 1), b + 32 * (g + 1), leaves[(g + 1) % 2], first + g + 1, r);
-            multiply_leaves(a + 32 * g, leaves[g % 2], first + g, ir);
+            if (g + 1 < count)
+                forward_leaves<kSquare>(a + 32 * (g + 1), b + 32 * (g + 1), leaves[(g + 1) % 2], first + g + 1, r);
+            multiply_leaves<kSquare>(a + 32 * g, leaves[g % 2], first + g, ir);
         }
     }
 };
@@ -703,14 +716,17 @@ struct WideBottom : Butterflies<S> {
     // [A_k B_k, A_(k+1) B_(k+1)] 2^-32 mod x^8 - w per half, < 2P. Windows are load_halves of the
     // rows, b_i per half broadcast_halves of b: those run on p0 or p5 on Emerald Rapids, where the
     // vpermd of b ran on p5 only, as all shuffles do (notes.md).
+    // kSquare: B is A.
+    template <bool kSquare>
     [[gnu::always_inline]] static V leaf_products(const Leaves& in, int t) {
         using M = typename B::M;
+        const u32* b = kSquare ? in.a[t] : in.b[t];
         const V p = S::broadcast(kP), ninv = S::broadcast(u32(0) - M::kPinv);
         const auto x = [&](int j) { return j == 8 ? S::load(in.a[t]) : S::load_halves(in.rows[t][0] + j, in.rows[t][1] + j); };
         V e = {}, o = {};
         #pragma GCC unroll 8
         for (int i = 0; i < 8; ++i) {
-            const V bi = S::broadcast_halves(in.b[t] + i, in.b[t] + 8 + i);
+            const V bi = S::broadcast_halves(b + i, b + 8 + i);
             const V pe = S::mul_even(x(8 - i), bi), po = S::mul_even(x(9 - i), bi);
             e = i == 0 ? pe : S::add64(e, pe), o = i == 0 ? po : S::add64(o, po);
         }
@@ -719,6 +735,7 @@ struct WideBottom : Butterflies<S> {
         return low(S::join_high(e, o));
     }
 
+    template <bool kSquare>
     [[gnu::always_inline]] static void forward_leaves(const u32* a, const u32* b, std::size_t k, const u32* r,
                                                       const Indices& n, Leaves& out) {
         const V p = S::broadcast(kP), ones = S::broadcast(~u32(0));
@@ -727,23 +744,24 @@ struct WideBottom : Butterflies<S> {
         const F* weight[4] = {&w.y, &minus_y, &w.z, &minus_z};
         V f[4], g[4];
         load(a, f, n);
-        load(b, g, n);
         B::forward4(f, w.x, w.y, w.z);
-        B::forward4(g, w.x, w.y, w.z);
+        if constexpr (!kSquare) load(b, g, n), B::forward4(g, w.x, w.y, w.z);
         #pragma GCC unroll 4
         for (int t = 0; t < 4; ++t) {
             const V at = canonical(low(f[t])), wat = canonical(B::mul(at, *weight[t]));
             S::template store_half<0>(out.rows[t][0], wat), S::template store_half<0>(out.rows[t][0] + 8, at);
             S::template store_half<1>(out.rows[t][1], wat), S::template store_half<1>(out.rows[t][1] + 8, at);
-            S::store(out.a[t], at), S::store(out.b[t], canonical(low(g[t])));
+            S::store(out.a[t], at);
+            if constexpr (!kSquare) S::store(out.b[t], canonical(low(g[t])));
         }
     }
 
+    template <bool kSquare>
     [[gnu::always_inline]] static void multiply_leaves(u32* a, std::size_t k, const u32* ir, const Indices& n,
                                                        const Leaves& in) {
         V f[4];
         #pragma GCC unroll 4
-        for (int t = 0; t < 4; ++t) f[t] = leaf_products(in, t);
+        for (int t = 0; t < 4; ++t) f[t] = leaf_products<kSquare>(in, t);
         const Pair iw = twiddles(ir, k);
         B::inverse4(f, iw.x, iw.y, iw.z);
         store(a, f, n);
@@ -753,13 +771,14 @@ struct WideBottom : Butterflies<S> {
     // halves into a buffer, then one of leaf products and inverse halves: shorter dependency chains
     // per loop iteration than both in one loop (notes.md).
     static constexpr std::size_t kChunk = 4;
+    template <bool kSquare = false>
     static void multiply(u32* a, const u32* b, std::size_t count, std::size_t first, const u32* r, const u32* ir) {
         const Indices n;
         Leaves leaves[kChunk];
         for (std::size_t c = 0; c < count / 2; c += kChunk, a += 64 * kChunk, b += 64 * kChunk) {
             const std::size_t m = std::min(kChunk, count / 2 - c), k = first + 2 * c;
-            for (std::size_t g = 0; g < m; ++g) forward_leaves(a + 64 * g, b + 64 * g, k + 2 * g, r, n, leaves[g]);
-            for (std::size_t g = 0; g < m; ++g) multiply_leaves(a + 64 * g, k + 2 * g, ir, n, leaves[g]);
+            for (std::size_t g = 0; g < m; ++g) forward_leaves<kSquare>(a + 64 * g, b + 64 * g, k + 2 * g, r, n, leaves[g]);
+            for (std::size_t g = 0; g < m; ++g) multiply_leaves<kSquare>(a + 64 * g, k + 2 * g, ir, n, leaves[g]);
         }
     }
 };
@@ -807,11 +826,12 @@ struct Ntt : Butterflies<S> {
             if (count % 2 == 0) return WideBottom<S>::inverse(f, count, first, ir);
         Leaf::inverse(f, count, first, ir);
     }
+    template <bool kSquare>
     static void bottom_multiply(u32* a, const u32* b, std::size_t count, std::size_t first, const u32* r,
                                 const u32* ir) {
         if constexpr (kWideBottom)
-            if (count % 2 == 0) return WideBottom<S>::multiply(a, b, count, first, r, ir);
-        Leaf::multiply(a, b, count, first, r, ir);
+            if (count % 2 == 0) return WideBottom<S>::template multiply<kSquare>(a, b, count, first, r, ir);
+        Leaf::template multiply<kSquare>(a, b, count, first, r, ir);
     }
 
     // Subtree of group k with nv leaves (a power of 4), depth first; its inputs < kIn P.
@@ -884,33 +904,35 @@ struct Ntt : Butterflies<S> {
 
     // Both transforms, the leaf products and the inverse transform of a subtree; inputs < kIn P.
     // The first level reads a_from and b_from (a and b, or other memory if nv >= 16): pointers or
-    // Sources (first_group).
-    template <int kIn = 4, class From>
+    // Sources (first_group). kSquare: a times a; b and b_from not read.
+    template <int kIn = 4, bool kSquare = false, class From>
     static void multiply_tree(From a_from, From b_from, u32* a, u32* b, std::size_t nv, std::size_t k, const u32* r,
                               const u32* ir, const u32* scaled = nullptr) {
         std::size_t h = nv / 4;
         if (nv > kTile) {
             first_group<kIn>(a_from, a, 8 * h, k, r);
-            first_group<kIn>(b_from, b, 8 * h, k, r);
-            for (std::size_t t = 0; t < 4; ++t) multiply_tree(a + 8 * h * t, b + 8 * h * t, h, 4 * k + t, r, ir);
+            if constexpr (!kSquare) first_group<kIn>(b_from, b, 8 * h, k, r);
+            for (std::size_t t = 0; t < 4; ++t)
+                multiply_tree<4, kSquare>(a + 8 * h * t, b + 8 * h * t, h, 4 * k + t, r, ir);
             return inverse_top(a, 8 * h, k, ir, scaled);
         }
         if (h >= 4) {  // the first level: group k alone
             first_group<kIn>(a_from, a, 8 * h, k, r);
-            first_group<kIn>(b_from, b, 8 * h, k, r);
+            if constexpr (!kSquare) first_group<kIn>(b_from, b, 8 * h, k, r);
             h /= 4;
         }
         for (; h >= 4; h /= 4) {
             const std::size_t g = k * (nv / (4 * h)), count = nv / (4 * h);
-            B::forward_groups(a, 8 * h, g, count, r), B::forward_groups(b, 8 * h, g, count, r);
+            B::forward_groups(a, 8 * h, g, count, r);
+            if constexpr (!kSquare) B::forward_groups(b, 8 * h, g, count, r);
         }
-        bottom_multiply(a, b, nv / 4, k * (nv / 4), r, ir);
+        bottom_multiply<kSquare>(a, b, nv / 4, k * (nv / 4), r, ir);
         inverse_levels(a, nv, k, ir, scaled);
     }
-    template <int kIn = 4>
+    template <int kIn = 4, bool kSquare = false>
     static void multiply_tree(u32* a, u32* b, std::size_t nv, std::size_t k, const u32* r, const u32* ir,
                               const u32* scaled = nullptr) {
-        multiply_tree<kIn>(a, b, a, b, nv, k, r, ir, scaled);
+        multiply_tree<kIn, kSquare>(a, b, a, b, nv, k, r, ir, scaled);
     }
 
     // Top levels. Inputs canonical. If the upper half of f is zero ("sparse"), it is not read.
@@ -1199,6 +1221,29 @@ struct Ntt : Butterflies<S> {
                          fold);
         inverse_radix2_out(p.a, half, p.out, p.count, fold ? 0 : s);
     }
+
+    // The square of p.f (g, m and b unused): multiply(p) with one forward transform.
+    static void square(const Product& p, const u32* r, const u32* ir) {
+        if constexpr (kNarrow)
+            if (p.lg < kWideMinLog) return Ntt<N>::square(p, r, ir);
+        const std::size_t len = std::size_t(1) << p.lg, nv = len / 8;
+        const u32 s = product_scale(p.lg);
+        if (!has_radix2(p.lg)) {
+            const std::size_t q = len / 4;
+            const u32* fold = fold_scale(nv / 4, p.lg, true);
+            forward_radix4_from(p.f, p.n, p.a, q, r);
+            for (std::size_t t = 0; t < 4; ++t) multiply_tree<4, true>(p.a + t * q, p.a + t * q, nv / 4, t, r, ir, fold);
+            return inverse_radix4_out(p.a, q, p.out, p.count, ir, fold ? 0 : s);
+        }
+        const std::size_t half = len / 2;
+        const bool share = p.n <= half && nv / 2 >= 16;
+        if (!share) forward_radix2_from(p.f, p.n, p.a, half);
+        const auto source = [&](u32* a) { return share ? Source{p.f, p.n} : Source{a, half}; };
+        const u32* fold = fold_scale(nv / 2, p.lg, true);
+        multiply_tree<2, true>(source(p.a + half), source(p.a + half), p.a + half, p.a + half, nv / 2, 1, r, ir, fold);
+        multiply_tree<2, true>(source(p.a), source(p.a), p.a, p.a, nv / 2, 0, r, ir, fold);
+        inverse_radix2_out(p.a, half, p.out, p.count, fold ? 0 : s);
+    }
 };
 
 }  // namespace fps::ntt::detail::intrinsics
@@ -1227,6 +1272,10 @@ struct intrinsics {
 
     static void multiply(const detail::Product& p, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
         Ntt::multiply(p, roots, inverse_roots);
+    }
+
+    static void square(const detail::Product& p, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
+        Ntt::square(p, roots, inverse_roots);
     }
 };
 

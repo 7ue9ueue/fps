@@ -125,6 +125,21 @@ fps::detail::Words ntt_product(const Poly& f, const Poly& g, std::size_t size) {
     return out;
 }
 
+// The kernel cases of square and middle_product: ntt::square and ntt::middle_product into new
+// memory, as the API's result holds it.
+fps::detail::Words ntt_square(const Poly& f) {
+    fps::detail::Words out(2 * f.size() - 1, fps::detail::Words::Unwritten{});
+    fps::ntt::square(f.span(), {out.data(), 2 * f.size() - 1});
+    return out;
+}
+
+fps::detail::Words ntt_middle(const Poly& f, const Poly& g) {
+    const std::size_t count = f.size() - g.size() + 1;
+    fps::detail::Words out(count, fps::detail::Words::Unwritten{});
+    fps::ntt::middle_product(f.span(), g.span(), {out.data(), count});
+    return out;
+}
+
 // f * g for f and g of n coefficients against ntt::multiply on the same factors into new memory
 // (ntt_product). "<lg>": n = 2^lg / 2. "480x480": a shape an old cutoff (n m < 2^18) ran
 // schoolbook. Products small::beats_ntt gives to small::multiply (e.g. lg = 6 on most targets)
@@ -152,9 +167,9 @@ void multiply(bench::Suite& suite) {
 
 // fps/products.hpp on transform length L = 2^lg, against the backend call on the same factors:
 // - mul(f, g, n), f and g of n = L / 2: ntt_product of n words;
-// - square(f), f of L / 2: ntt_product with f twice;
-// - middle_product(f, g), f of L / 2, g of L / 4: ntt_product of L / 2 words; the API then moves
-//   L / 4 + 1 words down;
+// - square(f), f of L / 2: ntt::square (ntt_square);
+// - middle_product(f, g), f of L / 2, g of L / 4: ntt::middle_product, a transform of L / 2
+//   (ntt_middle);
 // - raw::mul into a kept out of L / 2 words: ntt::multiply into the same out.
 void products(bench::Suite& suite) {
     for (int lg : {11, 14, 18, 22}) {
@@ -171,7 +186,7 @@ void products(bench::Suite& suite) {
             return [f = random_poly(n, seed)] { bench::keep(fps::square(f)); };
         }, L);
         suite.add("square@kernel" + size, [n, seed] {
-            return [f = random_poly(n, seed), n] { bench::keep(ntt_product(f, f, 2 * n - 1)); };
+            return [f = random_poly(n, seed)] { bench::keep(ntt_square(f)); };
         }, L);
         suite.add("middle_product" + size, [n, seed] {
             return [f = random_poly(n, seed), g = random_poly(n / 2, seed + 1)] {
@@ -179,9 +194,7 @@ void products(bench::Suite& suite) {
             };
         }, L);
         suite.add("middle_product@kernel" + size, [n, seed] {
-            return [f = random_poly(n, seed), g = random_poly(n / 2, seed + 1), n] {
-                bench::keep(ntt_product(f, g, n));
-            };
+            return [f = random_poly(n, seed), g = random_poly(n / 2, seed + 1)] { bench::keep(ntt_middle(f, g)); };
         }, L);
         suite.add("raw_mul" + size, [n, seed] {
             return [f = random_poly(n, seed), g = random_poly(n, seed + 1), out = Poly(n)]() mutable {

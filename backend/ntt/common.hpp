@@ -121,7 +121,8 @@ constexpr bool has_radix2(int lg) { return (lg - 3) % 2 == 1; }
 // words, g: m words, values < P, in caller memory of any alignment, read only there; n, m >= 1,
 // n + m - 1 <= 2^lg, 1 <= count <= 2^lg. out: count words of caller memory, any alignment, written
 // only there; it may overlap f or g, as the variants read f and g before they write out. a, b: the
-// variants' scratch, 2^lg + kPadding words each, 64-byte aligned.
+// variants' scratch, 2^lg + kPadding words each, 64-byte aligned. g may be b itself, with m = 2^lg
+// (read in place: ntt::middle_product). The variants' square(p) ignores g, m and b: f^2.
 struct Product {
     const std::uint32_t* f;
     std::size_t n;

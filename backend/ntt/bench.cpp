@@ -13,12 +13,20 @@
 //   product@copy/<lg>            what product/<lg> replaces: a Convolution, f and g copied in, the
 //                                product copied out (fps::raw::mul before issue #38 round 2).
 //   product@into/<lg>            f copied into the caller's a, Convolution(n, n, a), g copied in.
+//   square/<lg>                  square(f, out), f of 2^lg / 2 words, out of 2^lg - 1, as product.
+//   square@multiply/<lg>         multiply(f, f, out) on the same spans: what square/<lg> replaces.
+//   middle_product/<lg>          middle_product(f, g, out), f of 2^lg words, g of 2^lg / 2, out of
+//                                2^lg / 2 + 1: a transform of 2^lg.
+//   middle_product@multiply/<lg> what it replaces (fps::middle_product before issue #55):
+//                                multiply(f, g, out) into 2^lg words (a transform of 2^(lg + 1)),
+//                                then 2^lg / 2 + 1 words moved down.
 // Tables past 2^16 are built by a thread's first call, then kept (ntt.hpp, Memory). Repeated calls
 // reuse the last output as input, and convolution cases write no factors: the timing does not
 // depend on the values.
 #include "backend/ntt/ntt.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <new>
 #include <random>
@@ -121,6 +129,33 @@ void add_product_cases(bench::Suite& suite) {
                 std::ranges::copy(s->gs(), conv.b());
                 const u32* c = conv.multiply();
                 std::copy_n(c, conv.size(), s->out.begin());
+                bench::keep(s->out.begin()[0]);
+            };
+        }, 2 * n);
+        suite.add("square" + size, [n] {
+            return [s = std::make_shared<Spans>(n, 2 * n - 1)] {
+                square(s->fs(), s->outs());
+                bench::keep(s->out.begin()[0]);
+            };
+        }, 2 * n);
+        suite.add("square@multiply" + size, [n] {
+            return [s = std::make_shared<Spans>(n, 2 * n - 1)] {
+                multiply(s->fs(), s->fs(), s->outs());
+                bench::keep(s->out.begin()[0]);
+            };
+        }, 2 * n);
+        // f of 2n words, g the first n of the second factor.
+        suite.add("middle_product" + size, [n] {
+            return [s = std::make_shared<Spans>(2 * n, n + 1)] {
+                middle_product(s->fs(), s->gs().first(s->n / 2), s->outs());
+                bench::keep(s->out.begin()[0]);
+            };
+        }, 2 * n);
+        suite.add("middle_product@multiply" + size, [n] {
+            return [s = std::make_shared<Spans>(2 * n, 2 * n)] {
+                const std::size_t m = s->n / 2;
+                multiply(s->fs(), s->gs().first(m), s->outs());
+                std::memmove(s->out.begin(), s->out.begin() + (m - 1), (m + 1) * sizeof(u32));
                 bench::keep(s->out.begin()[0]);
             };
         }, 2 * n);
