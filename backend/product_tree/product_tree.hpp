@@ -166,7 +166,7 @@ void product(const F& fs, std::span<u32> out, Mode mode) {
     const u32 cut = std::min(top, mode == Mode::lanes ? top : mode == Mode::standard ? 0 : u32(total / 64));
     const std::size_t lane_length = LaneTree<Slots<F>>::length(u32(cut + total / 8 + 1));
     const std::size_t lane_words = 8 * 4 * (lane_length + 1);
-    const std::size_t standard_words = 8 * (lane_length + 1) + 4 * (StandardTree::length(u32(total)) + 1);
+    const std::size_t standard_words = 8 * (lane_length + 1) + 4 * (StandardTree<>::length(u32(total)) + 1);
     constexpr std::size_t kLeafWords = sizeof(Leaf) / sizeof(u32);
     const std::size_t words = cut + 2 + (kLeafWords + 1) * (count + 8) + std::max(lane_words, standard_words) + 8192;
     RegionGuard guard{ntt::detail::take_region(words * sizeof(u32))};
@@ -205,7 +205,7 @@ void product(const F& fs, std::span<u32> out, Mode mode) {
         for (std::size_t l = 0; l < 8; ++l)  // a lane of degree 0 holds 1: only with fewer than 8 small factors
             if (root.node.degree[l]) leaves[leaf_count++] = {root.coefficients + l, root.node.degree[l], true, 8};
     }
-    StandardTree tree({leaves, leaf_count}, stack);
+    StandardTree<> tree({leaves, leaf_count}, stack);
     scale<Wide>(tree.root(), constant, out.data(), n);
 }
 

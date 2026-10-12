@@ -25,6 +25,8 @@
 //   t.inverse(f);                              // leaf form -> L coefficients
 //   t.forward_upper(h);                        // h: L / 2 words, p mod (x^(L/2) + 1) -> the upper
 //                                              // half of p's leaf form (transform doubling)
+//   t.inverse_upper(h);                        // forward_upper undone: the upper half of a leaf
+//                                              // form -> p mod (x^(L/2) + 1)
 //   t.multiply(a, b, out);                     // out = a b leaf by leaf; out may be a or b
 //   t.multiply_add(acc, a, b);                 // acc += a b leaf by leaf; acc may be a or b
 //   t.inverse(F, out);                         // out = the first out.size() coefficients; F kept
@@ -89,6 +91,11 @@
 // with r(1) first). So a product tree's node of length L / 2 doubles to its parent's length with
 // one transform of L / 2 words and no twist pass (backend/product_tree). The variant is the
 // forward's at L / 2.
+//
+// inverse_upper(h): forward_upper undone, with the inverse's scale: the subtrees' inverse levels,
+// then (radix-4 top) the radix-2 level with r(1)^-1 and the scale, or (radix-2 top) a pass for the
+// scale. With the lower half's inverse it gives p mod (x^(L/2) -+ 1) from p's leaf form at half
+// the cost of an inverse of length L each (backend/evaluation's descent halves a node's transform).
 //
 // inverse(F, out, ...): into other memory, F kept. Its subtrees copy (or join) their leaves from F
 // into this thread's region before their bottom level, and the top level writes out: no copy of
@@ -331,6 +338,15 @@ public:
     void forward_upper(std::uint32_t* h) const {
         if (lg_ == kMinLog) throw std::length_error("fps::ntt::Transform::forward_upper: needs lg > kMinLog");
         Variant::forward_upper(h, lg_ - 1, roots());
+    }
+
+    // forward_upper undone: h (length() / 2 words, 32-byte aligned, kPadding after), leaves L / 16
+    // .. L / 8 - 1 of p's leaf form -> the coefficients of p mod (x^(L/2) + 1), canonical. lg >
+    // kMinLog. The variant is the inverse's at L / 2.
+    template <class Variant = SelectedInverse>
+    void inverse_upper(std::uint32_t* h) const {
+        if (lg_ == kMinLog) throw std::length_error("fps::ntt::Transform::inverse_upper: needs lg > kMinLog");
+        Variant::inverse_upper(h, lg_ - 1, inverse_roots());
     }
 
     // F in that form -> its coefficients, in place.

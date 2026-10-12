@@ -137,6 +137,11 @@ template <class... V>
     (void)((i++ == v && (V::inverse(f, lg, ir), true)) || ...);
 }
 template <class... V>
+[[gnu::always_inline]] inline void run_inverse_upper(Candidates<V...>, int v, std::uint32_t* f, int lg, const std::uint32_t* ir) {
+    int i = 0;
+    (void)((i++ == v && (V::inverse_upper(f, lg, ir), true)) || ...);
+}
+template <class... V>
 [[gnu::always_inline]] inline void run_multiply(Candidates<V...>, int v, std::uint32_t* a, std::uint32_t* b,
                                                 std::size_t n, std::size_t m, int lg, const std::uint32_t* r,
                                                 const std::uint32_t* ir) {
@@ -191,6 +196,11 @@ struct tuned {
 
     static void inverse(std::uint32_t* f, int lg, const std::uint32_t* inverse_roots) {
         detail::run_inverse(Selected{}, choice(kInverse, lg), f, lg, inverse_roots);
+    }
+
+    // The inverse's candidate at the length it runs, 2^lg (its table is the one of 2^(lg + 1)).
+    static void inverse_upper(std::uint32_t* f, int lg, const std::uint32_t* inverse_roots) {
+        detail::run_inverse_upper(Selected{}, choice(kInverse, lg), f, lg, inverse_roots);
     }
 
     static void multiply(std::uint32_t* a, std::uint32_t* b, std::size_t n, std::size_t m, int lg,

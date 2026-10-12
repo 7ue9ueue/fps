@@ -1477,6 +1477,26 @@ struct Ntt : Butterflies<S> {
         forward_tree<4>(f + half, nv / 2, 3, r);
     }
 
+    // forward_upper undone, times s: the upper half of the leaf form of length 2L, L = 2^lg, to
+    // p mod (x^L + 1), canonical; ir: the table of length 2L.
+    static void inverse_upper(u32* f, int lg, const u32* ir, u32 s) {
+        const std::size_t len = std::size_t(1) << lg, nv = len / 8, half = len / 2;
+        const F scale = B::factor(s);
+        if (has_radix2(lg + 1)) {
+            inverse_tree(f, nv, 1, ir);
+            for (std::size_t i = 0; i < len; i += S::lanes) S::store(f + i, canonical(B::mul(S::load(f + i), scale)));
+            return;
+        }
+        inverse_tree(f, nv / 2, 2, ir);
+        inverse_tree(f + half, nv / 2, 3, ir);
+        const F sz = B::factor(multiply_mod(s, ir[slot(1)]));
+        for (std::size_t i = 0; i < half; i += S::lanes) {
+            const V x = S::load(f + i), y = S::load(f + i + half);
+            S::store(f + i, canonical(B::mul(add(x, y), scale)));
+            S::store(f + i + half, canonical(B::mul(diff(x, y), sz)));
+        }
+    }
+
     static void inverse(u32* f, int lg, const u32* ir, u32 s) {
         const std::size_t len = std::size_t(1) << lg, nv = len / 8;
         if (!has_radix2(lg)) {
@@ -1649,6 +1669,10 @@ struct intrinsics {
 
     static void inverse(std::uint32_t* f, int lg, const std::uint32_t* inverse_roots) {
         Ntt::inverse(f, lg, inverse_roots, detail::leaf_scale(lg));
+    }
+
+    static void inverse_upper(std::uint32_t* f, int lg, const std::uint32_t* inverse_roots) {
+        Ntt::inverse_upper(f, lg, inverse_roots, detail::leaf_scale(lg));
     }
 
     // Does not read the upper half of a factor of at most half the transform length.
