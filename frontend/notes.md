@@ -495,3 +495,69 @@ belongs in `backend/`).
        one factor is now multiplied by reference. `product/<lg>` against the PR's previous head
        6001cc7, `lc-bench`, 11 rounds: lg 10 / 14 / 18 = 0.803 / 0.847 / 0.885 (IQR within
        0.006). Now 69 / 93 / 127 ns per factor.
+- 2026-10-12: tuning (#66): `fps::tune_all()`, `fps::save_wisdom(path)`, `fps::load_wisdom(path)`
+  in `include/fps/tune.hpp`, on backend/tune's `run`, `save` and `load` (#54). The header includes
+  `backend/small/tune.hpp` and `backend/factorials/tune.hpp`, so "small.variant", "small.ntt" and
+  "factorials.variant" register; ntt's goes there when #78 adds it.
+  - The name: DESIGN.md had `fps::tune()`, which does not compile: `fps::tune` is the backend
+    tuner's namespace ("redefinition of 'tune' as different kind of symbol"). Renaming the
+    namespace (17 backend files, three running backend rounds on them: #78, #70, #37) was the
+    other way; `tune_all()` keeps this change in the frontend. DESIGN.md says so.
+  - Behaviour, as DESIGN.md now states it: both wisdom functions return bool and never throw on a
+    bad path (`save_wisdom` false if the file cannot be written; `load_wisdom` false, setting
+    nothing, if it is missing, malformed, or from another CPU or target). `tune_all()` runs once
+    per process and measures from the compiled defaults. `-DFPS_NO_TUNER`: the three compile;
+    `tune_all()` does nothing, the other two touch no file and return false, so the usual
+    `if (!load_wisdom(p)) { tune_all(); save_wisdom(p); }` still runs. The kernel tune headers
+    are not included then.
+  - Tests (`test_tune.cpp`): its own wisdom loads back; 17 refused files (empty, a cut header, no
+    target line, another format, CPU or target (each of the other five), a line without values,
+    too few values, not a number, a negative NTT time, a variant past the list, another candidate
+    list, good lines before a bad one) and a missing file each leave the saved wisdom byte-identical;
+    unwritable paths (missing directory, a directory, "") return false and create nothing;
+    wisdom forcing each candidate of each choice everywhere it can run (every small variant, the
+    NTT times x1/8 and x8, every factorials variant) loads, saves back identical, and f * g (66
+    shapes on both sides of every target's cutoffs, up to 4096 x 4096) and Factorials (every
+    class end to 2^17, and one past) match O(n^2) references; then `tune_all()` while another
+    thread checks the same results, a second `tune_all()` changes nothing, and the defaults and
+    the tuned wisdom load back in turn. `test_tune_no_tuner.cpp`: the -DFPS_NO_TUNER behaviour
+    above, f * g and Factorials. Both pass at -O2 and ASan/UBSan on every target's test machine
+    and on the Mac (scalar, arm). Mutations: `load_wisdom` returning true fails the test; dropping
+    factorials' tune header fails to compile the test.
+  - Cost of `tune_all()`, one fresh process, ms (3 runs; lines of 3 that changed): `lc-bench`
+    (Zen 3, avx2) 119-130 (2-3), `lc-intel` (avx512) 118-121 (3), `lc-zen5` 105-106 (3), `lc-arm`
+    159 (1); the Mac (M4, arm build, laptop) 217. DESIGN.md said "seconds"; now "about 0.1 s".
+  - A call with loaded wisdom against the compiled defaults, the same choices (save the defaults,
+    load them back: the tables are then heap copies). `wisdom_cost.cpp` (explore dir
+    `build-66/`): processes alternating on the last core under the bench lock, bench.hpp
+    timing, GCC 15.2, target flags, this branch on d1f5f4d. Paired wisdom / defaults, median of 7
+    (min-max):
+
+    | case | `lc-bench` | `lc-intel` | `lc-zen5` | `lc-arm` |
+    |---|---:|---:|---:|---:|
+    | multiply 8x8 / 16x16 / 32x32 | 1.000 / 0.997 / 0.996 | 0.997 / 1.000 / 0.997 | 1.000 / 0.987 / 1.000 | 0.998 / 1.001 / 1.000 |
+    | multiply 64x64 / 4096x16 | 1.003 / 1.006 | 1.020 / 1.000 | 1.005 / 1.001 | 1.000 / 1.001 |
+    | multiply 512x512 / 8192x8192 | 0.995 / 0.998 | 1.000 / 0.997 | 0.995 / 0.999 | 1.001 / 1.000 |
+    | Factorials 64 / 1024 / 16384 | 0.939 / 1.023 / 1.001 | 1.082 / 0.975 / 1.001 | 1.058 / 0.997 / 0.999 | 1.001 / 1.000 / 1.000 |
+
+    The Factorials 64 and 1024 shifts (narrow, both signs) are heap placement, not the tables: a
+    control process doing the same file work with a failed load (tables stay the defaults), 9
+    rounds of three: wisdom / control for Factorials 64 1.002 (Zen 3), 0.940 (Emerald Rapids; that
+    run wisdom / defaults 1.000, control / defaults 1.065), 1.003 (Zen 5); 1024 1.007, 1.012, 1.010;
+    64x64 1.000, 1.004, 1.000. So a loaded table costs nothing measurable beyond the choice it
+    holds.
+  - Bench: no new pair (the three are no kernel wrappers; tune_all() is a measurement). The
+    existing pairs, new against d1f5f4d, 11 rounds: geomean of gated cases `lc-bench` 1.0073 and
+    1.0048 (two runs), `lc-intel` 0.9856, `lc-zen5` 0.9921, `lc-arm` 0.9933. No kernel or
+    frontend operation changed; the moves are layout and placement (the tune headers add code and
+    allocate the registry at start-up). Their `@kernel` cases, code in bench.cpp that this change
+    does not touch, move with them: on `lc-bench` add/sub/neg at lg 10 and 14 read 1.026-1.037,
+    and add@kernel/14 1.076, sub@kernel/14 1.082, multiply/7 1.059 with multiply@kernel/7 1.029;
+    on `lc-zen5` multiply/10 1.039 with multiply@kernel/10 1.041.
+  - API / kernel (new ns medians, run 2 on `lc-bench`): factorials 1.000-1.012 on all four
+    machines (`lc-intel` /10 1.019, `lc-zen5` /10 1.032); multiply from lg 10 1.03-1.07 on x86
+    and 1.01-1.02 on `lc-arm`, the known copy out of the Convolution (above; measured on d1f5f4d,
+    before #59 moved f * g onto `ntt::multiply(f, g, out)`); multiply 4096x4 and 4096x16
+    1.00-1.01; element-wise 0.59-1.03, placement as before.
+  - `polynomial.hpp`'s cutoff comment: the issue asked for 38-180 / 24-104; #59 rewrote that
+    comment with its own ranges first, so this change keeps #59's.
