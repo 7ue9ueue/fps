@@ -5,12 +5,12 @@
 //   avx2: lc-bench (AMD EPYC 7B13), 2026-10-12, commit 6658dfc
 //   avx512: lc-intel (INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz), 2026-10-12, commit 877a450+changes
 //   zen5: lc-zen5 (AMD EPYC 9B45), 2026-10-12, commit 1e867c9
-//   arm: lc-arm (implementer 0x41 variant 0x0 part 0xd4f revision 1), 2026-10-12, commit 1e867c9
+//   arm: lc-arm (implementer 0x41 variant 0x0 part 0xd4f revision 1), 2026-10-13, commit 877a450+changes
 #pragma once
 
 namespace fps::ntt::tuned {
 
-inline constexpr int signature[] = {229487757, 1938428766, 816417160, 188484110, 1106315347, 1288679911};
+inline constexpr int signature[] = {229487757, 1938428766, 816417160, 188484110, 1106315347, 395475373};
 
 inline constexpr int forward[][20] = {
     {  // scalar

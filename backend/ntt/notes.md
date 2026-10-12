@@ -4,6 +4,7 @@ Number-theoretic transforms and products modulo P = 998244353. API: `ntt.hpp` (`
 `square`, `middle_product`, `Convolution`, `Transform`, the leaf form). Variants: `scalar.hpp` (every target; the model),
 `intrinsics.hpp` (`intrinsics<S>`, templates on any `backend/simd` struct S), `avx2.hpp` (lc-opt's
 `lib/ntt`), `avx512.hpp` (intrinsics on zmm with generated asm kernels, issue #150).
+`lib/ntt`), `neon.hpp` (arm: `intrinsics<Neon>` with generated asm kernels, issue #151).
 `select.hpp`: the variant per op and length, a tuned choice ("ntt.variant", issue #78): per target
 a list of candidates and a table of one per op (forward, inverse, multiply, product) and lg, with
 compiled defaults in `tuned.hpp` (`tools/tune.py ntt`, `tune.cpp`); `tune.hpp` measures it at run
@@ -11,6 +12,7 @@ time. `memory.hpp`: `Convolution`'s memory, kept per thread. Tests: `test.cpp`,
 `test_no_tuner.cpp`; benches: `bench.cpp`.
 Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_product_kernels.hpp`
 (`gen_avx2_product_kernels.py`), `avx512_kernels.hpp` (`gen_avx512_kernels.py`).
+(`gen_avx2_product_kernels.py`), `neon_kernels.hpp` (`gen_neon_kernels.py`).
 
 ## Design
 
@@ -265,6 +267,26 @@ intrinsics'. A candidate on the avx512 target only (Zen 5's tuning is issue #152
   row is stored in halves. Kernel time 0.93 of WideBottom::multiply's on L1 data.
 - Constants: each statement loads its own (pure loads); masks are "Yk" operands, as a kmovw from
   memory costs a p0/p5 uop (measured, notes/150-r1.md).
+### neon (issue #151)
+
+The arm target's one candidate: the intrinsics on `neon::Vec` (`simd::Neon` under its own name)
+with asm kernels generated for Neoverse V2 (`gen_neon_kernels.py`) where SVE2 is there (`umulh`);
+without it (the Mac) the same name runs the intrinsics alone, so every arm build has one candidate
+list. `intrinsics::Generated<neon::Vec>` (the hook of the avx512 variant, issue #150, with optional
+members) replaces: the bottoms of products, squares and products by stored leaves
+(`Bottom::multiply`, `multiply_stored`) and of transforms (`Bottom::forward`, `inverse`) for an
+even group count, and the group levels (forward in place with inputs < 4P or < 2P, from other
+memory with inputs < 2P; inverse).
+- Generator: graph, source order, list schedule on a V2 model under the register budget (an op that
+  grows the live set only if the rest can follow in source order within it: no deadlock), then a
+  reorder that alternates multiplies and other vector ops (2-5% on V2), linear-scan allocation.
+- Product bottoms: two groups per asm statement, the forward half of pair j + 1 interleaved with
+  the products of pair j through a leaf buffer; twiddles and B by element (`umlal v, x, b.s[i]`),
+  quotients broadcast once per group. Group levels: an asm loop, 4 columns per iteration.
+- Against `intrinsics<Neon>` on L1 data: product bottom 0.74, group loops 0.84-0.91, transform
+  bottoms 0.83 (forward) and 0.95 (inverse). Whole ops, same binary, 2^8-2^22: multiply and
+  products 0.80-0.84, forward 0.84-0.89, inverse 0.90-0.98; 2^6-2^7 unchanged (single-group
+  subtrees). `Native` is neon on arm. Attempts and numbers: `notes/151-r1.md`.
 
 ### Variant selection (issue #78)
 
@@ -275,6 +297,9 @@ A tuned choice, "ntt.variant" (`backend/tune`): per target a list of candidates 
   (issue #150); avx2 {avx2,
   intrinsics<Avx2>}; arm, sse, scalar intrinsics<Native> alone (no table read: `choice()` is a
   constant 0). Each is fastest somewhere on our machines (Log, issue #78).
+- Candidates: avx512 and zen5 {avx2, intrinsics<Avx512Vl>, intrinsics<Avx512>}; avx2 {avx2,
+  intrinsics<Avx2>}; sse, scalar intrinsics<Native> alone (no table read: `choice()` is a
+  constant 0), arm neon alone (issue #151). Each is fastest somewhere on our machines (Log, issue #78).
 - Ops: forward and inverse (`Transform`), multiply (`Convolution::multiply`) and product
   (`multiply(f, g, out)`). The two products have their own rows: their top levels differ (from
   spans: `forward_top_from` and `inverse_top_to<T>` in the asm, `forward_radix4_from` and

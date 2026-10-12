@@ -58,6 +58,14 @@ constexpr int kLatencyOps = 64, kThroughputOps = 96;
         name, nullptr,                                                                                          \
             [](long n) { for (long i = 0; i < n; ++i) asm volatile(REPT8(IRP6A(tp_a) IRP6B(tp_b)) ::: CLOBBERS); } \
     }
+// MIX with %0 the address of a 64-byte aligned buffer (loads and stores; throughput only).
+alignas(64) unsigned char buffer[1024];
+#define MEM(name, tp_a, tp_b)                                                                                    \
+    Probe {                                                                                                      \
+        name, nullptr, [](long n) {                                                                              \
+            for (long i = 0; i < n; ++i) asm volatile(REPT8(IRP6A(tp_a) IRP6B(tp_b)) ::"r"(buffer) : CLOBBERS); \
+        }                                                                                                        \
+    }
 
 std::vector<Probe> probes() {
     return {
@@ -103,6 +111,28 @@ std::vector<Probe> probes() {
         MIX("mul + sqdmulh", "mul v\\r\\().4s, v14.4s, v15.4s", "sqdmulh v\\r\\().4s, v14.4s, v15.4s"),
         MIX("mul + add", "mul v\\r\\().4s, v14.4s, v15.4s", "add v\\r\\().4s, v14.4s, v15.4s"),
         MIX("umull + uzp2", "umull v\\r\\().2d, v14.2s, v15.2s", "uzp2 v\\r\\().4s, v14.4s, v15.4s"),
+        // By-element forms, dup and ext, loads and stores (ntt issue #151: the Neon asm kernels).
+        PROBE("mul 4s by element", "mul v0.4s, v0.4s, v1.s[1]", "mul v\\r\\().4s, v14.4s, v15.s[1]"),
+        PROBE("mls 4s by element", "mls v0.4s, v1.4s, v2.s[1]", "mls v\\r\\().4s, v14.4s, v15.s[1]"),
+        PROBE("umlal 2d by element", "umlal v0.2d, v1.2s, v2.s[1]", "umlal v\\r\\().2d, v14.2s, v15.s[1]"),
+        PROBE("umlal2 2d by element", "umlal2 v0.2d, v1.4s, v2.s[1]", "umlal2 v\\r\\().2d, v14.4s, v15.s[1]"),
+        PROBE("umull 2d by element", "umull v0.2d, v0.2s, v1.s[1]", "umull v\\r\\().2d, v14.2s, v15.s[1]"),
+        PROBE("dup 4s element", "dup v0.4s, v0.s[1]", "dup v\\r\\().4s, v15.s[1]"),
+        PROBE("ext 16b", "ext v0.16b, v0.16b, v1.16b, #4", "ext v\\r\\().16b, v14.16b, v15.16b, #4"),
+        MIX("umlal by element + add", "umlal v\\r\\().2d, v14.2s, v15.s[1]", "add v\\r\\().4s, v14.4s, v15.4s"),
+        MIX("dup + mul", "dup v\\r\\().4s, v15.s[1]", "mul v\\r\\().4s, v14.4s, v15.4s"),
+        MIX("ext + add", "ext v\\r\\().16b, v14.16b, v15.16b, #4", "add v\\r\\().4s, v14.4s, v15.4s"),
+        MEM("ldr q", "ldr q\\r, [%0, #16*\\r]", "ldr q\\r, [%0, #16*\\r]"),
+        MEM("ldur q (4 bytes past)", "ldur q\\r, [%0, #4+16*\\r]", "ldur q\\r, [%0, #4+16*\\r]"),
+        MEM("ld1r 4s", "ld1r {v\\r\\().4s}, [%0]", "ld1r {v\\r\\().4s}, [%0]"),
+        MEM("str q", "str q\\r, [%0, #16*\\r]", "str q\\r, [%0, #16*\\r]"),
+        MEM("stur q (4 bytes past)", "stur q\\r, [%0, #4+16*\\r]", "stur q\\r, [%0, #4+16*\\r]"),
+        MEM("ldr q + mul", "ldr q\\r, [%0, #16*\\r]", "mul v\\r\\().4s, v14.4s, v15.4s"),
+        MEM("ld1r + mul", "ld1r {v\\r\\().4s}, [%0]", "mul v\\r\\().4s, v14.4s, v15.4s"),
+        MEM("ld1r + add", "ld1r {v\\r\\().4s}, [%0]", "add v\\r\\().4s, v14.4s, v15.4s"),
+        MEM("str q + mul", "str q\\r, [%0, #16*\\r]", "mul v\\r\\().4s, v14.4s, v15.4s"),
+        MEM("str q + add", "str q\\r, [%0, #16*\\r]", "add v\\r\\().4s, v14.4s, v15.4s"),
+        MEM("str q + ldr q", "str q\\r, [%0, #16*\\r]", "ldr q\\r, [%0, #512+16*\\r]"),
 #if defined(__ARM_FEATURE_SVE2)
         PROBE("umulh z.s (sve2)", "umulh z0.s, z0.s, z1.s", "umulh z\\r\\().s, z14.s, z15.s"),
         MIX("mul + umulh", "mul v\\r\\().4s, v14.4s, v15.4s", "umulh z\\r\\().s, z14.s, z15.s"),
