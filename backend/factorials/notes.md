@@ -601,6 +601,11 @@ rounds, ns per position. Names as in round 1; y4 = Avx512Vl K = 4, p = prefetch.
   question for the frontend's allocation (`Words`). (3) Other operators that write fresh results
   (add, sub at 2^22) pay the same faults.
 
+2026-10-12, claude (issue #63, gate time): the test builds the Chains variants of `simd::Native`
+only; each other struct is tested on its own target, and every candidate of select.hpp still is.
+-O2 build 42 -> 23 s, ASan/UBSan compile 48 -> 30 s. Measured with clang 18 in a 4-core x86 cloud
+container (-march=x86-64-v3, one run each, not a timing machine; the gate builds with GCC 15.2).
+
 ## Sources
 
 - lc-opt `lib/poly/factorials.hpp` and its notes (Factorials): the product chains, the scan with
