@@ -9,7 +9,7 @@
 // Unlike std::vector it can allocate without writing, so an operator writes its result in one
 // pass, and it copies with memcpy (std::vector with such an allocator copies word by word under
 // GCC 15). The larger block is for a product written past the words kept (small::multiply writes
-// all of a b; the middle product keeps the top of f g mod x^n); those words stay allocated until
+// all of a b, of which mul or the middle product keeps a part); those words stay allocated until
 // the Words dies, and a copy holds size() words only. Growing past size() reallocates: one word
 // at a time costs O(n^2), and copy assignment always allocates.
 #pragma once

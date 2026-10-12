@@ -251,8 +251,8 @@ void test_product() {
 }
 
 // Results that keep spare words past their size: mul on the small::multiply path with n below the
-// product (small::multiply writes all of it), and the middle product (f g mod x^n on the NTT path,
-// all of f g on small's). Copies, resizes and sums see size() coefficients only.
+// product (small::multiply writes all of it), and the middle product on small's path (all of f g;
+// the NTT path's result is tight). Copies, resizes and sums see size() coefficients only.
 void check_spare(Poly h, const Vec& want) {
     CHECK(vec(h) == want, want.size());
     const Poly copy = h;
