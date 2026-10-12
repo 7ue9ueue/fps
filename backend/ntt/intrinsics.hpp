@@ -764,14 +764,6 @@ struct WideBottom : Butterflies<S> {
     }
 };
 
-// Lengths below 2^kWideMinLog run on Narrow<S> (notes.md, 2026-10-11): at 2^7 zmm was slower
-// than ymm on Emerald Rapids (inverse 1.36x the asm against 1.05x), not on Zen 5.
-#if defined(__znver4__) || defined(__znver5__)
-inline constexpr int kWideMinLog = 7;
-#else
-inline constexpr int kWideMinLog = 8;
-#endif
-
 template <class S>
 struct Ntt : Butterflies<S> {
     using N = typename Narrow<S>::type;
@@ -1123,8 +1115,6 @@ struct Ntt : Butterflies<S> {
         });
     }
 
-    static constexpr bool kNarrow = !std::is_same_v<S, N>;
-
     // The scale goes into the top groups of the subtrees below the top level when those have one
     // (nv >= 16 leaves) and lg <= kFoldMaxLog: their scaled twiddles, else null (the top level
     // scales). Per vector: 0.5 products fewer and 1.25 other ops more under a radix-2 top, 0.375
@@ -1135,8 +1125,6 @@ struct Ntt : Butterflies<S> {
 
     // Top levels by lg: nv = 4^j leaves start with group 0; nv = 2 * 4^j with the radix-2 level.
     static void forward(u32* f, int lg, const u32* r) {
-        if constexpr (kNarrow)
-            if (lg < kWideMinLog) return Ntt<N>::forward(f, lg, r);
         const std::size_t len = std::size_t(1) << lg, nv = len / 8;
         if (!has_radix2(lg)) return forward_tree<1>(f, nv, 0, r);
         forward_radix2(f, len / 2, false);
@@ -1145,8 +1133,6 @@ struct Ntt : Butterflies<S> {
     }
 
     static void inverse(u32* f, int lg, const u32* ir, u32 s) {
-        if constexpr (kNarrow)
-            if (lg < kWideMinLog) return Ntt<N>::inverse(f, lg, ir, s);
         const std::size_t len = std::size_t(1) << lg, nv = len / 8;
         if (!has_radix2(lg)) {
             const u32* fold = fold_scale(nv / 4, lg, false);
@@ -1160,8 +1146,6 @@ struct Ntt : Butterflies<S> {
     }
 
     static void multiply(u32* a, u32* b, std::size_t n, std::size_t m, int lg, const u32* r, const u32* ir) {
-        if constexpr (kNarrow)
-            if (lg < kWideMinLog) return Ntt<N>::multiply(a, b, n, m, lg, r, ir);
         const std::size_t len = std::size_t(1) << lg, nv = len / 8;
         const bool sparse_a = n <= len / 2, sparse_b = m <= len / 2;
         const u32 s = product_scale(lg);
@@ -1188,8 +1172,6 @@ struct Ntt : Butterflies<S> {
 
     // The product p (detail::Product).
     static void multiply(const Product& p, const u32* r, const u32* ir) {
-        if constexpr (kNarrow)
-            if (p.lg < kWideMinLog) return Ntt<N>::multiply(p, r, ir);
         const std::size_t len = std::size_t(1) << p.lg, nv = len / 8;
         const u32 s = product_scale(p.lg);
         if (!has_radix2(p.lg)) {

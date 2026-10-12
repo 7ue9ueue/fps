@@ -43,6 +43,7 @@
 #include <vector>
 
 #include "backend/ntt/ntt.hpp"
+#include "backend/ntt/tune.hpp"  // registers "ntt.variant" before "small.ntt", which times the NTT
 #include "backend/small/small.hpp"
 #include "backend/tune/tune.hpp"
 

@@ -5,7 +5,8 @@ Run-time tuning of the kernels' choices (variants, cutoffs, layouts), FFTW-style
 Converted choices: small's NTT times behind `small::beats_ntt` ("small.ntt",
 `backend/small/tune.hpp`, round 1); factorials' variant per size class ("factorials.variant",
 `backend/factorials/tune.hpp`, round 2); small's schoolbook variant per shape class
-("small.variant", `backend/small/tune.hpp`, round 3).
+("small.variant", `backend/small/tune.hpp`, round 3); the NTT's variant per op and length
+("ntt.variant", `backend/ntt/tune.hpp`, issue #78).
 
 ## Design
 
@@ -48,8 +49,11 @@ Converted choices: small's NTT times behind `small::beats_ntt` ("small.ntt",
   a product's path, and the gate's benches, depend on noise. Benches and tests read the compiled
   defaults.
 - The frontend's `fps::tune()`, `save_wisdom` and `load_wisdom` (DESIGN.md) wrap `tune::run`,
-  `save` and `load`; they need `backend/small/tune.hpp` (it pulls in the NTT) and
-  `backend/factorials/tune.hpp` included for those choices to be registered.
+  `save` and `load`; they need `backend/ntt/tune.hpp`, `backend/small/tune.hpp` and
+  `backend/factorials/tune.hpp` included for those choices to be registered. Order:
+  `backend/small/tune.hpp` includes `backend/ntt/tune.hpp`, so in every translation unit
+  "ntt.variant" is defined, and registered, before "small.variant" and "small.ntt" (which times
+  the NTT); inline variables initialize in that order ([basic.start.dynamic]).
 - A variant choice (factorials, round 2): the target's variants are a compile-time list
   (`Candidates<Variant<S, K, step>...>`, all instantiated); the table holds one byte per size
   class, the index of the variant (0 the scalar loop); the kernel runs it through a chain of
@@ -81,6 +85,12 @@ Converted choices: small's NTT times behind `small::beats_ntt` ("small.ntt",
   and keeps the current variant unless another's geometric mean of time / fastest is better by
   the margin. Run time measures classes with m <= 256 only (beats_ntt sends larger m to the NTT).
   "small.variant" is registered before "small.ntt", which times multiply().
+- A variant choice per op and length (the NTT, issue #78): one byte per op (forward, inverse,
+  multiply, product) and lg 6..25, indexing the target's candidates (`backend/ntt/select.hpp`);
+  a target with one candidate reads no table. The size class is lg itself: a product picks its
+  transform length first. The dispatch is small's inlined fold, one per op. `measure` times every
+  candidate through the public ops (Transform, a Convolution on the thread's kept region,
+  multiply(f, g, out)); past `max_lg` it keeps the table unless the choice at `max_lg` changed.
 
 ## Measurements
 
@@ -318,6 +328,77 @@ The frontend bench's NTT-only shapes move with code layout: main against main wi
 function added to `frontend/bench.cpp` (no kernel changed), 11 rounds: Zen 3 `multiply/6` 1.075,
 `/7` 0.973, geomean 1.0022; Zen 5 `/9` 1.031, `/10` 1.023; Emerald Rapids within 0.6%.
 
+### ntt.variant (issue #78)
+
+GCC 15.2, `tools/kernel.py` flags, 2026-10-12, this branch on main bfd491b. Programs in
+`~/Documents/hpc_library-explore/tune/ntt-r1/`: `probe.cpp` (every variant per op and lg),
+`validate.cpp` (decisions, run-time cost), `lookup.cpp` (lookup and dispatch), `analyze.py`;
+outputs in `out/`. The backend side (candidates, crossovers, benches): `backend/ntt/notes.md`.
+
+Lookup (`lookup.cpp`): `variants.get()[op][lg - 6]` for 4096 random (op, lg), ns per decision,
+median of 11 samples of 2 ms, inline in the loop / through a noinline call; main's compare
+`lg < 8 ? 0 : 2` (inline it vectorizes).
+
+| Machine | table | `FPS_NO_TUNER` | main's compare |
+|---|---:|---:|---:|
+| Zen 3 | 0.62-0.65 / 1.75 | 0.61 / 1.74 | 0.04 / 1.45 |
+| Emerald Rapids | 0.45 / 0.61 | 0.37 / 0.54 | 0.04 / 0.49 |
+| Zen 5 | 0.47 / 0.98 | 0.41 / 0.97 | 0.04 / 0.97-0.98 |
+| Neoverse V2 | 0.73 / 0.86 | | 0.47 / 0.70 |
+
+In the call (`lookup.cpp`): each op at 2^6-2^8 through `variant::tuned` against the candidate the
+table picks, called directly, timed in turn in one binary (11 samples of 2 ms, 3 rounds, two
+builds). Next to a 2^6 product: multiply/6 Emerald Rapids 0.984-0.999, Zen 5 1.001-1.003,
+Neoverse V2 (one candidate, no table read) 0.998-1.000; product/6 1.001-1.006, 1.001-1.003,
+0.994-0.995. So the lookup is free next to a 90-140 ns product. Exceptions, both code placement:
+Emerald Rapids inverse/6 through any dispatch +2.1 ns (1.08x; main's `by_length` path paid the
+same: inverse/6 27 ns in both benches against 25 for `inverse@intrinsics_avx512vl/6`); Zen 3 with
+two candidates multiply/7 1.064 in one build and 1.000 in the next (one function added).
+
+Cost of tuning: `tune::run()` for "ntt.variant" at `kRunTime` (lengths to 2^12, 5 samples of 100
+us, margin 3%), 5 runs: Emerald Rapids 55.1-56.0 ms, Zen 5 56.3-57.0 (the avx512 build there
+56.3-57.3); 0 on the one-candidate targets (avx2, sse, scalar, arm). Other budgets, same runs:
+
+| Budget | ms | Emerald Rapids, 5 runs (compiled: 1.0006) | avx512 on Zen 5 |
+|---|---:|---|---|
+| to 2^12, 3 samples of 10 us | 3.8-4.1 | one run changed 7-8 entries: 1.0071-1.0078, worst 1.24-1.45 | 1.0000 |
+| to 2^12, 3 of 50 us | 17.7-18.1 | one run 1.0012 (worst 1.098) | 1.0000 |
+| to 2^12, 5 of 100 us (kRunTime) | 55-57 | 1.0005 every run | 1.0000 |
+| to 2^12, 5 of 200 us, 5% | 104-113 | 1.0006 | 1.0000 |
+| to 2^10, 5 of 100 us | 35-39 | 1.0005-1.0006 | 1.0000 |
+
+(Validation geomeans, below. To 2^10 one Zen 3 run, with two candidates, changed 16 entries: a
+change at 2^10 carried to every longer length. 200 us at 5% kept more of Zen 3's table for the
+avx2 build on Emerald Rapids: 1.0045 against 1.0029-1.0030.)
+
+`tools/tune.py ntt`: 47.7 s on Emerald Rapids, 30.4 s on Zen 5 (30.1 s on Zen 3 with two
+candidates); the one-candidate targets measure nothing. Three runs on Emerald Rapids differed in
+0-1 of 80 entries (forward/6: the asm or ymm intrinsics, within 1.6-3.5%).
+
+Decisions (`validate.cpp`): per lg 6..20, forward and inverse, multiply at factors (5L/16, 5L/16),
+(5L/8, L/4), (L - 9, 10), product at the same and f, g of L/2 with out of L/2: 135 points, none a
+shape `measure` times; every candidate timed there (median of 7, samples of 200 us), in another
+binary than tune.cpp's. Geometric mean of chosen / fastest (lg <= 9 in brackets), points more
+than 2% slower, worst; two runs of the program.
+
+| Build on machine | main's `by_length` | compiled table | tuned at run time (5 runs) |
+|---|---|---|---|
+| avx512 on Emerald Rapids (home) | 1.0010-1.0014 (1.0039-1.0054), 1, 1.12-1.18 | 1.0006 (1.0022), 1, 1.056 | 1.0005 (1.0021), 1, 1.056 (1 entry changes) |
+| zen5 on Zen 5 (home) | 1.0000 | 1.0000, 0, 1.001-1.003 | 1.0000 (none change) |
+| avx512 on Zen 5 (Emerald Rapids' table) | 1.0083-1.0091 (1.0313-1.0344), 10, 1.15-1.17 | 1.0071-1.0076 (1.0270-1.0287), 8, 1.15-1.17 | 1.0000, 0 (3 entries change) |
+
+- Emerald Rapids' one point: inverse/7, where tune.cpp's binary ran the asm 5.6-9.7% faster than
+  the ymm intrinsics in 3 runs and this binary, a probe and the bench 1.8-5.8% slower (code
+  placement). Run-time tuning moves it back.
+- Zen 5 with Emerald Rapids' table loses at 2^6-2^7: the asm is 10-15% faster there at inverse/6,
+  multiply/6 and product/6, which Emerald Rapids runs on ymm intrinsics.
+- With intrinsics<Avx2> as a second candidate on avx2 (dropped, Log): Zen 3 compiled 1.0005-1.0007;
+  the avx2 build on Emerald Rapids (Zen 3's table) 1.0050-1.0061, tuned 1.0029-1.0045, best in
+  sample 1.0006-1.0009; on Zen 5 1.0016-1.0018, tuned 1.0011.
+- Products into fresh pages (2^15-2^20, out not yet touched, 6 points): every table 1.0000 on the
+  home machines and the avx512 build on Zen 5 (1.0008-1.0047 for the avx2 build on Emerald
+  Rapids). Page faults in the product do not change the ranking.
+
 ## Log
 
 2026-10-11, claude (issue #54, round 1): the mechanism, and small's NTT times converted.
@@ -415,6 +496,29 @@ function added to `frontend/bench.cpp` (no kernel changed), 11 rounds: Zen 3 `mu
   two such runs differed in 1 of 88 classes.
 - Not changed: `tools/kernel.py` (benches, the gate) still runs freshly linked binaries, so Zen 5
   bench numbers keep a bias per binary (e.g. PR #73's frontend `factorials/10` at 1.294).
+
+2026-10-12, claude (issue #78, round 1): the NTT's variant per op and length converted
+("ntt.variant"). Measurements above (ntt.variant); the kernel side in `backend/ntt/notes.md`
+(Variant selection, Log); files in `~/Documents/hpc_library-explore/tune/ntt-r1/`.
+- Representation: one candidate index per op and lg (80 bytes). The ops are forward, inverse,
+  multiply (Convolution) and product (multiply(f, g, out), #79); the products have their own rows
+  because their top levels differ and the candidates cross at 2^6-2^7, where those levels weigh
+  most (Emerald Rapids at 2^6: ymm intrinsics 9-12% ahead of the asm on multiply, 1-3% on product).
+- Dispatch: small's inlined fold (a chain of compares per op, `detail::run_forward` ...), behind
+  `variant::tuned`, the selected variant of every op. Forms tried on Zen 3 for f * g at 2^6 (the
+  frontend's multiply/6, gate build): the static functions 176 ns, always inlined 185, never
+  inlined 183, the asm forced 134, main 134. The same asm forced, with intrinsics<Avx2> only
+  instantiated (never called), 163: the cost was the second candidate's code in the binary, not the
+  dispatch. With the asm as avx2's one candidate (no table read) the dispatch builds as main: 134.6
+  ns. So avx2 keeps one candidate.
+- Run-time budget: lengths to 2^12, 5 samples of 100 us, 3% (55-57 ms). 10 us samples (4 ms) let
+  one Emerald Rapids run in five change 7-8 entries and lose 0.7% on its own machine.
+- Order: `backend/small/tune.hpp` includes `backend/ntt/tune.hpp`; a program including small's,
+  factorials' and the NTT's tune headers registers ntt.variant, small.variant, small.ntt,
+  factorials.variant (checked).
+- tune.cpp's own binary disagrees with three others at Emerald Rapids inverse/7 (asm 5.6-9.7%
+  faster in it, 1.8-5.8% slower in the others): a compiled default can carry its binary's
+  placement. Not fixed; run-time tuning in the validation binary moved it back (1 entry).
 
 ## Sources
 
