@@ -1,5 +1,5 @@
 // Tests of fps/polynomial.hpp against O(n^2) references: the class, the sums and scalings, and
-// f * g on each path (shift, small::multiply, ntt::Convolution), on edge sizes and random inputs.
+// f * g on each path (shift, small::multiply, ntt::multiply), on edge sizes and random inputs.
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -303,7 +303,7 @@ void test_products() {
     Poly g = f;
     g *= g;
     CHECK(vec(g) == naive_product(vec(f), vec(f)));
-    // ntt::Convolution's lengths: 2^lg - 1 and 2^lg coefficients.
+    // Products of 2^lg - 1 and 2^lg coefficients, at the ends of a transform length.
     for (int lg = 10; lg <= 20; ++lg) {
         const std::size_t half = std::size_t(1) << (lg - 1);
         check_long_product(half, half);
