@@ -19,9 +19,10 @@
 // and the remainder is f - (q g mod x^d), one product. The products are fps/products.hpp's
 // (raw::mul: shift, small::multiply or ntt::multiply, as small::beats_ntt picks).
 // The backend has no division kernel yet: lc-opt's blocked division (quotient blocks against one
-// inverse of G, the remainder from a cyclic product of length >= d) is backend issue #102. In units
-// of one ntt::multiply of two factors of n into n words, f of 2n and g of n coefficients:
-// frontend/notes.md has the times.
+// inverse of G, the remainder from a cyclic product of length >= d) is backend issue #102. f of 2n
+// by g of n coefficients from 2^10 on, in units of one ntt::multiply of two factors of n into n
+// words: divmod and f % g 6.9-8.5, f / g 5.9-7.4, on the timed targets (frontend/notes.md). The
+// recurrence: 2.9-4.2 ns per coefficient of f for 2 terms.
 //
 // A product or inverse past 2^25 coefficients throws std::length_error from the backend
 // (fps/series.hpp, fps/products.hpp); the recurrence and the shift have no such limit.

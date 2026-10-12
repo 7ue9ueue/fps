@@ -684,3 +684,71 @@ belongs in `backend/`).
     API did before.
   - `multiply/6` (f * g, 32 x 32, bench.cpp) 1.13 on Zen 3 (152 -> 172 ns) with its @kernel at
     1.00, 1.00 elsewhere: code placement (#81, #93).
+
+- 2026-10-12: division (#21): `divmod(f, g)`, `f / g`, `f % g`, `/=`, `%=` in
+  `include/fps/division.hpp`, from the prototype's `division.hpp`, which wrapped its private copy
+  of lc-opt's blocked division. The backend has no division kernel: moving lc-opt's is backend
+  issue #102 (opened by the coordinator; the measurements below are on it too).
+  - Sizes, as the prototype: q has max(n - d, 0) coefficients and r has d = deg g (f's, then
+    zeros, when n <= d), so `f / x^k` drops the lowest k coefficients and `f % x^k` is
+    `f.truncate(k)`, as DESIGN.md's table says. g = 0 of any size throws `std::domain_error`.
+    DESIGN.md did not state the sizes or the error; now it does (Functions, after
+    `middle_product`).
+  - Paths. The divisor is scanned once (`detail::division::divisor`: deg g, and whether g[0, d)
+    is zero). g = c x^d: q = f[d, n) / c (a copy for c = 1), r = f mod x^d, O(n). Else, with
+    G = x^d g(1/x), F = x^(n-1) f(1/x), k = n - d: rev q = F / G mod x^k, by the recurrence
+    G[0] Q[i] = F[i] - sum_j G[j] Q[i - j] when G mod x^k has at most 16 terms past G[0]
+    (`series::sparse` and `tap_sum`, as for inverse: short divisors, quotients of <= 17
+    coefficients, sparse tops such as x^d - x - 1), else `series::inverse` (Newton) and one
+    product on the `raw::mul` paths; r = f - (q g mod x^d), one more product. `f / g` computes
+    no remainder; `f % g` with a monomial g or n <= d computes no quotient. Scratch: 3 k words of
+    `series::scratch`.
+  - Tests (`test_division.cpp`): every pair of edge sizes (0, 1, 2^k +- 1, k <= 10) twice, with
+    f random, mostly zero, all P - 1 or of few terms, and g random, mostly zero, all P - 1, of few
+    terms, or with trailing zeros, against long division, through all five forms, after
+    `dirty_heap`, with ASan's `max_malloc_fill_size` as in `test_products.cpp`; monomials c x^k
+    for c = 1, 2, P - 1, random and k = 0, 1, 5, n - 1, n, n + 3, and `f / Poly::x(k)`,
+    `f % Poly::x(k)`; constants; G mod x^k with exactly 0, 1, 2, 15, 16, 17, 18 terms, near the
+    top and spread (both paths); x^d - x - 1 and 1 - x^d / 2; f = q g + r exactly at 7 large
+    shapes (2^17 + 1 by 2^16 up to 500000 by 277012; lc-opt's n_max_02 shape, 500000 by 53336;
+    2^20 by 4) and two sparse ones (10^6 by x^500000 - x - 1); aliasing (`f /= f`, `f %= f`,
+    `divmod(f, f)`); 4 threads; every error, and `std::length_error` from the remainder's product
+    at d = 2^25 (the quotient, by the recurrence, still returns). Pass at -O2 and ASan/UBSan on
+    the Mac (scalar, arm), `lc-amd` (scalar, sse, avx2), `lc-intel-test`, `lc-zen5-test` and
+    `lc-arm`. 10 mutations (the scale's c = 1 test, the recurrence's subtraction, F's offset, the
+    remainder's subtraction length, its zero fill, the monomial scan's bound, the final reverse,
+    a dropped coefficient of G, G one word short, the unscaled taps) all fail it; the zero fill
+    only under ASan's fill on the Mac.
+  - Bench (`frontend/bench_division.cpp`, its own binary, as `bench_series.cpp`): `divmod`,
+    `divide` (f / g), `modulo` (f % g) for f of 2^lg by g of 2^(lg-1), and `divmod_long` by g of
+    2^(lg-6), the shapes of #102; `divmod_short` (by x^3 + 2x + 5), `divide_monomial` and
+    `modulo_monomial` (by x^(n/2)) for f of 2^lg. No `@kernel` pairs: no division kernel. Each
+    case per round over `mul@kernel/<lg>` (`ntt::multiply` of two factors of 2^(lg-1) into
+    2^(lg-1) words, bench.cpp, same run), median of 7 rounds (IQR within 0.02; zen5 lg 11 within
+    0.2), GCC 15.2, main ad1e1b4 plus this change, lg 11 / 14 / 18 / 22:
+
+    | case | `lc-bench` (avx2) | `lc-intel` (avx512) | `lc-zen5` (zen5) | `lc-arm` (arm) |
+    |---|---|---|---|---|
+    | divmod | 7.35 / 7.25 / 6.95 / 7.15 | 7.41 / 7.16 / 6.86 / 7.05 | 8.54 / 7.48 / 7.23 / 6.94 | 6.95 / 6.98 / 7.03 / 7.00 |
+    | divide | 6.29 / 6.18 / 5.93 / 6.14 | 6.35 / 6.10 / 5.86 / 5.98 | 7.44 / 6.42 / 6.18 / 5.95 | 5.92 / 5.96 / 6.01 / 5.99 |
+    | modulo | 7.33 / 7.25 / 6.95 / 7.15 | 7.39 / 7.08 / 6.90 / 7.06 | 8.55 / 7.48 / 7.25 / 6.96 | 6.94 / 6.98 / 7.03 / 6.99 |
+    | divmod_long (lg 14 / 18 / 22) | 6.28 / 6.02 / 6.33 | 6.18 / 6.08 / 6.24 | 6.56 / 6.33 / 6.10 | 6.06 / 6.12 / 6.07 |
+
+    ns per coefficient of f at lg 22, divmod / divide: `lc-bench` 32.9 / 28.2, `lc-intel` 31.4 /
+    26.7, `lc-zen5` 16.8 / 14.4, `lc-arm` 60.8 / 52.0. lc-opt's division did k = 446665,
+    d = 53335 in about 6.2 ms on `lc-amd` (its notes); here 2^22 by 2^21 takes 138 ms on Zen 3.
+    - Where the time goes (a count, not profiled): the quotient has k = 2^(lg-1) + 1
+      coefficients, one past a power of two, so the Newton inverse takes one more step whose
+      first product runs a transform of 2^lg, and F (1 / G) mod x^k one of 2^(lg+1): about 2.4
+      and 2 units, and the remainder 1 more. lc-opt's blocks avoid both. Not tuned here (#102).
+    - `divmod_short` (the recurrence, 2 taps), ns per coefficient of f: 4.17 (Zen 3), 2.88-2.91
+      (Emerald Rapids), 3.22-3.24 (Zen 5), 4.04-4.05 (Neoverse V2), flat in n: a `% P` and a
+      `mod_mul` per coefficient, scalar (#87, #102).
+    - `divide_monomial`, `modulo_monomial`: 0.15-0.26 ns per coefficient of f (a scan of n / 2
+      zeros and a copy of n / 2 words).
+  - The other bench binaries: `fps.hpp` now includes `division.hpp`, which nothing in them
+    instantiates. GCC's `bench.cpp`, `bench_series.cpp` and `bench_values.cpp` are not
+    byte-identical to main's, but `objdump -d` of `bench.cpp` on `lc-amd` (avx2) differs only in
+    rip-relative offsets of constants (32 bytes later in .rodata); the instruction addresses are
+    the same. Clang's assembly of `bench.cpp` is identical. `mul@kernel/<lg>` against main in the
+    same runs: 0.999-1.005.
