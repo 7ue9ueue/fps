@@ -32,7 +32,10 @@ For each issue:
    while you keep coordinating (gates queue on a lock; start each one when its review passes). On a
    fail (a test or a slowdown), send the implementer the gate's comment with SendMessage; it fixes,
    pushes and returns, and you gate again. A conflict with main is not a failed gate: nothing was
-   tested. Send the implementer a rebase, then gate again. After 2 failed gates, label the issue
+   tested. Resolve a small conflict yourself (notes, DESIGN.md, an include line, a few lines of
+   code): rebase the branch in your worktree, build and test what the conflict touched, force-push,
+   and gate again; start no agent for it. Only a conflict that needs the implementer's judgement
+   goes back to it. After 2 failed gates, label the issue
    `blocked` and comment for the user. Once merged, comment on the issue with the pull request and
    a last line that is exactly `Result: done`, then close it with the label `done`.
 6. Remove the worktree once the implementer has stopped all background work.
