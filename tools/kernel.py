@@ -4,9 +4,11 @@
   kernel.py test UNIT [--target T]
       Build every test*.cpp of the unit for target T at -O2 and with ASan/UBSan; run them all.
   kernel.py bench UNIT [--target T] [--base DIR] [--rounds N] [--filter RE] [--json FILE]
-      Time the unit's bench*.cpp, each its own binary (bench.cpp, and e.g. frontend/
-      bench_values.cpp, whose code changes how GCC compiles bench.cpp's). With --base (another checkout, e.g. of main), time both in
-      the same run, alternating, and print each case's paired ratio new/base: below 1 is faster.
+      Time the unit's bench*.cpp, each its own binary (e.g. frontend/bench_values.cpp, whose
+      code changes how GCC compiles bench.cpp's). Case names must be unique across a unit's
+      bench files: a duplicate within one round is an error. With --base (another checkout,
+      e.g. of main), time both in the same run, alternating, and print each case's paired
+      ratio new/base: below 1 is faster.
 
 A unit is a backend kernel (folder backend/<kernel>/) or `frontend` (folder frontend/, headers in
 include/fps/).
@@ -233,18 +235,23 @@ def bench(args) -> int:
                 for name in (names if r % 2 == 0 else names[::-1]):
                     for b in binaries[name]:
                         binary = f'{paths[name]}/{b.relative_to(trees[name])}'
-                        lines.append(f'echo "## {name}"; {pin}{binary} {shlex.quote(args.filter)}')
+                        run = f'{pin}{binary} {shlex.quote(args.filter)}'
+                        lines.append(f'echo "## {name} {r}"; {run}')
             return '\n'.join(lines)
 
         result = sh(trees, script)
         if result.returncode:
             sys.exit(f'bench failed:\n{result.stdout}{result.stderr}')
-        current = None
+        current, round_, seen = None, None, set()
         for line in result.stdout.splitlines():
             if line.startswith('## '):
-                current = line[3:]
+                current, round_ = line[3:].split()
             elif '\t' in line:
                 case, ns, *rest = line.split('\t')  # older benches print no items
+                if (current, round_, case) in seen:
+                    sys.exit(f'bench case {case} appears twice in one round of {current}: '
+                             'case names must be unique across the bench*.cpp files')
+                seen.add((current, round_, case))
                 entry = report['cases'].setdefault(case, {'items': 0})
                 entry.setdefault(current, []).append(float(ns))
                 if current == 'new' and rest:
