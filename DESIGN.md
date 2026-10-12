@@ -107,7 +107,7 @@ with a scalar c, an integer of at most 64 bits taken mod P: `f + c`, `c + f`, `f
 ```cpp
 // Products
 Polynomial mul(f, g, n);                  // f g mod x^n: n coefficients
-Polynomial square(f);                     // f^2; cheaper than f * f once the backend squares (#55)
+Polynomial square(f);                     // f^2; one forward transform less than f * f
 Polynomial product(std::span<const Polynomial> fs);   // balanced product tree; 1 if fs is empty
 Polynomial middle_product(f, g);          // coefficients m - 1 .. n - 1 of f g (below)
 
@@ -144,7 +144,8 @@ std::vector<std::pair<Polynomial, int>> factor(f);   // monic irreducible factor
 `middle_product(f, g)`, for n = `f.size()` >= m = `g.size()` >= 1 (else `std::domain_error`):
 the n - m + 1 coefficients m - 1 .. n - 1 of f g, h[i] = sum over j < m of f[i + j] g[m - 1 - j].
 They are the coefficients whose sums meet all of g. With g reversed it is the transposed product,
-sum over j of f[i + j] g[j]. `product(fs)` runs the backend's product tree (small factors 8 at a
+sum over j of f[i + j] g[j]. It runs a cyclic product of length >= n (the wrapped terms land
+below m - 1), not n + m - 1. `product(fs)` runs the backend's product tree (small factors 8 at a
 time in lanes, one transform of each length per node); it also takes a `std::vector`.
 
 `Factorials<P> fact(n)`, n <= P: `fact[i]` = i!, `fact.inverse(i)` = 1/i!, `fact.binomial(n, k)`
