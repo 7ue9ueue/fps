@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <random>
 #include <span>
@@ -294,12 +295,19 @@ void test_twist() {
     for (int lg = 6; lg <= (kSanitized ? 16 : 20); ++lg) {
         const std::size_t m = std::size_t(1) << lg;
         Vec a = random_vec(m, 0);
-        Vec full(2 * m + fps::ntt::kPadding), half(m + fps::ntt::kPadding);
-        std::copy(a.begin(), a.end(), full.begin());
-        fps::series::detail::transform(lg + 1).forward(full.data());
-        fps::series::detail::twist(a.data(), half.data(), m / 8);
-        fps::series::detail::transform(lg).forward(half.data());
-        CHECK(std::equal(half.begin(), half.begin() + std::ptrdiff_t(m), full.begin() + std::ptrdiff_t(m)), lg);
+        // Transform's arrays: 32-byte aligned (std::vector's are not, on x86 the asm faults).
+        const auto aligned = [](std::size_t words) {
+            return std::unique_ptr<u32[], decltype(&std::free)>(
+                static_cast<u32*>(std::aligned_alloc(64, (words + 15) / 16 * 64)), &std::free);
+        };
+        const auto full = aligned(2 * m + fps::ntt::kPadding), half = aligned(m + fps::ntt::kPadding);
+        std::fill_n(full.get(), 2 * m + fps::ntt::kPadding, 0u);
+        std::fill_n(half.get(), m + fps::ntt::kPadding, 0u);
+        std::copy(a.begin(), a.end(), full.get());
+        fps::series::detail::transform(lg + 1).forward(full.get());
+        fps::series::detail::twist(a.data(), half.get(), m / 8);
+        fps::series::detail::transform(lg).forward(half.get());
+        CHECK(std::equal(half.get(), half.get() + m, full.get() + m), lg);
     }
 }
 
