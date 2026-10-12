@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Test and time backend kernels, per target (see TARGETS and BACKEND.md).
 
-  kernel.py test UNIT... [--target T] [-j N]
+  kernel.py test UNIT... [--target T] [-j N] [--base DIR]
       Build every test*.cpp of the units for target T at -O2 and with ASan/UBSan, at most N at a
       time (default: every core), fewer if the machine is busy (build_slots); run each as soon as
-      it is built, one run at a time, in order.
+      it is built, one run at a time, in order. With --base (another checkout that passed these
+      tests, e.g. of main), skip a build whose preprocessed text is identical there: the same
+      compiler, flags and text give the same binary, so the same result. A skipped one prints
+      `skip` instead of `pass`.
   kernel.py bench UNIT [--target T] [--base DIR] [--rounds N] [--filter RE] [--json FILE]
       Time the unit's bench*.cpp, each its own binary (e.g. frontend/bench_values.cpp, whose
       code changes how GCC compiles bench.cpp's). Case names must be unique across a unit's
@@ -182,12 +185,29 @@ def compile_(tree: Path, unit: str, source: str, target: str, sanitize: bool = F
     """Compile <unit folder>/<source> in tree, from relative paths, so the same sources give
     byte-identical binaries in any tree. Returns the binary and, on a failure, the output."""
     out = f'build/{target}/{unit}-{Path(source).stem}{"-san" if sanitize else ""}'
+    result = sh({'w': tree}, lambda _: f'mkdir -p build/{target}\n'
+                f'{CXX} {options(sanitize)} {flags(target)} {unit_dir(unit)}/{source} -o {out}')
+    return tree / out, (result.stdout + result.stderr if result.returncode else None)
+
+
+def options(sanitize: bool) -> str:
     # -g1: line numbers for sanitizer reports, without GCC's variable tracking, which doubled the
     # slowest builds (factorials test: 190 s with -g, 96 s with -g1).
-    opt = '-O1 -g1 -fsanitize=address,undefined -fno-sanitize-recover=all' if sanitize else '-O2'
-    result = sh({'w': tree}, lambda _: f'mkdir -p build/{target}\n'
-                f'{CXX} {opt} {flags(target)} {unit_dir(unit)}/{source} -o {out}')
-    return tree / out, (result.stdout + result.stderr if result.returncode else None)
+    return '-O1 -g1 -fsanitize=address,undefined -fno-sanitize-recover=all' if sanitize else '-O2'
+
+
+def fingerprints(tree: Path, jobs: list[tuple[str, str, bool]], target: str) -> dict:
+    """Hash of each job's preprocessed text in tree (-P: no line markers, so moving code does not
+    change it); None where the file is missing or does not preprocess."""
+    hasher = 'shasum -a 256' if MAC else 'sha256sum'
+    steps = []
+    for i, (unit, source, sanitize) in enumerate(jobs):
+        flag = f'{options(sanitize)} {flags(target)}'
+        preprocess = f'{CXX} {flag} -E -P {unit_dir(unit)}/{source} -o build/pp 2>/dev/null'
+        steps.append(f'{preprocess} && echo "{i} $({hasher} < build/pp | cut -c1-64)" || echo "{i} -"')
+    out = sh({'w': tree}, lambda _: 'mkdir -p build\n' + '\n'.join(steps)).stdout
+    hashes = dict(line.split() for line in out.splitlines())
+    return {job: None if hashes[str(i)] == '-' else hashes[str(i)] for i, job in enumerate(jobs)}
 
 
 def build(tree: Path, unit: str, source: str, target: str, sanitize: bool = False) -> Path:
@@ -218,12 +238,22 @@ def test(args) -> int:
             print(f'FAIL {unit}: no test*.cpp in {unit_dir(unit)}')
             return 1
         jobs += [(unit, source, sanitize) for source in sources for sanitize in (False, True)]
+    same = set()
+    if args.base:
+        with ThreadPoolExecutor(2) as pool:
+            new, base = [pool.submit(fingerprints, t, jobs, args.target) for t in (tree, Path(args.base))]
+        same = {job for job in jobs if new.result()[job] is not None and new.result()[job] == base.result()[job]}
     # Runs stay one at a time, in order: some tests time their kernel (tune.hpp).
     with ThreadPoolExecutor(max(1, min(args.jobs, build_slots()))) as pool:
-        builds = [pool.submit(compile_, tree, unit, source, args.target, sanitize) for unit, source, sanitize in jobs]
-        for (unit, source, sanitize), built in zip(jobs, builds):
-            binary, error = built.result()
+        builds = {job: pool.submit(compile_, tree, job[0], job[1], args.target, job[2])
+                  for job in jobs if job not in same}
+        for job in jobs:
+            unit, source, sanitize = job
             label = f'{unit} {args.target} {source} {"ASan/UBSan" if sanitize else "-O2"}'
+            if job in same:
+                print(f'skip {label} (preprocessed text identical to base)')
+                continue
+            binary, error = builds[job].result()
             if error is None:
                 result = sh({'w': tree}, lambda _: './' + shlex.quote(str(binary.relative_to(tree))))
                 sys.stdout.write(result.stdout + result.stderr)
@@ -319,6 +349,7 @@ def main() -> int:
     p.add_argument('kernel', nargs='+')
     p.add_argument('--target', choices=TARGETS, default=default)
     p.add_argument('-j', '--jobs', type=int, default=os.cpu_count(), help='builds at a time, at most')
+    p.add_argument('--base', help='root of a checkout that passed: skip a test whose preprocessed text is the same')
     p.set_defaults(run=test)
     p = sub.add_parser('bench')
     p.add_argument('kernel')

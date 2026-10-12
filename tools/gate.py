@@ -6,7 +6,9 @@
 
 For every target in tools/kernel.py, all at once, on the target's machines:
   - test: kernel.py test of every affected unit on each test machine, at once ('mac' is this Mac,
-    with clang); kernel.py check once, on the first target's first test machine;
+    with clang); kernel.py check once, on the first target's first test machine. A test whose
+    preprocessed text for the target is identical to the base's is skipped (kernel.py --base):
+    the base passed it already, and the same text, compiler and flags give the same binary;
   - time, if the target has a timing machine: kernel.py bench of the gated cases against the base,
     21 rounds; on a slowdown, a second run of 21, pooled with the first. If the two runs disagree
     (a case's new/base moved by more than SHIFT and out of both runs' IQRs: a state of the run,
@@ -194,19 +196,21 @@ def geomean(values: list[float]) -> float | None:
     return math.exp(sum(map(math.log, values)) / len(values)) if values else None
 
 
-def run_tests(machine: str, name: str, new_tar: bytes, target: str, units: list[str],
+def run_tests(machine: str, name: str, new_tar: bytes, base_tar: bytes, target: str, units: list[str],
               check: bool) -> subprocess.CompletedProcess:
+    """Tests that build to the same preprocessed text as in base are skipped (kernel.py --base)."""
     command = ('python3 tools/kernel.py check && ' if check else '') + \
         f'python3 tools/kernel.py test {" ".join(units)} --target {target}'
     if machine == 'mac':
-        with tempfile.TemporaryDirectory() as tree:
+        with tempfile.TemporaryDirectory() as tree, tempfile.TemporaryDirectory() as base:
             tarfile.open(fileobj=io.BytesIO(new_tar), mode='r:gz').extractall(tree)
-            return subprocess.run(command, shell=True, cwd=tree, capture_output=True)
+            tarfile.open(fileobj=io.BytesIO(base_tar), mode='r:gz').extractall(base)
+            return subprocess.run(f'{command} --base {base}', shell=True, cwd=tree, capture_output=True)
     share = sum(machine in spec['test'] for spec in TARGETS.values())  # targets testing here share its cores
     command += f' -j $(( ($(nproc) + {share - 1}) / {share} ))'
-    path = ship(machine, name, new_tar)
-    result = ssh(machine, f'cd {path} && {command}', capture=True)
-    ssh(machine, f'rm -rf {path}')
+    path, base_path = ship(machine, name, new_tar), ship(machine, f'{name}-base', base_tar)
+    result = ssh(machine, f'cd {path} && {command} --base $HOME/{base_path}', capture=True)
+    ssh(machine, f'rm -rf {path} {base_path}')
     return result
 
 
@@ -245,7 +249,8 @@ def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, units: 
     def test_on(machine: str) -> tuple[subprocess.CompletedProcess, float]:
         log(f'[{target}] testing on {machine}')
         start = time.monotonic()
-        result = run_tests(machine, f'{name}-test', new_tar, target, units, check and machine == spec['test'][0])
+        result = run_tests(machine, f'{name}-test', new_tar, base_tar, target, units,
+                           check and machine == spec['test'][0])
         if result.returncode:
             failed.set()
         return result, minutes(start)
@@ -263,9 +268,11 @@ def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, units: 
 
     tests_ok = True
     for machine, (result, took) in results.items():
-        lines = [line for line in result.stdout.decode().splitlines() if line.startswith(('pass', 'FAIL'))]
+        lines = [line for line in result.stdout.decode().splitlines() if line.startswith(('pass', 'FAIL', 'skip'))]
         if result.returncode == 0:
-            out.append(f'Tests on {machine}: pass ({len(lines)} checks, {took:.1f} min)')
+            skipped = sum(line.startswith('skip') for line in lines)
+            out.append(f'Tests on {machine}: pass ({len(lines) - skipped} checks'
+                       + (f', {skipped} skipped as identical to base' if skipped else '') + f', {took:.1f} min)')
             continue
         tests_ok = False
         out += [f'Tests on {machine}: FAIL ({took:.1f} min)',
