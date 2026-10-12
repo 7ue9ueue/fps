@@ -69,6 +69,7 @@ constexpr std::size_t kLanes = S::lanes;
 inline constexpr std::size_t kInverseBase = 32;  // inverse: the recurrence up to this many terms
 inline constexpr std::size_t kLogBase = 64;      // log and exp: the recurrences up to this many
 inline constexpr std::size_t kExpBase = 64;
+static_assert(kExpBase <= kLogBase);
 inline constexpr std::size_t kLogBlocks = 4;
 
 constexpr u32 mul(u32 a, u32 b) { return u32(u64(a) * b % kP); }
@@ -211,21 +212,34 @@ void twist(const u32* src, u32* dst, std::size_t g) {
 
 // ---- The recurrences for few coefficients -----------------------------------------------------
 
-// sum += a b, kept below 8 P^2 (< 2^63) so the next product cannot overflow.
-inline void accumulate(u64& sum, u32 a, u32 b) {
-    constexpr u64 k8P2 = 8 * u64(kP) * kP;
-    sum += u64(a) * b;
-    if (sum >= k8P2) sum -= k8P2;
+// 1 / i mod P for i < kLogBase (entry 0 unused).
+inline constexpr auto kSmallInverses = [] {
+    std::array<u32, kLogBase> r{};
+    for (std::size_t i = 1; i < kLogBase; ++i) r[i] = power(u32(i), kP - 2);
+    return r;
+}();
+
+// sum over lo <= j < hi of a[j] b[i - j] mod P: 64-bit sums of 16 products < P^2 (< 2^64), each
+// reduced.
+inline u32 dot(const u32* a, const u32* b, std::size_t i, std::size_t lo, std::size_t hi) {
+    u64 total = 0;
+    for (std::size_t j0 = lo; j0 < hi; j0 += 16) {
+        u64 sum = 0;
+        const std::size_t end = std::min(hi, j0 + 16);
+        for (std::size_t j = j0; j < end; ++j) sum += u64(a[j]) * b[i - j];
+        total += sum % kP;
+    }
+    return u32(total % kP);
 }
 
 // g = 1 / f mod x^n, n = g.size() <= kInverseBase: f0 g_i = -sum_(0<j<=i) f_j g_(i-j).
 inline void inverse_direct(Span f, Out g) {
-    const u32 c = power(f[0], kP - 2);
+    u32 a[kInverseBase] = {};
+    std::copy_n(f.begin(), std::min(f.size(), g.size()), a);
+    const u32 c = power(a[0], kP - 2);
     g[0] = c;
     for (std::size_t i = 1; i < g.size(); ++i) {
-        u64 sum = 0;
-        for (std::size_t j = 1; j <= std::min(i, f.size() - 1); ++j) accumulate(sum, f[j], g[i - j]);
-        const u32 s = u32(sum % kP);
+        const u32 s = dot(a, g.data(), i, 1, i + 1);
         g[i] = mul(s ? kP - s : 0, c);
     }
 }
@@ -238,28 +252,55 @@ inline void log_direct(Span f, Out g) {
     std::copy_n(f.begin(), std::min(f.size(), n), a);
     g[0] = 0;
     for (std::size_t i = 1; i < n; ++i) {
-        u64 sum = 0;
-        for (std::size_t k = 1; k < i; ++k) accumulate(sum, G[k], a[i - k]);
-        const u32 s = u32(sum % kP), d = mul(u32(i), a[i]);
+        const u32 s = dot(G, a, i, 1, i), d = mul(u32(i), a[i]);
         G[i] = d >= s ? d - s : d + kP - s;
-        g[i] = mul(G[i], power(u32(i), kP - 2));
+        g[i] = mul(G[i], kSmallInverses[i]);
     }
 }
 
 // g = exp f mod x^n, n = g.size() <= kExpBase, from q = x f': i g_i = sum_(0<k<=i) q_k g_(i-k).
 inline void exp_direct(const u32* q, Out g) {
     g[0] = 1;
-    for (std::size_t i = 1; i < g.size(); ++i) {
-        u64 sum = 0;
-        for (std::size_t k = 1; k <= i; ++k) accumulate(sum, q[k], g[i - k]);
-        g[i] = mul(u32(sum % kP), power(u32(i), kP - 2));
-    }
+    for (std::size_t i = 1; i < g.size(); ++i) g[i] = mul(dot(q, g.data(), i, 1, i + 1), kSmallInverses[i]);
 }
 
 // ---- inverse ----------------------------------------------------------------------------------
 
 // Arrays of inverse_newton for n coefficients: 2 of bit_ceil(n) words.
 inline std::size_t inverse_words(std::size_t n) { return n <= kInverseBase ? 0 : 2 * footprint(std::bit_ceil(n)); }
+
+// The last step from k to k + c, c <= k/2, k >= 64, at length k: as g f = 1 mod x^k, the cyclic
+// product (g f_lo) mod (x^k - 1) is 1 + (g f_lo)[k, 2k), f_lo = f mod x^k; with f_hi = f[k, k + c)
+// and g_c = g mod x^c, e = (f g)[k, k + c) = (g f_lo)[k, k + c) + (g_c f_hi) mod x^c, both read
+// from one inverse; then g[k, k + c) = -(g_c e mod x^c). 7 transforms and 3 leaf products of
+// length k, against 5 and 2 of length 2k. G, E as for inverse_newton (2k + kGap words each): G_c
+// at G + k (G's padding is read, never written), f_hi's transform at E + k + 64 (256 bytes from
+// G_c's page offset, as E from G's).
+inline void inverse_half_step(Span f, Out g, std::size_t k, std::size_t c, u32* G, u32* E) {
+    const ntt::Transform& t = transform(std::countr_zero(k));
+    u32 *const Gc = G + k, *const F = E + k + 64;
+    const std::size_t lo = std::min(f.size(), k), hi = std::min(f.size(), k + c) - lo;
+    std::copy_n(g.data(), k, G);
+    t.forward(G);
+    std::copy_n(g.data(), c, Gc);
+    zero(Gc + c, k - c + ntt::kPadding);
+    t.forward(Gc);
+    negate(f.data(), E, lo);
+    zero(E + lo, k - lo);
+    t.forward(E);
+    t.multiply(E, G, E);
+    negate(f.data() + lo, F, hi);
+    zero(F + hi, k - hi + ntt::kPadding);
+    t.forward(F);
+    t.multiply_add(E, F, Gc);
+    t.inverse(E);  // E[i] = -e[i] - [i = 0], i < c
+    E[0] = E[0] == kP - 1 ? 0 : E[0] + 1;
+    zero(E + c, k - c);
+    t.forward(E);
+    t.multiply(E, Gc, E);
+    t.inverse(E);
+    std::copy_n(E, c, g.data() + k);
+}
 
 // g = 1 / f mod x^n, n = g.size() >= 1, f mod x^n given (f[0] != 0); g apart from f. G, E: arrays
 // of bit_ceil(n) + kGap words.
@@ -268,6 +309,7 @@ inline void inverse_newton(Span f, Out g, u32* G, u32* E) {
     inverse_direct(f, g.first(std::min(n, kInverseBase)));
     for (std::size_t k = kInverseBase; k < n; k *= 2) {
         const std::size_t len = 2 * k, c = std::min(k, n - k), fl = std::min(f.size(), k + c);
+        if (2 * c <= k && k >= (std::size_t(1) << ntt::kMinLog)) return inverse_half_step(f, g, k, c, G, E);
         const ntt::Transform& t = transform(std::countr_zero(len));
         std::copy_n(g.data(), k, G);
         zero(G + k, k + ntt::kPadding);
