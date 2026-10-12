@@ -45,6 +45,7 @@ Run from the checkout's root. Each script's `--help` has the details.
 | `tools/kernel.py test <unit>... --target <t>` | Mac, VM | Builds every `test*.cpp` of the units at -O2 and under ASan/UBSan, all cores at once (`-j`), and runs each once built. A unit is a kernel name or `frontend`. `--base DIR` (the gate uses it) skips a test whose preprocessed text equals that checkout's. |
 | `tools/kernel.py bench <unit> [--base DIR]` | timing VM | Times each `bench*.cpp` (one binary each); with `--base`, old and new in the same run, as paired ratios (below 1 is faster). Holds the bench lock. |
 | `tools/kernel.py check` | anywhere | Generators and tuned tables match what is committed. |
+| `tools/sanitize.py [--issue]` | Mac | ASan/UBSan tests of every unit on every target, for `origin/main`: what the gate leaves out (it sanitizes only the kernels a pull request changes; the frontend never). Run it when the VMs are idle (nightly, after a batch of merges); `--issue` files a `ready` issue on a failure. |
 | `tools/tune.py <kernel>` | Mac | Measures a kernel's tuned choices on each target's timing machine; writes `tuned.json` and `tuned.hpp`. |
 | `tools/gate.py <pr> --merge` | Mac | Tests every affected unit on every target, times it against `main`, comments the report on the PR, and squash-merges on a pass. Always runs `origin/main`'s copy of `tools/`; one gate at a time, the others wait (a pull request that affects no unit takes no lock). |
 

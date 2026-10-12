@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Test and time backend kernels, per target (see TARGETS and BACKEND.md).
 
-  kernel.py test UNIT... [--target T] [-j N] [--base DIR]
+  kernel.py test UNIT... [--target T] [-j N] [--base DIR] [--sanitize [UNIT...]]
       Build every test*.cpp of the units for target T at -O2 and with ASan/UBSan, at most N at a
       time (default: every core), fewer if the machine is busy (build_slots); run each as soon as
       it is built, one run at a time, in order. With --base (another checkout that passed these
       tests, e.g. of main), skip a build whose preprocessed text is identical there: the same
       compiler, flags and text give the same binary, so the same result. A skipped one prints
-      `skip` instead of `pass`.
+      `skip` instead of `pass`. With --sanitize, only the listed units are built with ASan/UBSan
+      (none, if the list is empty); the gate uses it, and tools/sanitize.py runs them all.
   kernel.py bench UNIT [--target T] [--base DIR] [--rounds N] [--filter RE] [--json FILE]
       Time the unit's bench*.cpp, each its own binary (e.g. frontend/bench_values.cpp, whose
       code changes how GCC compiles bench.cpp's). Case names must be unique across a unit's
@@ -237,7 +238,8 @@ def test(args) -> int:
         if not sources:
             print(f'FAIL {unit}: no test*.cpp in {unit_dir(unit)}')
             return 1
-        jobs += [(unit, source, sanitize) for source in sources for sanitize in (False, True)]
+        modes = (False, True) if args.sanitize is None or unit in args.sanitize else (False,)
+        jobs += [(unit, source, sanitize) for source in sources for sanitize in modes]
     same = set()
     if args.base:
         with ThreadPoolExecutor(2) as pool:
@@ -350,6 +352,7 @@ def main() -> int:
     p.add_argument('--target', choices=TARGETS, default=default)
     p.add_argument('-j', '--jobs', type=int, default=os.cpu_count(), help='builds at a time, at most')
     p.add_argument('--base', help='root of a checkout that passed: skip a test whose preprocessed text is the same')
+    p.add_argument('--sanitize', nargs='*', metavar='UNIT', help='only these units with ASan/UBSan (default: all)')
     p.set_defaults(run=test)
     p = sub.add_parser('bench')
     p.add_argument('kernel')
