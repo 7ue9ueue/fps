@@ -569,3 +569,71 @@ belongs in `backend/`).
   (5 rounds).
   New pair `product@kernel/<lg>`: the kernel on spans built in the setup, into new memory. API /
   kernel, `lc-bench`, 5 rounds: 1.005 / 1.002 / 1.003.
+- 2026-10-12: series (#20): `derivative`, `integral`, `inverse(f, n)`, `log(f, n)`, `exp(f, n)` (n
+  defaults to `f.size()`) and `raw::inverse`, `raw::log`, `raw::exp` in `include/fps/series.hpp`.
+  The prototype's `series.hpp` wraps its private copy of lc-opt (`include/fps/lcopt/`), which stays
+  there; the algorithms here are written plainly, and lc-opt's tuned ones are backend issue #87
+  (searched first: no open issue covered series).
+  - Internals for #21 (division), #22 (pow, sqrt) and #23: `detail::series::{inverse, log, exp}(f,
+    out, scratch)` on spans, writing into the caller's `out`, scratch passed in (n, 2 n and 3 n
+    words). The raw functions take it from one per-thread `Words` kept across calls.
+  - Newton on `raw::mul` (shift, `small::multiply` or `ntt::multiply`, as `small::beats_ntt` picks;
+    no cutoff of the frontend's own), precision doubling from 1. inverse: two products a step,
+    e = f g mod x^2k, then g[k, 2k) = -(g e[k, 2k)) mod x^k. log f = integral of f' (1/f) mod
+    x^(n-1). exp: g[k, 2k) = g (f - log g)[k, 2k) mod x^k, a whole log of g per step.
+  - Few terms: f mod x^n with at most 16 nonzero terms past f[0] (lc-opt's and the prototype's
+    `kSparseTaps`) runs a recurrence with one tap per term, O(n t), all three functions;
+    `inverse(1 - x, n)` is O(n). 64-bit sums of at most 16 products below P^2 < 2^60.
+  - Reciprocals 1 / i (log, exp, integral) from the backend's `factorials::tables`: (i - 1)! / i!.
+    A per-call linear recurrence (r[i] = -(P / i) r[P mod i]) would divide by a variable i per
+    entry.
+  - `raw::exp`: out may be f (step k reads f[k, 2k) before it writes there; words of out past
+    f.size() are not read as f), else apart (`std::domain_error`). `raw::log`: any overlap, f is
+    read first. `raw::inverse`: apart.
+  - DESIGN.md: the result sizes of `derivative` (f.size() - 1) and `integral` (f.size() + 1), and
+    `f.size() < P` for `integral` and `n <= P` for `log` and `exp` (they divide by 1 .. n - 1; a
+    sparse f has no 2^25 limit to stop it first); the precondition on f[0] applies for n > 0
+    only, since only f mod x^n is read; `raw::inverse` and `raw::log` listed with their overlap
+    rules, as "same names in fps::raw" implies.
+  - Tests (`test_series.cpp`): every function and raw form against O(n^2) recurrences on sizes 0,
+    1, 2^k +- 1 (k <= 10), f of n - 1, n, n + 2 coefficients, random, mostly zero, all P - 1 and
+    1 to 20 terms; exactly 0, 1, 2, 15, 16, 17, 18 terms, near index 0 and spread (both paths);
+    closed forms at n = 10^6 (1/(1 - x), log(1/(1 - x)), log(1 - x), exp(x), exp(5 x^3));
+    identities at 2^14 +- 1, 2^17, 300001 (f inverse(f) = 1, log exp, exp log) and on the
+    recurrence at 200000; aliasing (exp in place, also with f shorter than out; log shifted both
+    ways); outputs pre-filled with P - 1; 4 threads; every error, including n > P and
+    f.size() >= P on 4 GB of unwritten memory. 15 mutations: 14 fail the test (one by timeout:
+    the dropped n > P check runs exp over 4 GB); a sparse bound of 15 terms is no bug.
+    Pass at -O2 and ASan/UBSan on the Mac (scalar, arm), `lc-amd` (scalar, sse, avx2),
+    `lc-intel-test`, `lc-zen5-test` and `lc-arm`.
+  - Bench (`frontend/bench_series.cpp`, its own binary): `inverse/<lg>`, `log/<lg>`, `exp/<lg>` on
+    n = 2^(lg-1) random coefficients, as `mul/<lg>`; `raw_exp/14`, `/18`; `inverse_sparse`,
+    `log_sparse`, `exp_sparse` (1 - x - x^2, x + x^2/2 + 3 x^5; n = 2^lg); `derivative` and
+    `integral` (n = 2^lg). No `@kernel` pairs: there is no series kernel (#87). Instead, each
+    Newton case per round over `mul@kernel/<lg>` (`ntt::multiply` of two factors of n into n
+    words, bench.cpp, same run), median of 11 rounds (IQR within 0.01 except zen5 lg 11, 0.1),
+    GCC 15.2, base a34ce14 plus this change:
+
+    | lg | `lc-bench` (avx2) inverse / log / exp | `lc-intel` (avx512) | `lc-zen5` (zen5) | `lc-arm` (arm) |
+    |---:|---|---|---|---|
+    | 11 | 3.03 / 4.98 / 10.58 | 2.96 / 4.93 / 10.19 | 3.90 / 6.33 / 15.34 | 2.73 / 4.29 / 8.10 |
+    | 14 | 2.79 / 4.53 / 8.63 | 2.74 / 4.44 / 8.34 | 2.87 / 4.75 / 9.77 | 2.75 / 4.17 / 7.77 |
+    | 18 | 2.75 / 4.27 / 7.89 | 2.64 / 4.12 / 7.58 | 2.76 / 4.44 / 8.46 | 2.79 / 4.12 / 7.71 |
+    | 22 | 2.85 / 4.31 / 8.21 | 2.80 / 4.17 / 7.90 | 2.70 / 4.24 / 7.89 | 2.81 / 4.09 / 7.67 |
+
+    ns per coefficient at lg 22 (n = 2^21), inverse / log / exp: `lc-bench` 26.0 / 39.2 / 74.7,
+    `lc-intel` 24.9 / 37.1 / 70.3, `lc-zen5` 12.3 / 19.4 / 36.0, `lc-arm` 49.1 / 71.4 / 134.1.
+    lc-opt's counts (`lib/poly/notes.md`) give about 1.7 / 2 / 2.6 products (guess), so #87 is
+    worth 1.6x (inverse) to 3x (exp).
+    - `exp/<lg>` over `raw_exp/<lg>` (result allocated against a kept out): 0.999-1.001.
+    - Recurrences, ns per coefficient at n = 2^14 / 2^18 / 2^22, inverse / log / exp sparse:
+      `lc-bench` 4.35 / 7.0 / 9.3, `lc-intel` 4.8 / 7.0 / 8.8, `lc-zen5` 3.7 / 5.4 / 7.5,
+      `lc-arm` 6.4 / 9.6 / 12.3 (flat in n).
+    - `derivative` (a scalar loop, `% P` per word) 1.45 / 1.21 / 0.90 / 1.62 ns per coefficient;
+      `integral` (factorial tables, then two products per word) 2.3-2.5 / 1.9 / 1.4 / 2.8-3.0
+      (`lc-bench`, `lc-intel`, `lc-zen5`, `lc-arm`).
+    - The existing cases against main: geomean of the gated cases 0.9994 (`lc-bench`), 1.0001
+      (`lc-intel`), 0.9765 (`lc-zen5`), 0.9990 (`lc-arm`). On `lc-zen5` lg 11 products came out
+      faster (`square`, `raw_mul`, `mul`, `multiply` /11: 0.82-0.83) with `series.hpp` in
+      bench.cpp's program; codegen, as #81 (guess, not inspected). Elsewhere 0.955 (`add/22`,
+      `lc-arm`) to 1.035 (`neg/22`, `lc-arm`): placement, as in earlier entries.
