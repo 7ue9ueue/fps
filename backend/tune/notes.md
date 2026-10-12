@@ -48,9 +48,10 @@ Converted choices: small's NTT times behind `small::beats_ntt` ("small.ntt",
   (Measurements), against the issue's "well under a millisecond", and a lazy first call would make
   a product's path, and the gate's benches, depend on noise. Benches and tests read the compiled
   defaults.
-- The frontend's `fps::tune()`, `save_wisdom` and `load_wisdom` (DESIGN.md) wrap `tune::run`,
-  `save` and `load`; they need `backend/ntt/tune.hpp`, `backend/small/tune.hpp` and
-  `backend/factorials/tune.hpp` included for those choices to be registered. Order:
+- The frontend's `fps::tune_all()`, `save_wisdom` and `load_wisdom` (`include/fps/tune.hpp`, issue
+  #66) wrap `tune::run`, `save` and `load`. That header includes every kernel's `tune.hpp` the
+  frontend uses, so those choices register; a new kernel tune header is added there. (Not
+  `fps::tune()`: a function cannot share this namespace's name.) Order:
   `backend/small/tune.hpp` includes `backend/ntt/tune.hpp`, so in every translation unit
   "ntt.variant" is defined, and registered, before "small.variant" and "small.ntt" (which times
   the NTT); inline variables initialize in that order ([basic.start.dynamic]).

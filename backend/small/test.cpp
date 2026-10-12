@@ -1,12 +1,12 @@
-// Tests the small kernel against the O(n m) model: every Schoolbook<S, R, P, U, Solo> this machine
-// can run (every simd struct; R = 1, 2, 4, 6, 8; R = 4, U = 2; R = 6, U = 4; R = 8, U = 2; Solo
-// with R = 4, U = 1 and R = 6, U = 4; six primes) and every candidate of select.hpp's list
-// (run_variant) on all shapes up to 40 x 40, term counts at the bounds of the 64-bit sums, 0, 1,
-// powers of two and their neighbours up to 1025, panels (m > 1024) and long factors; multiply()
-// with its argument orders and empty factors, and with each candidate set for every shape class.
-// Inputs random, or making the largest sums or sums near them. Words past the product must stay
-// untouched. Then beats_ntt on the compiled defaults, measure_ntt and measure_variants (tune.hpp),
-// and both choices through wisdom. Exits nonzero on a failure.
+// Tests the small kernel against the O(n m) model: every Schoolbook<S, R, P, U, Solo> of the
+// target's struct S = simd::Native (the others are tested on their own targets; R = 1, 2, 4, 6, 8;
+// R = 4, U = 2; R = 6, U = 4; R = 8, U = 2; Solo with R = 4, U = 1 and R = 6, U = 4; six primes)
+// and every candidate of select.hpp's list (run_variant) on all shapes up to 40 x 40, term counts
+// at the bounds of the 64-bit sums, 0, 1, powers of two and their neighbours up to 1025, panels
+// (m > 1024) and long factors; multiply() with its argument orders and empty factors, and with each
+// candidate set for every shape class. Inputs random, or making the largest sums or sums near them.
+// Words past the product must stay untouched. Then beats_ntt on the compiled defaults, measure_ntt
+// and measure_variants (tune.hpp), and both choices through wisdom. Exits nonzero on a failure.
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -122,7 +122,7 @@ void candidates(const Vec& a, const Vec& b, const Vec& want) {
 template <u32 P>
 void all_structs(std::size_t n, std::size_t m, int kind) {
     const Vec a = random_vec<P>(n, kind), b = random_vec<P>(m, kind, true), want = model<P>(a, b);
-    fps::simd::for_each(fps::simd::All{}, [&]<class S> { schoolbooks<S, P>(a, b, want); });
+    fps::simd::for_each(fps::simd::List<fps::simd::Native>{}, [&]<class S> { schoolbooks<S, P>(a, b, want); });
     candidates<P>(a, b, want);
 }
 

@@ -3,7 +3,7 @@
 //   "<op>/<lg>"          through the API, on 2^lg items (gated)
 //   "<op>@kernel/<lg>"   the backend call the API wraps, on the same inputs
 // Cases run in the order they are added. Each makes its inputs in its setup, so they live only
-// while it runs; the products, which map fresh memory per call, run last.
+// while it runs. The products run last: ntt::multiply keeps its memory per thread.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -117,10 +117,18 @@ void elementwise(bench::Suite& suite) {
                 });
 }
 
-// f * g for f and g of n coefficients against ntt::Convolution on the same factors (construct,
-// copy them in, multiply). "<lg>": n = 2^lg / 2. "480x480": a shape an old cutoff (n m < 2^18) ran
+// The kernel case of a product: ntt::multiply(f, g, out) into new memory of size words, as the
+// API's result holds it: f g mod x^size.
+fps::detail::Words ntt_product(const Poly& f, const Poly& g, std::size_t size) {
+    fps::detail::Words out(size, fps::detail::Words::Unwritten{});
+    fps::ntt::multiply(f.span(), g.span(), {out.data(), size});
+    return out;
+}
+
+// f * g for f and g of n coefficients against ntt::multiply on the same factors into new memory
+// (ntt_product). "<lg>": n = 2^lg / 2. "480x480": a shape an old cutoff (n m < 2^18) ran
 // schoolbook. Products small::beats_ntt gives to small::multiply (e.g. lg = 6 on most targets)
-// are still timed against the Convolution here; short_products() times them against
+// are still timed against ntt::multiply here; short_products() times them against
 // small::multiply.
 void multiply(bench::Suite& suite) {
     std::vector<std::pair<std::string, std::size_t>> shapes;
@@ -135,13 +143,93 @@ void multiply(bench::Suite& suite) {
             };
         }, 2 * n);
         suite.add("multiply@kernel/" + size, [n, seed] {
-            return [f = random_poly(n, seed), g = random_poly(n, seed + 1)] {
-                fps::ntt::Convolution conv(f.size(), g.size());
-                std::ranges::copy(f.span(), conv.a());
-                std::ranges::copy(g.span(), conv.b());
-                bench::keep(*conv.multiply());
+            return [f = random_poly(n, seed), g = random_poly(n, seed + 1), n] {
+                bench::keep(ntt_product(f, g, 2 * n - 1));
             };
         }, 2 * n);
+    }
+}
+
+// fps/products.hpp on transform length L = 2^lg, against the backend call on the same factors:
+// - mul(f, g, n), f and g of n = L / 2: ntt_product of n words;
+// - square(f), f of L / 2: ntt_product with f twice;
+// - middle_product(f, g), f of L / 2, g of L / 4: ntt_product of L / 2 words; the API then moves
+//   L / 4 + 1 words down;
+// - raw::mul into a kept out of L / 2 words: ntt::multiply into the same out.
+void products(bench::Suite& suite) {
+    for (int lg : {11, 14, 18, 22}) {
+        const std::size_t n = std::size_t(1) << (lg - 1), L = 2 * n;
+        const std::string size = "/" + std::to_string(lg);
+        const unsigned seed = unsigned(5 * lg);
+        suite.add("mul" + size, [n, seed] {
+            return [f = random_poly(n, seed), g = random_poly(n, seed + 1), n] { bench::keep(fps::mul(f, g, n)); };
+        }, L);
+        suite.add("mul@kernel" + size, [n, seed] {
+            return [f = random_poly(n, seed), g = random_poly(n, seed + 1), n] { bench::keep(ntt_product(f, g, n)); };
+        }, L);
+        suite.add("square" + size, [n, seed] {
+            return [f = random_poly(n, seed)] { bench::keep(fps::square(f)); };
+        }, L);
+        suite.add("square@kernel" + size, [n, seed] {
+            return [f = random_poly(n, seed), n] { bench::keep(ntt_product(f, f, 2 * n - 1)); };
+        }, L);
+        suite.add("middle_product" + size, [n, seed] {
+            return [f = random_poly(n, seed), g = random_poly(n / 2, seed + 1)] {
+                bench::keep(fps::middle_product(f, g));
+            };
+        }, L);
+        suite.add("middle_product@kernel" + size, [n, seed] {
+            return [f = random_poly(n, seed), g = random_poly(n / 2, seed + 1), n] {
+                bench::keep(ntt_product(f, g, n));
+            };
+        }, L);
+        suite.add("raw_mul" + size, [n, seed] {
+            return [f = random_poly(n, seed), g = random_poly(n, seed + 1), out = Poly(n)]() mutable {
+                fps::raw::mul<P>(f.span(), g.span(), out.span());
+                bench::keep(out);
+            };
+        }, L);
+        suite.add("raw_mul@kernel" + size, [n, seed] {
+            return [f = random_poly(n, seed), g = random_poly(n, seed + 1), out = Poly(n)]() mutable {
+                fps::ntt::multiply(f.span(), g.span(), out.span());
+                bench::keep(out);
+            };
+        }, L);
+    }
+}
+
+// raw::mul of two short factors of n into n words: small::multiply writes all 2 n - 1, so the API
+// runs its own truncated loop (backend issue #37). The kernel case: small::multiply into a kept
+// array of 2 n - 1 words. "<n>x<n>".
+void short_raw_products(bench::Suite& suite) {
+    for (const std::size_t n : {std::size_t(16), std::size_t(24)}) {
+        const std::string size = "/" + std::to_string(n) + "x" + std::to_string(n);
+        const unsigned seed = unsigned(7 * n);
+        suite.add("raw_mul" + size, [n, seed] {
+            return [f = random_poly(n, seed), g = random_poly(n, seed + 1), out = Poly(n)]() mutable {
+                fps::raw::mul<P>(f.span(), g.span(), out.span());
+                bench::keep(out);
+            };
+        }, n * n);
+        suite.add("raw_mul@kernel" + size, [n, seed] {
+            return [f = random_poly(n, seed), g = random_poly(n, seed + 1), out = Poly(2 * n - 1)]() mutable {
+                fps::small::multiply<P>(f.span(), g.span(), out.span());
+                bench::keep(out);
+            };
+        }, n * n);
+    }
+}
+
+// product(fs) of 2^lg factors x - r_i: a tree of f * g, no single backend call, so no @kernel pair.
+void product(bench::Suite& suite) {
+    for (int lg : {10, 14, 18}) {
+        const std::size_t count = std::size_t(1) << lg;
+        suite.add("product/" + std::to_string(lg), [count, lg] {
+            std::mt19937 rng{unsigned(lg)};
+            std::vector<Poly> fs;
+            for (std::size_t i = 0; i < count; ++i) fs.push_back(Poly{std::uint32_t(rng() % P), 1});
+            return [fs] { bench::keep(fps::product(fs)); };
+        }, count);
     }
 }
 
@@ -176,5 +264,8 @@ int main(int argc, char** argv) {
     elementwise(suite);
     short_products(suite);
     multiply(suite);
+    products(suite);
+    short_raw_products(suite);
+    product(suite);
     return suite.run();
 }

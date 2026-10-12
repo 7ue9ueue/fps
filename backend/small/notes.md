@@ -198,6 +198,12 @@ Zen 5 and Neoverse V2, and in 12 on Emerald Rapids: 2^20 x 256 runs small at 11.
 
 ## Log
 
+2026-10-12, claude (issue #63, gate time): the test builds `Schoolbook<S, ...>` for S =
+`simd::Native` only; each other struct is tested on its own target, and every candidate of
+select.hpp still is. -O2 build 110 -> 41 s. Keeping every struct but three of the six primes: 62 s
+(not done). Measured with clang 18 in a 4-core x86 cloud container (-march=x86-64-v3, one run each,
+not a timing machine; the gate builds with GCC 15.2).
+
 2026-10-11, claude (issue #54, round 3): the variant is a tuned choice per shape class. Main
 e452c18, then (rebased) e66ce2f; GCC 15.2, `tools/kernel.py` flags; design and the tuning
 measurements in `backend/tune/notes.md` (small.variant); files in

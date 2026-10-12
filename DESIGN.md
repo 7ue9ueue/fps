@@ -57,8 +57,9 @@ Users name their modulus once: `using Poly = fps::Polynomial<998244353>;`.
   (`f * x^k`, `f / x^k`, `f % x^k`, O(n)), a linear inner function (`compose(f, x + c)`,
   `compose(f, c x)`).
 - A broken precondition throws `std::domain_error` (e.g. `inverse` with f[0] = 0); a size past a
-  backend limit throws `std::length_error` (e.g. an NTT product past 2^25 coefficients). A result
-  that may not exist is a `std::optional` (`sqrt`, `inverse_mod`).
+  backend limit throws `std::length_error` (e.g. a product past 2^25 coefficients that runs the NTT;
+  a short factor next to a longer one runs `small::multiply` where that is faster, which has no
+  limit). A result that may not exist is a `std::optional` (`sqrt`, `inverse_mod`).
 - Thread safety: functions are safe to call from several threads; each thread has its own scratch.
 - Moduli: v1 supports P = 998244353 only; any other P fails to compile (`static_assert`). Other
   primes come later (see Later).
@@ -104,10 +105,10 @@ with a scalar c, an integer of at most 64 bits taken mod P: `f + c`, `c + f`, `f
 
 ```cpp
 // Products
-Polynomial mul(f, g, n);                  // f g mod x^n
-Polynomial square(f);                     // f^2, cheaper than f * f
-Polynomial product(std::span<const Polynomial> fs);   // balanced product tree
-Polynomial middle_product(f, g);          // the transposed product
+Polynomial mul(f, g, n);                  // f g mod x^n: n coefficients
+Polynomial square(f);                     // f^2; cheaper than f * f once the backend squares (#55)
+Polynomial product(std::span<const Polynomial> fs);   // balanced product tree; 1 if fs is empty
+Polynomial middle_product(f, g);          // coefficients m - 1 .. n - 1 of f g (below)
 
 // Division and calculus
 std::pair<Polynomial, Polynomial> divmod(f, g);       // quotient, remainder
@@ -138,6 +139,12 @@ std::optional<Polynomial> inverse_mod(f, m);   // f^-1 mod m
 std::vector<std::uint32_t> roots(f);      // distinct roots in [0, P)
 std::vector<std::pair<Polynomial, int>> factor(f);   // monic irreducible factors, multiplicities
 ```
+
+`middle_product(f, g)`, for n = `f.size()` >= m = `g.size()` >= 1 (else `std::domain_error`):
+the n - m + 1 coefficients m - 1 .. n - 1 of f g, h[i] = sum over j < m of f[i + j] g[m - 1 - j].
+They are the coefficients whose sums meet all of g. With g reversed it is the transposed product,
+sum over j of f[i + j] g[j]. `product(fs)` splits fs where the sums of sizes come closest to
+halves; it also takes a `std::vector`.
 
 `Factorials<P> fact(n)`, n <= P: `fact[i]` = i!, `fact.inverse(i)` = 1/i!, `fact.binomial(n, k)`
 = C(n, k) (0 for k > n), for i, n < `fact.size()`. n > P throws: P! = 0 has no inverse. Indices
@@ -196,19 +203,21 @@ A polynomial in value form. A product of two `Values` is value by value, O(L), s
 used in many products is converted once and reused. A sum of products needs one conversion back.
 
 ```cpp
+enum class Layout { automatic, pointwise };   // automatic: the backend picks
+
 template <std::uint32_t P>
 class Values {
 public:
+    Values();                             // empty (L = 0), for containers; assign before use
+    explicit Values(std::size_t L, Layout layout = Layout::automatic);   // zero
     std::size_t size() const;             // L, a power of two
     Values& operator+=(const Values&);
     Values& operator-=(const Values&);
     Values& operator*=(const Values&);    // value by value
-    Values& operator*=(std::uint32_t c);
-    void multiply_add(const Values& a, const Values& b);   // *this += a b
+    Values& operator*=(c);                // c an integer of at most 64 bits, taken mod P
+    void multiply_add(const Values& a, const Values& b);   // *this += a b; a or b may be *this
 };
-// Also A + B, A - B, A * B, c * A.
-
-enum class Layout { automatic, pointwise };   // automatic: the backend picks
+// Also A + B, A - B, A * B, c * A, A * c.
 
 Values<P> to_values(f, std::size_t L, Layout layout = Layout::automatic);   // f.size() <= L; zeros above
 Polynomial<P> to_coefficients(const Values<P>& A);   // L coefficients: the product mod (x^L - 1)
@@ -216,27 +225,35 @@ Polynomial<P> to_coefficients(const Values<P>& A);   // L coefficients: the prod
 
 - `to_coefficients(A * B)` is a b mod (x^L - 1): coefficient L + i adds onto i. For the exact
   product, L > deg a + deg b. With a smaller L the wrapped terms land low; a middle product keeps
-  only the upper part.
+  only the upper part. On an rvalue, as there, the inverse transform runs in A's own memory.
 - `Layout::pointwise` is the hint for a polynomial used in many products per conversion: the
-  value-by-value layout wins there (ABC222 H v2).
-- Operands must have the same L and layout; a mismatch throws.
+  value-by-value layout wins there (ABC222 H v2). L above 2^23 has no such values (P - 1 =
+  119 2^23 has no larger power-of-two roots of unity) and keeps the automatic layout.
+- `Values(L, layout)` is the zero polynomial: the start of a sum of products (`multiply_add`) and
+  the buffer that `raw::to_values` fills.
+- Operands must have the same L and layout; a mismatch throws `std::domain_error`, as do L not a
+  power of two and f.size() > L. L > 2^25 throws `std::length_error` (the backend's longest
+  transform).
 - The contents are opaque: no `operator[]`. The layout depends on the CPU (lc-opt's transform
   ends at blocks of 8 coefficients, not single values), so it is not a DFT. `fps::dft` and
   `fps::idft` give the true values at the roots, in a documented order, for users who need them.
 
 ## Raw functions
 
-Same names in `fps::raw`, on spans. They write into the caller's memory and never allocate;
-n is `out.size()`. For hot loops, and for code that keeps its own buffers.
+Same names in `fps::raw`, on spans. They write into the caller's memory and never allocate,
+except for a per-thread scratch that grows to the longest length a thread uses and is then
+reused (`raw::mul` multiplies there; `raw::to_coefficients` and `raw::add_coefficients` transform
+a copy of A there); n is `out.size()`. For hot loops, and for code that keeps its own buffers.
 
 ```cpp
 fps::raw::exp<P>(std::span<const std::uint32_t> f, std::span<std::uint32_t> out);  // out may be f
-fps::raw::mul<P>(a, b, out);
+fps::raw::mul<P>(a, b, out);                                                       // out apart from a, b
 fps::raw::to_values<P>(std::span<const std::uint32_t> f, Values<P>& A);            // into an existing A
 fps::raw::to_coefficients<P>(const Values<P>& A, std::span<std::uint32_t> out, std::size_t offset);
                                           // out[i] = coefficient offset + i
 fps::raw::add_coefficients<P>(const Values<P>& A, std::span<std::uint32_t> out, std::size_t offset);
                                           // out[i] += coefficient offset + i
+                                          // offset + out.size() <= L, else std::domain_error
 ```
 
 Each function documents whether `out` may overlap an input.
@@ -246,14 +263,26 @@ Each function documents whether `out` may overlap an input.
 Not part of the user API, except for tuning:
 
 ```cpp
-fps::tune();                     // measure the codelets on this machine (seconds)
-fps::save_wisdom(path);
-fps::load_wisdom(path);          // without wisdom: compile-time and hardware-fact choices
+fps::tune_all();                 // measure the backend's choices on this machine (about 0.1 s)
+bool fps::save_wisdom(const std::string& path);   // false if path cannot be written
+bool fps::load_wisdom(const std::string& path);   // false, setting nothing, if path is missing,
+                                                  // malformed, or from another CPU or target
 ```
 
 Choices are made in this order: compile time (the ISA from compiler macros), hardware facts at
 run time (cache sizes, CPU features), then measurement (wisdom). Every variant stays testable by a
 flag that forces it.
+
+- Explicit only: nothing tunes on first use, so a call costs the same every time. Without wisdom,
+  every call uses the compiled defaults, measured per target on our machines.
+- `tune_all()` runs once per process; it measures from the compiled defaults and replaces what
+  `load_wisdom` set. Choices change speed, never results.
+- Wisdom records the CPU and the target; a file from another CPU or target, a malformed file and
+  a missing one change nothing. Neither function throws on a bad path.
+- `-DFPS_NO_TUNER` (single-file contest bundles) compiles the defaults in as constants: `tune_all`
+  does nothing, and `save_wisdom` and `load_wisdom` touch no file and return false.
+- The name is `tune_all`, not `tune`: `fps::tune` is the backend tuner's namespace
+  (`backend/tune/`), and a function cannot share its name.
 
 ## Examples
 

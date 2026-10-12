@@ -21,19 +21,18 @@
 //
 // f * g with n and m coefficients: a factor with at most one nonzero term (c x^k) makes it a
 // shift, O(n + m); a product the backend's small::multiply does faster than the NTT on this target
-// runs it (small::beats_ntt(n, m): on the timed targets min(n, m) up to 38-175 next to a long
-// factor of any length, or n = m up to 25-104); the rest runs ntt::Convolution, which needs
-// n + m - 1 <= 2^25 (else std::length_error). The Convolution keeps the product in its own memory,
-// so f * g copies it out: 0.6% to 6% over the kernel on x86 from 2^10 coefficients
-// (frontend/notes.md). The fast path is fps::ntt::Convolution itself, reading
-// the product from multiply(), or Convolution(n, m, a), which leaves it in the caller's a (backend
-// issue #38; f * g does not use it yet). Later: fps::raw::mul (DESIGN.md, Raw functions).
+// runs it (small::beats_ntt(n, m), tuned per target: on the timed targets min(n, m) up to 38-161
+// next to a long factor of any length, or n = m up to 27-94); the rest runs ntt::multiply, which
+// needs n + m - 1 <= 2^25 (else std::length_error). Both write into the result's own memory, so
+// nothing is copied out. The same paths run mul, square, middle_product, product and raw::mul
+// (fps/products.hpp).
 #pragma once
 
 #include <algorithm>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
 #include <optional>
 #include <span>
@@ -49,6 +48,9 @@
 #include "fps/words.hpp"
 
 namespace fps {
+
+template <std::uint32_t P>
+class Polynomial;
 
 namespace detail {
 
@@ -93,6 +95,15 @@ inline std::optional<Term> single_term(std::span<const std::uint32_t> f) {
     }
     return t;
 }
+
+// n coefficients, unwritten: for the library's functions that write all of them.
+template <std::uint32_t P>
+Polynomial<P> unwritten_polynomial(std::size_t n);
+
+// The products of polynomials (f * g here; mul, square, middle_product and raw::mul in
+// fps/products.hpp), defined after Polynomial.
+template <std::uint32_t P>
+struct Products;
 
 }  // namespace detail
 
@@ -225,15 +236,7 @@ public:
     }
 
     friend Polynomial operator*(const Polynomial& f, const Polynomial& g) {
-        if (f.size() == 0 || g.size() == 0) return {};
-        if (const auto t = detail::single_term(g.span())) return shifted(f, *t, g.size());
-        if (const auto t = detail::single_term(f.span())) return shifted(g, *t, f.size());
-        if (small::beats_ntt(f.size(), g.size())) {
-            Polynomial h(f.size() + g.size() - 1, kUnwritten);
-            small::multiply<P>(f.span(), g.span(), h.span());
-            return h;
-        }
-        return convolution(f, g);
+        return detail::Products<P>::multiply(f.span(), g.span(), f.size() && g.size() ? f.size() + g.size() - 1 : 0);
     }
 
     // f + c, c + f and f - c change one coefficient: the copy of f is their one pass.
@@ -280,7 +283,12 @@ private:
     using Word = Ops<simd::Scalar>;
     static constexpr detail::Words::Unwritten kUnwritten{};
 
+    template <std::uint32_t Q>
+    friend Polynomial<Q> detail::unwritten_polynomial(std::size_t n);
+    friend struct detail::Products<P>;
+
     Polynomial(std::size_t n, detail::Words::Unwritten u) : c_(n, u) {}
+    Polynomial(std::size_t n, std::size_t capacity, detail::Words::Unwritten u) : c_(n, capacity, u) {}
 
     std::uint32_t* data() { return c_.data(); }
     const std::uint32_t* data() const { return c_.data(); }
@@ -307,28 +315,116 @@ private:
         });
     }
 
-    // f t for the term t of a factor of m coefficients: f.size() + m - 1 coefficients.
-    static Polynomial shifted(const Polynomial& f, detail::Term t, std::size_t m) {
-        Polynomial h(f.size() + m - 1, kUnwritten);
-        std::uint32_t* const middle = h.data() + t.k;
-        std::fill(h.data(), middle, 0u);
-        if (t.c == 1) std::copy_n(f.data(), f.size(), middle);
-        else scale(f.data(), t.c, middle, f.size());
-        std::fill(middle + f.size(), h.data() + h.size(), 0u);
-        return h;
-    }
-
-    static Polynomial convolution(const Polynomial& f, const Polynomial& g) {
-        ntt::Convolution conv(f.size(), g.size());
-        std::copy_n(f.data(), f.size(), conv.a());
-        std::copy_n(g.data(), g.size(), conv.b());
-        const std::uint32_t* product = conv.multiply();
-        Polynomial h(conv.size(), kUnwritten);
-        std::copy_n(product, conv.size(), h.data());
-        return h;
-    }
-
     detail::Words c_;
 };
+
+template <std::uint32_t P>
+Polynomial<P> detail::unwritten_polynomial(std::size_t n) {
+    return Polynomial<P>(n, Polynomial<P>::kUnwritten);
+}
+
+namespace detail {
+
+// a b mod x^n for f * g, mul, square and product, the middle product, and raw::mul. Factors are
+// cut to n coefficients first. A factor with at most one nonzero term (c x^k) makes a shift, O(n);
+// a product small::beats_ntt gives to the backend's small::multiply runs it; the rest runs
+// ntt::multiply, which writes a b mod x^n into the caller's memory.
+template <std::uint32_t P>
+struct Products {
+    using Poly = Polynomial<P>;
+    using Span = std::span<const std::uint32_t>;
+    using Out = std::span<std::uint32_t>;
+
+    // n coefficients. Both kernels write into the result's own memory: no copy out.
+    static Poly multiply(Span a, Span b, std::size_t n) {
+        a = a.first(std::min(a.size(), n)), b = b.first(std::min(b.size(), n));
+        if (a.empty() || b.empty()) return Poly(n);
+        if (const auto t = single_term(b)) return shifted(a, *t, n);
+        if (const auto t = single_term(a)) return shifted(b, *t, n);
+        if (!small::beats_ntt(a.size(), b.size())) {
+            Poly h(n, Poly::kUnwritten);
+            ntt::multiply(a, b, h.span());
+            return h;
+        }
+        // small::multiply writes all of a b: past n too, into spare words of the result.
+        const std::size_t size = a.size() + b.size() - 1;
+        Poly h = n >= size ? Poly(n, Poly::kUnwritten) : Poly(n, size, Poly::kUnwritten);
+        small::multiply<P>(a, b, {h.data(), size});
+        if (n > size) std::fill(h.data() + size, h.data() + n, 0u);
+        return h;
+    }
+
+    // out = a b mod x^out.size(); out apart from a and b.
+    static void multiply_into(Span a, Span b, Out out) {
+        const std::size_t n = out.size();
+        a = a.first(std::min(a.size(), n)), b = b.first(std::min(b.size(), n));
+        if (a.empty() || b.empty()) return void(std::ranges::fill(out, 0u));
+        if (const auto t = single_term(b)) return shift(a, *t, out);
+        if (const auto t = single_term(a)) return shift(b, *t, out);
+        const std::size_t size = a.size() + b.size() - 1;
+        if (small::beats_ntt(a.size(), b.size())) {
+            if (n < size) return low_product(a, b, out);
+            small::multiply<P>(a, b, out.first(size));
+            return void(std::fill(out.begin() + size, out.end(), 0u));
+        }
+        ntt::multiply(a, b, out);
+    }
+
+    // Coefficients m - 1 .. n - 1 of f g, for n = f.size() >= m = g.size() >= 1: f g mod x^n by
+    // ntt::multiply (all of f g by small::multiply) in the result's own memory, then the n - m + 1
+    // coefficients moved down.
+    static Poly middle(Span f, Span g) {
+        const std::size_t n = f.size(), m = g.size(), count = n - m + 1;
+        Poly h;
+        if (small::beats_ntt(n, m)) {
+            h = Poly(count, n + m - 1, Poly::kUnwritten);
+            small::multiply<P>(f, g, {h.data(), n + m - 1});
+        } else {
+            h = Poly(count, n, Poly::kUnwritten);
+            ntt::multiply(f, g, {h.data(), n});
+        }
+        std::memmove(h.data(), h.data() + (m - 1), count * sizeof(std::uint32_t));
+        return h;
+    }
+
+private:
+    static Poly shifted(Span f, Term t, std::size_t n) {
+        Poly h(n, Poly::kUnwritten);
+        shift(f, t, h.span());
+        return h;
+    }
+
+    // out = c x^k f mod x^out.size() for the term t = c x^k.
+    static void shift(Span f, Term t, Out out) {
+        const std::size_t n = out.size(), k = std::min(t.k, n), count = std::min(f.size(), n - k);
+        std::uint32_t* const middle = out.data() + k;
+        std::fill(out.data(), middle, 0u);
+        if (t.c == 1) std::copy_n(f.data(), count, middle);
+        else Poly::scale(f.data(), t.c, middle, count);
+        std::fill(middle + count, out.data() + n, 0u);
+    }
+
+    // out = a b mod x^out.size() for out shorter than a b, which small::multiply cannot write
+    // (backend issue #37): the plain loop, in blocks of 64 outputs. 64-bit sums: a reduced sum
+    // plus 16 products below P^2 stays below 2^64 for P < 2^30.
+    static void low_product(Span a, Span b, Out out) {
+        constexpr std::size_t kBlock = 64;
+        std::uint64_t sum[kBlock];
+        for (std::size_t lo = 0; lo < out.size(); lo += kBlock) {
+            const std::size_t hi = std::min(out.size(), lo + kBlock);
+            std::fill(sum, sum + (hi - lo), 0);
+            const std::size_t first = lo < a.size() ? 0 : lo - a.size() + 1, last = std::min(b.size(), hi);
+            for (std::size_t j = first; j < last; ++j) {
+                const std::size_t begin = lo > j ? lo - j : 0, end = std::min(a.size(), hi - j);
+                for (std::size_t i = begin; i < end; ++i) sum[i + j - lo] += std::uint64_t(a[i]) * b[j];
+                if ((j - first) % 16 == 15)
+                    for (std::size_t k = 0; k < hi - lo; ++k) sum[k] %= P;
+            }
+            for (std::size_t k = 0; k < hi - lo; ++k) out[lo + k] = std::uint32_t(sum[k] % P);
+        }
+    }
+};
+
+}  // namespace detail
 
 }  // namespace fps

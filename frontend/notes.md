@@ -221,3 +221,343 @@ belongs in `backend/`).
 
     Below lg 10 main ran the scalar loop up to 443 x 443; with the Convolution of issue #38 the NTT
     wins there from about 32 x 32 (Zen 3, Neoverse V2) to 104 x 104 (Zen 5).
+- 2026-10-11: `Values` (#19): `fps::Values<P>` with `+`, `-`, `*` (value by value), scalars,
+  `multiply_add`, `fps::Layout` (`automatic`, `pointwise`), `to_values`, `to_coefficients`, and
+  `raw::to_values`, `raw::to_coefficients`, `raw::add_coefficients`, on `ntt::Transform`. From the
+  prototype's `values.hpp`, which had no layouts; the split into values from lc-opt-explore
+  `showcase-abc222_h_dc` v2 (`Split`), rewritten as plain scalar code.
+  - Storage: max(L, 64) + 16 words, 64-byte aligned (the transform needs 32 and reads 16 words
+    of padding). L < 64 is held at 64: x^L - 1 divides x^64 - 1, so sums and products are exact
+    mod x^64 - 1 and the conversion back folds mod x^L - 1. One code path for every L.
+  - Per length, a table set built once (`std::call_once`) and kept: the `ntt::Transform`, the leaf
+    roots r(k) and, up to 2^23, the 8th roots rho_v of each leaf's w_v. A fresh `Transform` per
+    call would rebuild L / 16 table entries and allocate.
+  - Automatic layout: the backend's leaf form; `*` is an 8 x 8 product per leaf mod x^8 - w_v
+    (64-bit sums, two `%` per word). Pointwise: each leaf twisted by rho_v^k and taken through an
+    8-point transform, so `*` is one product per word (modarith Barrett on `simd::Native`). Above
+    2^23 no such roots exist (P - 1 = 119 2^23): pointwise keeps the leaf form there.
+  - `to_coefficients(const Values&)` copies A into a per-thread scratch (A is const and the inverse
+    works in place), inverts there and copies out; on an rvalue (`to_coefficients(A * B)`) it
+    inverts in A's own memory. `Polynomial` gets `detail::unwritten_polynomial` (no zero fill
+    before the copy out); nothing else in `polynomial.hpp` changes. `Values` has its own add,
+    subtract and scale streams on `detail::lanewise` (an earlier version moved `Polynomial`'s
+    streams to `detail` to share them; undone on the rebase below, to leave `Polynomial` as main
+    has it while #18 edits the same lines).
+  - Backend issue #49: leaf products, the pointwise split, and an inverse into other memory.
+    Searched first: #38 (Convolution memory) and #4 (ntt intrinsics) do not cover them.
+  - DESIGN.md: `Values()` (empty, for containers) and `Values(L, layout)` (zero: the start of a
+    `multiply_add` sum and the buffer for `raw::to_values`; the ABC222 H example needs one), which
+    it did not list; scalars are any integer of at most 64 bits, as for `Polynomial`; pointwise
+    above 2^23 keeps the leaf form (no roots); which errors throw what; the raw functions' scratch,
+    which "never allocate" did not allow for (`to_coefficients` of a const A needs L words to run
+    the in-place inverse); `Layout` declared before `Values`.
+  - Tests (`test_values.cpp`): both layouts, L = 2^0 .. 2^11, inputs of 0, 1, 2^k - 1, 2^k,
+    2^k + 1 and random sizes, random and all P - 1: conversions, every operator and its rvalue
+    form, aliasing (`A *= A`, `A.multiply_add(A, B)`, `(B, A)`, `(A, A)`), scalars 0, 1, P - 1,
+    -1, -3P - 5, 2^64 - 1, against cyclic schoolbook products; the raw functions on every range for
+    L <= 32 and on edge and random ranges above; DESIGN.md's two examples (one factor in many
+    products and a sum of products; ABC222 H's divide and conquer, here f = 1 + x f^2 against the
+    Catalan numbers, N = 4096); L = 2^20 exact products, 2^23 and 2^24 pointwise with wrapping at
+    2^23-th roots of unity; 4 threads building tables of new lengths at once; every error. 12
+    injected bugs (leaf modulus sign, a split twiddle, the fold, `multiply_add`, `add_coefficients`
+    on short ranges, the odd-leaf rho, the layout check, the leaf product's wrap, the zero fill,
+    the 2^23 limit, 1/8, the raw range check) all fail it; the 2^23 one crashes.
+  - Bench (`frontend/bench.cpp`), L = 2^lg, 11 rounds, GCC 15.2, main 7ddddf3 plus this change (before #47).
+    `to_values` (f of L / 2 coefficients into new memory) against `Transform::forward` by hand
+    (new aligned memory, copy, zero fill, forward); `to_coefficients` against a copy into new
+    aligned memory and the inverse in place; `add_coefficients` (ABC222 H's step, the upper half
+    added into a kept array) against copy, inverse and a modarith add. API / kernel, median of the
+    per-round ratios:
+
+    | case | `lc-bench` (avx2) | `lc-intel` (avx512) | `lc-zen5` (zen5) | `lc-arm` (arm) |
+    |---|---:|---:|---:|---:|
+    | to_values/10, /14, /18, /22 | 1.018, 0.993, 1.003, 0.992 | 1.011, 0.996, 0.981, 1.000 | 0.999, 0.998, 0.997, 1.001 | 1.007, 1.000, 0.999, 1.001 |
+    | to_coefficients | 1.020, 1.090, 1.125, 1.173 | 1.025, 1.090, 1.147, 1.172 | 1.040, 1.094, 1.123, 1.145 | 1.020, 1.024, 1.026, 1.036 |
+    | add_coefficients | 0.984, 0.994, 1.013, 0.992 | 1.005, 1.003, 0.959, 1.001 | 0.991, 0.989, 0.998, 0.988 | 1.002, 0.994, 1.002, 1.004 |
+
+    `lc-zen5`: from the gate's run of 311471a (21 rounds, main 03c970b); the rest from separate
+    runs of 11 rounds.
+
+    `to_coefficients` pays the copy out of the scratch; the kernel case reads the coefficients in
+    place. Only an inverse into other memory closes it (#49): a `Polynomial` is 16-byte aligned
+    and has no padding, so the frontend cannot run the inverse in it. Aligning every
+    `Polynomial` would change all their allocations and the copy placement measured for #16, to
+    save one copy here; #49 saves the copy in as well.
+
+    No kernel to pair with, ns per coefficient, lg 10 / 14 / 18 / 22:
+
+    | case | `lc-bench` | `lc-intel` | `lc-zen5` | `lc-arm` |
+    |---|---|---|---|---|
+    | values_product (leaf form) | 6.91 / 6.86 / 6.87 / 6.88 | 4.21 / 4.18 / 4.22 / 4.23 | 4.39 / 4.35 / 4.35 / 4.35 | 4.73 / 4.70 / 4.70 / 4.70 |
+    | values_product_pointwise | 0.23 / 0.19 / 0.18 / 0.33 | 0.17 / 0.15 / 0.36 / 0.40 | 0.08 / 0.06 / 0.11 / 0.17 | 0.34 / 0.30 / 0.30 / 0.34 |
+    | to_values_pointwise | 7.55 / 7.78 / 8.12 / 8.52 | 5.23 / 5.53 / 5.63 / 6.12 | 5.11 / 5.21 / 5.38 / 5.56 | 7.29 / 7.81 / 8.41 / 9.11 |
+    | to_coefficients_pointwise | 8.67 / 9.03 / 9.45 / 10.00 | 6.07 / 6.39 / 6.61 / 7.21 | 6.27 / 6.40 / 6.60 / 6.83 | 8.01 / 8.53 / 9.16 / 10.01 |
+    | to_values (for scale) | 0.60 / 0.85 / 1.18 / 1.48 | 0.55 / 0.85 / 1.14 / 1.70 | 0.32 / 0.45 / 0.61 / 0.77 | 1.13 / 1.66 / 2.25 / 2.94 |
+
+    The scalar leaf product costs 2 to 14 times `to_values` (one forward transform), so until #49
+    a single product through `Values` is slower than `f * g`; a pointwise conversion costs 3 to 20
+    times `to_values`.
+    Products in the pointwise layout are already a stream (0.06 to 0.40 ns). Not tuned here, as
+    AGENTS.md (Performance) asks: these are #49's.
+  - Gate runs. The first failed avx2 at 1.0081, from `add`, `sub`, `neg` and `scale` at +1% to
+    +6%, with their `@kernel` cases (bench code this change does not touch) at +1% to +10%
+    alike. On `lc-bench` against main, those cases alone gave 1.0001 with the `Values` cases
+    registered and 0.9966 without; after the factorials, 1.0048 (the factorials) with and 0.9991
+    without, the element-wise cases within 0.5% either way except the noisy lg 22. So neither
+    the code nor the registration moves them; they move only in some full-suite runs (+2-3% in
+    three gate runs, not in a fourth with the same code). Placement, as in #16's log; not fixed.
+  - After #48 (Convolution memory per thread) the gate found arm `multiply/<lg>` and
+    `multiply@kernel/<lg>` 3-5% slower from 2^10. Not the run order: still so with the `Values`
+    cases last. `nm` of the two binaries: with `Transform::forward` and `inverse` in the program,
+    GCC kept the NTT's top-level helpers out of line, shared by both paths. Forcing them inline
+    (`backend/ntt/intrinsics.hpp`, 5 attributes; `backend/ntt/notes.md`) gave 0.999 against main,
+    from 1.034. The `Values` cases now run last anyway: they leave tables and scratch behind.
+    (Dropped on the rebase below: #61 and #68 rewrote those levels, and the slowdown is gone.)
+  - 2026-10-12: rebased onto main 006fa57 (after #37, #38, #51, #61, #65, #68). No conflicts in
+    the frontend; the tests pass unchanged on the Mac (scalar, arm), `lc-amd` (scalar, sse, avx2),
+    `lc-intel-test`, `lc-zen5-test` and `lc-arm`, at -O2 and under ASan/UBSan.
+    - The NTT inlining commit is dropped: a backend change, and no longer needed. Without it, on
+      `lc-arm`, `multiply/<lg>` against main is 0.998 to 1.007 (lg 6 to 22) and the frontend
+      geomean 0.9996 and 0.9992 in two runs of 11 rounds. No backend issue needed.
+    - Bench, GCC 15.2, 11 rounds, against main 006fa57: geomean of gated new/base 1.0047 (`lc-bench`;
+      1.0045 and 1.0085 in two runs with `Polynomial`'s streams still in `detail`), 0.9860
+      (`lc-intel`), 0.9922 (`lc-zen5`), 0.9992 (`lc-arm`). On `lc-bench` the excess comes from
+      `add`, `sub`, `neg` at lg 10 and 14 (+2% to +4%, IQR within 1.02-1.04), whose code is main's
+      byte for byte in the source. Run alone (`--filter "^(add|sub|neg|scale)"`) the same binaries
+      give 0.996 to 1.000 for them. Placement again, as in the gate runs above; not fixed.
+    - API / kernel, median of the 11 per-round ratios, lg 10, 14, 18, 22 (the runs with the
+      streams in `detail`; `Values` runs the same code either way):
+
+      | case | `lc-bench` (avx2) | `lc-intel` (avx512) | `lc-zen5` (zen5) | `lc-arm` (arm) |
+      |---|---:|---:|---:|---:|
+      | to_values | 1.017, 0.991, 1.002, 1.007 | 1.010, 0.999, 1.003, 1.000 | 1.008, 1.006, 0.994, 1.000 | 1.005, 1.001, 1.000, 1.001 |
+      | to_coefficients | 1.048, 1.081, 1.115, 1.189 | 1.035, 1.105, 1.179, 1.186 | 1.043, 1.101, 1.136, 1.169 | 1.026, 1.030, 1.033, 1.036 |
+      | add_coefficients | 1.013, 0.990, 1.015, 1.003 | 0.999, 1.001, 0.982, 0.998 | 0.982, 0.987, 0.998, 0.931 | 0.999, 1.004, 0.998, 0.997 |
+
+      `to_coefficients` still pays the copy out of the scratch (#49, part 3). The ns per
+      coefficient of the cases with no kernel are within 5% of the table above (`lc-bench`
+      values_product 6.86 to 6.92, pointwise conversions 7.55 to 10.02).
+  - Gate of 2026-10-12 (PR #50): avx2 1.0096 over 42 rounds, with `multiply/6` (f * g, 32 x 32,
+    the NTT) at 1.253, `/7` 1.037, `/8` 1.019, and their `@kernel` cases unmoved. Not placement:
+    the same four shapes alone (`--filter "^multiply(@kernel)?/[6789]$"`) gave 1.262, 1.042,
+    1.018 and 0.977, and 0.997 to 1.000 with `values(suite)` not called, the rest of the source
+    the same. Cause: with `Transform::forward` and `inverse` (avx2) in the program, GCC 15.2
+    inlines `product<GroupBottom>` into `Polynomial::convolution` and calls `Tree::visit` out of
+    line; without them it calls `Convolution::multiply [clone .part.0]`, which calls
+    `Tree<GroupBottom>::tile<4> [clone .isra.0]` directly (`nm`, `objdump` on `lc-amd`).
+    `forward_groups`, `forward_trees`, `forward_leaves`, `inverse_leaves` and `inverse_trees`
+    become out-of-line functions both paths share. Which of these costs the 35 ns is a guess. A
+    program that uses `Values` and `f * g` pays it; the backend can make its codegen not depend
+    on that: issue #81.
+    - Fix here: the `Values` cases move to `frontend/bench_values.cpp`, a binary of their own,
+      and `tools/kernel.py bench` times every `bench*.cpp` of a unit (AGENTS.md says so).
+      `frontend/bench.cpp` is main's again. `polynomial.hpp` is unchanged apart from
+      `detail::unwritten_polynomial`.
+    - Rebased onto main d1f5f4d (after #79, #80). Bench against it, 11 rounds, gated geomean:
+      `lc-bench` 1.0024 (`multiply/6` 1.005, all `multiply/<lg>` 0.995 to 1.005), `lc-intel`
+      1.0008, `lc-zen5` 1.0012, `lc-arm` 0.9967. API / kernel, lg 10 / 14 / 18 / 22:
+
+      | case | `lc-bench` (avx2) | `lc-intel` (avx512) | `lc-zen5` (zen5) | `lc-arm` (arm) |
+      |---|---:|---:|---:|---:|
+      | to_values | 0.992, 0.992, 1.002, 1.001 | 0.996, 1.004, 0.999, 1.001 | 0.986, 1.005, 1.000, 1.006 | 0.996, 1.002, 1.000, 1.000 |
+      | to_coefficients | 1.010, 1.087, 1.120, 1.182 | 1.015, 1.103, 1.184, 1.178 | 1.024, 1.106, 1.134, 1.159 | 1.025, 1.031, 1.036, 1.043 |
+      | add_coefficients | 1.028, 0.996, 1.012, 0.997 | 1.006, 0.998, 0.999, 0.995 | 1.031, 1.010, 1.000, 0.989 | 0.994, 1.004, 0.995, 0.999 |
+- 2026-10-11: products (#18): `mul(f, g, n)`, `square(f)`, `product(fs)`, `middle_product(f, g)`
+  and `raw::mul<P>(a, b, out)` in `include/fps/products.hpp`, from the prototype's
+  `polynomial.hpp`. One engine, `detail::Products<P>` in `polynomial.hpp`, runs them and `f * g`:
+  factors cut to n, then a shift (one nonzero term), `small::multiply` where `small::beats_ntt`
+  says so (the choice `f * g` makes since #37; no cutoff of the frontend's own), or
+  `ntt::Convolution(n, m, a)` with a = the result's own memory (#38). Both kernels write into the
+  result, so nothing is copied out.
+  - Storage: `detail::Words(n, capacity, Unwritten)` allocates a 64-byte aligned block of
+    `length + kPadding` words (`std::aligned_alloc`; the other constructors use `std::malloc`, as
+    `new[]` did, so their placement is unchanged). A product's result keeps the block: up to
+    2 (n + m - 1) + 16 words for `f * g`, up to 4 n + 16 for `mul` with a short n. A copy is tight.
+    The length is checked against 2^25 before the block is allocated. `small::multiply` writes the
+    whole product, so `mul` with a short n gets n + m - 1 words for it.
+  - `middle_product`: DESIGN.md said "the transposed product" without saying which coefficients.
+    Now: coefficients m - 1 .. n - 1 of f g, n = f.size() >= m = g.size() >= 1, else
+    `std::domain_error`, as the prototype; with g reversed it is the transposed product. It runs
+    all of f g (`small::multiply` or the `Convolution`, by `beats_ntt(n, m)`) in the result's memory
+    and moves the n - m + 1 coefficients down in place. A cyclic product of length >= n would halve
+    the transform: backend issue #55. (Before #37 merged it had its own direct loop for short sums,
+    with the old frontend cutoff; dropped with that cutoff.)
+  - `square(f)`: the engine with f twice, so it costs `f * f`. DESIGN.md said "cheaper than
+    f * f"; now it says so once the backend squares (#55, one forward transform less).
+  - `product(fs)`: split where the sums of sizes come closest to halves (lc-opt's tree splits on
+    degrees the same way), each node `f * g`. 1 for no factors, empty if a factor is empty. A
+    `std::vector` overload, since P cannot be deduced through the span. lc-opt's tree: #56.
+  - `raw::mul`: allocates nothing per call; the NTT path runs `Convolution(n, m)` in the thread's
+    region and copies out (a tight output is not in the backend: commented on #38).
+    `small::multiply` writes all n + m - 1 words, so a shorter `out` (the usual case: a, b and out
+    of n) runs `low_product`, the old frontend schoolbook (blocks of 64 outputs, 64-bit sums),
+    computing only the n outputs; a truncated short product is asked of #37. `out` must not overlap
+    `a` or `b` (`std::domain_error`, an O(1) check), since both short kernels write as they read.
+  - DESIGN.md also: `mul` returns n coefficients; raw functions allocate nothing per call (scratch
+    is the library's, per thread); `raw::mul`'s out is apart from a and b.
+  - Tests (`test_products.cpp`): `mul` and `raw::mul` on every pair of edge sizes (0, 1,
+    2^k +- 1, k <= 10) with outputs 0, 1, 2, the shorter size, the product's size -1, 0, +1, +70,
+    3 s + 100 and random; shapes on the NTT path and at the cutoffs; shifts; long factors against
+    `f * g`; `square` on edge sizes and all P - 1; `middle_product` on every pair n >= m, at its
+    cutoffs and long, against the definition and against f g; `product` of 0 to 100 factors,
+    unbalanced, with an empty factor, 2^14 linear factors at random points; results resized and
+    copied; 4 threads; every error (`domain_error` for the middle product and overlaps,
+    `length_error` past 2^25 for each function). Under ASan the test sets
+    `max_malloc_fill_size`, so every allocation starts as 0xbe bytes: with that, dropping the zero
+    fill past the transform's length fails on the Mac too (it passed before, on fresh pages).
+    Mutations killed: the middle move's offset, the middle loop's reduction cadence, `raw::mul`'s
+    zero fill, the shift's tail fill and its truncation, the NTT path's zero fill. Splitting
+    `product` always at 1 still passes: balance is speed, not correctness.
+  - Bench (`frontend/bench.cpp`): `multiply@kernel` is now `Convolution(n, m, a)` into a new
+    `Words` block like the API's result (`convolve`). New pairs at lg 11, 14, 18, 22 (transform
+    length 2^lg): `mul` (f, g, n of 2^(lg-1)), `square`, `middle_product` (f of 2^(lg-1), g of
+    2^(lg-2)), `raw_mul` (out kept across calls; kernel: the product left in the region);
+    `product/<lg>` (2^lg linear factors, lg 10, 14, 18) has no pair. API / kernel, median of 11
+    paired rounds (IQR in the PR), GCC 15.2, main 8367228 plus this change:
+
+    | case | `lc-bench` (avx2) | `lc-intel` (avx512) | `lc-zen5` (zen5) | `lc-arm` (arm) |
+    |---|---:|---:|---:|---:|
+    | multiply/10, /14, /18, /22 | 0.999, 1.000, 1.001, 0.999 | 0.998, 0.988, 1.005, 0.999 | 1.002, 1.001, 1.001, 1.000 | 1.000, 1.000, 1.002, 1.001 |
+    | mul/11, /14, /18, /22 | 1.001, 1.000, 0.998, 0.999 | 0.999, 0.999, 1.001, 0.997 | 1.002, 1.001, 1.000, 1.005 | 1.000, 1.000, 0.999, 1.000 |
+    | square | 0.998, 1.000, 1.001, 1.002 | 0.999, 1.000, 1.000, 0.999 | 1.000, 1.000, 1.000, 1.002 | 1.000, 1.000, 1.000, 1.000 |
+    | middle_product | 0.978, 1.006, 1.007, 1.003 | 1.002, 1.003, 1.005, 1.012 | 1.004, 1.003, 1.006, 1.006 | 1.002, 1.002, 1.003, 1.004 |
+    | raw_mul | 1.009, 1.012, 1.022, 1.030 | 1.009, 1.015, 1.018, 1.023 | 1.009, 1.014, 1.015, 1.023 | 1.005, 1.003, 1.004, 1.007 |
+
+    `multiply` against main (same run): 0.95-0.97 from 2^14 on `lc-bench`, 0.92-0.96 on
+    `lc-intel`, 0.96-0.98 on `lc-zen5`, 0.98-0.99 on `lc-arm`: the copy out is gone (#16's
+    1-6% gap). The two gaps left are copies the backend can remove: the middle product's move
+    (#55) and `raw::mul`'s copy out (#38). `product/<lg>`, ns per factor at lg 10 / 14 / 18:
+    `lc-bench` 130 / 155 / 189, `lc-intel` 107 / 133 / 169, `lc-zen5` 88 / 103 / 121, `lc-arm`
+    118 / 170 / 236; lc-opt's tree did 500000 linear factors in about 20 ms on `lc-amd`
+    (40 ns per factor, its notes).
+- 2026-10-12: products (#18) rebased on main bfd491b and moved to `ntt::multiply(f, g, out)`
+  (backend #38 round 2, PR #79): it reads the factors from the caller and writes f g mod
+  x^out.size() into the caller's memory, so the frontend no longer needs `Convolution(n, m, a)`.
+  - `f * g`, `mul`, `square`, `product` and `raw::mul` call it into the result (or `out`) of exactly
+    n words; the NTT path keeps no spare words and `raw::mul` copies nothing out. `middle_product`
+    calls it into n words (f g mod x^n, the same transform length as the whole product) and moves
+    the n - m + 1 coefficients down. The choice between `small::multiply` and the NTT is
+    `small::beats_ntt`, as for `f * g` since #37; the frontend has no cutoff of its own.
+  - `detail::Words(n, capacity, Unwritten)` is now a plain block of max(n, capacity) words
+    (`make_unique_for_overwrite`), no longer 64-byte aligned with `kPadding` words: only
+    `small::multiply` with an output cut short (`mul`) and the middle product keep spare words.
+    `checked_length` is gone: `ntt::multiply` throws `std::length_error` before it writes.
+  - DESIGN.md (Conventions): the `std::length_error` line now says that a short factor next to a
+    longer one runs `small::multiply` where that is faster, which has no limit (#37's behaviour:
+    2^25 x 2 returns; 2^25 x 4096 throws). The test checks both.
+  - Bench: every `@kernel` case of a product is now `ntt::multiply` into new memory of the
+    result's size (`ntt_product`), or into the same kept `out` for `raw_mul`. Tests pass at -O2
+    and ASan/UBSan on the Mac (scalar, arm), `lc-amd` (scalar, sse, avx2), `lc-intel-test`,
+    `lc-zen5-test` and `lc-arm`. A mutation (the middle product's NTT output one word short)
+    fails 234 checks.
+  - API / kernel, median of 11 paired rounds (IQR in brackets where wider than 0.005), GCC 15.2,
+    `kernel.py bench frontend --base bfd491b --filter 'mul|square|middle|product'`:
+
+    | case | `lc-bench` (avx2) | `lc-intel` (avx512) | `lc-zen5` (zen5) | `lc-arm` (arm) |
+    |---|---:|---:|---:|---:|
+    | multiply/10, /14, /18, /22 | 1.005, 1.001, 1.005, 1.003 | 1.007, 1.001, 1.001, 1.000 | 1.006, 1.000, 0.999, 1.000 | 1.001, 1.000, 1.000, 1.000 |
+    | mul/11, /14, /18, /22 | 0.998, 1.001, 1.000, 1.001 | 1.003, 1.000, 1.000, 1.000 | 1.004, 0.999, 1.000, 1.002 | 1.000, 1.000, 1.000, 1.001 |
+    | square | 0.999, 1.000, 1.000, 0.997 | 1.002, 1.000, 1.000, 1.002 | 1.012, 1.000, 1.000, 1.000 | 1.001, 1.000, 1.000, 1.000 |
+    | middle_product | 1.001, 1.007, 1.009, 1.013 | 1.004, 1.005, 1.014, 1.015 | 1.008, 1.004, 1.011, 1.023 | 1.003, 1.003, 1.004, 1.005 |
+    | raw_mul | 1.004, 1.000, 1.003, 1.001 | 1.003, 1.000, 1.000, 1.000 | 1.005, 1.001, 1.000, 1.000 | 1.001, 1.000, 1.000, 0.999 |
+    | raw_mul/16x16, /24x24 | 2.245, 2.082 | 2.150, 2.224 | 2.458, 3.007 | 1.176, 0.996 |
+    | multiply/16x16 | 1.106 | 1.096 | 1.134 | 1.074 |
+
+    - `mul`, `square` and `raw_mul` are within 0.5% of `ntt::multiply` (one case, zen5
+      square/11, 1.2%). `raw_mul` was 1.003-1.030 with the copy out; that gap is gone.
+    - `middle_product`: 0.3% to 2.3%, growing with size: the move of n - m + 1 words down. Only
+      a cyclic product written at out[0] can remove it (#55).
+    - `multiply/16` came out 1.027 (`lc-bench`) and 1.058 (`lc-intel`) in this run; alone, 21
+      rounds, 0.999 and 1.003 (lg 15 and 17 also 0.994-1.001). Placement of the run, not work.
+    - `raw_mul/<n>x<n>`: `raw::mul` into n words runs the frontend's truncated loop
+      (`low_product`) against `small::multiply`'s whole product: 2.1-3.0x on x86 (40-124 ns),
+      1.0-1.2x on Neoverse V2. Asked of #37 (a short product cut to out.size()).
+    - `multiply/16x16`: 1.07-1.13 (40-92 ns), the scans for a single term and `beats_ntt` before
+      `small::multiply`; 4096x4 and 4096x16 are 1.001-1.008.
+  - `multiply/<lg>` against main bfd491b (which ran `Convolution(n, m, a)`), same run:
+    0.92-0.99 from 2^10 on every target (lg 22: 0.924, 0.946, 0.996, 0.980), except lg 16 on
+    `lc-intel`, 1.020-1.022 in both runs. At 2^6-2^9, where `beats_ntt` still picks the NTT,
+    `ntt::multiply` is slower than the Convolution it replaces: lg 6 / 7 / 8 / 9 = 1.353 / 1.050
+    / 1.074 / 0.973 (`lc-bench`), 1.032 / 1.060 / 1.017 / 1.011 (`lc-intel`), 1.017 / 0.995 /
+    0.980 / 1.007 (`lc-zen5`), 1.078 / 1.007 / 0.986 / 0.986 (`lc-arm`). PR #79 measured up to 10%
+    at 2^6-2^8. `small`'s tuner times the NTT as a `Convolution(n, m, out)`, so `beats_ntt` is
+    now fitted to the wrong NTT: noted on #37 and #38.
+  - `product/<lg>`, ns per factor at lg 10 / 14 / 18: `lc-bench` 84 / 109 / 141, `lc-intel`
+    63 / 86 / 117, `lc-zen5` 48 / 59 / 76, `lc-arm` 97 / 141 / 201 (were 130 / 155 / 189 on
+    `lc-bench` before #37's tuned `small` and #79).
+  - Review of #59, round 1 (two findings), and what changed:
+    1. `test_results` assumed that NTT results keep spare words, which stopped being true with
+       `ntt::multiply`. It now copies, resizes and adds to the results that do keep them:
+       `mul` of 16 x 16 into 20 (`small::multiply` writes all 31 words) and middle products on
+       both paths (3000 by 1000 on the NTT, 3000 by 16 on `small`). The test asserts each path
+       with `beats_ntt`. A `resize` that reuses spare words without zeroing them fails it.
+    2. `product` copied every factor at the leaves (`return fs[0]` for a side of one). A side of
+       one factor is now multiplied by reference. `product/<lg>` against the PR's previous head
+       6001cc7, `lc-bench`, 11 rounds: lg 10 / 14 / 18 = 0.803 / 0.847 / 0.885 (IQR within
+       0.006). Now 69 / 93 / 127 ns per factor.
+- 2026-10-12: tuning (#66): `fps::tune_all()`, `fps::save_wisdom(path)`, `fps::load_wisdom(path)`
+  in `include/fps/tune.hpp`, on backend/tune's `run`, `save` and `load` (#54). The header includes
+  `backend/small/tune.hpp` and `backend/factorials/tune.hpp`, so "small.variant", "small.ntt" and
+  "factorials.variant" register; ntt's goes there when #78 adds it.
+  - The name: DESIGN.md had `fps::tune()`, which does not compile: `fps::tune` is the backend
+    tuner's namespace ("redefinition of 'tune' as different kind of symbol"). Renaming the
+    namespace (17 backend files, three running backend rounds on them: #78, #70, #37) was the
+    other way; `tune_all()` keeps this change in the frontend. DESIGN.md says so.
+  - Behaviour, as DESIGN.md now states it: both wisdom functions return bool and never throw on a
+    bad path (`save_wisdom` false if the file cannot be written; `load_wisdom` false, setting
+    nothing, if it is missing, malformed, or from another CPU or target). `tune_all()` runs once
+    per process and measures from the compiled defaults. `-DFPS_NO_TUNER`: the three compile;
+    `tune_all()` does nothing, the other two touch no file and return false, so the usual
+    `if (!load_wisdom(p)) { tune_all(); save_wisdom(p); }` still runs. The kernel tune headers
+    are not included then.
+  - Tests (`test_tune.cpp`): its own wisdom loads back; 17 refused files (empty, a cut header, no
+    target line, another format, CPU or target (each of the other five), a line without values,
+    too few values, not a number, a negative NTT time, a variant past the list, another candidate
+    list, good lines before a bad one) and a missing file each leave the saved wisdom byte-identical;
+    unwritable paths (missing directory, a directory, "") return false and create nothing;
+    wisdom forcing each candidate of each choice everywhere it can run (every small variant, the
+    NTT times x1/8 and x8, every factorials variant) loads, saves back identical, and f * g (66
+    shapes on both sides of every target's cutoffs, up to 4096 x 4096) and Factorials (every
+    class end to 2^17, and one past) match O(n^2) references; then `tune_all()` while another
+    thread checks the same results, a second `tune_all()` changes nothing, and the defaults and
+    the tuned wisdom load back in turn. `test_tune_no_tuner.cpp`: the -DFPS_NO_TUNER behaviour
+    above, f * g and Factorials. Both pass at -O2 and ASan/UBSan on every target's test machine
+    and on the Mac (scalar, arm). Mutations: `load_wisdom` returning true fails the test; dropping
+    factorials' tune header fails to compile the test.
+  - Cost of `tune_all()`, one fresh process, ms (3 runs; lines of 3 that changed): `lc-bench`
+    (Zen 3, avx2) 119-130 (2-3), `lc-intel` (avx512) 118-121 (3), `lc-zen5` 105-106 (3), `lc-arm`
+    159 (1); the Mac (M4, arm build, laptop) 217. DESIGN.md said "seconds"; now "about 0.1 s".
+  - A call with loaded wisdom against the compiled defaults, the same choices (save the defaults,
+    load them back: the tables are then heap copies). `wisdom_cost.cpp` (explore dir
+    `build-66/`): processes alternating on the last core under the bench lock, bench.hpp
+    timing, GCC 15.2, target flags, this branch on d1f5f4d. Paired wisdom / defaults, median of 7
+    (min-max):
+
+    | case | `lc-bench` | `lc-intel` | `lc-zen5` | `lc-arm` |
+    |---|---:|---:|---:|---:|
+    | multiply 8x8 / 16x16 / 32x32 | 1.000 / 0.997 / 0.996 | 0.997 / 1.000 / 0.997 | 1.000 / 0.987 / 1.000 | 0.998 / 1.001 / 1.000 |
+    | multiply 64x64 / 4096x16 | 1.003 / 1.006 | 1.020 / 1.000 | 1.005 / 1.001 | 1.000 / 1.001 |
+    | multiply 512x512 / 8192x8192 | 0.995 / 0.998 | 1.000 / 0.997 | 0.995 / 0.999 | 1.001 / 1.000 |
+    | Factorials 64 / 1024 / 16384 | 0.939 / 1.023 / 1.001 | 1.082 / 0.975 / 1.001 | 1.058 / 0.997 / 0.999 | 1.001 / 1.000 / 1.000 |
+
+    The Factorials 64 and 1024 shifts (narrow, both signs) are heap placement, not the tables: a
+    control process doing the same file work with a failed load (tables stay the defaults), 9
+    rounds of three: wisdom / control for Factorials 64 1.002 (Zen 3), 0.940 (Emerald Rapids; that
+    run wisdom / defaults 1.000, control / defaults 1.065), 1.003 (Zen 5); 1024 1.007, 1.012, 1.010;
+    64x64 1.000, 1.004, 1.000. So a loaded table costs nothing measurable beyond the choice it
+    holds.
+  - Bench: no new pair (the three are no kernel wrappers; tune_all() is a measurement). The
+    existing pairs, new against d1f5f4d, 11 rounds: geomean of gated cases `lc-bench` 1.0073 and
+    1.0048 (two runs), `lc-intel` 0.9856, `lc-zen5` 0.9921, `lc-arm` 0.9933. No kernel or
+    frontend operation changed; the moves are layout and placement (the tune headers add code and
+    allocate the registry at start-up). Their `@kernel` cases, code in bench.cpp that this change
+    does not touch, move with them: on `lc-bench` add/sub/neg at lg 10 and 14 read 1.026-1.037,
+    and add@kernel/14 1.076, sub@kernel/14 1.082, multiply/7 1.059 with multiply@kernel/7 1.029;
+    on `lc-zen5` multiply/10 1.039 with multiply@kernel/10 1.041.
+  - API / kernel (new ns medians, run 2 on `lc-bench`): factorials 1.000-1.012 on all four
+    machines (`lc-intel` /10 1.019, `lc-zen5` /10 1.032); multiply from lg 10 1.03-1.07 on x86
+    and 1.01-1.02 on `lc-arm`, the known copy out of the Convolution (above; measured on d1f5f4d,
+    before #59 moved f * g onto `ntt::multiply(f, g, out)`); multiply 4096x4 and 4096x16
+    1.00-1.01; element-wise 0.59-1.03, placement as before.
+  - `polynomial.hpp`'s cutoff comment: the issue asked for 38-180 / 24-104; #59 rewrote that
+    comment with its own ranges first, so this change keeps #59's.

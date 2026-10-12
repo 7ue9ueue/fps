@@ -94,6 +94,7 @@ Kernels to start with: `simd` (per-ISA vector wrappers), `modarith`, `ntt`, `mul
   test machine, not the timing machine.
 - A change merges only if every target's tests pass and no target gets slower beyond noise
   (geomean of new/base at most 1.005; `TOLERANCE` in `tools/gate.py`). The agent opens the pull
-  request and returns; the coordinator runs the gate and sends failures back (AGENTS.md, Process).
+  request and returns; the coordinator runs the gate and sends failures back (AGENTS.md, How work
+  flows).
 - A round ends with a comment on its issue: what was tried, the numbers, and a last line that is
   exactly `Result: gain` or `Result: no gain`. An issue stops after 3 rounds, or 2 in a row without gain.

@@ -3,12 +3,15 @@
 //
 //   detail::Words w(n);                                // n zeros
 //   detail::Words w(n, detail::Words::Unwritten{});    // n words, unwritten: the caller fills them
+//   detail::Words w(n, capacity, Unwritten{});         // the same in a block of max(n, capacity) words
 //   w.size(), w.data(), w.resize(n)                    // resize zero-fills past the old size
 //
 // Unlike std::vector it can allocate without writing, so an operator writes its result in one
 // pass, and it copies with memcpy (std::vector with such an allocator copies word by word under
-// GCC 15). With no spare capacity, growing one word at a time costs O(n^2), and copy assignment
-// always allocates.
+// GCC 15). The larger block is for a product written past the words kept (small::multiply writes
+// all of a b; the middle product keeps the top of f g mod x^n); those words stay allocated until
+// the Words dies, and a copy holds size() words only. Growing past size() reallocates: one word
+// at a time costs O(n^2), and copy assignment always allocates.
 #pragma once
 
 #include <algorithm>
@@ -25,8 +28,10 @@ public:
 
     Words() = default;
     explicit Words(std::size_t n) : Words(n, Unwritten{}) { std::fill_n(data(), n, 0u); }
-    Words(std::size_t n, Unwritten)
-        : words_(n ? std::make_unique_for_overwrite<std::uint32_t[]>(n) : nullptr), size_(n) {}
+    Words(std::size_t n, Unwritten) : Words(n, n, Unwritten{}) {}
+    Words(std::size_t n, std::size_t capacity, Unwritten)
+        : words_(n || capacity ? std::make_unique_for_overwrite<std::uint32_t[]>(std::max(n, capacity)) : nullptr),
+          size_(n) {}
     Words(const Words& w) : Words(w.size_, Unwritten{}) { std::copy_n(w.data(), size_, data()); }
     Words(Words&& w) noexcept : words_(std::move(w.words_)), size_(std::exchange(w.size_, 0)) {}
     Words& operator=(const Words& w) { return *this = Words(w); }
