@@ -188,20 +188,23 @@ void test_projection_large() {
     }
 }
 
-// The leaf passes of every simd struct against the scalar ones.
+// The leaf runs of every simd struct against the scalar ones (whole and from pair 8 on), and the
+// scalar Graeffe and product against their definitions. Outputs carry 2^-32.
 void test_passes() {
     const std::size_t m = 256, pairs = m / 4;
     const auto& tables = c::detail::pair_tables(pairs);
     const Vec F = random_vec(4 * m, 0), F2 = random_vec(4 * m, 0), H = random_vec(2 * m, 0);
     using Ref = c::detail::Pairs<fps::simd::Scalar>;
-    Vec rF = F, rG(2 * m), rV(2 * m), rW(2 * m), rA(4 * m);
-    Ref::graeffe_pass(rF.data(), rG.data(), pairs, tables, true);
-    Ref::projection_pass(F.data(), F2.data(), rV.data(), rW.data(), pairs, tables);
-    Ref::spread_pass(H.data(), rA.data(), pairs, tables);
-    // The scalar Graeffe against its definition on pair 3: c(z) c(-z) mod (z^8 -+ s), then the CRT.
+    Vec rG(2 * m), rV(2 * m), rW(2 * m), rR(4 * m);
+    Ref::graeffe_run(F.data(), rG.data(), 0, pairs, tables);
+    Ref::projection_run(F.data(), F2.data(), rV.data(), rW.data(), 0, pairs, tables);
+    Ref::product_run(H.data(), F.data(), rR.data(), 0, pairs, tables);
+    CHECK(rV == rG);
+    const u32 rinv = power(u32((u64(1) << 32) % P), P - 2);  // 2^-32
+    const std::size_t p = 3;
+    const u32 s = mul(tables.s[p], rinv);
+    // The Graeffe on pair 3: c(z) c(-z) mod (z^8 -+ s), then the CRT.
     {
-        const std::size_t p = 3;
-        const u32 s = mul(tables.s[p], power(u32((u64(1) << 32) % P), P - 2));
         u32 V[2][8] = {};
         for (int half = 0; half < 2; ++half) {
             const u32 t = half ? P - s : s;
@@ -213,7 +216,7 @@ void test_passes() {
                     V[half][(i + j) % 8] = add(V[half][(i + j) % 8], x);
                 }
         }
-        const u32 half = (P + 1) / 2, inverse = power(mul(2, s), P - 2);
+        const u32 half = mul((P + 1) / 2, rinv), inverse = mul(power(mul(2, s), P - 2), rinv);
         bool ok = true;
         for (int k = 0; k < 4; ++k) {
             ok = ok && V[0][2 * k + 1] == 0 && V[1][2 * k + 1] == 0;
@@ -222,15 +225,37 @@ void test_passes() {
         }
         CHECK(ok);
     }
+    // The product on pair 3: a(z^2) c(-z) mod (z^8 -+ s), a = lo +- s hi from leaf 3 of H.
+    {
+        bool ok = true;
+        for (int half = 0; half < 2; ++half) {
+            const u32 t = half ? P - s : s;
+            u32 a[8] = {}, out[8] = {};
+            for (int k = 0; k < 4; ++k) a[2 * k] = add(H[8 * p + k], mul(t, H[8 * p + k + 4]));
+            for (int i = 0; i < 8; ++i)
+                for (int j = 0; j < 8; ++j) {
+                    u32 x = mul(a[i], F[16 * p + 8 * half + j]);
+                    if (j % 2) x = x ? P - x : 0;
+                    if (i + j >= 8) x = mul(x, t);
+                    out[(i + j) % 8] = add(out[(i + j) % 8], x);
+                }
+            for (int k = 0; k < 8; ++k) ok = ok && rR[16 * p + 8 * half + k] == mul(out[k], rinv);
+        }
+        CHECK(ok);
+    }
     fps::simd::for_each(fps::simd::All{}, [&]<class S> {
         using N = c::detail::Pairs<c::detail::Narrow<S>>;
-        Vec f = F, G(2 * m), V(2 * m), W(2 * m), A(4 * m);
-        N::graeffe_pass(f.data(), G.data(), pairs, tables, true);
-        CHECK(f == rF && G == rG, S::lanes);
-        N::projection_pass(F.data(), F2.data(), V.data(), W.data(), pairs, tables);
-        CHECK(V == rV && W == rW, S::lanes);
-        N::spread_pass(H.data(), A.data(), pairs, tables);
-        CHECK(A == rA, S::lanes);
+        for (std::size_t p0 : {std::size_t(0), std::size_t(8)}) {
+            Vec G(2 * m), V(2 * m), W(2 * m), R(4 * m);
+            const std::size_t count = pairs - p0;
+            N::graeffe_run(F.data() + 16 * p0, G.data() + 8 * p0, p0, count, tables);
+            N::projection_run(F.data() + 16 * p0, F2.data() + 16 * p0, V.data() + 8 * p0, W.data() + 8 * p0, p0, count, tables);
+            N::product_run(H.data() + 8 * p0, F.data() + 16 * p0, R.data() + 16 * p0, p0, count, tables);
+            const auto tail = [p0](const Vec& x, const Vec& y, std::size_t per) {
+                return std::equal(x.begin() + std::ptrdiff_t(per * p0), x.end(), y.begin() + std::ptrdiff_t(per * p0));
+            };
+            CHECK(tail(G, rG, 8) && tail(V, rV, 8) && tail(W, rW, 8) && tail(R, rR, 16), S::lanes);
+        }
     });
 }
 

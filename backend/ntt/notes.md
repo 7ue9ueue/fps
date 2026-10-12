@@ -108,6 +108,12 @@ Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_produc
     alignment, count words). With an offset or add, the top level runs in place and one pass
     copies or adds the range. Work array: the thread's region (`place` keeps it 256 bytes from
     F's and out's page offsets), on the stack up to 2^10.
+- Hooked and pruned ops (issue #149, for backend/composition; notes/149-r1.md):
+  `forward_hooked(in, F, hook, zero)` hands each run of leaves to the caller's hook after its
+  bottom level; `inverse_hooked(hook, work, out, o, unused)` lets the hook write each run (times
+  2^-32) before its bottom level. A column bit zero in the forward's source (unused in the
+  inverse's output) prunes the groups above it to half their columns, the top level included
+  (`PrunedLevel` in common.hpp; avx2 `kernels::*_columns`, intrinsics `*_group_columns`).
 
 ### avx2
 

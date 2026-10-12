@@ -45,6 +45,10 @@
 //   const fps::ntt::Term terms[] = {{A, B}, {C, D}};
 //   t.inverse_product(terms, work, out);       // out = coefficients of A B + C D
 //
+//   // Hooked ops: the caller's pass on each run of leaves in cache; pruned levels (issue #149).
+//   t.forward_hooked(in, F, hook, zero);       // F = leaf form of in; hook(F + 8 i, i, count) on runs
+//   t.inverse_hooked(hook, work, out, o, unused);  // hook writes the leaves (times 2^-32), then inverse
+//
 // multiply(f, g, out): the product from and into the caller's memory, with nothing copied: the
 // first transform level reads f and g, the last writes out, the levels between run in this
 // thread's region (below). out gets f g cut to out.size() words, zeros past its last coefficient;
@@ -504,7 +508,39 @@ public:
                                  inverse_roots(), output);
     }
 
+    // Hooked ops (issue #149): the caller's pass over each run of leaves while it is in cache, and
+    // pruned levels for Kronecker layouts. hook(leaves, first, count) gets the leaves [first, first +
+    // count) of the leaf form at `leaves` (u32*, 8 count words, 32-byte aligned); count >= 4 a power of
+    // two, first a multiple of count. A column bit (a power of two of words; 0: none) skips the half
+    // of the columns above it: the levels above that bit of the index run on the words i with (i &
+    // bit) == 0 only. Not a power of two: std::invalid_argument.
+
+    // F = the leaf form of in (as forward(in, F)); hook(F + 8 first, first, count) after the bottom
+    // level of each run, which may read and change those leaves (canonical). in[i] must be 0 where
+    // i & zero is not 0.
+    template <class Variant = SelectedForward, class Hook>
+    void forward_hooked(std::span<const std::uint32_t> in, std::uint32_t* F, Hook hook, std::size_t zero = 0) const {
+        Variant::forward_hooked(in.data(), checked_source(in, length()), F, lg_, roots(), checked_bit(zero), hook);
+    }
+
+    // out[i] = coefficient o.offset + i of the polynomial whose leaf form times 2^-32 (as Montgomery
+    // products leave it) the hook writes: hook(work + 8 first, first, count) writes those leaves,
+    // canonical, then the inverse levels of the run. out[i] is unspecified where (o.offset + i) &
+    // unused is not 0. work, o: as cyclic_product.
+    template <class Variant = SelectedInverse, class Hook>
+    void inverse_hooked(Hook hook, std::uint32_t* work, std::span<std::uint32_t> out, Output o = {},
+                        std::size_t unused = 0) const {
+        const unsigned output = checked_output(out, o);
+        const std::size_t width = checked_bit(unused);
+        if (out.empty()) return;
+        Variant::inverse_hooked(hook, work, out.data(), out.size(), lg_, roots(), inverse_roots(), output, width);
+    }
+
 private:
+    static std::size_t checked_bit(std::size_t bit) {
+        if (bit & (bit - 1)) throw std::invalid_argument("fps::ntt::Transform: column bit not a power of two");
+        return bit;
+    }
     static std::size_t checked_source(std::span<const std::uint32_t> in, std::size_t most) {
         if (in.size() > most) throw std::out_of_range("fps::ntt::Transform: source longer than the transform");
         return in.size();
