@@ -337,3 +337,28 @@ belongs in `backend/`).
       `to_coefficients` still pays the copy out of the scratch (#49, part 3). The ns per
       coefficient of the cases with no kernel are within 5% of the table above (`lc-bench`
       values_product 6.86 to 6.92, pointwise conversions 7.55 to 10.02).
+  - Gate of 2026-10-12 (PR #50): avx2 1.0096 over 42 rounds, with `multiply/6` (f * g, 32 x 32,
+    the NTT) at 1.253, `/7` 1.037, `/8` 1.019, and their `@kernel` cases unmoved. Not placement:
+    the same four shapes alone (`--filter "^multiply(@kernel)?/[6789]$"`) gave 1.262, 1.042,
+    1.018 and 0.977, and 0.997 to 1.000 with `values(suite)` not called, the rest of the source
+    the same. Cause: with `Transform::forward` and `inverse` (avx2) in the program, GCC 15.2
+    inlines `product<GroupBottom>` into `Polynomial::convolution` and calls `Tree::visit` out of
+    line; without them it calls `Convolution::multiply [clone .part.0]`, which calls
+    `Tree<GroupBottom>::tile<4> [clone .isra.0]` directly (`nm`, `objdump` on `lc-amd`).
+    `forward_groups`, `forward_trees`, `forward_leaves`, `inverse_leaves` and `inverse_trees`
+    become out-of-line functions both paths share. Which of these costs the 35 ns is a guess. A
+    program that uses `Values` and `f * g` pays it; the backend can make its codegen not depend
+    on that: issue #81.
+    - Fix here: the `Values` cases move to `frontend/bench_values.cpp`, a binary of their own,
+      and `tools/kernel.py bench` times every `bench*.cpp` of a unit (AGENTS.md says so).
+      `frontend/bench.cpp` is main's again. `polynomial.hpp` is unchanged apart from
+      `detail::unwritten_polynomial`.
+    - Rebased onto main d1f5f4d (after #79, #80). Bench against it, 11 rounds, gated geomean:
+      `lc-bench` 1.0024 (`multiply/6` 1.005, all `multiply/<lg>` 0.995 to 1.005), `lc-intel`
+      1.0008, `lc-zen5` 1.0012, `lc-arm` 0.9967. API / kernel, lg 10 / 14 / 18 / 22:
+
+      | case | `lc-bench` (avx2) | `lc-intel` (avx512) | `lc-zen5` (zen5) | `lc-arm` (arm) |
+      |---|---:|---:|---:|---:|
+      | to_values | 0.992, 0.992, 1.002, 1.001 | 0.996, 1.004, 0.999, 1.001 | 0.986, 1.005, 1.000, 1.006 | 0.996, 1.002, 1.000, 1.000 |
+      | to_coefficients | 1.010, 1.087, 1.120, 1.182 | 1.015, 1.103, 1.184, 1.178 | 1.024, 1.106, 1.134, 1.159 | 1.025, 1.031, 1.036, 1.043 |
+      | add_coefficients | 1.028, 0.996, 1.012, 0.997 | 1.006, 0.998, 0.999, 0.995 | 1.031, 1.010, 1.000, 0.989 | 0.994, 1.004, 0.995, 0.999 |

@@ -16,7 +16,7 @@ Use your judgement; the few things that must hold are under Ground rules.
 ```
 DESIGN.md, BACKEND.md      the plans (frontend, backend); change them when you find better
 include/fps/               the frontend headers, API at the top of each
-frontend/                  its tests (test_<area>.cpp), bench.cpp, notes.md
+frontend/                  its tests (test_<area>.cpp), bench*.cpp, notes.md
 backend/<kernel>/          one kernel: headers (API at the top), select.hpp (variant per target),
                            test.cpp, bench.cpp, notes.md, gen_*.py and their generated output
 backend/bench.hpp          the timing harness every bench.cpp uses
@@ -39,7 +39,7 @@ Run from the checkout's root. Each script's `--help` has the details.
 |---|---|---|
 | `tools/vm.py <vm> [--base REV] '<cmd>'` | Mac | Copies your working tree (uncommitted changes too) to the VM and runs the command there. `--base` copies REV as well, as `$BASE`. |
 | `tools/kernel.py test <unit> --target <t>` | Mac, VM | Builds and runs every `test*.cpp` of a unit at -O2 and under ASan/UBSan. A unit is a kernel name or `frontend`. |
-| `tools/kernel.py bench <unit> [--base DIR]` | timing VM | Times `bench.cpp`; with `--base`, old and new in the same run, as paired ratios (below 1 is faster). Holds the bench lock. |
+| `tools/kernel.py bench <unit> [--base DIR]` | timing VM | Times each `bench*.cpp` (one binary each); with `--base`, old and new in the same run, as paired ratios (below 1 is faster). Holds the bench lock. |
 | `tools/kernel.py check` | anywhere | Generators and tuned tables match what is committed. |
 | `tools/tune.py <kernel>` | Mac | Measures a kernel's tuned choices on each target's timing machine; writes `tuned.json` and `tuned.hpp`. |
 | `tools/gate.py <pr> --merge` | Mac | Tests every affected unit on every target, times it against `main`, comments the report on the PR, and squash-merges on a pass. |

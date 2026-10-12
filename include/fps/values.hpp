@@ -35,13 +35,15 @@
 //
 // Cost against the backend (frontend/notes.md): to_values and raw::add_coefficients run as fast as
 // ntt::Transform by hand. to_coefficients(A) copies A into the scratch, runs the inverse there and
-// copies the coefficients out: one copy more than the kernel, 5% to 19% on Zen 3 from 2^10 to
+// copies the coefficients out: one copy more than the kernel, 1% to 18% on Zen 3 from 2^10 to
 // 2^22, as the backend has no inverse into other memory (backend issue #49). An rvalue A, as in
 // to_coefficients(A * B), is transformed in its own memory: no copy in. The leaf products and the
 // pointwise layout's conversions have no backend kernel yet (#49): they are plain scalar loops
 // here, about 7 ns per coefficient on Zen 3 for A * B in the automatic layout (5 forward
 // transforms) and 8 to 10 ns for each pointwise conversion. Products in the pointwise layout are a
 // modarith stream, about 0.2 ns per coefficient.
+// In a program that also runs f * g on avx2, GCC 15.2 compiles the NTT product differently: f * g
+// of 32 x 32 coefficients ran 25% slower on Zen 3, 64 x 64 4% (backend issue #81).
 #pragma once
 
 #include <algorithm>
