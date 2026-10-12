@@ -708,6 +708,25 @@ inline void forward_upper(u32* words, int lg, const u32* r) {
     forward_trees(f, h, 2, 2, r);
 }
 
+// forward_upper undone: the upper half of the leaf form of length 2L, L = 2^lg, to p mod (x^L + 1),
+// canonical; ir: the table of length 2L.
+inline void inverse_upper(u32* words, int lg, const u32* ir) {
+    auto* f = reinterpret_cast<Vec*>(words);
+    const std::size_t nv = (std::size_t(1) << lg) / 8, h = nv / 2;
+    const Factor scale(leaf_scale(lg));
+    if (has_radix2(lg + 1)) {
+        inverse_trees(f, nv, 1, 1, ir);
+        for (std::size_t i = 0; i < nv; ++i) f[i] = reduce(multiply(f[i], scale), kP);
+        return;
+    }
+    inverse_trees(f, h, 2, 2, ir);
+    const Factor sz(multiply_mod(leaf_scale(lg), ir[slot(1)]));
+    for (std::size_t i = 0; i < h; ++i) {
+        const Vec x = f[i], y = f[i + h];
+        f[i] = reduce(multiply(add(x, y), scale), kP), f[i + h] = reduce(multiply(diff(x, y), sz), kP);
+    }
+}
+
 inline void inverse(u32* words, int lg, const u32* ir) {
     auto* f = reinterpret_cast<Vec*>(words);
     const std::size_t nv = (std::size_t(1) << lg) / 8;
@@ -806,6 +825,10 @@ struct avx2 {
 
     static void inverse(std::uint32_t* f, int lg, const std::uint32_t* inverse_roots) {
         detail::avx2::inverse(f, lg, inverse_roots);
+    }
+
+    static void inverse_upper(std::uint32_t* f, int lg, const std::uint32_t* inverse_roots) {
+        detail::avx2::inverse_upper(f, lg, inverse_roots);
     }
 
     // Two groups per bottom kernel, but one at 2^7 and 2^8, where that was faster (notes.md).

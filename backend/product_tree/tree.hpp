@@ -18,6 +18,13 @@
 //   forward_upper of length L.
 // - Standard: one polynomial per node, leaf products mod (x^8 - w_v), the upper half as the
 //   lanes'. Per node: leaf products (and the copy), one inverse and one forward_upper of length L.
+//
+// Kept transforms (a Keep, for descents through the tree such as backend/evaluation's): at each
+// node [lo, hi) above the base, keep.place(lo, mid, hi, words) gives the rooms where the tree
+// builds its children's transforms of the node's length (words each); a null room is the tree's
+// own memory, overwritten later (the tree still takes it from its stack, unused: with NoKeep the
+// code is as without the hook). The standard tree's root also writes its product transform
+// (before the inverse) to keep.root(words) if not null.
 #pragma once
 
 #include <algorithm>
@@ -63,8 +70,12 @@ public:
             return p;
         }
         spilled_.push_back(std::make_unique<Line[]>(need / 16));
+        ever_spilled_ = true;
         return spilled_.back()[0].words;
     }
+
+    // Whether a take went past the span (for tests of callers' sizes).
+    bool ever_spilled() const { return ever_spilled_; }
 
 private:
     struct alignas(64) Line {
@@ -73,6 +84,7 @@ private:
     u32* base_;
     std::size_t size_, top_ = 0;
     std::vector<std::unique_ptr<Line[]>> spilled_;
+    bool ever_spilled_ = false;
 };
 
 // This thread's transforms, one per length, kept across calls.
@@ -108,6 +120,18 @@ inline const u32* leaf_weights(std::size_t count) {
     return weights.data();
 }
 
+// Rooms for a node's children's transforms (Keep::place); null: the tree's own memory.
+struct Rooms {
+    u32* left = nullptr;
+    u32* right = nullptr;
+};
+
+// A Keep that keeps nothing: the trees run as without the hook.
+struct NoKeep {
+    Rooms place(std::size_t, std::size_t, std::size_t, std::size_t) const { return {}; }
+    u32* root(std::size_t) const { return nullptr; }
+};
+
 // The leaf of a tree's leaves where node [lo, hi) splits, from prefix[k] = degree(0) + ... +
 // degree(k - 1): the sums before and after it closest to halves.
 inline std::size_t split(const u32* prefix, std::size_t lo, std::size_t hi) {
@@ -138,7 +162,8 @@ inline LaneNode combine(const LaneNode& x, const LaneNode& y) {
 //   LaneNode load(std::size_t k, u32* c) const;
 //       // writes the degree(k) + 1 coefficients of slot k at c (8 words each, Montgomery form,
 //       // zero past a lane's degree)
-template <class Leaves>
+// Keep: kept transforms (above); NoKeep for none.
+template <class Leaves, class Keep = NoKeep>
 class LaneTree {
 public:
     struct Root {
@@ -150,7 +175,8 @@ public:
     static std::size_t length(u32 degree) { return std::max<std::size_t>(8, std::bit_ceil(degree)); }
 
     // The prefix sums of the slots' degrees go in the stack.
-    LaneTree(const Leaves& leaves, Stack& stack) : leaves_(leaves), stack_(stack), prefix_(stack.take(leaves.count() + 1)) {
+    LaneTree(const Leaves& leaves, Stack& stack, Keep keep = {})
+        : leaves_(leaves), stack_(stack), keep_(keep), prefix_(stack.take(leaves.count() + 1)) {
         prefix_[0] = 0;
         for (std::size_t k = 0; k < leaves.count(); ++k) prefix_[k + 1] = prefix_[k] + leaves.degree(k);
     }
@@ -161,17 +187,20 @@ public:
         const std::size_t count = leaves_.count();
         const u32 d = degree(0, count);
         const std::size_t len = length(d);
-        if (count == 1 || d <= kLaneBase) {
+        if (base(0, count)) {
             u32* const c = stack_.take(8 * (d + 1));
             return {c, coefficients(0, count, c), d};
         }
         u32* const a = stack_.take(8 * len + 8);
         const Stack::Mark mark = stack_.mark();
         u32* const b = stack_.take(8 * len);
-        const std::size_t mid = split(prefix_, 0, count);
-        const LaneNode left = build(0, mid, a, len);
-        const LaneNode node = combine(left, build(mid, count, b, len));
-        pointwise<Wide>(a, b, a, 8 * len);
+        const std::size_t mid = split(0, count);
+        const Rooms room = keep_.place(0, mid, count, 8 * len);
+        u32* const left_at = room.left ? room.left : a;  // NoKeep: a and b, as without the hook
+        u32* const right_at = room.right ? room.right : b;
+        const LaneNode left = build(0, mid, left_at, len);
+        const LaneNode node = combine(left, build(mid, count, right_at, len));
+        pointwise<Wide>(left_at, right_at, a, 8 * len);
         inverse(a, 8 * len);
         for (int l = 0; l < 8; ++l) {
             const u32 top = node.degree[l] == len ? node.lead[l] : 0;
@@ -182,9 +211,13 @@ public:
         return {a, node, len};
     }
 
-private:
+    // The structure, for descents: the degree of slots [lo, hi) (every lane's largest), where the
+    // node splits, and whether it is a base node (multiplied out and transformed, no children).
     u32 degree(std::size_t lo, std::size_t hi) const { return prefix_[hi] - prefix_[lo]; }
+    std::size_t split(std::size_t lo, std::size_t hi) const { return detail::split(prefix_, lo, hi); }
+    bool base(std::size_t lo, std::size_t hi) const { return hi - lo == 1 || degree(lo, hi) <= kLaneBase; }
 
+private:
     // The degree(lo, hi) + 1 coefficients of node [lo, hi) at c: a leaf, or a node of degree <=
     // kLaneBase multiplied out in consecutive pairs, level by level.
     LaneNode coefficients(std::size_t lo, std::size_t hi, u32* c) const {
@@ -226,7 +259,7 @@ private:
     // out = the transform of node [lo, hi) of 8 out_length words (out_length >= its length).
     LaneNode build(std::size_t lo, std::size_t hi, u32* out, std::size_t out_length) {
         const u32 d = degree(lo, hi);
-        if (hi - lo == 1 || d <= kLaneBase) {  // out_length > d: not the root
+        if (base(lo, hi)) {  // out_length > d: not the root
             const LaneNode node = coefficients(lo, hi, out);
             std::fill(out + 8 * (d + 1), out + 8 * out_length, 0u);
             forward(out, 8 * out_length);
@@ -236,17 +269,21 @@ private:
         const Stack::Mark mark = stack_.mark();
         u32* const a = out_length >= 2 * len ? out + words : stack_.take(words);
         u32* const c = stack_.take(words + 8);  // the right child's transform, then p's coefficients
-        const std::size_t mid = split(prefix_, lo, hi);
-        const LaneNode left = build(lo, mid, a, len);
-        const LaneNode node = combine(left, build(mid, hi, c, len));
+        const std::size_t mid = split(lo, hi);
+        const Rooms room = keep_.place(lo, mid, hi, words);
+        u32* const left_at = room.left ? room.left : a;  // NoKeep: a and c, as without the hook
+        u32* const right_at = room.right ? room.right : c;
+        const LaneNode left = build(lo, mid, left_at, len);
+        const LaneNode node = combine(left, build(mid, hi, right_at, len));
         if (out_length == len) {
-            pointwise<Wide>(a, c, out, words);
+            pointwise<Wide>(left_at, right_at, out, words);
         } else {
             // a = out + words, the upper half: the forward_upper of p mod (X^L + 1). Longer
-            // extensions (out_length > 2L) need p itself: then c keeps it.
+            // extensions (out_length > 2L) need p itself: then c keeps it (c is not kept: the
+            // kept children are elsewhere).
             const bool longer = out_length > 2 * len;
             u32* const h = longer ? c : a;
-            pointwise2<Wide>(a, c, out, h, words);
+            pointwise2<Wide>(left_at, right_at, out, h, words);
             inverse(h, words);
             // h = p mod (X^L - 1) = p + top (1 - X^L), top = p[L] or 0.
             alignas(32) u32 top[8];
@@ -270,6 +307,7 @@ private:
 
     const Leaves& leaves_;
     Stack& stack_;
+    [[no_unique_address]] Keep keep_;
     u32* prefix_;  // prefix_[k] = degree(0) + ... + degree(k - 1)
 };
 
@@ -286,11 +324,14 @@ struct Node {
     u32 degree, lead;  // lead in Montgomery form
 };
 
+// Keep: kept transforms (above); NoKeep for none.
+template <class Keep = NoKeep>
 class StandardTree {
 public:
     static std::size_t length(u32 degree) { return std::max<std::size_t>(64, std::bit_ceil(degree)); }
 
-    StandardTree(std::span<const Leaf> leaves, Stack& stack) : leaves_(leaves), stack_(stack), prefix_(stack.take(leaves.size() + 1)) {
+    StandardTree(std::span<const Leaf> leaves, Stack& stack, Keep keep = {})
+        : leaves_(leaves), stack_(stack), keep_(keep), prefix_(stack.take(leaves.size() + 1)) {
         prefix_[0] = 0;
         for (std::size_t k = 0; k < leaves.size(); ++k) prefix_[k + 1] = prefix_[k] + leaves[k].degree;
         const std::size_t len = length(prefix_[leaves.size()]);
@@ -301,7 +342,7 @@ public:
     u32* root() {
         const std::size_t count = leaves_.size();
         const u32 d = degree(0, count);
-        if (count == 1 || d <= kStandardBase) {
+        if (base(0, count)) {
             u32* const c = stack_.take(d + 1);
             coefficients(0, count, c);
             return c;
@@ -309,10 +350,13 @@ public:
         const std::size_t len = length(d);
         u32* const a = stack_.take(len + 1);
         u32* const b = stack_.take(len);
-        const std::size_t mid = split(prefix_, 0, count);
-        const Node left = build(0, mid, a, len);
-        const Node right = build(mid, count, b, len);
-        leaf_products<Lanes>(a, b, a, len / 8, weights_);
+        const std::size_t mid = split(0, count);
+        const Rooms room = keep_.place(0, mid, count, len);
+        u32* const left_at = room.left ? room.left : a;  // NoKeep: a and b, as without the hook
+        u32* const right_at = room.right ? room.right : b;
+        const Node left = build(0, mid, left_at, len);
+        const Node right = build(mid, count, right_at, len);
+        leaf_products<Lanes>(left_at, right_at, a, len / 8, weights_, keep_.root(len));
         inverse(a, len);
         const u32 top = d == len ? montgomery(left.lead, right.lead) : 0;
         a[0] = a[0] >= top ? a[0] - top : a[0] + kP - top;
@@ -320,9 +364,12 @@ public:
         return a;
     }
 
-private:
+    // The structure, for descents (as LaneTree's).
     u32 degree(std::size_t lo, std::size_t hi) const { return prefix_[hi] - prefix_[lo]; }
+    std::size_t split(std::size_t lo, std::size_t hi) const { return detail::split(prefix_, lo, hi); }
+    bool base(std::size_t lo, std::size_t hi) const { return hi - lo == 1 || degree(lo, hi) <= kStandardBase; }
 
+private:
     Node load(std::size_t k, u32* c) const {
         const Leaf& f = leaves_[k];
         if (f.stride != 1) {
@@ -379,7 +426,7 @@ private:
     // out = the transform of node [lo, hi) of out_length words (out_length >= its length).
     Node build(std::size_t lo, std::size_t hi, u32* out, std::size_t out_length) {
         const u32 d = degree(lo, hi);
-        if (hi - lo == 1 || d <= kStandardBase) {
+        if (base(lo, hi)) {
             const Node node = coefficients(lo, hi, out);
             std::fill(out + d + 1, out + out_length, 0u);
             forward(out, out_length);
@@ -389,18 +436,21 @@ private:
         const Stack::Mark mark = stack_.mark();
         u32* const a = out_length >= 2 * len ? out + len : stack_.take(len);
         u32* const c = stack_.take(len + 8);  // the right child's transform, then p's coefficients
-        const std::size_t mid = split(prefix_, lo, hi);
-        const Node left = build(lo, mid, a, len);
-        const Node right = build(mid, hi, c, len);
+        const std::size_t mid = split(lo, hi);
+        const Rooms room = keep_.place(lo, mid, hi, len);
+        u32* const left_at = room.left ? room.left : a;  // NoKeep: a and c, as without the hook
+        u32* const right_at = room.right ? room.right : c;
+        const Node left = build(lo, mid, left_at, len);
+        const Node right = build(mid, hi, right_at, len);
         const Node node{d, montgomery(left.lead, right.lead)};
         if (out_length == len) {
-            leaf_products<Lanes>(a, c, out, len / 8, weights_);
+            leaf_products<Lanes>(left_at, right_at, out, len / 8, weights_);
         } else {
             // As the lanes' (LaneTree::build): a = out + len gets the forward_upper of p mod
             // (x^L + 1); c keeps p for longer extensions.
             const bool longer = out_length > 2 * len;
             u32* const h = longer ? c : a;
-            leaf_products<Lanes>(a, c, out, len / 8, weights_, h);
+            leaf_products<Lanes>(left_at, right_at, out, len / 8, weights_, h);
             inverse(h, len);
             const u32 top = d == len ? node.lead : 0;
             if (longer) {
@@ -422,6 +472,7 @@ private:
 
     std::span<const Leaf> leaves_;
     Stack& stack_;
+    [[no_unique_address]] Keep keep_;
     u32* prefix_;
     const u32* weights_;
 };
