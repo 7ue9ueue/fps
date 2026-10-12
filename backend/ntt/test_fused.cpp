@@ -273,6 +273,9 @@ int main() {
 #ifdef __AVX2__
     test_variant<variant::avx2>("avx2", kMaxTestLog);
 #endif
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+    test_variant<variant::avx512>("avx512", kMaxTestLog);
+#endif
     test_variant<variant::tuned>("tuned", kMaxTestLog);
     if (failures) {
         std::printf("%d failures\n", failures);

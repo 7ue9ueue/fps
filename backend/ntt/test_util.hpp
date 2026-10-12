@@ -326,7 +326,7 @@ inline std::vector<u32> reference_product(const char* name, const std::vector<u3
 }
 
 // f.operator()<V>(name, max_lg) for every variant this machine runs: scalar, intrinsics<S> for
-// every simd struct (Scalar is slow, so shorter), avx2.
+// every simd struct (Scalar is slow, so shorter), avx2, avx512.
 template <class F>
 inline void for_each_variant(F f) {
     f.template operator()<variant::scalar>("scalar", kScalarMaxLog);
@@ -336,6 +336,9 @@ inline void for_each_variant(F f) {
     });
 #ifdef __AVX2__
     f.template operator()<variant::avx2>("avx2", kVectorMaxLog);
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+    f.template operator()<variant::avx512>("avx512", kVectorMaxLog);
 #endif
 }
 

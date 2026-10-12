@@ -32,6 +32,13 @@ struct Narrow<simd::Avx512> {
 };
 #endif
 
+// Generated kernels in place of some of the code below, for S (avx512.hpp: variant::avx512 runs
+// this file on a struct of its own, with asm forward groups and product bottoms). None here.
+template <class S>
+struct Generated {
+    static constexpr bool kOn = false;
+};
+
 // Lazy arithmetic mod P on S: values < 4P in forward transforms, < 2P in inverse ones.
 template <class S>
 struct Arith {
@@ -339,6 +346,8 @@ struct Butterflies : Arith<S> {
     template <int kIn, int kLoad>
     [[gnu::always_inline]] static void forward_group_part(const u32* from, u32* f, std::size_t q, std::size_t words,
                                                           std::size_t k, const u32* r) {
+        if constexpr (Generated<S>::kOn && kLoad == 4)
+            if (from == f && Generated<S>::template forward<kIn>(f, q, words, k, r)) return;
         if constexpr (kLoad <= 1) {
             prefetching(q, kPrefetchMin, [&]<bool kPf> [[gnu::always_inline]] (std::bool_constant<kPf>) {
                 const bool write = from != f;
@@ -1277,6 +1286,8 @@ struct Ntt : Butterflies<S> {
     // The bottom stages of Transform's fused ops (Bottom::multiply_stored, inverse_terms).
     static void bottom_multiply_stored(u32* a, const u32* b, std::size_t count, std::size_t first, const u32* r,
                                        const u32* ir) {
+        if constexpr (Generated<S>::kOn)
+            if (count % 2 == 0) return Generated<S>::multiply_stored(a, b, count, first, r, ir);
         if constexpr (kWideBottom)
             if (count % 2 == 0) return WideBottom<S>::multiply_stored(a, b, count, first, r, ir);
         Leaf::multiply_stored(a, b, count, first, r, ir);
@@ -1290,6 +1301,8 @@ struct Ntt : Butterflies<S> {
     template <bool kSquare>
     static void bottom_multiply(u32* a, const u32* b, std::size_t count, std::size_t first, const u32* r,
                                 const u32* ir) {
+        if constexpr (Generated<S>::kOn)
+            if (count % 2 == 0) return Generated<S>::template multiply<kSquare>(a, b, count, first, r, ir);
         if constexpr (kWideBottom)
             if (count % 2 == 0) return WideBottom<S>::template multiply<kSquare>(a, b, count, first, r, ir);
         Leaf::template multiply<kSquare>(a, b, count, first, r, ir);

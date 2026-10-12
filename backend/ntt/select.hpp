@@ -29,6 +29,7 @@
 #ifdef __AVX2__
 #include "backend/ntt/avx2.hpp"
 #endif
+#include "backend/ntt/avx512.hpp"
 
 namespace fps::ntt {
 
@@ -43,11 +44,16 @@ template <class... V>
 struct Candidates {};
 
 // Per target, the variants that are fastest at some op and length on our machines (notes.md). With
-// AVX-512: the asm, intrinsics on ymm (32 registers) and on zmm. With AVX2 alone the asm: on Zen 3
-// intrinsics<Avx2> won only forward at 2^8 (2.7%), and its code in the binary, even unused, made
-// f * g at 2^6 22-31% slower there (code placement). Elsewhere intrinsics on the widest struct.
-// A target with one candidate reads no table.
-#if defined(__AVX512F__) && defined(__AVX512BW__)  // avx512, zen5
+// AVX-512: the asm, intrinsics on ymm (32 registers) and on zmm, and on avx512 (Emerald Rapids) the
+// zmm intrinsics with generated asm kernels (avx512.hpp; Zen 5's tuning is issue #152). With AVX2
+// alone the asm: on Zen 3 intrinsics<Avx2> won only forward at 2^8 (2.7%), and its code in the
+// binary, even unused, made f * g at 2^6 22-31% slower there (code placement). Elsewhere
+// intrinsics on the widest struct. A target with one candidate reads no table.
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && !defined(__znver4__) && \
+    !defined(__znver5__)  // avx512
+using Selected = Candidates<variant::avx2, variant::intrinsics<simd::Avx512Vl>, variant::intrinsics<simd::Avx512>,
+                            variant::avx512>;
+#elif defined(__AVX512F__) && defined(__AVX512BW__)  // zen5
 using Selected = Candidates<variant::avx2, variant::intrinsics<simd::Avx512Vl>, variant::intrinsics<simd::Avx512>>;
 #elif defined(__AVX2__)
 using Selected = Candidates<variant::avx2>;
@@ -71,6 +77,12 @@ struct Name;
 template <>
 struct Name<variant::avx2> {
     static constexpr std::string_view prefix = "avx2", isa = "";
+};
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+template <>
+struct Name<variant::avx512> {
+    static constexpr std::string_view prefix = "avx512", isa = "";
 };
 #endif
 template <class S>

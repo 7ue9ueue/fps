@@ -3,7 +3,7 @@
 //   multiply/<lg>                Convolution::multiply, factors of 2^lg / 2 coefficients each.
 //   multiply_dense/<lg>          factors of 3 2^lg / 4 and 2^lg / 4 + 1 coefficients.
 //   <op>@<variant>/<lg>          one variant: scalar, intrinsics_<simd struct>, avx2 (unless the
-//                                target's one candidate, select.hpp).
+//                                target's one candidate, select.hpp), avx512.
 //   convolution/<lg>             a Convolution of 2^lg / 2 and 2^lg / 2 coefficients constructed,
 //                                multiplied and destroyed, to 2^22: construction against multiply/<lg>.
 //   convolution_into/<lg>        the same with a in the caller's memory, 64 bytes past a page boundary.
@@ -223,6 +223,9 @@ int main(int argc, char** argv) {
 #ifdef __AVX2__
     if constexpr (!only_candidate<variant::avx2>)
         add_cases<variant::avx2, variant::avx2, variant::avx2>(suite, "@avx2", kVariantMaxLog);
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+    add_cases<variant::avx512, variant::avx512, variant::avx512>(suite, "@avx512", kVariantMaxLog);
 #endif
     add_convolution_cases(suite);
     add_product_cases(suite);
