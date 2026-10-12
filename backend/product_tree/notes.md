@@ -52,8 +52,9 @@ both also over any span of items with a projection to their words). Trees: `tree
 
 ## Measurements
 
-Bench (`bench.cpp`), GCC 15.2, medians of 5 rounds, ns per factor, commit 43a68fc (`lc-arm`: 3
-rounds of cd70b24, the same trees with `kMinLaneFactors` 64 and no cases below 2^10).
+Bench (`bench.cpp`), GCC 15.2, medians of 5 rounds, ns per factor, commit 328b28a (on main
+a34ce14; `lc-arm`: 3 rounds of 2bd03d3, the same trees with `kMinLaneFactors` 64 and no cases
+below 2^10).
 `product/<lg>`: 2^lg factors x - r; `product_mixed`: degrees 0 .. 8, a quarter constants (sum
 about 3.4 2^lg); `product_few/<lg>`: 8 factors of 2^lg / 8 or 2^lg / 8 + 1 coefficients.
 
@@ -72,7 +73,7 @@ about 3.4 2^lg); `product_few/<lg>`: 8 factors of 2^lg / 8 or 2^lg / 8 + 1 coeff
 Against the frontend's former tree of `f * g` (main a34ce14), frontend `product/<lg>`, 7 rounds,
 new/base at lg 10 / 14 / 18: `lc-bench` 0.309 / 0.309 / 0.322 (40.6 ns per factor at 2^18, was
 126); `lc-intel` 0.395 / 0.364 / 0.361; `lc-zen5` 0.355 / 0.329 / 0.333; `lc-arm` (5 rounds,
-cd70b24) 0.372 / 0.353 / 0.348.
+2bd03d3) 0.372 / 0.353 / 0.348.
 
 Zen 3 (`lc-bench`), 2^18 linear factors, phases (`explore_profile.cpp`, Log): all 10.39 ms; lane
 tree 6.87 (slot loads 0.87, base schoolbook about 0.4, base forwards 0.2, 11 levels of
