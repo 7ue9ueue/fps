@@ -11,8 +11,10 @@ machine by `tools/tune.py`, and run-time tuning (explicit, FFTW-style wisdom) ca
 ## Starting point
 
 lc-opt's kernels (`lib/ntt`, `lib/poly`, `lib/multimod`) are AVX2 only, tuned for Zen 3, with no
-fallback and no other ISA. Their notes hold the measurements and lessons (register
-pressure, spills, aliasing, Zen 3 instruction costs). Read them before exploring a kernel they cover.
+fallback and no other ISA. They are the fastest implementations we have: start from their code
+(it may move here) and their notes, which hold the measurements and lessons (register pressure,
+spills, aliasing, Zen 3 instruction costs, and the attempts that lost). Read both before exploring
+a kernel they cover. For other ISAs, port the algorithm and the generators, and measure.
 
 v1 serves one modulus, P = 998244353 (DESIGN.md). Kernels for other moduli (`multimod`, `crt`)
 come after v1.
