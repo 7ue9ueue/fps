@@ -116,7 +116,8 @@ inline void multiply_by(u32* f, std::size_t n, u32 c) {
     using M = modarith::Ops<S, kP>;
     const typename S::V factor = S::broadcast(mul(c, kR));
     std::size_t k = 0;
-    for (; k + S::lanes <= n; k += S::lanes) S::store(f + k, M::template reduce<kP>(M::montgomery(S::load(f + k), factor)));
+    for (; k + S::lanes <= n; k += S::lanes)
+        S::store(f + k, M::template reduce<kP>(M::montgomery(S::load(f + k), factor)));
     for (; k < n; ++k) f[k] = mul(f[k], c);
 }
 
@@ -237,7 +238,8 @@ void products_lanes(const U& u, std::size_t n, u32* prefix, u32 sp, u32* inverse
             });
         detail::unrolled<K>([&](auto v) {
             factorials::transpose(tile[v]);
-            for (int i = 0; i < L; ++i) S::store(inverse_prefix + starts[v * L + i] + j - L, M::template reduce<kP>(tile[v][i]));
+            for (int i = 0; i < L; ++i)
+                S::store(inverse_prefix + starts[v * L + i] + j - L, M::template reduce<kP>(tile[v][i]));
         });
     }
 }
@@ -245,7 +247,8 @@ void products_lanes(const U& u, std::size_t n, u32* prefix, u32 sp, u32* inverse
 template <class U>
 void products(const U& u, std::size_t n, u32* prefix, u32 sp, u32* inverse_prefix, u32 si) {
     constexpr std::size_t kMin = std::size_t(kLanesVectors) * Wide::lanes * Wide::lanes;
-    if (n >= std::max(kMin, kLanesMinSize)) return products_lanes<Wide, kLanesVectors>(u, n, prefix, sp, inverse_prefix, si);
+    if (n >= std::max(kMin, kLanesMinSize))
+        return products_lanes<Wide, kLanesVectors>(u, n, prefix, sp, inverse_prefix, si);
     products_scalar(u, n, prefix, sp, inverse_prefix, si);
 }
 

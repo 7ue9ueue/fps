@@ -24,7 +24,6 @@
 #pragma once
 
 #include <algorithm>
-#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -90,8 +89,7 @@ inline void evaluate_geometric(std::span<const u32> f, u32 a, u32 r, std::span<u
     multiply_chirp(1, 1, r, out);
 }
 
-template <Products kProducts = kInterpolationProducts>
-void interpolate_geometric(u32 a, u32 r, std::span<const u32> y, std::span<u32> out) {
+inline void interpolate_geometric(u32 a, u32 r, std::span<const u32> y, std::span<u32> out) {
     using namespace detail;
     const std::size_t n = y.size();
     if (out.size() != n) throw std::invalid_argument("fps::chirp::interpolate_geometric: out and y differ in size");
@@ -113,41 +111,20 @@ void interpolate_geometric(u32 a, u32 r, std::span<const u32> y, std::span<u32> 
         return newton(x.data(), y.data(), out.data(), n);
     }
     const u32 r_inverse = inverse(r);
-    const int lg = std::max(ntt::kMinLog, int(std::bit_width(2 * n - 2)));  // 2^lg >= 2n - 1
-    const bool transform = kProducts == Products::transform && lg <= ntt::kValuesMaxLog;
-    const std::size_t len = std::size_t(1) << lg, words = (n + 16) / 16 * 16, span = len + ntt::kPadding;
-    // A and B = 1 / A: products of u(s) = r - r^-s. Then work (n words, or a transform's span).
-    u32* A = Scratch::get(2 * words + (transform ? 2 * span : 2 * words));
-    u32 *B = A + words, *work = B + words, *e = work + (transform ? span : words);
+    // A and B = 1 / A: products of u(s) = r - r^-s.
+    const std::size_t words = (n + 16) / 16 * 16;
+    u32* A = Scratch::get(4 * words);
+    u32 *B = A + words, *work = B + words, *e = work + words;
     products(Geometric(r, kP - 1, r_inverse), n - 1, A, 1, B, 1);
     if (A[n - 1] == 0) not_distinct();
     // work_i = y_i B_i (-1)^i r^-t(i); E' = work B mod x^n.
     multiply_chirp(1, kP - 1, r_inverse, y, {work, n});
     multiply(work, B, work, n);
-    if (transform) {
-        // Products in the values form, with B's transform (in e) shared: 5 transforms, not 6.
-        const ntt::Transform t(lg);
-        std::copy_n(B, n, e);
-        std::fill(e + n, e + span, 0u);
-        t.forward(e, ntt::Form::values);
-        const auto product = [&] {  // work[0, n) = work[0, n) B mod x^n
-            std::fill(work + n, work + span, 0u);
-            t.forward(work, ntt::Form::values);
-            multiply(work, e, work, len);
-            t.inverse(work, ntt::Form::values);
-        };
-        product();
-        multiply(A, work, work, n);
-        std::reverse(work, work + n);
-        product();
-        e = work;
-    } else {
-        ntt::multiply({work, n}, {B, n}, {e, n});
-        // work = (A E') reversed; H reversed = work B mod x^n.
-        multiply(A, e, work, n);
-        std::reverse(work, work + n);
-        ntt::multiply({work, n}, {B, n}, {e, n});
-    }
+    ntt::multiply({work, n}, {B, n}, {e, n});
+    // work = (A E') reversed; H reversed = work B mod x^n.
+    multiply(A, e, work, n);
+    std::reverse(work, work + n);
+    ntt::multiply({work, n}, {B, n}, {e, n});
     // f_l = (-1/a)^l r^-t(l) B_l H_l.
     std::reverse(e, e + n);
     multiply(e, B, e, n);

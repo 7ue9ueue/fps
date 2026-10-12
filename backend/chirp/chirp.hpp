@@ -179,7 +179,9 @@ void multiply_chirp(u32 c, u32 s, u32 q, std::span<const u32> f, std::span<u32> 
         using M = modarith::Ops<S, kP>;
         constexpr u32 R = u32((u64(1) << 32) % kP);
         detail::pass<true>(Terms<S, K>(detail::mul(c, R), s, q), f.data(), out.data(), out.size(),
-                           [](typename S::V x, typename S::V a) { return M::template reduce<kP>(M::montgomery(a, x)); });
+                           [](typename S::V x, typename S::V a) {
+                               return M::template reduce<kP>(M::montgomery(a, x));
+                           });
     }
 }
 

@@ -6,7 +6,6 @@
 //   products@lanes<K>/<lg>      in scalar chains or in lanes, K in {1, 2, 4}, lg in {10, 16, 20}
 //   evaluate_geometric/<lg>     f of 2^lg coefficients at 2^lg points a r^i
 //   interpolate_geometric/<lg>  2^lg values at a r^i -> coefficients
-//   interpolate_geometric@<products>/<lg>   the same with ntt::multiply or ntt::Transform products
 //   extrapolate/<lg>            2^lg samples f(0 .. n - 1) -> f(c + k), k < 2^lg, c past the samples
 #include <cstdint>
 #include <random>
@@ -99,18 +98,6 @@ int main(int argc, char** argv) {
         suite.add("interpolate_geometric" + size, [n, lg] {
             return [y = random_words(n, unsigned(lg)), out = std::vector<u32>(n)]() mutable {
                 fps::chirp::interpolate_geometric(kC, kS, y, out);
-                bench::keep(out);
-            };
-        }, n);
-        suite.add("interpolate_geometric@transform" + size, [n, lg] {
-            return [y = random_words(n, unsigned(lg)), out = std::vector<u32>(n)]() mutable {
-                fps::chirp::interpolate_geometric<fps::chirp::Products::transform>(kC, kS, y, out);
-                bench::keep(out);
-            };
-        }, n);
-        suite.add("interpolate_geometric@multiply" + size, [n, lg] {
-            return [y = random_words(n, unsigned(lg)), out = std::vector<u32>(n)]() mutable {
-                fps::chirp::interpolate_geometric<fps::chirp::Products::multiply>(kC, kS, y, out);
                 bench::keep(out);
             };
         }, n);

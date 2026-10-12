@@ -1,11 +1,12 @@
 // Tests of backend/chirp. Terms and chirp / multiply_chirp, for every struct this target runs and
-// K in {1, 2, 4, 8}: terms against the recurrence x_(k+1) = x_k s q^k, sizes 0 .. 99, powers of
-// two and neighbours, random sizes up to 2^16 + small; c, s, q in {0, 1, 2, P - 1} and random;
-// spans at offsets 0 .. 3 words with guard words around them. evaluate_geometric against Horner
-// (all points up to n m = 2^22, sampled beyond); interpolate_geometric (both products) by the round trip from a
-// random f (against O(n^2) Lagrange for small n), its errors; extrapolate from random samples
-// against Lagrange at c + k, with c at, inside, past and wrapping around the samples. Exits
-// nonzero on a failure. Also the prefix products under them (scan.hpp), every variant.
+// K in {1, 2, 4, 8} (and the default K across kLargeSize): terms against the recurrence
+// x_(k+1) = x_k s q^k, sizes 0 .. 99, powers of two and neighbours, random sizes up to 2^16 +
+// small; c, s, q in {0, 1, 2, P - 1} and random; spans at offsets 0 .. 3 words with guard words
+// around them. The prefix products under the rest (scan.hpp), every variant, against running
+// products. evaluate_geometric against Horner (all points up to n, m = 1000, sampled beyond);
+// interpolate_geometric against O(n^2) Lagrange and by round trips from a random
+// f, and its errors; extrapolate from random samples against Lagrange at c + k, with c at, inside,
+// past and wrapping around the samples. Exits nonzero on a failure.
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -105,7 +106,8 @@ void test_terms() {
             for (int v = 0; v < K; ++v) {
                 u32 lanes[S::lanes];
                 S::store(lanes, terms[v]);
-                for (int l = 0; l < S::lanes; ++l) ok = ok && lanes[l] < 2 * P && lanes[l] % P == x[j * W + v * S::lanes + l];
+                for (int l = 0; l < S::lanes; ++l)
+                    ok = ok && lanes[l] < 2 * P && lanes[l] % P == x[j * W + v * S::lanes + l];
             }
         check(ok, name + " Terms");
     }
@@ -171,7 +173,8 @@ void check_products(const U& u, std::size_t n, const std::string& what) {
     fps::simd::for_each(fps::simd::All{}, [&]<class S> {
         const auto lanes = [&]<int K> {
             if (n >= std::size_t(K) * S::lanes * S::lanes)
-                run_one([](auto&&... a) { d::products_lanes<S, K>(a...); }, std::string(S::name) + " K=" + std::to_string(K));
+                run_one([](auto&&... a) { d::products_lanes<S, K>(a...); },
+                        std::string(S::name) + " K=" + std::to_string(K));
         };
         lanes.template operator()<1>();
         lanes.template operator()<2>();
@@ -187,7 +190,8 @@ void test_products() {
     for (std::size_t n : ns) {
         check_products(fps::chirp::detail::Arithmetic{u32(1 + rng() % (P - 70000))}, n, "products arithmetic");
         check_products(fps::chirp::detail::Arithmetic{u32(P - n / 2)}, n, "products arithmetic through 0");
-        check_products(fps::chirp::detail::Geometric(random_word(), random_word(), random_word() | 1), n, "products geometric");
+        check_products(fps::chirp::detail::Geometric(random_word(), random_word(), random_word() | 1), n,
+                       "products geometric");
     }
 }
 
@@ -253,12 +257,11 @@ void test_interpolate() {
     for (std::size_t n : {0, 1, 2, 3, 4, 7, 8, 9, 31, 32, 33, 34, 63, 64, 65, 100, 127, 128, 129, 300}) {
         for (int trial = 0; trial < 3; ++trial) {
             const u32 a = trial == 0 ? 1 : random_word() | 1, r = trial == 1 ? 2 : random_word() | 1;
-            const Vec y = random_vec(n), expect = lagrange(a, r, y);
-            Vec out(n), other(n);
+            const Vec y = random_vec(n);
+            Vec out(n);
             fps::chirp::interpolate_geometric(a, r, y, out);
-            fps::chirp::interpolate_geometric<fps::chirp::Products::transform>(a, r, y, other);
-            check(out == expect && other == expect, "interpolate_geometric n=" + std::to_string(n) +
-                                                        " a=" + std::to_string(a) + " r=" + std::to_string(r));
+            check(out == lagrange(a, r, y), "interpolate_geometric n=" + std::to_string(n) + " a=" + std::to_string(a) +
+                                                " r=" + std::to_string(r));
         }
     }
     // r = 0 with two points; r = P - 1 (order 2) with two.
@@ -269,15 +272,14 @@ void test_interpolate() {
         check(out == lagrange(3, r, y), "interpolate_geometric n=2 r=" + std::to_string(r));
     }
     // Round trips.
-    for (std::size_t n : {std::size_t(1000), std::size_t(1) << 12, (std::size_t(1) << 15) + 1, (std::size_t(1) << 16) + 3,
-                          std::size_t(1) << 17}) {
+    for (std::size_t n : {std::size_t(1000), std::size_t(1) << 12, (std::size_t(1) << 15) + 1,
+                          (std::size_t(1) << 16) + 3, std::size_t(1) << 17}) {
         const u32 a = random_word() | 1, r = random_word() | 1;
         const Vec f = random_vec(n);
-        Vec y(n), out(n), other(n);
+        Vec y(n), out(n);
         fps::chirp::evaluate_geometric(f, a, r, y);
-        fps::chirp::interpolate_geometric<fps::chirp::Products::multiply>(a, r, y, out);
-        fps::chirp::interpolate_geometric<fps::chirp::Products::transform>(a, r, y, other);
-        check(out == f && other == f, "interpolate_geometric round trip n=" + std::to_string(n));
+        fps::chirp::interpolate_geometric(a, r, y, out);
+        check(out == f, "interpolate_geometric round trip n=" + std::to_string(n));
     }
     // Errors: points not distinct; out of another size.
     const auto throws = [](u32 a, u32 r, std::size_t n, std::size_t out_size) {
