@@ -221,3 +221,119 @@ belongs in `backend/`).
 
     Below lg 10 main ran the scalar loop up to 443 x 443; with the Convolution of issue #38 the NTT
     wins there from about 32 x 32 (Zen 3, Neoverse V2) to 104 x 104 (Zen 5).
+- 2026-10-11: `Values` (#19): `fps::Values<P>` with `+`, `-`, `*` (value by value), scalars,
+  `multiply_add`, `fps::Layout` (`automatic`, `pointwise`), `to_values`, `to_coefficients`, and
+  `raw::to_values`, `raw::to_coefficients`, `raw::add_coefficients`, on `ntt::Transform`. From the
+  prototype's `values.hpp`, which had no layouts; the split into values from lc-opt-explore
+  `showcase-abc222_h_dc` v2 (`Split`), rewritten as plain scalar code.
+  - Storage: max(L, 64) + 16 words, 64-byte aligned (the transform needs 32 and reads 16 words
+    of padding). L < 64 is held at 64: x^L - 1 divides x^64 - 1, so sums and products are exact
+    mod x^64 - 1 and the conversion back folds mod x^L - 1. One code path for every L.
+  - Per length, a table set built once (`std::call_once`) and kept: the `ntt::Transform`, the leaf
+    roots r(k) and, up to 2^23, the 8th roots rho_v of each leaf's w_v. A fresh `Transform` per
+    call would rebuild L / 16 table entries and allocate.
+  - Automatic layout: the backend's leaf form; `*` is an 8 x 8 product per leaf mod x^8 - w_v
+    (64-bit sums, two `%` per word). Pointwise: each leaf twisted by rho_v^k and taken through an
+    8-point transform, so `*` is one product per word (modarith Barrett on `simd::Native`). Above
+    2^23 no such roots exist (P - 1 = 119 2^23): pointwise keeps the leaf form there.
+  - `to_coefficients(const Values&)` copies A into a per-thread scratch (A is const and the inverse
+    works in place), inverts there and copies out; on an rvalue (`to_coefficients(A * B)`) it
+    inverts in A's own memory. `Polynomial` gets `detail::unwritten_polynomial` (no zero fill
+    before the copy out); nothing else in `polynomial.hpp` changes. `Values` has its own add,
+    subtract and scale streams on `detail::lanewise` (an earlier version moved `Polynomial`'s
+    streams to `detail` to share them; undone on the rebase below, to leave `Polynomial` as main
+    has it while #18 edits the same lines).
+  - Backend issue #49: leaf products, the pointwise split, and an inverse into other memory.
+    Searched first: #38 (Convolution memory) and #4 (ntt intrinsics) do not cover them.
+  - DESIGN.md: `Values()` (empty, for containers) and `Values(L, layout)` (zero: the start of a
+    `multiply_add` sum and the buffer for `raw::to_values`; the ABC222 H example needs one), which
+    it did not list; scalars are any integer of at most 64 bits, as for `Polynomial`; pointwise
+    above 2^23 keeps the leaf form (no roots); which errors throw what; the raw functions' scratch,
+    which "never allocate" did not allow for (`to_coefficients` of a const A needs L words to run
+    the in-place inverse); `Layout` declared before `Values`.
+  - Tests (`test_values.cpp`): both layouts, L = 2^0 .. 2^11, inputs of 0, 1, 2^k - 1, 2^k,
+    2^k + 1 and random sizes, random and all P - 1: conversions, every operator and its rvalue
+    form, aliasing (`A *= A`, `A.multiply_add(A, B)`, `(B, A)`, `(A, A)`), scalars 0, 1, P - 1,
+    -1, -3P - 5, 2^64 - 1, against cyclic schoolbook products; the raw functions on every range for
+    L <= 32 and on edge and random ranges above; DESIGN.md's two examples (one factor in many
+    products and a sum of products; ABC222 H's divide and conquer, here f = 1 + x f^2 against the
+    Catalan numbers, N = 4096); L = 2^20 exact products, 2^23 and 2^24 pointwise with wrapping at
+    2^23-th roots of unity; 4 threads building tables of new lengths at once; every error. 12
+    injected bugs (leaf modulus sign, a split twiddle, the fold, `multiply_add`, `add_coefficients`
+    on short ranges, the odd-leaf rho, the layout check, the leaf product's wrap, the zero fill,
+    the 2^23 limit, 1/8, the raw range check) all fail it; the 2^23 one crashes.
+  - Bench (`frontend/bench.cpp`), L = 2^lg, 11 rounds, GCC 15.2, main 7ddddf3 plus this change (before #47).
+    `to_values` (f of L / 2 coefficients into new memory) against `Transform::forward` by hand
+    (new aligned memory, copy, zero fill, forward); `to_coefficients` against a copy into new
+    aligned memory and the inverse in place; `add_coefficients` (ABC222 H's step, the upper half
+    added into a kept array) against copy, inverse and a modarith add. API / kernel, median of the
+    per-round ratios:
+
+    | case | `lc-bench` (avx2) | `lc-intel` (avx512) | `lc-zen5` (zen5) | `lc-arm` (arm) |
+    |---|---:|---:|---:|---:|
+    | to_values/10, /14, /18, /22 | 1.018, 0.993, 1.003, 0.992 | 1.011, 0.996, 0.981, 1.000 | 0.999, 0.998, 0.997, 1.001 | 1.007, 1.000, 0.999, 1.001 |
+    | to_coefficients | 1.020, 1.090, 1.125, 1.173 | 1.025, 1.090, 1.147, 1.172 | 1.040, 1.094, 1.123, 1.145 | 1.020, 1.024, 1.026, 1.036 |
+    | add_coefficients | 0.984, 0.994, 1.013, 0.992 | 1.005, 1.003, 0.959, 1.001 | 0.991, 0.989, 0.998, 0.988 | 1.002, 0.994, 1.002, 1.004 |
+
+    `lc-zen5`: from the gate's run of 311471a (21 rounds, main 03c970b); the rest from separate
+    runs of 11 rounds.
+
+    `to_coefficients` pays the copy out of the scratch; the kernel case reads the coefficients in
+    place. Only an inverse into other memory closes it (#49): a `Polynomial` is 16-byte aligned
+    and has no padding, so the frontend cannot run the inverse in it. Aligning every
+    `Polynomial` would change all their allocations and the copy placement measured for #16, to
+    save one copy here; #49 saves the copy in as well.
+
+    No kernel to pair with, ns per coefficient, lg 10 / 14 / 18 / 22:
+
+    | case | `lc-bench` | `lc-intel` | `lc-zen5` | `lc-arm` |
+    |---|---|---|---|---|
+    | values_product (leaf form) | 6.91 / 6.86 / 6.87 / 6.88 | 4.21 / 4.18 / 4.22 / 4.23 | 4.39 / 4.35 / 4.35 / 4.35 | 4.73 / 4.70 / 4.70 / 4.70 |
+    | values_product_pointwise | 0.23 / 0.19 / 0.18 / 0.33 | 0.17 / 0.15 / 0.36 / 0.40 | 0.08 / 0.06 / 0.11 / 0.17 | 0.34 / 0.30 / 0.30 / 0.34 |
+    | to_values_pointwise | 7.55 / 7.78 / 8.12 / 8.52 | 5.23 / 5.53 / 5.63 / 6.12 | 5.11 / 5.21 / 5.38 / 5.56 | 7.29 / 7.81 / 8.41 / 9.11 |
+    | to_coefficients_pointwise | 8.67 / 9.03 / 9.45 / 10.00 | 6.07 / 6.39 / 6.61 / 7.21 | 6.27 / 6.40 / 6.60 / 6.83 | 8.01 / 8.53 / 9.16 / 10.01 |
+    | to_values (for scale) | 0.60 / 0.85 / 1.18 / 1.48 | 0.55 / 0.85 / 1.14 / 1.70 | 0.32 / 0.45 / 0.61 / 0.77 | 1.13 / 1.66 / 2.25 / 2.94 |
+
+    The scalar leaf product costs 2 to 14 times `to_values` (one forward transform), so until #49
+    a single product through `Values` is slower than `f * g`; a pointwise conversion costs 3 to 20
+    times `to_values`.
+    Products in the pointwise layout are already a stream (0.06 to 0.40 ns). Not tuned here, as
+    AGENTS.md (Performance) asks: these are #49's.
+  - Gate runs. The first failed avx2 at 1.0081, from `add`, `sub`, `neg` and `scale` at +1% to
+    +6%, with their `@kernel` cases (bench code this change does not touch) at +1% to +10%
+    alike. On `lc-bench` against main, those cases alone gave 1.0001 with the `Values` cases
+    registered and 0.9966 without; after the factorials, 1.0048 (the factorials) with and 0.9991
+    without, the element-wise cases within 0.5% either way except the noisy lg 22. So neither
+    the code nor the registration moves them; they move only in some full-suite runs (+2-3% in
+    three gate runs, not in a fourth with the same code). Placement, as in #16's log; not fixed.
+  - After #48 (Convolution memory per thread) the gate found arm `multiply/<lg>` and
+    `multiply@kernel/<lg>` 3-5% slower from 2^10. Not the run order: still so with the `Values`
+    cases last. `nm` of the two binaries: with `Transform::forward` and `inverse` in the program,
+    GCC kept the NTT's top-level helpers out of line, shared by both paths. Forcing them inline
+    (`backend/ntt/intrinsics.hpp`, 5 attributes; `backend/ntt/notes.md`) gave 0.999 against main,
+    from 1.034. The `Values` cases now run last anyway: they leave tables and scratch behind.
+    (Dropped on the rebase below: #61 and #68 rewrote those levels, and the slowdown is gone.)
+  - 2026-10-12: rebased onto main 006fa57 (after #37, #38, #51, #61, #65, #68). No conflicts in
+    the frontend; the tests pass unchanged on the Mac (scalar, arm), `lc-amd` (scalar, sse, avx2),
+    `lc-intel-test`, `lc-zen5-test` and `lc-arm`, at -O2 and under ASan/UBSan.
+    - The NTT inlining commit is dropped: a backend change, and no longer needed. Without it, on
+      `lc-arm`, `multiply/<lg>` against main is 0.998 to 1.007 (lg 6 to 22) and the frontend
+      geomean 0.9996 and 0.9992 in two runs of 11 rounds. No backend issue needed.
+    - Bench, GCC 15.2, 11 rounds, against main 006fa57: geomean of gated new/base 1.0047 (`lc-bench`;
+      1.0045 and 1.0085 in two runs with `Polynomial`'s streams still in `detail`), 0.9860
+      (`lc-intel`), 0.9922 (`lc-zen5`), 0.9992 (`lc-arm`). On `lc-bench` the excess comes from
+      `add`, `sub`, `neg` at lg 10 and 14 (+2% to +4%, IQR within 1.02-1.04), whose code is main's
+      byte for byte in the source. Run alone (`--filter "^(add|sub|neg|scale)"`) the same binaries
+      give 0.996 to 1.000 for them. Placement again, as in the gate runs above; not fixed.
+    - API / kernel, median of the 11 per-round ratios, lg 10, 14, 18, 22 (the runs with the
+      streams in `detail`; `Values` runs the same code either way):
+
+      | case | `lc-bench` (avx2) | `lc-intel` (avx512) | `lc-zen5` (zen5) | `lc-arm` (arm) |
+      |---|---:|---:|---:|---:|
+      | to_values | 1.017, 0.991, 1.002, 1.007 | 1.010, 0.999, 1.003, 1.000 | 1.008, 1.006, 0.994, 1.000 | 1.005, 1.001, 1.000, 1.001 |
+      | to_coefficients | 1.048, 1.081, 1.115, 1.189 | 1.035, 1.105, 1.179, 1.186 | 1.043, 1.101, 1.136, 1.169 | 1.026, 1.030, 1.033, 1.036 |
+      | add_coefficients | 1.013, 0.990, 1.015, 1.003 | 0.999, 1.001, 0.982, 0.998 | 0.982, 0.987, 0.998, 0.931 | 0.999, 1.004, 0.998, 0.997 |
+
+      `to_coefficients` still pays the copy out of the scratch (#49, part 3). The ns per
+      coefficient of the cases with no kernel are within 5% of the table above (`lc-bench`
+      values_product 6.86 to 6.92, pointwise conversions 7.55 to 10.02).
