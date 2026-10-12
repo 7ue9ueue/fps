@@ -15,7 +15,7 @@
 // - G mod x^k with at most 16 nonzero terms past G[0] (fps/series.hpp's kSparseTerms: divisors of
 //   degree <= 16, quotients of <= 17 coefficients, divisors such as x^d - x - 1): the recurrence
 //   G[0] Q[i] = F[i] - sum_j G[j] Q[i - j], O(k t) for t terms;
-// - else F (1 / G mod x^k) mod x^k: fps/series.hpp's Newton inverse, then one product;
+// - else F (1 / G mod x^k) mod x^k: fps/series.hpp's inverse (backend/series), then one product;
 // and the remainder is f - (q g mod x^d), one product. The products are fps/products.hpp's
 // (raw::mul: shift, small::multiply or ntt::multiply, as small::beats_ntt picks).
 // The backend has no division kernel yet: lc-opt's blocked division (quotient blocks against one
