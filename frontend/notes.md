@@ -362,3 +362,126 @@ belongs in `backend/`).
       | to_values | 0.992, 0.992, 1.002, 1.001 | 0.996, 1.004, 0.999, 1.001 | 0.986, 1.005, 1.000, 1.006 | 0.996, 1.002, 1.000, 1.000 |
       | to_coefficients | 1.010, 1.087, 1.120, 1.182 | 1.015, 1.103, 1.184, 1.178 | 1.024, 1.106, 1.134, 1.159 | 1.025, 1.031, 1.036, 1.043 |
       | add_coefficients | 1.028, 0.996, 1.012, 0.997 | 1.006, 0.998, 0.999, 0.995 | 1.031, 1.010, 1.000, 0.989 | 0.994, 1.004, 0.995, 0.999 |
+- 2026-10-11: products (#18): `mul(f, g, n)`, `square(f)`, `product(fs)`, `middle_product(f, g)`
+  and `raw::mul<P>(a, b, out)` in `include/fps/products.hpp`, from the prototype's
+  `polynomial.hpp`. One engine, `detail::Products<P>` in `polynomial.hpp`, runs them and `f * g`:
+  factors cut to n, then a shift (one nonzero term), `small::multiply` where `small::beats_ntt`
+  says so (the choice `f * g` makes since #37; no cutoff of the frontend's own), or
+  `ntt::Convolution(n, m, a)` with a = the result's own memory (#38). Both kernels write into the
+  result, so nothing is copied out.
+  - Storage: `detail::Words(n, capacity, Unwritten)` allocates a 64-byte aligned block of
+    `length + kPadding` words (`std::aligned_alloc`; the other constructors use `std::malloc`, as
+    `new[]` did, so their placement is unchanged). A product's result keeps the block: up to
+    2 (n + m - 1) + 16 words for `f * g`, up to 4 n + 16 for `mul` with a short n. A copy is tight.
+    The length is checked against 2^25 before the block is allocated. `small::multiply` writes the
+    whole product, so `mul` with a short n gets n + m - 1 words for it.
+  - `middle_product`: DESIGN.md said "the transposed product" without saying which coefficients.
+    Now: coefficients m - 1 .. n - 1 of f g, n = f.size() >= m = g.size() >= 1, else
+    `std::domain_error`, as the prototype; with g reversed it is the transposed product. It runs
+    all of f g (`small::multiply` or the `Convolution`, by `beats_ntt(n, m)`) in the result's memory
+    and moves the n - m + 1 coefficients down in place. A cyclic product of length >= n would halve
+    the transform: backend issue #55. (Before #37 merged it had its own direct loop for short sums,
+    with the old frontend cutoff; dropped with that cutoff.)
+  - `square(f)`: the engine with f twice, so it costs `f * f`. DESIGN.md said "cheaper than
+    f * f"; now it says so once the backend squares (#55, one forward transform less).
+  - `product(fs)`: split where the sums of sizes come closest to halves (lc-opt's tree splits on
+    degrees the same way), each node `f * g`. 1 for no factors, empty if a factor is empty. A
+    `std::vector` overload, since P cannot be deduced through the span. lc-opt's tree: #56.
+  - `raw::mul`: allocates nothing per call; the NTT path runs `Convolution(n, m)` in the thread's
+    region and copies out (a tight output is not in the backend: commented on #38).
+    `small::multiply` writes all n + m - 1 words, so a shorter `out` (the usual case: a, b and out
+    of n) runs `low_product`, the old frontend schoolbook (blocks of 64 outputs, 64-bit sums),
+    computing only the n outputs; a truncated short product is asked of #37. `out` must not overlap
+    `a` or `b` (`std::domain_error`, an O(1) check), since both short kernels write as they read.
+  - DESIGN.md also: `mul` returns n coefficients; raw functions allocate nothing per call (scratch
+    is the library's, per thread); `raw::mul`'s out is apart from a and b.
+  - Tests (`test_products.cpp`): `mul` and `raw::mul` on every pair of edge sizes (0, 1,
+    2^k +- 1, k <= 10) with outputs 0, 1, 2, the shorter size, the product's size -1, 0, +1, +70,
+    3 s + 100 and random; shapes on the NTT path and at the cutoffs; shifts; long factors against
+    `f * g`; `square` on edge sizes and all P - 1; `middle_product` on every pair n >= m, at its
+    cutoffs and long, against the definition and against f g; `product` of 0 to 100 factors,
+    unbalanced, with an empty factor, 2^14 linear factors at random points; results resized and
+    copied; 4 threads; every error (`domain_error` for the middle product and overlaps,
+    `length_error` past 2^25 for each function). Under ASan the test sets
+    `max_malloc_fill_size`, so every allocation starts as 0xbe bytes: with that, dropping the zero
+    fill past the transform's length fails on the Mac too (it passed before, on fresh pages).
+    Mutations killed: the middle move's offset, the middle loop's reduction cadence, `raw::mul`'s
+    zero fill, the shift's tail fill and its truncation, the NTT path's zero fill. Splitting
+    `product` always at 1 still passes: balance is speed, not correctness.
+  - Bench (`frontend/bench.cpp`): `multiply@kernel` is now `Convolution(n, m, a)` into a new
+    `Words` block like the API's result (`convolve`). New pairs at lg 11, 14, 18, 22 (transform
+    length 2^lg): `mul` (f, g, n of 2^(lg-1)), `square`, `middle_product` (f of 2^(lg-1), g of
+    2^(lg-2)), `raw_mul` (out kept across calls; kernel: the product left in the region);
+    `product/<lg>` (2^lg linear factors, lg 10, 14, 18) has no pair. API / kernel, median of 11
+    paired rounds (IQR in the PR), GCC 15.2, main 8367228 plus this change:
+
+    | case | `lc-bench` (avx2) | `lc-intel` (avx512) | `lc-zen5` (zen5) | `lc-arm` (arm) |
+    |---|---:|---:|---:|---:|
+    | multiply/10, /14, /18, /22 | 0.999, 1.000, 1.001, 0.999 | 0.998, 0.988, 1.005, 0.999 | 1.002, 1.001, 1.001, 1.000 | 1.000, 1.000, 1.002, 1.001 |
+    | mul/11, /14, /18, /22 | 1.001, 1.000, 0.998, 0.999 | 0.999, 0.999, 1.001, 0.997 | 1.002, 1.001, 1.000, 1.005 | 1.000, 1.000, 0.999, 1.000 |
+    | square | 0.998, 1.000, 1.001, 1.002 | 0.999, 1.000, 1.000, 0.999 | 1.000, 1.000, 1.000, 1.002 | 1.000, 1.000, 1.000, 1.000 |
+    | middle_product | 0.978, 1.006, 1.007, 1.003 | 1.002, 1.003, 1.005, 1.012 | 1.004, 1.003, 1.006, 1.006 | 1.002, 1.002, 1.003, 1.004 |
+    | raw_mul | 1.009, 1.012, 1.022, 1.030 | 1.009, 1.015, 1.018, 1.023 | 1.009, 1.014, 1.015, 1.023 | 1.005, 1.003, 1.004, 1.007 |
+
+    `multiply` against main (same run): 0.95-0.97 from 2^14 on `lc-bench`, 0.92-0.96 on
+    `lc-intel`, 0.96-0.98 on `lc-zen5`, 0.98-0.99 on `lc-arm`: the copy out is gone (#16's
+    1-6% gap). The two gaps left are copies the backend can remove: the middle product's move
+    (#55) and `raw::mul`'s copy out (#38). `product/<lg>`, ns per factor at lg 10 / 14 / 18:
+    `lc-bench` 130 / 155 / 189, `lc-intel` 107 / 133 / 169, `lc-zen5` 88 / 103 / 121, `lc-arm`
+    118 / 170 / 236; lc-opt's tree did 500000 linear factors in about 20 ms on `lc-amd`
+    (40 ns per factor, its notes).
+- 2026-10-12: products (#18) rebased on main bfd491b and moved to `ntt::multiply(f, g, out)`
+  (backend #38 round 2, PR #79): it reads the factors from the caller and writes f g mod
+  x^out.size() into the caller's memory, so the frontend no longer needs `Convolution(n, m, a)`.
+  - `f * g`, `mul`, `square`, `product` and `raw::mul` call it into the result (or `out`) of exactly
+    n words; the NTT path keeps no spare words and `raw::mul` copies nothing out. `middle_product`
+    calls it into n words (f g mod x^n, the same transform length as the whole product) and moves
+    the n - m + 1 coefficients down. The choice between `small::multiply` and the NTT is
+    `small::beats_ntt`, as for `f * g` since #37; the frontend has no cutoff of its own.
+  - `detail::Words(n, capacity, Unwritten)` is now a plain block of max(n, capacity) words
+    (`make_unique_for_overwrite`), no longer 64-byte aligned with `kPadding` words: only
+    `small::multiply` with an output cut short (`mul`) and the middle product keep spare words.
+    `checked_length` is gone: `ntt::multiply` throws `std::length_error` before it writes.
+  - DESIGN.md (Conventions): the `std::length_error` line now says that a short factor next to a
+    longer one runs `small::multiply` where that is faster, which has no limit (#37's behaviour:
+    2^25 x 2 returns; 2^25 x 4096 throws). The test checks both.
+  - Bench: every `@kernel` case of a product is now `ntt::multiply` into new memory of the
+    result's size (`ntt_product`), or into the same kept `out` for `raw_mul`. Tests pass at -O2
+    and ASan/UBSan on the Mac (scalar, arm), `lc-amd` (scalar, sse, avx2), `lc-intel-test`,
+    `lc-zen5-test` and `lc-arm`. A mutation (the middle product's NTT output one word short)
+    fails 234 checks.
+  - API / kernel, median of 11 paired rounds (IQR in brackets where wider than 0.005), GCC 15.2,
+    `kernel.py bench frontend --base bfd491b --filter 'mul|square|middle|product'`:
+
+    | case | `lc-bench` (avx2) | `lc-intel` (avx512) | `lc-zen5` (zen5) | `lc-arm` (arm) |
+    |---|---:|---:|---:|---:|
+    | multiply/10, /14, /18, /22 | 1.005, 1.001, 1.005, 1.003 | 1.007, 1.001, 1.001, 1.000 | 1.006, 1.000, 0.999, 1.000 | 1.001, 1.000, 1.000, 1.000 |
+    | mul/11, /14, /18, /22 | 0.998, 1.001, 1.000, 1.001 | 1.003, 1.000, 1.000, 1.000 | 1.004, 0.999, 1.000, 1.002 | 1.000, 1.000, 1.000, 1.001 |
+    | square | 0.999, 1.000, 1.000, 0.997 | 1.002, 1.000, 1.000, 1.002 | 1.012, 1.000, 1.000, 1.000 | 1.001, 1.000, 1.000, 1.000 |
+    | middle_product | 1.001, 1.007, 1.009, 1.013 | 1.004, 1.005, 1.014, 1.015 | 1.008, 1.004, 1.011, 1.023 | 1.003, 1.003, 1.004, 1.005 |
+    | raw_mul | 1.004, 1.000, 1.003, 1.001 | 1.003, 1.000, 1.000, 1.000 | 1.005, 1.001, 1.000, 1.000 | 1.001, 1.000, 1.000, 0.999 |
+    | raw_mul/16x16, /24x24 | 2.245, 2.082 | 2.150, 2.224 | 2.458, 3.007 | 1.176, 0.996 |
+    | multiply/16x16 | 1.106 | 1.096 | 1.134 | 1.074 |
+
+    - `mul`, `square` and `raw_mul` are within 0.5% of `ntt::multiply` (one case, zen5
+      square/11, 1.2%). `raw_mul` was 1.003-1.030 with the copy out; that gap is gone.
+    - `middle_product`: 0.3% to 2.3%, growing with size: the move of n - m + 1 words down. Only
+      a cyclic product written at out[0] can remove it (#55).
+    - `multiply/16` came out 1.027 (`lc-bench`) and 1.058 (`lc-intel`) in this run; alone, 21
+      rounds, 0.999 and 1.003 (lg 15 and 17 also 0.994-1.001). Placement of the run, not work.
+    - `raw_mul/<n>x<n>`: `raw::mul` into n words runs the frontend's truncated loop
+      (`low_product`) against `small::multiply`'s whole product: 2.1-3.0x on x86 (40-124 ns),
+      1.0-1.2x on Neoverse V2. Asked of #37 (a short product cut to out.size()).
+    - `multiply/16x16`: 1.07-1.13 (40-92 ns), the scans for a single term and `beats_ntt` before
+      `small::multiply`; 4096x4 and 4096x16 are 1.001-1.008.
+  - `multiply/<lg>` against main bfd491b (which ran `Convolution(n, m, a)`), same run:
+    0.92-0.99 from 2^10 on every target (lg 22: 0.924, 0.946, 0.996, 0.980), except lg 16 on
+    `lc-intel`, 1.020-1.022 in both runs. At 2^6-2^9, where `beats_ntt` still picks the NTT,
+    `ntt::multiply` is slower than the Convolution it replaces: lg 6 / 7 / 8 / 9 = 1.353 / 1.050
+    / 1.074 / 0.973 (`lc-bench`), 1.032 / 1.060 / 1.017 / 1.011 (`lc-intel`), 1.017 / 0.995 /
+    0.980 / 1.007 (`lc-zen5`), 1.078 / 1.007 / 0.986 / 0.986 (`lc-arm`). PR #79 measured up to 10%
+    at 2^6-2^8. `small`'s tuner times the NTT as a `Convolution(n, m, out)`, so `beats_ntt` is
+    now fitted to the wrong NTT: noted on #37 and #38.
+  - `product/<lg>`, ns per factor at lg 10 / 14 / 18: `lc-bench` 84 / 109 / 141, `lc-intel`
+    63 / 86 / 117, `lc-zen5` 48 / 59 / 76, `lc-arm` 97 / 141 / 201 (were 130 / 155 / 189 on
+    `lc-bench` before #37's tuned `small` and #79).

@@ -57,8 +57,9 @@ Users name their modulus once: `using Poly = fps::Polynomial<998244353>;`.
   (`f * x^k`, `f / x^k`, `f % x^k`, O(n)), a linear inner function (`compose(f, x + c)`,
   `compose(f, c x)`).
 - A broken precondition throws `std::domain_error` (e.g. `inverse` with f[0] = 0); a size past a
-  backend limit throws `std::length_error` (e.g. an NTT product past 2^25 coefficients). A result
-  that may not exist is a `std::optional` (`sqrt`, `inverse_mod`).
+  backend limit throws `std::length_error` (e.g. a product past 2^25 coefficients that runs the NTT;
+  a short factor next to a longer one runs `small::multiply` where that is faster, which has no
+  limit). A result that may not exist is a `std::optional` (`sqrt`, `inverse_mod`).
 - Thread safety: functions are safe to call from several threads; each thread has its own scratch.
 - Moduli: v1 supports P = 998244353 only; any other P fails to compile (`static_assert`). Other
   primes come later (see Later).
@@ -104,10 +105,10 @@ with a scalar c, an integer of at most 64 bits taken mod P: `f + c`, `c + f`, `f
 
 ```cpp
 // Products
-Polynomial mul(f, g, n);                  // f g mod x^n
-Polynomial square(f);                     // f^2, cheaper than f * f
-Polynomial product(std::span<const Polynomial> fs);   // balanced product tree
-Polynomial middle_product(f, g);          // the transposed product
+Polynomial mul(f, g, n);                  // f g mod x^n: n coefficients
+Polynomial square(f);                     // f^2; cheaper than f * f once the backend squares (#55)
+Polynomial product(std::span<const Polynomial> fs);   // balanced product tree; 1 if fs is empty
+Polynomial middle_product(f, g);          // coefficients m - 1 .. n - 1 of f g (below)
 
 // Division and calculus
 std::pair<Polynomial, Polynomial> divmod(f, g);       // quotient, remainder
@@ -138,6 +139,12 @@ std::optional<Polynomial> inverse_mod(f, m);   // f^-1 mod m
 std::vector<std::uint32_t> roots(f);      // distinct roots in [0, P)
 std::vector<std::pair<Polynomial, int>> factor(f);   // monic irreducible factors, multiplicities
 ```
+
+`middle_product(f, g)`, for n = `f.size()` >= m = `g.size()` >= 1 (else `std::domain_error`):
+the n - m + 1 coefficients m - 1 .. n - 1 of f g, h[i] = sum over j < m of f[i + j] g[m - 1 - j].
+They are the coefficients whose sums meet all of g. With g reversed it is the transposed product,
+sum over j of f[i + j] g[j]. `product(fs)` splits fs where the sums of sizes come closest to
+halves; it also takes a `std::vector`.
 
 `Factorials<P> fact(n)`, n <= P: `fact[i]` = i!, `fact.inverse(i)` = 1/i!, `fact.binomial(n, k)`
 = C(n, k) (0 for k > n), for i, n < `fact.size()`. n > P throws: P! = 0 has no inverse. Indices
@@ -235,12 +242,12 @@ Polynomial<P> to_coefficients(const Values<P>& A);   // L coefficients: the prod
 
 Same names in `fps::raw`, on spans. They write into the caller's memory and never allocate,
 except for a per-thread scratch that grows to the longest length a thread uses and is then
-reused (`raw::to_coefficients` and `raw::add_coefficients` transform a copy of A there); n is
-`out.size()`. For hot loops, and for code that keeps its own buffers.
+reused (`raw::mul` multiplies there; `raw::to_coefficients` and `raw::add_coefficients` transform
+a copy of A there); n is `out.size()`. For hot loops, and for code that keeps its own buffers.
 
 ```cpp
 fps::raw::exp<P>(std::span<const std::uint32_t> f, std::span<std::uint32_t> out);  // out may be f
-fps::raw::mul<P>(a, b, out);
+fps::raw::mul<P>(a, b, out);                                                       // out apart from a, b
 fps::raw::to_values<P>(std::span<const std::uint32_t> f, Values<P>& A);            // into an existing A
 fps::raw::to_coefficients<P>(const Values<P>& A, std::span<std::uint32_t> out, std::size_t offset);
                                           // out[i] = coefficient offset + i
