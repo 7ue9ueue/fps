@@ -175,7 +175,7 @@ def judged(runs: list[dict]) -> list[int]:
 
 def disagreement_note(k: str, runs: list[dict], use: list[int]) -> list[str]:
     """Report lines for runs 1 and 2 of unit k disagreeing: the cases, each run's medians."""
-    found = disagreements(runs[0], runs[1])
+    found = disagreements(runs[0], runs[1]) if len(runs) > 1 else []  # one run: nothing to compare
     if not found:
         return []
     rows = [{r['case']: r for r in summarize(run['cases'])[0]} for run in runs]
