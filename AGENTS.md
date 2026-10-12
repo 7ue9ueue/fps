@@ -148,3 +148,5 @@ What has worked here; deviate when you have a reason and say it.
   place in the same pull request as the code, and say why there and in your notes entry.
 - Plain English, numbers over adjectives, guesses marked. Notes are logs. Commit subjects:
   imperative, at most 72 characters.
+- In GitHub text (pull requests, issues, comments), put code in backticks: a bare `intrinsics<S>`
+  opens an HTML `<s>` tag and strikes through the rest of the page (PR #142).
