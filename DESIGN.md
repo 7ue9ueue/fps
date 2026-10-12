@@ -143,8 +143,8 @@ std::vector<std::pair<Polynomial, int>> factor(f);   // monic irreducible factor
 `middle_product(f, g)`, for n = `f.size()` >= m = `g.size()` >= 1 (else `std::domain_error`):
 the n - m + 1 coefficients m - 1 .. n - 1 of f g, h[i] = sum over j < m of f[i + j] g[m - 1 - j].
 They are the coefficients whose sums meet all of g. With g reversed it is the transposed product,
-sum over j of f[i + j] g[j]. `product(fs)` splits fs where the sums of sizes come closest to
-halves; it also takes a `std::vector`.
+sum over j of f[i + j] g[j]. `product(fs)` runs the backend's product tree (small factors 8 at a
+time in lanes, one transform of each length per node); it also takes a `std::vector`.
 
 `Factorials<P> fact(n)`, n <= P: `fact[i]` = i!, `fact.inverse(i)` = 1/i!, `fact.binomial(n, k)`
 = C(n, k) (0 for k > n), for i, n < `fact.size()`. n > P throws: P! = 0 has no inverse. Indices
