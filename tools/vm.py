@@ -32,15 +32,17 @@ def zone(vm: str) -> str:
 
 
 def ssh(vm: str, command: str, stdin: bytes | None = None, capture: bool = False) -> subprocess.CompletedProcess:
-    """Run command on vm. A connection failure (exit 255) is retried twice: every command the
-    tools send (copy, test, bench) can safely run again."""
+    """Run command on vm. A connection failure (exit 255, or gcloud itself crashing on a timeout
+    to the Compute API, seen in PR 134's gate) is retried twice: every command the tools send
+    (copy, test, bench) can safely run again."""
     cmd = ['gcloud', 'compute', 'ssh', vm, f'--zone={zone(vm)}', '--quiet', f'--command={command}',
            '--', '-o', 'LogLevel=ERROR', '-o', 'ConnectTimeout=20']
     for attempt in range(3):
         result = subprocess.run(cmd, input=stdin, capture_output=capture)
-        if result.returncode != 255:
+        crashed = capture and b'gcloud crashed' in (result.stderr or b'')
+        if result.returncode != 255 and not crashed:
             return result
-        print(f'ssh to {vm} failed (exit 255), attempt {attempt + 1} of 3', file=sys.stderr)
+        print(f'ssh to {vm} failed (exit {result.returncode}), attempt {attempt + 1} of 3', file=sys.stderr)
         time.sleep(15)
     return result
 
