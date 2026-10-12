@@ -29,11 +29,12 @@ For each issue:
    and returns; then review again with a new reviewer. After two reviews with changes, label the
    issue `blocked` and comment for the user what is unresolved.
 5. On `Review: pass`, gate it yourself: `python3 tools/gate.py <pr> --merge`, in the background,
-   one gate at a time, while you keep coordinating. On a fail (a test, a slowdown, or a conflict
-   with main), send the implementer the gate's comment with SendMessage; it fixes, pushes and
-   returns, and you gate again. After 2 failed gates, label the issue `blocked` and comment for the
-   user. Once merged, comment on the issue with the pull request and a last line that is exactly
-   `Result: done`, then close it with the label `done`.
+   while you keep coordinating (gates queue on a lock; start each one when its review passes). On a
+   fail (a test or a slowdown), send the implementer the gate's comment with SendMessage; it fixes,
+   pushes and returns, and you gate again. A conflict with main is not a failed gate: nothing was
+   tested. Send the implementer a rebase, then gate again. After 2 failed gates, label the issue
+   `blocked` and comment for the user. Once merged, comment on the issue with the pull request and
+   a last line that is exactly `Result: done`, then close it with the label `done`.
 6. Remove the worktree once the implementer has stopped all background work.
 
 If the implementer or the reviewer labels the issue `blocked`, leave it for the user. Keep starting
