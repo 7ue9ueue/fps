@@ -12,7 +12,8 @@ For every target in tools/kernel.py, all at once, on the target's machines:
     alongside the tests unless the timing machine also tests the target (its bench lock would
     queue the two anyway); it stops at the next unit once any test has failed.
 Units are the backend kernels and the frontend (see tools/kernel.py). Affected units: those
-changed, those that include them, or all if a shared file changed.
+changed, those that #include them ("backend/<kernel>/..."), or all if a shared file changed.
+Changes to .md files (notes) affect no unit: no build reads them.
 Passes if every test passes and, per target, the geomean over units of new/base (each unit's
 geomean over its gated cases) is at most TOLERANCE (1.005). Byte-identical bench binaries count
 as 1. The tolerance absorbs code-layout and same-process effects on unchanged code (0.1-1% seen).
@@ -20,10 +21,14 @@ as 1. The tolerance absorbs code-layout and same-process effects on unchanged co
 For a pull request it posts the report as a comment and sets the commit status `gate` on its head,
 which `main` requires; with --merge it squash-merges that head on a pass (GitHub refuses if the
 head moved). The full report is kept with the raw times; the comment drops the case tables if it
-would pass GitHub's limit. Merges hold a lock on this Mac, so two gates never both merge against
-the same main. If main moved during the run, the gate runs again only when the new commits on main
-touch a unit this pull request affects (with the same include closure) or a shared file; otherwise
-the result still holds and it merges. The last line of the report is "Gate: pass" or "Gate: fail".
+would pass GitHub's limit. The last line of the report is "Gate: pass" or "Gate: fail".
+
+One gate runs at a time on this Mac: a gate waits for the lock, then holds it from its first look
+at main to the merge. Since main changes only through the gate, main cannot move under a running
+gate, and gates do not slow each other down on the VMs (PR 83: 44 minutes beside PR 82's gate; PR
+77, alone: at most 21). If main moved anyway (a merge by hand), the gate runs again only when the
+new commits on main touch a unit this pull request affects (with the same include closure) or a
+shared file; otherwise the result still holds and it merges.
 
 It runs as origin/main's copy of tools/ (gate.py, kernel.py, vm.py), whatever the checkout it is
 started from: a coordinator's checkout can lag main by hours, and the gate's rules are main's.
@@ -47,6 +52,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -57,6 +63,7 @@ ROUNDS = 21
 RAW = Path.home() / 'Documents' / 'hpc_library-explore' / 'gate'  # raw times, kept on the Mac
 TOLERANCE = 1.005  # new/base per target; above it, ROUNDS more rounds are pooled and judged again
 SHARED = re.compile(r'^(backend/[^/]+|tools/kernel\.py)$')  # files outside a kernel folder
+INCLUDE = re.compile(r'#include\s*"(backend/[A-Za-z0-9_]+/)')  # how one unit uses another
 GATED = '^[^@]*$'  # the cases the verdict uses (kernel.gated); the others took 30-50% of bench time
 COMMENT_LIMIT = 65536  # characters in a GitHub comment
 
@@ -93,12 +100,13 @@ def affected(base: str, tree: str, includes: str | None = None) -> list[str]:
     `includes` (default: tree)."""
     includes = includes or tree
     units = units_in(includes)
-    changed = git('diff', '--name-only', base, tree).stdout.split()
+    changed = [path for path in git('diff', '--name-only', base, tree).stdout.split() if not path.endswith('.md')]
     if any(SHARED.match(path) for path in changed):
         return units
     hit = {u for u in units if any(path.startswith(tuple(unit_paths(u))) for path in changed)}
-    uses = {u: set(git('grep', '-h', '-o', '-E', r'backend/[A-Za-z0-9_]+/', includes, '--',
-                       *unit_paths(u), check=False).stdout.split()) for u in units}
+    # Notes name other units' folders too: only #include lines say what a unit builds from.
+    uses = {u: set(INCLUDE.findall(git('grep', '-h', '-F', '#include', includes, '--', *unit_paths(u),
+                                       check=False).stdout)) for u in units}
     while True:  # add units that include an affected kernel, until nothing changes
         more = {u for u in units if u not in hit and any(f'backend/{h}/' in uses[u] for h in hit)}
         if not more:
@@ -128,6 +136,10 @@ def pool(report: dict, again: dict) -> None:
 
 def kernel_ratio(report: dict) -> float | None:
     return 1.0 if report['identical'] else summarize(report['cases'])[1]
+
+
+def minutes(start: float) -> float:
+    return (time.monotonic() - start) / 60
 
 
 def geomean(values: list[float]) -> float | None:
@@ -179,12 +191,13 @@ def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, units: 
     name = f'gate-{label}-{target}'
     out = [f'### {target}: `{spec["flags"] or "no flags"}`', '']
 
-    def test_on(machine: str) -> subprocess.CompletedProcess:
+    def test_on(machine: str) -> tuple[subprocess.CompletedProcess, float]:
         log(f'[{target}] testing on {machine}')
+        start = time.monotonic()
         result = run_tests(machine, f'{name}-test', new_tar, target, units, check and machine == spec['test'][0])
         if result.returncode:
             failed.set()
-        return result
+        return result, minutes(start)
 
     vm = spec['time']
     with ThreadPoolExecutor() as executor:
@@ -192,17 +205,20 @@ def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, units: 
         if vm in spec['test']:
             for future in tests.values():
                 future.result()
+        start = time.monotonic()
         reports = time_units(vm, name, new_tar, base_tar, target, timed, failed) if vm else {}
+        timing_minutes = minutes(start)
         results = {m: future.result() for m, future in tests.items()}
 
     tests_ok = True
-    for machine, result in results.items():
+    for machine, (result, took) in results.items():
         lines = [line for line in result.stdout.decode().splitlines() if line.startswith(('pass', 'FAIL'))]
         if result.returncode == 0:
-            out.append(f'Tests on {machine}: pass ({len(lines)} checks)')
+            out.append(f'Tests on {machine}: pass ({len(lines)} checks, {took:.1f} min)')
             continue
         tests_ok = False
-        out += [f'Tests on {machine}: FAIL', *[f'- {line}' for line in lines if line.startswith('FAIL')],
+        out += [f'Tests on {machine}: FAIL ({took:.1f} min)',
+                *[f'- {line}' for line in lines if line.startswith('FAIL')],
                 '', '```', (result.stdout + result.stderr).decode()[-3000:], '```']
     if not tests_ok:
         return False, '\n'.join(out)
@@ -218,7 +234,7 @@ def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, units: 
     ratios = {k: kernel_ratio(r) for k, r in reports.items()}
     overall = geomean([r for r in ratios.values() if r is not None])
     cpu = next(iter(reports.values()))['cpu'] if reports else vm
-    out += ['', f'Timing on {vm} ({cpu}), new/base, below 1 is faster. '
+    out += ['', f'Timing on {vm} ({cpu}), {timing_minutes:.1f} min, new/base, below 1 is faster. '
             f'Raw times per round: `{RAW / label}/{target}-<unit>.json` on the Mac.']
     for k in units:
         if k not in reports:
@@ -326,12 +342,23 @@ def set_status(head: str, passed: bool, url: str) -> None:
                     '-f', f'target_url={url}'], check=True, capture_output=True)
 
 
-def merge_lock():
-    """Held from the last look at main to the merge."""
+def gate_lock(label: str):
+    """Held by one gate at a time, from its first look at main to its merge. The file is the one
+    gates before the queue held around their merge, so a gate still running that code waits too.
+    It names the holder, for those waiting."""
     path = Path.home() / '.cache' / 'fps' / 'gate-merge.lock'
     path.parent.mkdir(parents=True, exist_ok=True)
-    lock = open(path, 'w')
-    fcntl.flock(lock, fcntl.LOCK_EX)
+    lock = open(path, 'a+')  # not 'w': that would erase the holder's name before the wait
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.seek(0)
+        log(f'waiting for the gate lock, held by {lock.read().strip() or "another gate"}')
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    lock.seek(0)
+    lock.truncate()
+    lock.write(f'{label}, pid {os.getpid()}, since {time.strftime("%H:%M:%S")}\n')
+    lock.flush()
     return lock
 
 
@@ -349,8 +376,16 @@ def main() -> int:
     parser.add_argument('--merge', action='store_true', help='squash-merge the pull request on a pass')
     args = parser.parse_args()
     pr = args.target if args.target.isdigit() else None
+    start = time.monotonic()
+    lock = gate_lock(f'pr{pr}' if pr else args.target)  # held until this process exits
+    waited = minutes(start)
     for _ in range(3):
+        start = time.monotonic()
         passed, report, base, head, units = gate(args)
+        before, _, verdict = report.rpartition('\nGate: ')
+        report = f'{before}\nRan in {minutes(start):.1f} min, after {waited:.1f} min waiting for the gate lock.\n' \
+                 f'\nGate: {verdict}'
+        waited = 0.0
         print(report)
         if pr:
             url = subprocess.run(['gh', 'pr', 'comment', pr, '--body-file', '-'], input=comment(f'pr{pr}', report),
@@ -358,22 +393,23 @@ def main() -> int:
             set_status(head, passed, url)
         if not (passed and args.merge and pr):
             return 0 if passed else 1
-        with merge_lock():
-            git('fetch', '--quiet', 'origin', 'main')
-            tip = git('rev-parse', 'origin/main').stdout.strip()
-            if tip != base:
-                merged = git('merge-tree', '--write-tree', tip, head, check=False)
-                if merged.returncode:
-                    log(f'main moved to {tip[:10]} and now conflicts: rebase, then run the gate again')
-                    return 1
-                if stale(base, tip, merged.stdout.split()[0], units):
-                    log(f'main moved to {tip[:10]} and touches {", ".join(units)}: running the gate again')
-                    continue
-                log(f'main moved to {tip[:10]} but touches none of {", ".join(units) or "no units"}: merging')
-            if subprocess.run(['gh', 'pr', 'merge', pr, '--squash', '--match-head-commit', head]).returncode:
-                log(f'merge of {head[:10]} refused: if the pull request moved on, run the gate again')
+        # main moves only through the gate, and this gate holds the lock: tip == base, unless
+        # someone merged by hand or a gate from before the queue merged.
+        git('fetch', '--quiet', 'origin', 'main')
+        tip = git('rev-parse', 'origin/main').stdout.strip()
+        if tip != base:
+            merged = git('merge-tree', '--write-tree', tip, head, check=False)
+            if merged.returncode:
+                log(f'main moved to {tip[:10]} and now conflicts: rebase, then run the gate again')
                 return 1
-            return 0
+            if stale(base, tip, merged.stdout.split()[0], units):
+                log(f'main moved to {tip[:10]} and touches {", ".join(units)}: running the gate again')
+                continue
+            log(f'main moved to {tip[:10]} but touches none of {", ".join(units) or "no units"}: merging')
+        if subprocess.run(['gh', 'pr', 'merge', pr, '--squash', '--match-head-commit', head]).returncode:
+            log(f'merge of {head[:10]} refused: if the pull request moved on, run the gate again')
+            return 1
+        return 0
     log('main kept changing the affected units; not merged')
     return 1
 
