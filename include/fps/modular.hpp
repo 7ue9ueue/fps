@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 
 namespace fps {
@@ -28,5 +29,31 @@ constexpr std::uint32_t mod_inverse(std::uint32_t a) {
     if (a == 0) throw std::domain_error("fps::mod_inverse: 0 has no inverse");
     return mod_pow<P>(a, P - 2);
 }
+
+namespace detail {
+
+// The smaller of the two r in [0, P) with r^2 = a, for an odd prime P (a itself for a < 2);
+// std::nullopt if a is not a square. Tonelli-Shanks: O(log^2 P) products.
+template <std::uint32_t P>
+constexpr std::optional<std::uint32_t> mod_sqrt(std::uint32_t a) {
+    if (a < 2) return a;
+    if (mod_pow<P>(a, (P - 1) / 2) != 1) return std::nullopt;
+    std::uint32_t z = 2;  // a non-square
+    while (mod_pow<P>(z, (P - 1) / 2) == 1) ++z;
+    int s = 0;
+    std::uint32_t q = P - 1;
+    for (; q % 2 == 0; q /= 2) ++s;
+    std::uint32_t c = mod_pow<P>(z, q), t = mod_pow<P>(a, q), r = mod_pow<P>(a, (q + 1) / 2);
+    while (t != 1) {  // r^2 = a t, t of order 2^i < 2^s
+        int i = 0;
+        for (std::uint32_t u = t; u != 1; u = mod_mul<P>(u, u)) ++i;
+        std::uint32_t b = c;
+        for (int j = 0; j < s - i - 1; ++j) b = mod_mul<P>(b, b);
+        s = i, c = mod_mul<P>(b, b), t = mod_mul<P>(t, c), r = mod_mul<P>(r, b);
+    }
+    return r <= P - r ? r : P - r;
+}
+
+}  // namespace detail
 
 }  // namespace fps
