@@ -239,6 +239,44 @@ inline void products(const u32* x0, const u32* y0, const u32* x1, const u32* y1,
     }
 }
 
+// ---- Division ------------------------------------------------------------------------------------
+
+inline constexpr std::size_t kShortQuotient = 32;  // long division (k d word steps) up to this many words of q
+
+// Stack words divide_in() takes for f of n and g of m >= 1 words.
+inline std::size_t divide_words(std::size_t n, std::size_t m) {
+    const std::size_t k = division::quotient_size(n, m);
+    if (k == 0) return 0;
+    if (k <= kShortQuotient) return footprint(k) + footprint(n);
+    return footprint(k) + footprint(division::scratch_words(n, m, true));
+}
+
+// r = f mod g (m - 1 words, m = g.size(), g[m - 1] != 0), and q = f quo g into q if not empty (else
+// into the stack): long division for short quotients, else division::divide in the stack (or the
+// heap, if the stack is short; not for the sizes divide_words() counts).
+inline void divide_in(Stack& stack, Span f, Span g, Out q, Out r) {
+    const std::size_t k = division::quotient_size(f.size(), g.size());
+    if (k == 0) {
+        std::copy(f.begin(), f.end(), r.begin());
+        std::fill(r.begin() + std::ptrdiff_t(f.size()), r.end(), 0u);
+        return;
+    }
+    u32* const mark = stack.mark();
+    if (q.empty()) q = stack.take_span(k);
+    if (k <= kShortQuotient) {
+        division::detail::long_division(f, g, q, r, stack.take(f.size()));
+    } else {
+        const std::size_t words = division::scratch_words(f.size(), g.size(), true);
+        if (stack.room() >= footprint(words)) {
+            division::divide(f, g, q, r, stack.take_span(words));
+        } else {
+            std::vector<u32> scratch(words);
+            division::divide(f, g, q, r, scratch);
+        }
+    }
+    stack.release(mark);
+}
+
 // ---- Matrices -----------------------------------------------------------------------------------
 
 // A 2 x 2 matrix of polynomials: entry[2 i + j] is row i, column j, with size[2 i + j]
@@ -514,20 +552,10 @@ private:
     }
 
     // rest = a mod b (m words; b of m + 1 coefficients, b[m] != 0), q (n - m + 1 words) = a quo b if
-    // given. division::divide in scratch from the stack, else from the heap.
+    // given (divide_in).
     void remainder(const u32* a, std::ptrdiff_t n, const u32* b, std::ptrdiff_t m, u32* rest, u32* q = nullptr) {
-        const Span f(a, std::size_t(n + 1)), g(b, std::size_t(m + 1));
-        u32* const mark = stack_.mark();
-        const std::size_t qs = std::size_t(n - m + 1);
-        const Out quotient = q ? Out(q, qs) : take_span(qs);
-        const std::size_t words = division::scratch_words(f.size(), g.size(), true);
-        if (stack_.room() >= footprint(words)) {
-            division::divide(f, g, quotient, Out(rest, std::size_t(m)), take_span(words));
-        } else {
-            std::vector<u32> scratch(words);
-            division::divide(f, g, quotient, Out(rest, std::size_t(m)), scratch);
-        }
-        stack_.release(mark);
+        const Out quotient = q ? Out(q, std::size_t(n - m + 1)) : Out();
+        divide_in(stack_, Span(a, std::size_t(n + 1)), Span(b, std::size_t(m + 1)), quotient, Out(rest, std::size_t(m)));
     }
 
     // (c, d) = (b, a - q b) for q = a quo b, and r = [[0, 1], [1, -q]]. rest: n + 1 words.
@@ -693,19 +721,13 @@ inline std::size_t half_gcd_words(std::size_t n) {
     return 56 * len + levels * 48 * footprint(0) + 4096;
 }
 
-// Words of f mod g (q and division's scratch).
-inline std::size_t remainder_words(std::size_t n, std::size_t m) {
-    if (division::quotient_size(n, m) == 0) return 0;
-    return footprint(division::quotient_size(n, m)) + footprint(division::scratch_words(n, m, true));
-}
-
 inline std::size_t gcd_words(std::size_t nf, std::size_t ng) {  // trimmed sizes, both > 0, nf >= ng
-    return 2 * footprint(nf) + std::max(remainder_words(nf, ng), 2 * footprint(ng) + half_gcd_words(ng));
+    return 2 * footprint(nf) + std::max(divide_words(nf, ng), 2 * footprint(ng) + half_gcd_words(ng));
 }
 
 inline std::size_t inverse_mod_words(std::size_t n, std::size_t m) {  // m >= 2
     const std::size_t d = m - 1;
-    return footprint(d) + std::max(remainder_words(n, m), half_gcd_words(d));
+    return footprint(d) + std::max(divide_words(n, m), half_gcd_words(d));
 }
 
 inline constexpr std::size_t kAlignSlack = 16;
@@ -738,13 +760,7 @@ inline std::size_t gcd_run(Stack& stack, Span a, Span b, Out out, std::ptrdiff_t
     std::fill(x + nb, x + na, 0u);
     std::fill(y, y + na, 0u);
     HalfGcd h(stack, direct);
-    {
-        u32* const mark = stack.mark();
-        const std::size_t qs = division::quotient_size(na, nb);
-        const std::size_t words = division::scratch_words(na, nb, true);
-        division::divide(a, b, stack.take_span(qs), Out(y, nb - 1), stack.take_span(words));
-        stack.release(mark);
-    }
+    divide_in(stack, a, b, Out(), Out(y, nb - 1));
     std::ptrdiff_t n = std::ptrdiff_t(nb) - 1, m = n - 1;
     while (m >= 0 && y[m] == 0) --m;
     return h.spine(x, n, y, m, out);
@@ -754,13 +770,7 @@ inline std::size_t gcd_run(Stack& stack, Span a, Span b, Out out, std::ptrdiff_t
 inline std::ptrdiff_t inverse_mod_run(Stack& stack, Span f, Span g, Out h, std::ptrdiff_t direct) {
     const std::ptrdiff_t d = std::ptrdiff_t(g.size()) - 1;
     u32* const b = stack.take(std::size_t(d));
-    {
-        u32* const mark = stack.mark();
-        const std::size_t qs = division::quotient_size(f.size(), g.size());
-        const std::size_t words = division::scratch_words(f.size(), g.size(), true);
-        division::divide(f, g, stack.take_span(qs), Out(b, std::size_t(d)), stack.take_span(words));
-        stack.release(mark);
-    }
+    divide_in(stack, f, g, Out(), Out(b, std::size_t(d)));
     std::ptrdiff_t m = d - 1;
     while (m >= 0 && b[m] == 0) --m;
     if (m < 0) return -1;
