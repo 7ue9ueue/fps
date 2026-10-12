@@ -4,8 +4,8 @@
 // `tables` against the model: with the compiled defaults, and with each candidate set for every
 // class it runs at. Sizes: every n up to 1100, powers of two and their neighbours up to 2^20, both
 // sides of every change of the lane length C up to 2^14 and of every size class up to 2^13, random
-// n, and n = P - 1, P for small P; 32 lanes with the scan's prefetch also at 2^k - 1, 2^k, 2^k + 1
-// up to 2^22. Placements: tables 64-byte aligned, and at word offsets 0-15
+// n, and n = P - 1, P for small P; 32 lanes with the scan's prefetch, and zmm with streaming
+// stores, also at 2^k - 1, 2^k, 2^k + 1 up to 2^22. Placements: tables 64-byte aligned, and at word offsets 0-15
 // from it, the same or different for the two. Words before and after the tables must stay
 // untouched. Then the size classes, and tune.hpp: measure() at a small budget, wisdom text and
 // "factorials.variant" through tune::save / load. Then fresh (never written) tables in their own
@@ -113,6 +113,7 @@ std::vector<std::size_t> sizes(std::size_t limit, std::size_t min) {
 }
 
 using fps::factorials::Step;
+using fps::factorials::Store;
 
 // The sanitizer build compiles 5x slower than -O2: it runs every K and both chain products, at
 // fewer sizes and primes; the -O2 build runs everything.
@@ -128,16 +129,16 @@ using fps::factorials::Step;
 #endif
 constexpr bool kAll = FACTORIALS_TEST_ALL;
 
-template <class S, int K, Step step, bool prefetch = false>
+template <class S, int K, Step step, Store store = Store::plain>
 std::string variant() {
     return std::string("Chains<") + S::name + ", " + std::to_string(K) + (step == Step::shoup ? ", shoup" : ", montgomery") +
-           (prefetch ? ", prefetch>" : ">");
+           (store == Store::prefetch ? ", prefetch>" : store == Store::stream ? ", stream>" : ">");
 }
 
-template <class S, int K, u32 P, Step step, bool prefetch = false>
+template <class S, int K, u32 P, Step step, Store store = Store::plain>
 void chains(std::size_t limit) {
-    using C = fps::factorials::Chains<S, K, P, step, prefetch>;
-    const std::string name = variant<S, K, step, prefetch>();
+    using C = fps::factorials::Chains<S, K, P, step, store>;
+    const std::string name = variant<S, K, step, store>();
     const auto run = [](u32* fact, u32* inverse, std::size_t n) { C::run(fact, inverse, n); };
     const std::vector<std::size_t> base = sizes(limit, C::kMinSize);
     std::set<std::size_t> n(base.begin(), base.end());
@@ -149,9 +150,9 @@ void chains(std::size_t limit) {
 
 // Placements, on fewer sizes: the lane grid starts at h = (16 - offset) % S::lanes words, and
 // positions below h come from constant tables.
-template <class S, int K, u32 P, Step step>
+template <class S, int K, u32 P, Step step, Store store = Store::plain>
 void placements(std::size_t limit) {
-    using C = fps::factorials::Chains<S, K, P, step>;
+    using C = fps::factorials::Chains<S, K, P, step, store>;
     std::set<std::size_t> n;
     for (std::size_t m = C::kMinSize; m <= 300; ++m) n.insert(m);
     for (std::size_t m = 301; m <= std::min<std::size_t>(limit, 1 << 12); ++m)
@@ -161,21 +162,21 @@ void placements(std::size_t limit) {
     for (int t = 0; t < 8; ++t) n.insert(C::kMinSize + rng() % ((1 << 18) - C::kMinSize));
     if (limit == P) n.insert({P - 16, P - 1, P});
     const std::pair<std::size_t, std::size_t> offsets[] = {{1, 1}, {4, 4}, {12, 12}, {15, 15}, {0, 8}, {3, 13}, {9, 2}};
-    const std::string name = variant<S, K, step>();
+    const std::string name = variant<S, K, step, store>();
     const auto run = [](u32* fact, u32* inverse, std::size_t m) { C::run(fact, inverse, m); };
     for (std::size_t m : n)
         if (m <= limit)
             for (auto [f, i] : offsets) check<P>(name, m, run, f, i);
 }
 
-// 32 lanes with the scan's prefetch (issue #70): sizes just below, at and above 2^18 .. 2^max_lg,
-// at the placements' offsets and both tables aligned.
-template <class S, Step step>
+// 32 lanes with the scan's prefetch (issue #70), or K lanes' vectors with streaming stores
+// (round 3): sizes just below, at and above 2^18 .. 2^max_lg, at the placements' offsets and both
+// tables aligned (streaming: inverse at fact's offset or not).
+template <class S, Step step, Store store = Store::prefetch, int K = 32 / S::lanes>
 void wide(int max_lg) {
     constexpr u32 P = 998244353;
-    constexpr int K = 32 / S::lanes;
-    using C = fps::factorials::Chains<S, K, P, step, true>;
-    const std::string name = variant<S, K, step, true>();
+    using C = fps::factorials::Chains<S, K, P, step, store>;
+    const std::string name = variant<S, K, step, store>();
     const auto run = [](u32* fact, u32* inverse, std::size_t m) { C::run(fact, inverse, m); };
     const std::pair<std::size_t, std::size_t> offsets[] = {{0, 0}, {1, 1}, {4, 4}, {12, 12},
                                                            {15, 15}, {0, 8}, {3, 13}, {9, 2}};
@@ -185,6 +186,22 @@ void wide(int max_lg) {
             fps::factorials::model::tables<P>(fact.data(), inverse.data(), n);
             for (auto [f, i] : offsets) compare<P>(name, fact, inverse, run, f, i);
         }
+}
+
+// Streaming stores (Avx512, round 3), from kStreamSize on: lanes s < k stream into fact, and into
+// inverse when it has fact's offset; the lanes past n - C store plain over the same positions.
+// Below kStreamSize the same variants store plain.
+template <class S>
+void streaming() {
+    constexpr Store stream = Store::stream;
+    static_assert(fps::factorials::kStreamSize == std::size_t(1) << 22);  // wide() reaches it
+    chains<S, 1, 998244353, Step::shoup, stream>(kAll ? 1 << 20 : 1 << 16);
+    chains<S, 2, 998244353, Step::shoup, stream>(kAll ? 1 << 20 : 1 << 16);
+    chains<S, 2, 4099, Step::shoup, stream>(4099);
+    placements<S, 1, 998244353, Step::shoup, stream>(kAll ? 1 << 20 : 1 << 16);
+    wide<S, Step::shoup, stream, 1>(22);
+    wide<S, Step::shoup, stream, 2>(22);
+    wide<S, Step::montgomery, stream, 1>(22);
 }
 
 template <class S>
@@ -200,6 +217,9 @@ void test_isa() {
     placements<S, 2, 998244353, shoup>(1 << 20);
     placements<S, 2, 4099, shoup>(4099);
     if constexpr (S::lanes == 16) wide<S, shoup>(kAll ? 22 : 19), wide<S, montgomery>(kAll ? 22 : 19);
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if constexpr (std::is_same_v<S, fps::simd::Avx512>) streaming<S>();
+#endif
     if constexpr (S::lanes >= 4 && S::lanes < 16 && kAll) wide<S, shoup>(20);
     if constexpr (kAll) {
         chains<S, 4, 998244353, montgomery>(1 << 16);
@@ -217,7 +237,7 @@ namespace fx = fps::factorials;
 // Every candidate of select.hpp, also those test_isa leaves out (K = 1 Montgomery, K = 8, prefetch).
 template <class... V>
 void candidates(fx::Candidates<V...>) {
-    (chains<typename V::Isa, V::vectors, 998244353, V::scan, V::prefetch>(kAll ? 1 << 18 : 1 << 14), ...);
+    (chains<typename V::Isa, V::vectors, 998244353, V::scan, V::stores>(kAll ? 1 << 18 : 1 << 14), ...);
 }
 
 const auto selected = [](u32* fact, u32* inverse, std::size_t n) {

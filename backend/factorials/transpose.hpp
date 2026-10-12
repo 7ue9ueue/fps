@@ -1,4 +1,4 @@
-// In-register lane moves, per simd struct.
+// In-register lane moves, per simd struct; and non-temporal stores.
 //
 // Transposes of lanes x lanes words, one per vector type: on entry r[t] holds step t of every
 // lane, on exit r[l] holds every step of lane l (lane l of r[t] moves to lane t of r[l]).
@@ -9,6 +9,9 @@
 //   shift_down<S, d>(x, fill)   lane i = x[i + d] for i < S::lanes - d, else fill[i]
 //   broadcast_lane<S, i>(x)     every lane x[i]
 // One instruction each (valignd, palignr, ext, dup), Avx2: vpermd and a blend for the shifts.
+//
+// Non-temporal stores (Avx512): stream_store<S>(p, x) stores x at p (64-byte aligned) past the
+// caches; stream_fence<S>() orders them before later stores (sfence).
 #pragma once
 
 #include <cstdint>
@@ -139,6 +142,24 @@ typename S::V shift_down(typename S::V x, typename S::V fill) {
 #if defined(__ARM_NEON) && defined(__aarch64__)
     if constexpr (std::is_same_v<S, simd::Neon>) return vextq_u32(x, fill, d);
 #endif
+}
+
+template <class S>
+void stream_store([[maybe_unused]] std::uint32_t* p, [[maybe_unused]] typename S::V x) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if constexpr (std::is_same_v<S, simd::Avx512>) _mm512_stream_si512(reinterpret_cast<__m512i*>(p), x);
+    else
+#endif
+        static_assert(false, "streaming stores: Avx512 only");
+}
+
+template <class S>
+void stream_fence() {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if constexpr (std::is_same_v<S, simd::Avx512>) _mm_sfence();
+    else
+#endif
+        static_assert(false, "streaming stores: Avx512 only");
 }
 
 template <class S, int i>
