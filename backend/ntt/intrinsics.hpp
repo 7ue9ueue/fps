@@ -1224,8 +1224,6 @@ struct Ntt : Butterflies<S> {
 
     // The square of p.f (g, m and b unused): multiply(p) with one forward transform.
     static void square(const Product& p, const u32* r, const u32* ir) {
-        if constexpr (kNarrow)
-            if (p.lg < kWideMinLog) return Ntt<N>::square(p, r, ir);
         const std::size_t len = std::size_t(1) << p.lg, nv = len / 8;
         const u32 s = product_scale(p.lg);
         if (!has_radix2(p.lg)) {
