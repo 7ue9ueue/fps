@@ -94,7 +94,8 @@ GCC 15.2, `tools/kernel.py` flags, `lc-bench` (Zen 3), `lc-intel` (Emerald Rapid
 Round 1's numbers (main e754d90, same bench): 8x8 46 / 43 / 34 / 50 ns, 16x16 73 / 61 / 45 /
 112, 32x32 167 / 121 / 68 / 274, 512x512 15753 / 11948 / 5785 / 32548, 4096x128 27792 / 21890 /
 10564 / 58551 (Zen 3 / Emerald Rapids / Zen 5 / Neoverse V2). Round 2 against main on all 22
-gated shapes: Log.
+gated shapes: Log. Round 3 (the tiny path, main ab84150): 8x8 23 / 15 / 11 / 26 ns, 16x16
+44 / 40 / 25 / 75; the other shapes as above within 1-4% (Log).
 
 The frontend's old loop (`detail::schoolbook`, scalar, 64-bit sums reduced by `% P` every 16
 terms) took 0.24 ns per term on Zen 3 (`frontend/notes.md`).
@@ -206,6 +207,86 @@ Zen 5 and Neoverse V2, and in 12 on Emerald Rapids: 2^20 x 256 runs small at 11.
 8.8 / 11.0 ms, NTT 9.3 / 9.4 ms for m = 160 / 200 (model cutoff 174).
 
 ## Log
+
+2026-10-12, claude (issue #37, round 3): a tiny path; folds, phases and layout measured. Main
+ab84150 (pinned), GCC 15.2, `tools/kernel.py` flags. Files and raw output:
+`~/Documents/hpc_library-explore/small/r3/` (`out/`). Timings of trees: `ns.sh` (loop.cpp, which
+checks the product against the model; median of 7 rounds, 3 interleaved runs, ratio to the first
+tree); counts: `perf stat` on `lc-intel` (no PEBS in the VM, `perf_event_paranoid` 4 on `lc-arm`).
+- Where a small call goes (Emerald Rapids, perf): 8x8 96 cycles and 463 instructions, of which
+  26 cycles / 149 instructions outside `edge` (dispatch, `panel`, copy, b'), 18 / 127 in `edge`'s
+  setup, phase scan and finish, the rest in 8 steps of one vector; 32x32 334 / 1429, `edge`'s
+  non-term part 453 instructions. Ablations (timing only): 8x8 without `edge` 9.9 / 5.3 / 8.0 ns
+  of 29.9 / 19.9 / 30.7 (Zen 3 / Zen 5 / Neoverse V2).
+- Store forwarding: windows read from a copy made a few cycles earlier wait for its stores
+  (`stale`: the same code reading an old copy): 8x8 0.85 on Emerald Rapids, 0.71 on Zen 5, 16x8
+  0.71 on Zen 5; nothing on Zen 3 or Neoverse V2, nothing from 32x32 up. Making the end's copy
+  first (before the interior) changed nothing (0.995-1.001).
+- GCC turns `pad`'s loop of vector copies into calls of memcpy on every target. An empty `asm` in
+  the loop: 0.96-1.00 on tiny shapes, but Neoverse V2 long products 1.17 (4096x128: 59.8 against
+  51.0 us), from the full-block loop moving 4 bytes.
+- Neoverse V2 layout (`alscan.sh`, the full-block loop of R4 U1 moved by `.p2align` and nops): at
+  loop start mod 64 = 8 or 40, where the closing `b.ne` is the first instruction of a 32-byte block
+  and its `cmp` the last of the one before, 5.42 cycles per step against 4.62 (+17%); every other
+  place within 1%. x86 long loops: 0.7% (Emerald Rapids, Zen 5) to 1.7% (Zen 3) between places.
+  `trap.py` lists such loops in a binary: 18 of 166 multiply loops in this round's small bench,
+  13 of 109 in main's; within a function they are the same loops in both.
+- Folds (timing only, no folds in full blocks): long products 0.91 / 0.95 / 0.92 / 0.90 (Zen 3 /
+  Emerald Rapids / Zen 5 / Neoverse V2), about the folds' share of the multiplies and adds.
+  Staggered folds (half the vectors folding kFold / 2 later, to hide the fold's latency):
+  1.019 / 1.003 / 0.999 / 1.11; not latency. Centred signed factors (37 terms between folds
+  instead of 17) need a centred copy of a and a 4-op signed fold: about 1% net on paper; not built.
+- Neon `umlal` by element (4 words of b' per load, no `ld1r`): long products 1.02-1.09; not kept.
+- Phases on a grid of W (edge folds every 16, vectors entering up to W/4 steps early so that they
+  enter where others leave): 1.032 / 0.994 / 0.988 / 0.999 over 15 shapes; not kept. Every edge
+  vector over the block's whole range (`whole`, round 1's first form): 32x32 to 64x64 1.14-1.38 on
+  AVX-512; not kept.
+- Tiny path, in the order tried (all shapes at most 32 words a side):
+  1. One or two vectors over every step, in `panel` with its copy (`pair`): Zen 3 8x8 0.83, 6x6
+     0.75, 4x4 0.86; Emerald Rapids 16x8 0.88; Zen 5 16x8 0.80; Neoverse V2 1.00 (8x8 has four
+     vectors there).
+  2. The same with masked loads of a on AVX-512 (`pairm2`): 8x8 0.64 (Emerald Rapids) and 0.60
+     (Zen 5), 1x1 0.46 / 0.52, 16x16 0.93 / 0.82, 16x8 0.83 / 0.65.
+  3. Up to four vectors inside `panel`, copy made by zero stores then the data over them (`quad`):
+     Zen 3 1.18-1.48 slower (loads spanning overlapping stores), Neoverse V2 8x8 0.94.
+  4. A separate function with a small frame, copy stored without overlap, up to four vectors
+     (`lean`, then `lean2` with the masked loads): Zen 3 8x8 0.78, 16x16 0.81, 12x12 0.80;
+     Neoverse V2 8x8 0.84, 10x3 0.69; Zen 5 12x12 0.76, 16x8 0.58; but four zmm vectors (32x32)
+     1.07 on Emerald Rapids and 1.02 on Zen 5 (36% zero terms).
+- Kept: `tiny` with T a candidate's parameter (2 to 4; T = 3 for the zmm candidates, from the
+  32x32 loss). Candidates: the T = 2 lists of #54 round 3, plus copies with T = 3 or 4 of the
+  main candidate (index 0) and of the candidates the tables used for small classes. A first list
+  had only the small-class ones: `tune.py` gave class 11 (m <= 4, n >= 8m) a Solo R4 copy, which
+  wins at 32x4 and 48x3 (on the tiny path) and loses 3-4% at 4096x4; the copies of the main
+  candidate fixed that. `tools/tune.py small` run three times (the last for avx512 and zen5
+  only), each from the previous table with the new signature (indices kept). `tune::run()` times
+  2-3 more candidates per class.
+- Bench against main ab84150, 11 rounds, the 22 gated shapes (`out/b5-<target>.txt`): geomean
+  Zen 3 0.9808, Emerald Rapids 0.9755, Zen 5 0.9705, Neoverse V2 0.9895. 8x8 0.773 / 0.627 /
+  0.597 / 0.793 (23 / 15 / 11 / 26 ns; were 30 / 24 / 20 / 31); 16x16 0.802 / 0.932 / 0.825 /
+  0.993; 32x32 1.037 / 0.989 / 1.004 / 0.999; 48x48 to 512x512 0.985-0.990 / 0.998-1.001 /
+  0.999-1.009 / 0.995-1.002.
+  - Zen 3 long products 1.008-1.021 (4096x128 and 16384x128 0.996): no kernel change there; the
+    R4 U2 full-block loop sits at 32 mod 64 in the bench binary, against main's 48 (layout, as in
+    round 2). Zen 3 32x32 1.037: `tune.py` moved class 20 to R5 U2, which wins at 17x17 and
+    24x24 (61.1 against 67.2 ns at 17x17) and loses 2% at 32x32.
+  - Neoverse V2 4096x16 1.036: `tune.py` gave class 19 R4 U1 (geomean of its points 1.015
+    against 1.019-1.020 for the others; 3% slower at 1024x16, faster from 96x12 to 768x12).
+  - Zen 5 4096x4 / 4096x8 1.013 / 1.009 (ranges 0.99-1.02).
+- Frontend bench (`out/fe5-<target>.txt`, multiply cases): geomean 0.976 / 0.997 / 0.996 / 1.007;
+  16x16 0.844 / 0.946 / 0.863 / 1.002; Zen 3 `multiply/6` (32x32) 0.759 (the retuned costs send it
+  to small). Neoverse V2 `multiply/6` 1.11 and `multiply/4096x16` 1.04 (class 19, above). All
+  frontend cases on Neoverse V2, 11 rounds (`out/fe8-arm.txt`): 1.0043, with elementwise cases
+  between 0.74 and 1.14 (their known per-process modes). `multiply/6` alone: `fe32.cpp` (f * g
+  against its parts, one binary per tree) times f * g at 32x32 at 259.8 against 259.4 ns, and
+  identical copies of the bench binary agree with each other; with main's arm candidates and
+  table it read 1.014. So it follows this binary's code layout, not the kernel (guess: where
+  the bench binary places the hot code).
+- Tests: `Schoolbook<S, R, P, U, Solo, T>` also with T = 3 and 4 on every struct (six primes,
+  shapes up to 40 x 40, so the tiny path's folds at m = 16 for P near 2^30 too); simd
+  `load_mask` for every offset and mask pattern. small, simd and the frontend pass at -O2 and
+  ASan/UBSan on `lc-amd` (scalar, sse, avx2), `lc-intel-test`, `lc-zen5-test`, `lc-arm` and the
+  Mac (scalar, arm); `kernel.py check` passes.
 
 2026-10-12, claude (issue #63, gate time): the test builds `Schoolbook<S, ...>` for S =
 `simd::Native` only; each other struct is tested on its own target, and every candidate of
