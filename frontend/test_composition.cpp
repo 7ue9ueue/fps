@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "fps/fps.hpp"
@@ -336,10 +337,10 @@ void test_errors() {
                                          [&longer] { (void)fps::compose(longer, Poly{1, 1, 1}, std::size_t(1) << 22); }));
 }
 
-// At the limits (-O2 only: seconds each, and gigabytes under ASan): the largest sizes the checks
-// above pass run through every product.
+// At the limits: the largest sizes the checks above pass run through every product. Vector
+// targets at -O2 only: 17 s on the Mac (arm), 192 s on lc-amd's scalar target, gigabytes under ASan.
 void test_limits() {
-    if (kSanitized) return;
+    if (kSanitized || std::is_same_v<fps::simd::Native, fps::simd::Scalar>) return;
     const std::size_t n = std::size_t(1) << 22;
     const fps::Factorials<P> fact(2 * n + 1);
     // compose: f = 1 + y, g of n random words, g[0] = 0, gives 1 + g.
