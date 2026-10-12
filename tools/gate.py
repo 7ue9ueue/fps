@@ -8,7 +8,11 @@ For every target in tools/kernel.py, all at once, on the target's machines:
   - test: kernel.py test of every affected unit on each test machine, at once ('mac' is this Mac,
     with clang); kernel.py check once, on the first target's first test machine. A test whose
     preprocessed text for the target is identical to the base's is skipped (kernel.py --base):
-    the base passed it already, and the same text, compiler and flags give the same binary;
+    the base passed it already, and the same text, compiler and flags give the same binary.
+    ASan/UBSan builds only for the kernels whose own folder changed (all, if a shared file did):
+    they were 70% of the compile time (Mac clang, 6 of 10 frontend files), and the bugs they find
+    do not depend on the pull request being gated, so tools/sanitize.py runs them for every unit
+    on every target apart from the gate;
   - time, if the target has a timing machine: kernel.py bench of the gated cases against the base,
     21 rounds; on a slowdown, a second run of 21, pooled with the first. If the two runs disagree
     (a case's new/base moved by more than SHIFT and out of both runs' IQRs: a state of the run,
@@ -196,20 +200,26 @@ def geomean(values: list[float]) -> float | None:
     return math.exp(sum(map(math.log, values)) / len(values)) if values else None
 
 
-def run_tests(machine: str, name: str, new_tar: bytes, base_tar: bytes, target: str, units: list[str],
-              check: bool) -> subprocess.CompletedProcess:
-    """Tests that build to the same preprocessed text as in base are skipped (kernel.py --base)."""
+def run_tests(machine: str, name: str, new_tar: bytes, base_tar: bytes | None, target: str, units: list[str],
+              check: bool, sanitized: list[str] | None = None) -> subprocess.CompletedProcess:
+    """Tests that build to the same preprocessed text as in base_tar are skipped (kernel.py --base);
+    only the units in `sanitized` are built with ASan/UBSan (None: all)."""
     command = ('python3 tools/kernel.py check && ' if check else '') + \
         f'python3 tools/kernel.py test {" ".join(units)} --target {target}'
+    if sanitized is not None:
+        command += f' --sanitize {" ".join(sanitized)}'
     if machine == 'mac':
         with tempfile.TemporaryDirectory() as tree, tempfile.TemporaryDirectory() as base:
             tarfile.open(fileobj=io.BytesIO(new_tar), mode='r:gz').extractall(tree)
-            tarfile.open(fileobj=io.BytesIO(base_tar), mode='r:gz').extractall(base)
-            return subprocess.run(f'{command} --base {base}', shell=True, cwd=tree, capture_output=True)
+            if base_tar:
+                tarfile.open(fileobj=io.BytesIO(base_tar), mode='r:gz').extractall(base)
+                command += f' --base {base}'
+            return subprocess.run(command, shell=True, cwd=tree, capture_output=True)
     share = sum(machine in spec['test'] for spec in TARGETS.values())  # targets testing here share its cores
     command += f' -j $(( ($(nproc) + {share - 1}) / {share} ))'
-    path, base_path = ship(machine, name, new_tar), ship(machine, f'{name}-base', base_tar)
-    result = ssh(machine, f'cd {path} && {command} --base $HOME/{base_path}', capture=True)
+    path = ship(machine, name, new_tar)
+    base_path = ship(machine, f'{name}-base', base_tar) if base_tar else ''
+    result = ssh(machine, f'cd {path} && {command}' + (f' --base $HOME/{base_path}' if base_path else ''), capture=True)
     ssh(machine, f'rm -rf {path} {base_path}')
     return result
 
@@ -241,7 +251,7 @@ def time_units(vm: str, name: str, new_tar: bytes, base_tar: bytes, target: str,
 
 
 def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, units: list[str], timed: list[str],
-               check: bool, failed: threading.Event) -> tuple[bool, str]:
+               sanitized: list[str], check: bool, failed: threading.Event) -> tuple[bool, str]:
     spec = TARGETS[target]
     name = f'gate-{label}-{target}'
     out = [f'### {target}: `{spec["flags"] or "no flags"}`', '']
@@ -250,7 +260,7 @@ def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, units: 
         log(f'[{target}] testing on {machine}')
         start = time.monotonic()
         result = run_tests(machine, f'{name}-test', new_tar, base_tar, target, units,
-                           check and machine == spec['test'][0])
+                           check and machine == spec['test'][0], sanitized)
         if result.returncode:
             failed.set()
         return result, minutes(start)
@@ -318,6 +328,16 @@ def gh_json(*args: str) -> dict:
     return json.loads(subprocess.run(['gh', *args], check=True, capture_output=True, text=True).stdout)
 
 
+def touched(base: str, tree: str, units: list[str]) -> list[str]:
+    """Units to build with ASan/UBSan: the backend kernels whose own folder changed, or every unit
+    if a shared file changed. The frontend and the units that only include a changed kernel are
+    built without: tools/sanitize.py runs everything, apart from the gate."""
+    changed = [path for path in git('diff', '--name-only', base, tree).stdout.split() if not path.endswith('.md')]
+    if any(SHARED.match(path) for path in changed):
+        return units
+    return [u for u in units if u != 'frontend' and any(path.startswith(tuple(unit_paths(u))) for path in changed)]
+
+
 def gate(args, locked: bool) -> tuple[bool, str, str, str, list[str]] | None:
     """Returns (passed, report, the base commit it ran against, the head commit, affected units).
     Without the lock it only looks at the diff: it returns None if a unit is affected (the tests
@@ -351,14 +371,17 @@ def gate(args, locked: bool) -> tuple[bool, str, str, str, list[str]] | None:
         return True, '\n'.join(lines + ['No unit affected.', '', 'Gate: pass']), base, head, []
     if not locked:
         return None
-    lines += [f'Units: {", ".join(kernels)}', '']
+    sanitized = touched(base, tree, kernels)
+    lines += [f'Units: {", ".join(kernels)}', f'ASan/UBSan: {", ".join(sanitized) or "none"} '
+              '(the others -O2 only; tools/sanitize.py runs all)', '']
     new_tar = subprocess.run(['git', 'archive', '--format=tar.gz', tree], check=True, capture_output=True).stdout
     base_tar = rev_tar(base)
     timed = [k for k in kernels if git('cat-file', '-e', f'{base}:{unit_dir(k)}/bench.cpp', check=False).returncode == 0]
     failed = threading.Event()  # a test failed somewhere: stop timing
     first = next(iter(TARGETS))
     with ThreadPoolExecutor(len(TARGETS)) as executor:
-        futures = [executor.submit(run_target, t, label, new_tar, base_tar, kernels, timed, t == first, failed)
+        futures = [executor.submit(run_target, t, label, new_tar, base_tar, kernels, timed, sanitized, t == first,
+                                   failed)
                    for t in TARGETS]
         results = [f.result() for f in futures]
     passed = all(ok for ok, _ in results)
