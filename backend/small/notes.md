@@ -282,9 +282,9 @@ tree); counts: `perf stat` on `lc-intel` (no PEBS in the VM, `perf_event_paranoi
   identical copies of the bench binary agree with each other; with main's arm candidates and
   table it read 1.014. So it follows this binary's code layout, not the kernel (guess: where
   the bench binary places the hot code).
-- Tests: `Schoolbook<S, R, P, U, Solo, T>` also with T = 3 and 4 on every struct (six primes,
-  shapes up to 40 x 40, so the tiny path's folds at m = 16 for P near 2^30 too); simd
-  `load_mask` for every offset and mask pattern. small, simd and the frontend pass at -O2 and
+- Tests: `Schoolbook<S, R, P, U, Solo, T>` also with T = 3 and 4 on the native struct, and every
+  candidate (six primes, shapes up to 40 x 40, so the tiny path's folds at m = 16 for P near 2^30
+  too); simd `load_mask` for every offset and mask pattern. small, simd and the frontend pass at -O2 and
   ASan/UBSan on `lc-amd` (scalar, sse, avx2), `lc-intel-test`, `lc-zen5-test`, `lc-arm` and the
   Mac (scalar, arm); `kernel.py check` passes.
 
