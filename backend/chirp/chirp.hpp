@@ -10,7 +10,7 @@
 // s = 0 gives x_0 = c and x_k = 0 after it.
 //
 // Terms<S, K> (the fast path for fused passes): x_k, W = K S::lanes at a time, in K vectors of S
-// (select.hpp picks S = simd::Native and K per target): after j calls of next(), terms[v] holds
+// (select.hpp picks S = simd::Native, and K by size): after j calls of next(), terms[v] holds
 // x_(W j + v S::lanes + l) in lane l, in [0, 2P). x_(k+W) = x_k g_k with g_k = s^W q^(W k + t(W))
 // and g_(k+W) = g_k q^(W^2); g is kept times 2^32, so a step is one Montgomery product (x) and
 // one Shoup product (g) per vector. Pass c 2^32 mod P as c for factors of montgomery(f, x_k) = f x
@@ -154,25 +154,36 @@ template <bool kRead, class S, int K, u32 P, class Put>
 
 }  // namespace detail
 
-// out[k] = c s^k q^t(k), with Terms<S, K> (the target's by default).
-template <class S = Wide, int K = kVectors>
+// out[k] = c s^k q^t(k), with Terms<S, K>; K = 0: kSmallVectors, or kLargeVectors from
+// kLargeSize terms on (select.hpp).
+template <class S = Wide, int K = 0>
 void chirp(u32 c, u32 s, u32 q, std::span<u32> out) {
-    using M = modarith::Ops<S, kP>;
-    detail::pass<false>(Terms<S, K>(c, s, q), nullptr, out.data(), out.size(),
-                 [](typename S::V x, typename S::V) { return M::template reduce<kP>(x); });
+    if constexpr (K == 0) {
+        if (out.size() >= kLargeSize) return chirp<S, kLargeVectors>(c, s, q, out);
+        return chirp<S, kSmallVectors>(c, s, q, out);
+    } else {
+        using M = modarith::Ops<S, kP>;
+        detail::pass<false>(Terms<S, K>(c, s, q), nullptr, out.data(), out.size(),
+                            [](typename S::V x, typename S::V) { return M::template reduce<kP>(x); });
+    }
 }
 
-// out[k] = f[k] c s^k q^t(k); out may be f.
-template <class S = Wide, int K = kVectors>
+// out[k] = f[k] c s^k q^t(k); out may be f. K as for chirp.
+template <class S = Wide, int K = 0>
 void multiply_chirp(u32 c, u32 s, u32 q, std::span<const u32> f, std::span<u32> out) {
-    using M = modarith::Ops<S, kP>;
     if (f.size() != out.size()) throw std::invalid_argument("fps::chirp::multiply_chirp: f and out differ in size");
-    constexpr u32 R = u32((u64(1) << 32) % kP);
-    detail::pass<true>(Terms<S, K>(detail::mul(c, R), s, q), f.data(), out.data(), out.size(),
-                 [](typename S::V x, typename S::V a) { return M::template reduce<kP>(M::montgomery(a, x)); });
+    if constexpr (K == 0) {
+        if (out.size() >= kLargeSize) return multiply_chirp<S, kLargeVectors>(c, s, q, f, out);
+        return multiply_chirp<S, kSmallVectors>(c, s, q, f, out);
+    } else {
+        using M = modarith::Ops<S, kP>;
+        constexpr u32 R = u32((u64(1) << 32) % kP);
+        detail::pass<true>(Terms<S, K>(detail::mul(c, R), s, q), f.data(), out.data(), out.size(),
+                           [](typename S::V x, typename S::V a) { return M::template reduce<kP>(M::montgomery(a, x)); });
+    }
 }
 
-template <class S = Wide, int K = kVectors>
+template <class S = Wide, int K = 0>
 void multiply_chirp(u32 c, u32 s, u32 q, std::span<u32> f) {
     multiply_chirp<S, K>(c, s, q, std::span<const u32>(f), f);
 }

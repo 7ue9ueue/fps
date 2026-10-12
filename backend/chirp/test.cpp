@@ -2,7 +2,7 @@
 // K in {1, 2, 4, 8}: terms against the recurrence x_(k+1) = x_k s q^k, sizes 0 .. 99, powers of
 // two and neighbours, random sizes up to 2^16 + small; c, s, q in {0, 1, 2, P - 1} and random;
 // spans at offsets 0 .. 3 words with guard words around them. evaluate_geometric against Horner
-// (all points up to n m = 2^22, sampled beyond); interpolate_geometric by the round trip from a
+// (all points up to n m = 2^22, sampled beyond); interpolate_geometric (both products) by the round trip from a
 // random f (against O(n^2) Lagrange for small n), its errors; extrapolate from random samples
 // against Lagrange at c + k, with c at, inside, past and wrapping around the samples. Exits
 // nonzero on a failure. Also the prefix products under them (scan.hpp), every variant.
@@ -253,11 +253,12 @@ void test_interpolate() {
     for (std::size_t n : {0, 1, 2, 3, 4, 7, 8, 9, 31, 32, 33, 34, 63, 64, 65, 100, 127, 128, 129, 300}) {
         for (int trial = 0; trial < 3; ++trial) {
             const u32 a = trial == 0 ? 1 : random_word() | 1, r = trial == 1 ? 2 : random_word() | 1;
-            const Vec y = random_vec(n);
-            Vec out(n);
+            const Vec y = random_vec(n), expect = lagrange(a, r, y);
+            Vec out(n), other(n);
             fps::chirp::interpolate_geometric(a, r, y, out);
-            check(out == lagrange(a, r, y), "interpolate_geometric n=" + std::to_string(n) + " a=" + std::to_string(a) +
-                                                " r=" + std::to_string(r));
+            fps::chirp::interpolate_geometric<fps::chirp::Products::transform>(a, r, y, other);
+            check(out == expect && other == expect, "interpolate_geometric n=" + std::to_string(n) +
+                                                        " a=" + std::to_string(a) + " r=" + std::to_string(r));
         }
     }
     // r = 0 with two points; r = P - 1 (order 2) with two.
@@ -272,10 +273,11 @@ void test_interpolate() {
                           std::size_t(1) << 17}) {
         const u32 a = random_word() | 1, r = random_word() | 1;
         const Vec f = random_vec(n);
-        Vec y(n), out(n);
+        Vec y(n), out(n), other(n);
         fps::chirp::evaluate_geometric(f, a, r, y);
-        fps::chirp::interpolate_geometric(a, r, y, out);
-        check(out == f, "interpolate_geometric round trip n=" + std::to_string(n));
+        fps::chirp::interpolate_geometric<fps::chirp::Products::multiply>(a, r, y, out);
+        fps::chirp::interpolate_geometric<fps::chirp::Products::transform>(a, r, y, other);
+        check(out == f && other == f, "interpolate_geometric round trip n=" + std::to_string(n));
     }
     // Errors: points not distinct; out of another size.
     const auto throws = [](u32 a, u32 r, std::size_t n, std::size_t out_size) {
@@ -362,7 +364,16 @@ void test_extrapolate() {
 
 int main() {
     fps::simd::for_each(fps::simd::All{}, []<class S> { test_struct<S>(); });
-    test_terms<fps::chirp::Wide, fps::chirp::kVectors>();
+    for (std::size_t n : {fps::chirp::kLargeSize - 1, fps::chirp::kLargeSize, fps::chirp::kLargeSize + 1}) {
+        const u32 c = random_word(), s = random_word(), q = random_word();
+        const Vec x = reference_chirp(c, s, q, n), f = random_vec(n);
+        Vec out(n), product(n);
+        fps::chirp::chirp(c, s, q, out);
+        fps::chirp::multiply_chirp(c, s, q, f, product);
+        bool ok = out == x;
+        for (std::size_t k = 0; k < n; ++k) ok = ok && product[k] == mul(f[k], x[k]);
+        check(ok, "chirp, multiply_chirp by size n=" + std::to_string(n));
+    }
     test_products();
     test_evaluate();
     test_interpolate();

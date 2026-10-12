@@ -2,8 +2,11 @@
 //   chirp/<lg>                  2^lg terms into an array
 //   multiply_chirp/<lg>         2^lg words times the terms, in place
 //   chirp@k<K>/<lg>             chirp with Terms<Wide, K>, K in {1, 2, 4, 8}, lg in {10, 16, 20}
+//   products@scalar/<lg>        prefix products of 2^lg geometric factors and their inverses (scan.hpp),
+//   products@lanes<K>/<lg>      in scalar chains or in lanes, K in {1, 2, 4}, lg in {10, 16, 20}
 //   evaluate_geometric/<lg>     f of 2^lg coefficients at 2^lg points a r^i
 //   interpolate_geometric/<lg>  2^lg values at a r^i -> coefficients
+//   interpolate_geometric@<products>/<lg>   the same with ntt::multiply or ntt::Transform products
 //   extrapolate/<lg>            2^lg samples f(0 .. n - 1) -> f(c + k), k < 2^lg, c past the samples
 #include <cstdint>
 #include <random>
@@ -40,6 +43,18 @@ void add_variant(bench::Suite& suite, int lg) {
     }, n);
 }
 
+template <class Run>
+void add_products(bench::Suite& suite, const std::string& name, int lg, Run run) {
+    const std::size_t n = std::size_t(1) << lg;
+    suite.add(name + "/" + std::to_string(lg), [n, run] {
+        return [prefix = std::vector<u32>(n + 1), inverse = std::vector<u32>(n + 1), n, run]() mutable {
+            run(fps::chirp::detail::Geometric(kQ, kP - 1, kS), n, prefix.data(), 1, inverse.data(), 1);
+            bench::keep(prefix);
+            bench::keep(inverse);
+        };
+    }, n);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -60,11 +75,17 @@ int main(int argc, char** argv) {
             };
         }, n);
     }
-    for (int lg : {10, 16, 20}) {
+    for (int lg : {10, 12, 14, 16, 20}) {
         add_variant<1>(suite, lg);
         add_variant<2>(suite, lg);
         add_variant<4>(suite, lg);
         add_variant<8>(suite, lg);
+        using fps::chirp::Wide;
+        namespace d = fps::chirp::detail;
+        add_products(suite, "products@scalar", lg, [](auto&&... a) { d::products_scalar(a...); });
+        add_products(suite, "products@lanes1", lg, [](auto&&... a) { d::products_lanes<Wide, 1>(a...); });
+        add_products(suite, "products@lanes2", lg, [](auto&&... a) { d::products_lanes<Wide, 2>(a...); });
+        add_products(suite, "products@lanes4", lg, [](auto&&... a) { d::products_lanes<Wide, 4>(a...); });
     }
     for (int lg = 6; lg <= 22; lg += 2) {
         const std::size_t n = std::size_t(1) << lg;
@@ -78,6 +99,18 @@ int main(int argc, char** argv) {
         suite.add("interpolate_geometric" + size, [n, lg] {
             return [y = random_words(n, unsigned(lg)), out = std::vector<u32>(n)]() mutable {
                 fps::chirp::interpolate_geometric(kC, kS, y, out);
+                bench::keep(out);
+            };
+        }, n);
+        suite.add("interpolate_geometric@transform" + size, [n, lg] {
+            return [y = random_words(n, unsigned(lg)), out = std::vector<u32>(n)]() mutable {
+                fps::chirp::interpolate_geometric<fps::chirp::Products::transform>(kC, kS, y, out);
+                bench::keep(out);
+            };
+        }, n);
+        suite.add("interpolate_geometric@multiply" + size, [n, lg] {
+            return [y = random_words(n, unsigned(lg)), out = std::vector<u32>(n)]() mutable {
+                fps::chirp::interpolate_geometric<fps::chirp::Products::multiply>(kC, kS, y, out);
                 bench::keep(out);
             };
         }, n);
