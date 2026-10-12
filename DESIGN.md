@@ -162,7 +162,9 @@ and distinct points (a repeat throws `std::domain_error`: it makes M'(x_i) = 0 f
 prod (x - x_i), which the algorithm divides by, so the check is free). `to_newton_basis(f, points)`
 returns c of `f.size()` = n coefficients with f = sum_k c_k prod_(i < k) (x - x_i); it reads the
 first n - 1 points, any of them (fewer throws `std::domain_error`). Points and values >= P throw
-`std::domain_error`; 2^25 or more points (n >= 2^25) throw `std::length_error`.
+`std::domain_error`; 2^25 or more points to `interpolate` (n >= 2^25 to `to_newton_basis`) throw
+`std::length_error`. `evaluate` has no size limit: the backend splits f and the points into chunks
+of 2^24 (#139; the limit was the frontend's own tree's, whose root passed the NTT's 2^25).
 
 `sqrt(f, n)` is the root of the polynomial f mod x^n = x^(2k) u, u[0] != 0: x^k s with s^2 = u
 mod x^(n - k) and s[0] the smaller of the two square roots of u[0] in [0, P) (`sqrt(1 - 4x)` starts
