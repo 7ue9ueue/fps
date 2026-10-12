@@ -32,10 +32,11 @@
 #include <string>
 
 // A kernel's choices register only if its tune header is included. Every kernel the frontend
-// calls that has tuned choices includes its backend/<kernel>/tune.hpp here (ntt's when issue #78
-// adds one), so tune_all() and the wisdom cover them all.
+// calls that has tuned choices includes its backend/<kernel>/tune.hpp here, so tune_all() and the
+// wisdom cover them all. ntt's comes before small's, whose "small.ntt" times the NTT.
 #ifndef FPS_NO_TUNER
 #include "backend/factorials/tune.hpp"
+#include "backend/ntt/tune.hpp"
 #include "backend/small/tune.hpp"
 #include "backend/tune/tune.hpp"
 #endif
