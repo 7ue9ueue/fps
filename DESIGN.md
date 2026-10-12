@@ -200,9 +200,9 @@ Operations, all exact and all returning a `Fraction` (a, b fractions; f a polyno
 
 | Code | Meaning |
 |---|---|
-| `a + b`, `a - b`, `-a`, `c * a` | Termwise sum, difference, scaling |
-| `a * b`, `f * a` | Product of series (convolution of the sequences) |
-| `a / f`, `a / b` | Division of series; needs f[0] != 0, b's numerator [0] != 0 |
+| `a + b`, `a - b`, `-a`, `c * a`, `a * c` | Termwise sum, difference, scaling |
+| `a * b`, `f * a`, `a * f` | Product of series (convolution of the sequences) |
+| `a / f`, `a / b` | Division of series; needs f[0] != 0, b's numerator [0] != 0 (else `std::domain_error`) |
 | `a / (1 - x)` | Prefix sums: coefficient k is a_0 + ... + a_k |
 | `a * Poly::x(k)` | The sequence moved k places later |
 | `derivative(a)` | Coefficient k is (k + 1) a_(k+1); `x * derivative(a)` gives k a_k |
@@ -211,9 +211,9 @@ Costs, with d the larger of deg p and deg q:
 
 | Operation | Cost |
 |---|---|
-| `f[k]` | O(d log d log k). Small d: microseconds. d = 10^5, k = 10^18: about 60 products of length 2d, roughly 100 ms (guess, not measured) |
-| `take(n)` | O(n d) by recurrence for small d, else `mul(p, inverse(q, n), n)` |
-| `a + b`, `a * b`, `a / b` | One or two polynomial products; the degrees add |
+| `f[k]` | O(d log d log k). k = 10^18: 3-6 us for Fibonacci, 6-16 us at d = 16; d = 10^5: 120 products of factors of about d, 44 ms (Zen 5), 86-92 ms (Emerald Rapids), 94 ms (Zen 3), 167 ms (Neoverse V2), measured (#23); a Bostan-Mori kernel is #114 |
+| `take(n)` | `mul(p, inverse(q, n), n)`; `inverse` runs a recurrence, O(n t), for q with t <= 16 nonzero terms past q[0] |
+| `a + b`, `a * b`, `a / b` | Three (`a + b`, `a - b`), two (`a * b`, `a / b`) or one (`a / f`, `f * a`) polynomial products; the degrees add |
 
 - Degrees grow and are never reduced: `fib + fib` has denominator q^2, not q. Long chains make
   `[k]` slower. See Later (`reduced()`).
