@@ -23,8 +23,8 @@ namespace {
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 using Vec = std::vector<u32>;
-constexpr u32 P = fps::gcd::kP;
-namespace gd = fps::gcd::detail;
+constexpr u32 P = fps::half_gcd::kP;
+namespace gd = fps::half_gcd::detail;
 
 int failures = 0, checks = 0;
 std::mt19937_64 rng(103);
@@ -102,7 +102,7 @@ Vec run_gcd(const Vec& f, const Vec& g, std::ptrdiff_t direct, bool scratch) {
     const std::size_t room = std::max(f.size(), g.size());
     Vec out(room + 2, 0xdeadbeef);
     Vec memory;
-    if (scratch) memory.assign(fps::gcd::gcd_scratch(tf.size(), tg.size()) + 3, 0xa5a5a5a5u);
+    if (scratch) memory.assign(fps::half_gcd::gcd_scratch(tf.size(), tg.size()) + 3, 0xa5a5a5a5u);
     const std::size_t t = gd::gcd(f, g, std::span<u32>(out.data() + 1, room), memory, direct);
     if (out[0] != 0xdeadbeef || out[room + 1] != 0xdeadbeef) fail("gcd wrote outside out");
     return Vec(out.begin() + 1, out.begin() + 1 + std::ptrdiff_t(t));
@@ -131,7 +131,7 @@ void check_inverse(const Vec& f, const Vec& g, std::ptrdiff_t direct, bool scrat
         Vec memory;
         Vec tf = f;
         trim(tf);
-        if (scratch) memory.assign(fps::gcd::inverse_mod_scratch(tf.size(), m) + 5, 0x5a5a5a5au);
+        if (scratch) memory.assign(fps::half_gcd::inverse_mod_scratch(tf.size(), m) + 5, 0x5a5a5a5au);
         const std::ptrdiff_t t = gd::inverse_mod(f, g, std::span<u32>(h.data() + 1, m - 1), memory, direct);
         if (h[0] != 0xdeadbeef || h[m] != 0xdeadbeef) fail(what + ": inverse_mod wrote outside h");
         const Vec hs(h.begin() + 1, h.begin() + std::ptrdiff_t(m));
@@ -254,24 +254,24 @@ void arguments() {
         } catch (const std::invalid_argument&) {
         }
     };
-    expect_throw("gcd out short", [&] { fps::gcd::gcd(f, g, out); });
-    expect_throw("inverse_mod h size", [&] { fps::gcd::inverse_mod(f, g, std::span<u32>(h.data(), 4)); });
+    expect_throw("gcd out short", [&] { fps::half_gcd::gcd(f, g, out); });
+    expect_throw("inverse_mod h size", [&] { fps::half_gcd::inverse_mod(f, g, std::span<u32>(h.data(), 4)); });
     Vec g0 = g;
     g0.back() = 0;
-    expect_throw("inverse_mod g top zero", [&] { fps::gcd::inverse_mod(f, g0, h); });
-    expect_throw("inverse_mod g empty", [&] { fps::gcd::inverse_mod(f, Vec{}, std::span<u32>()); });
+    expect_throw("inverse_mod g top zero", [&] { fps::half_gcd::inverse_mod(f, g0, h); });
+    expect_throw("inverse_mod g empty", [&] { fps::half_gcd::inverse_mod(f, Vec{}, std::span<u32>()); });
     Vec small(3);
     Vec big = make(200), big2 = make(200), out200(200);
-    expect_throw("scratch short", [&] { fps::gcd::gcd(big, big2, out200, small); });
+    expect_throw("scratch short", [&] { fps::half_gcd::gcd(big, big2, out200, small); });
     // Constants and zeros.
     ++checks;
     Vec o(6, 7);
-    if (fps::gcd::gcd(Vec{}, Vec{0, 0}, o) != 0) fail("gcd(0, 0) != 0");
-    if (fps::gcd::gcd(Vec{0, 5, 0}, Vec{}, o) != 2 || o[0] != 0 || o[1] != 1) fail("gcd(5x, 0) != x");
-    if (fps::gcd::gcd(Vec{3}, g, o) != 1 || o[0] != 1) fail("gcd(3, g) != 1");
-    if (fps::gcd::inverse_mod(f, Vec{4}, std::span<u32>()) != 0) fail("inverse_mod by a constant != 0");
+    if (fps::half_gcd::gcd(Vec{}, Vec{0, 0}, o) != 0) fail("gcd(0, 0) != 0");
+    if (fps::half_gcd::gcd(Vec{0, 5, 0}, Vec{}, o) != 2 || o[0] != 0 || o[1] != 1) fail("gcd(5x, 0) != x");
+    if (fps::half_gcd::gcd(Vec{3}, g, o) != 1 || o[0] != 1) fail("gcd(3, g) != 1");
+    if (fps::half_gcd::inverse_mod(f, Vec{4}, std::span<u32>()) != 0) fail("inverse_mod by a constant != 0");
     Vec h2(5);
-    if (fps::gcd::inverse_mod(Vec{}, g, h2) != -1) fail("inverse_mod(0, g) != -1");
+    if (fps::half_gcd::inverse_mod(Vec{}, g, h2) != -1) fail("inverse_mod(0, g) != -1");
 }
 
 }  // namespace

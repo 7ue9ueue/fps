@@ -40,13 +40,13 @@ int main(int argc, char** argv) {
         const std::string size = "/" + std::to_string(lg);
         suite.add("gcd" + size, [n] {
             return [f = random_vec(n, unsigned(n)), g = random_vec(n, unsigned(n + 1)), out = Vec(n)]() mutable {
-                bench::keep(fps::gcd::gcd(f, g, out));
+                bench::keep(fps::half_gcd::gcd(f, g, out));
                 bench::keep(out);
             };
         }, n);
         suite.add("inverse_mod" + size, [n] {
             return [f = random_vec(n, unsigned(n)), g = random_vec(n, unsigned(n + 1)), h = Vec(n - 1)]() mutable {
-                bench::keep(fps::gcd::inverse_mod(f, g, h));
+                bench::keep(fps::half_gcd::inverse_mod(f, g, h));
                 bench::keep(h);
             };
         }, n);

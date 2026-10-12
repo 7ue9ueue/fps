@@ -3,12 +3,12 @@
 // ntt::Transform's fused ops and division::divide, so every target runs it. Design and
 // measurements: notes.md.
 //
-//   std::size_t t = fps::gcd::gcd(f, g, out);           // out[0, t) = monic gcd(f, g); t = 0 if both 0
-//   std::ptrdiff_t t = fps::gcd::inverse_mod(f, g, h);  // h = 1 / f mod g, deg h < deg g; -1 if
+//   std::size_t t = fps::half_gcd::gcd(f, g, out);           // out[0, t) = monic gcd(f, g); t = 0 if both 0
+//   std::ptrdiff_t t = fps::half_gcd::inverse_mod(f, g, h);  // h = 1 / f mod g, deg h < deg g; -1 if
 //                                                       // gcd(f, g) != 1
 //   // The same in the caller's scratch (gcd_scratch(n, m), inverse_mod_scratch(n, m) words, any
 //   // alignment) instead of this thread's NTT region:
-//   fps::gcd::gcd(f, g, out, scratch);
+//   fps::half_gcd::gcd(f, g, out, scratch);
 //
 // f, g: words < P, any sizes; zeros at their ends are ignored. gcd: out needs as many words as the
 // gcd can have, min of the two sizes past trailing zeros if both are nonzero, else the nonzero one's
@@ -51,7 +51,7 @@
 #include "backend/series/series.hpp"
 #include "backend/simd/select.hpp"
 
-namespace fps::gcd {
+namespace fps::half_gcd {
 
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
@@ -86,12 +86,6 @@ inline constexpr std::size_t kMinLength = std::size_t(1) << ntt::kMinLog;
 
 inline const ntt::Transform& transform(std::size_t len) { return series::detail::transform(std::countr_zero(len)); }
 
-// F = the leaf form of in (zero past it) at t's length; an empty in gives zeros.
-inline void forward(const ntt::Transform& t, Span in, u32* F) {
-    if (in.empty()) std::fill_n(F, t.length(), 0u);
-    else t.forward(in, F);
-}
-
 // ---- Memory -------------------------------------------------------------------------------------
 
 // 64-byte aligned arrays (footprint: ntt::kPadding words after each) taken from one span and given
@@ -103,7 +97,7 @@ public:
     }
     u32* take(std::size_t words) {
         u32* p = next_;
-        if (footprint(words) > std::size_t(end_ - next_)) throw std::logic_error("fps::gcd: scratch too small");
+        if (footprint(words) > std::size_t(end_ - next_)) throw std::logic_error("fps::half_gcd: scratch too small");
         next_ += footprint(words);
         return p;
     }
@@ -118,14 +112,25 @@ private:
 
 // ---- Euclid's steps -----------------------------------------------------------------------------
 
-// The factors of out = x u + y v x + z v (one fraction-free step), as each combine3 path wants them.
+// Whether T has 64-bit products of lanes (x86 mul_even, Neon mul_wide_lo): sums of products then
+// take one Montgomery reduction.
+template <class T>
+constexpr bool kWideOf = requires(typename T::V a) { T::mul_even(a, a); } || requires(typename T::V a) { T::mul_wide_lo(a, a); };
+constexpr bool kWide = kWideOf<S>;
+
+// The factors of out = x u + y v x + z v (one fraction-free step), as combine3 wants them: times
+// 2^32 (Montgomery, kWide), else with their Shoup quotients.
 struct Step {
-    u32 x, y, z;     // < P
-    u32 xr, yr, zr;  // times 2^32 mod P (Montgomery paths)
-    u32 xq, yq, zq;  // Shoup quotients (generic path)
-    Step(u32 x_, u32 y_, u32 z_)
-        : x(x_), y(y_), z(z_), xr(mul(x_, kR)), yr(mul(y_, kR)), zr(mul(z_, kR)), xq(M::shoup_quotient(x_)),
-          yq(M::shoup_quotient(y_)), zq(M::shoup_quotient(z_)) {}
+    u32 x, y, z;  // kWide: times 2^32 mod P
+    u32 xq = 0, yq = 0, zq = 0;
+    Step(u32 x_, u32 y_, u32 z_) {
+        if constexpr (kWide) {
+            x = mul(x_, kR), y = mul(y_, kR), z = mul(z_, kR);
+        } else {
+            x = x_, y = y_, z = z_;
+            xq = M::shoup_quotient(x_), yq = M::shoup_quotient(y_), zq = M::shoup_quotient(z_);
+        }
+    }
 };
 
 // out[j] = x u[j] + y v[j - 1] + z v[j] mod P for j in [from, to), rounded out to whole vectors:
@@ -134,11 +139,11 @@ struct Step {
 // x86: 3 products in 64-bit sums (< 3 P 2^32 + 2^32 P < 2^64), one Montgomery reduction (lc-opt's).
 // Neon: the same with umull / umlal. Otherwise Shoup products, reduced in pairs.
 template <class T>
-typename T::V combine3_vector(typename T::V a, typename T::V b, typename T::V c, const Step& s) {
+[[gnu::always_inline]] inline typename T::V combine3_vector(typename T::V a, typename T::V b, typename T::V c, const Step& s) {
     using W = typename T::V;
     using Ops = modarith::Ops<T, kP>;
     if constexpr (requires { T::mul_even(a, b); }) {
-        const W xs = T::broadcast(s.xr), ys = T::broadcast(s.yr), zs = T::broadcast(s.zr);
+        const W xs = T::broadcast(s.x), ys = T::broadcast(s.y), zs = T::broadcast(s.z);
         const W ninv = T::broadcast(kNegPinv), p = T::broadcast(kP);
         W even = T::add64(T::add64(T::mul_even(a, xs), T::mul_even(b, ys)), T::mul_even(c, zs));
         W odd = T::add64(T::add64(T::mul_even(T::template shr64<32>(a), xs), T::mul_even(T::template shr64<32>(b), ys)),
@@ -147,7 +152,7 @@ typename T::V combine3_vector(typename T::V a, typename T::V b, typename T::V c,
         odd = T::add64(odd, T::mul_even(T::mul_even(odd, ninv), p));
         return Ops::template reduce<kP>(T::join_high(even, odd));
     } else if constexpr (requires { T::mul_wide_lo(a, b); }) {
-        const W xs = T::broadcast(s.xr), ys = T::broadcast(s.yr), zs = T::broadcast(s.zr), p = T::broadcast(kP);
+        const W xs = T::broadcast(s.x), ys = T::broadcast(s.y), zs = T::broadcast(s.z), p = T::broadcast(kP);
         auto low = T::mla_wide_lo(T::mla_wide_lo(T::mul_wide_lo(a, xs), b, ys), c, zs);
         auto high = T::mla_wide_hi(T::mla_wide_hi(T::mul_wide_hi(a, xs), b, ys), c, zs);
         const W m = T::mul_lo(T::lo_halves(low, high), T::broadcast(kNegPinv));
@@ -166,6 +171,72 @@ inline void combine3(const u32* u, const u32* v, u32* out, std::ptrdiff_t from, 
     constexpr std::ptrdiff_t L = std::ptrdiff_t(kLanes);
     for (std::ptrdiff_t j = from & ~(L - 1); j < to; j += L)
         S::store(out + j, combine3_vector<S>(S::load(u + j), S::load(v + j - 1), S::load(v + j), s));
+}
+
+// ---- Values-form passes ------------------------------------------------------------------------
+
+constexpr u32 kR2 = mul(kR, kR);  // 2^64 mod P
+
+// x[i] = x[i] 2^32 mod P for i < n (canonical).
+inline void to_montgomery(u32* x, std::size_t n) {
+    std::size_t i = 0;
+    const V r2 = S::broadcast(kR2);
+    for (; i + kLanes <= n; i += kLanes) S::store(x + i, M::template reduce<kP>(M::montgomery(S::load(x + i), r2)));
+    for (; i < n; ++i) x[i] = mul(x[i], kR);
+}
+
+// (x0 y0 + x1 y1) 2^-32 mod P, canonical, for canonical words; twice: then times 2^-32 again.
+// kWide: the two products in 64-bit sums (< 2 P^2 + 2^32 P < 2^64), one Montgomery reduction (and
+// a second of the result); else Montgomery products, added.
+template <class T>
+[[gnu::always_inline]] inline typename T::V products_vector(typename T::V x0, typename T::V y0, typename T::V x1, typename T::V y1, bool twice) {
+    using W = typename T::V;
+    using Ops = modarith::Ops<T, kP>;
+    if constexpr (requires { T::mul_even(x0, y0); }) {
+        const W ninv = T::broadcast(kNegPinv), p = T::broadcast(kP);
+        const auto reduce = [&](W s) { return T::add64(s, T::mul_even(T::mul_even(s, ninv), p)); };  // high words
+        W even = reduce(T::add64(T::mul_even(x0, y0), T::mul_even(x1, y1)));
+        W odd = reduce(T::add64(T::mul_even(T::template shr64<32>(x0), T::template shr64<32>(y0)),
+                                T::mul_even(T::template shr64<32>(x1), T::template shr64<32>(y1))));
+        if (twice) {  // (r + m P) / 2^32 again, r < 2P the high words
+            even = reduce(T::template shr64<32>(even));
+            odd = reduce(T::template shr64<32>(odd));
+        }
+        return Ops::template reduce<kP>(T::join_high(even, odd));
+    } else if constexpr (requires { T::mul_wide_lo(x0, y0); }) {
+        const W ninv = T::broadcast(kNegPinv), p = T::broadcast(kP);
+        auto low = T::mla_wide_lo(T::mul_wide_lo(x0, y0), x1, y1);
+        auto high = T::mla_wide_hi(T::mul_wide_hi(x0, y0), x1, y1);
+        W m = T::mul_lo(T::lo_halves(low, high), ninv);
+        W r = T::hi_halves(T::mla_wide_lo(low, m, p), T::mla_wide_hi(high, m, p));  // < 2P
+        if (twice) {  // r 2^-32: (r + m P) / 2^32 with m = -r P^-1, r + m P < 2^32 (2P + P)
+            m = T::mul_lo(r, ninv);
+            r = T::hi_halves(T::mla_wide_lo(T::mul_wide_lo(r, T::broadcast(1)), m, p),
+                             T::mla_wide_hi(T::mul_wide_hi(r, T::broadcast(1)), m, p));
+        }
+        return Ops::template reduce<kP>(r);
+    } else {
+        const W s = Ops::add(Ops::template reduce<kP>(Ops::montgomery(x0, y0)), Ops::template reduce<kP>(Ops::montgomery(x1, y1)));
+        return twice ? Ops::template reduce<kP>(Ops::montgomery(s, T::broadcast(1))) : s;
+    }
+}
+
+// m = (x0 y0 + x1 y1) 2^-32 mod P word by word (canonical words, n a multiple of kLanes); kept[i] =
+// m if kept is not null; out[i] = m 2^-32 if twice, else m. A product of two forms times 2^32 is
+// then kept as such and goes to the inverse as the plain values (twice).
+inline void products(const u32* x0, const u32* y0, const u32* x1, const u32* y1, u32* kept, u32* out, std::size_t n,
+                     bool twice) {
+    if (!kept) {
+        for (std::size_t i = 0; i < n; i += kLanes)
+            S::store(out + i, products_vector<S>(S::load(x0 + i), S::load(y0 + i), S::load(x1 + i), S::load(y1 + i), twice));
+        return;
+    }
+    const V one = S::broadcast(1);
+    for (std::size_t i = 0; i < n; i += kLanes) {
+        const V m = products_vector<S>(S::load(x0 + i), S::load(y0 + i), S::load(x1 + i), S::load(y1 + i), false);
+        S::store(kept + i, m);
+        S::store(out + i, twice ? M::template reduce<kP>(M::montgomery(m, one)) : m);
+    }
 }
 
 // ---- Matrices -----------------------------------------------------------------------------------
@@ -246,10 +317,9 @@ public:
         stack_.release(mark);
     }
 
-    // The remainders of (a, b) down to the gcd, deg a = n > deg b = m (b[m] != 0, or m = -1);
-    // a, b: n + 1 words each, overwritten. Returns the gcd's degree; the gcd (up to a constant) is
-    // in a or b (the returned pointer).
-    const u32* spine(u32* a, std::ptrdiff_t n, u32* b, std::ptrdiff_t m, std::ptrdiff_t& degree) {
+    // out[0, t) = the monic gcd of (a, b), deg a = n > deg b = m (b[m] != 0, or m = -1), t returned:
+    // the remainders by jumps, then by Euclid's steps. a, b: n + 1 words each, overwritten.
+    std::size_t spine(u32* a, std::ptrdiff_t n, u32* b, std::ptrdiff_t m, Out out) {
         u32* const top = stack_.mark();
         u32* c = take(std::size_t(n + 1));
         u32* d = take(std::size_t(n + 1));
@@ -273,21 +343,31 @@ public:
             n = c_deg, m = c_deg - 1;
             while (m >= 0 && b[m] == 0) --m;
         }
-        // Euclid with inversions, monic remainders.
+        // Euclid's fraction-free steps on whole remainders, in padded copies.
+        u32* p[3];
+        for (auto& x : p) x = take_padded(std::size_t(n + 1));
+        std::copy_n(a, n + 1, p[0]);
+        std::copy_n(b, m + 1, p[1]);
+        a = p[0], b = p[1];
+        u32* e = p[2];
         while (m >= 0) {
-            const u32 lead = inverse(b[m]);
-            for (std::ptrdiff_t i = n - m; i >= 0; --i) {
-                const u32 q = mul(a[m + i], lead);
-                if (q)
-                    for (std::ptrdiff_t t = 0; t <= m; ++t) a[i + t] = sub1(a[i + t], mul(q, b[t]));
+            if (n - m == 1) {
+                const u32 alpha = b[m], beta = a[n];
+                const u32 gamma = sub1(mul(alpha, a[n - 1]), mul(beta, m ? b[m - 1] : 0));
+                combine3(a, b, e, 0, m, Step(mul(alpha, alpha), negate(mul(alpha, beta)), negate(gamma)));
+            } else {
+                pseudo_remainder(a, n, b, m, e);
             }
-            std::swap(a, b);
+            u32* const old = a;
+            a = b, b = e, e = old;
             n = m, m = n - 1;
             while (m >= 0 && b[m] == 0) --m;
         }
+        const u32 scale = inverse(a[n]);
+        for (std::ptrdiff_t i = 0; i < n; ++i) out[std::size_t(i)] = mul(a[i], scale);
+        out[std::size_t(n)] = 1;
         stack_.release(top);
-        degree = n;
-        return a;
+        return std::size_t(n + 1);
     }
 
 private:
@@ -422,6 +502,17 @@ private:
         }
     }
 
+    // e = lc(d)^(delta + 1) c mod d (fraction-free, delta = c_deg - d_deg): e[0, d_deg).
+    static void pseudo_remainder(const u32* c, std::ptrdiff_t c_deg, const u32* d, std::ptrdiff_t d_deg, u32* e) {
+        const u32 alpha = d[d_deg];
+        std::copy(c, c + c_deg + 1, e);
+        for (std::ptrdiff_t t = c_deg - d_deg; t >= 0; --t) {
+            const u32 minus_tau = negate(e[d_deg + t]);
+            for (std::ptrdiff_t j = 0; j <= d_deg + t; ++j)
+                e[j] = u32((u64(alpha) * e[j] + u64(minus_tau) * (j >= t ? d[j - t] : 0)) % kP);
+        }
+    }
+
     // rest = a mod b (m words; b of m + 1 coefficients, b[m] != 0), q (n - m + 1 words) = a quo b if
     // given. division::divide in scratch from the stack, else from the heap.
     void remainder(const u32* a, std::ptrdiff_t n, const u32* b, std::ptrdiff_t m, u32* rest, u32* q = nullptr) {
@@ -453,33 +544,30 @@ private:
         r.progress = delta;
     }
 
-    // out (len words) = the leaf form of length len of c mod (x^len - 1), c of size coefficients.
-    static void transform_of(const u32* c, std::size_t size, u32* out, std::size_t len) {
-        const ntt::Transform& t = transform(len);
-        if (size <= len) return forward(t, Span(c, size), out);
+    // out (len words) = the values form of length len of c mod (x^len - 1), c of size coefficients,
+    // times 2^32 if montgomery (the matrices' form).
+    static void values_of(const u32* c, std::size_t size, u32* out, std::size_t len, bool montgomery) {
         division::detail::fold(Span(c, size), Out(out, len));
-        t.forward(out);
+        if (montgomery) to_montgomery(out, std::min(size, len));
+        transform(len).forward(out, ntt::Form::values);
     }
 
-    // r.transform[i] = the leaf form of length len of entry i (room >= len): kept, doubled from
-    // the half held (forward_upper of the entry mod x^(len/2) + 1), or computed.
+    // r.transform[i] = the values form of length len of entry i, times 2^32 (room >= len): kept,
+    // doubled from the half held (the upper half from the entry mod x^(len/2) + 1), or computed.
     static void extend(Matrix& r, int i, std::size_t len) {
         if (r.length[i] == len) return;
         u32* const t = r.transform[i];
         const std::size_t half = len / 2, size = r.size[i];
         if (r.length[i] == half && size <= half + 1) {
             u32* const upper = t + half;
-            if (size == 0) {
-                std::fill_n(upper, half, 0u);
-            } else if (size <= half) {
-                transform(len).forward_upper(Span(r.entry[i], size), upper);
-            } else {
-                std::copy_n(r.entry[i], half, upper);
-                upper[0] = sub1(upper[0], r.entry[i][half]);
-                transform(len).forward_upper(upper);
-            }
+            const u32* const e = r.entry[i];
+            std::copy_n(e, std::min(size, half), upper);
+            std::fill(upper + std::min(size, half), upper + half, 0u);
+            if (size > half) upper[0] = sub1(upper[0], e[half]);
+            to_montgomery(upper, std::min(size, half));
+            transform(len).forward_upper(upper, ntt::Form::values);
         } else {
-            transform_of(r.entry[i], size, t, len);
+            values_of(r.entry[i], size, t, len, true);
         }
         r.length[i] = len;
     }
@@ -492,11 +580,11 @@ private:
         u32* const mark = stack_.mark();
         const std::size_t len = std::max(kMinLength, std::bit_ceil(std::size_t(n + 1) / 2));
         for (int i = 0; i < 4; ++i) extend(r1, i, len);
-        u32 *const ta = take(len), *const tb = take(len), *const work = take(len);
-        transform_of(a, std::size_t(n + 1), ta, len);
-        transform_of(b, std::size_t(m + 1), tb, len);
+        u32 *const ta = take(len), *const tb = take(len);
+        values_of(a, std::size_t(n + 1), ta, len, false);
+        values_of(b, std::size_t(m + 1), tb, len, false);
         u32 *const pc = take(len), *const pd = take(len);
-        apply_products(r1.transform, ta, tb, work, Out(pc, len), Out(pd, len), len);
+        apply_products(r1.transform, ta, tb, pc, pd, len);
         const std::ptrdiff_t l = std::ptrdiff_t(len), mixed = c_deg - l;  // c[j] + c[j + L] at j <= mixed
         if (mixed < 0) {
             std::copy(pc + s2, pc + c_deg + 1, c + s2);
@@ -509,20 +597,18 @@ private:
         const std::size_t mb = std::min(low, std::size_t(m + 1));
         if (short_len < len) {
             // Few wrapped coefficients: (r1 mod x^low) (a, b mod x^low) of degree < 2 low - 1.
-            const ntt::Transform& t = transform(short_len);
             u32* rt[4];
             for (int i = 0; i < 4; ++i) {
                 rt[i] = take(short_len);
-                forward(t, Span(r1.entry[i], std::min(low, r1.size[i])), rt[i]);
+                values_of(r1.entry[i], std::min(low, r1.size[i]), rt[i], short_len, true);
             }
-            t.forward(Span(a, low), ta);
-            forward(t, Span(b, mb), tb);
-            apply_products(rt, ta, tb, work, Out(lc, low), Out(ld, low), short_len);
+            values_of(a, low, ta, short_len, false);
+            values_of(b, mb, tb, short_len, false);
+            apply_products(rt, ta, tb, lc, ld, short_len);
         } else {
-            const ntt::Transform& t = transform(len);
-            t.forward(Span(a, low), ta);
-            forward(t, Span(b, mb), tb);
-            apply_products(r1.transform, ta, tb, work, Out(lc, low), Out(ld, low), len);
+            values_of(a, low, ta, len, false);
+            values_of(b, mb, tb, len, false);
+            apply_products(r1.transform, ta, tb, lc, ld, len);
             // Coefficient L of the low products (if n = 2L) wraps onto 0.
             lc[0] = u32((u64(r1.at0[0]) * a[0] + u64(r1.at0[1]) * b[0]) % kP);
             ld[0] = u32((u64(r1.at0[2]) * a[0] + u64(r1.at0[3]) * b[0]) % kP);
@@ -539,18 +625,18 @@ private:
         stack_.release(mark);
     }
 
-    // c, d = the first c.size(), d.size() coefficients of r (a, b) mod (x^len - 1) from the leaf
-    // forms of length len of r's entries and of a, b.
-    static void apply_products(u32* const (&r)[4], const u32* ta, const u32* tb, u32* work, Out c, Out d,
-                               std::size_t len) {
+    // c, d (len words each) = the coefficients of r (a, b) mod (x^len - 1) from the values forms of
+    // length len of r's entries (times 2^32) and of a, b.
+    static void apply_products(u32* const (&r)[4], const u32* ta, const u32* tb, u32* c, u32* d, std::size_t len) {
         const ntt::Transform& t = transform(len);
-        const ntt::Term tc[2] = {{r[0], ta}, {r[1], tb}}, td[2] = {{r[2], ta}, {r[3], tb}};
-        t.inverse_product(tc, work, c);
-        t.inverse_product(td, work, d);
+        products(r[0], ta, r[1], tb, nullptr, c, len, false);
+        products(r[2], ta, r[3], tb, nullptr, d, len, false);
+        t.inverse(c, ntt::Form::values);
+        t.inverse(d, ntt::Form::values);
     }
 
     // out = r2 r1 (the entries in need), progress p = r2.progress + r1.progress: cyclic products
-    // of length L >= p (coefficient L, if p = L, wraps onto 0), whose leaf forms out keeps if its
+    // of length L >= p (coefficient L, if p = L, wraps onto 0), whose values forms out keeps if its
     // room allows.
     void combine(Matrix& r2, Matrix& r1, Matrix& out, unsigned need) {
         u32* const mark = stack_.mark();
@@ -570,21 +656,14 @@ private:
                 const u32 x0 = u32((u64(r2.at0[2 * i]) * r1.at0[j] + u64(r2.at0[2 * i + 1]) * r1.at0[2 + j]) % kP);
                 out.at0[ij] = x0;
                 if (!(need >> ij & 1)) continue;
-                // out[ij] = r2[2i] r1[j] + r2[2i + 1] r1[2 + j].
+                // out[ij] = r2[2i] r1[j] + r2[2i + 1] r1[2 + j]: kept times 2^32, its coefficients
+                // from the plain values in work.
+                products(r2.transform[2 * i], r1.transform[j], r2.transform[2 * i + 1], r1.transform[2 + j],
+                         keep ? out.transform[ij] : nullptr, work, len, true);
+                if (keep) out.length[ij] = len;
+                t.inverse(work, ntt::Form::values);
                 u32* const e = out.entry[ij];
-                const u32 *x0t = r2.transform[2 * i], *x1t = r2.transform[2 * i + 1];
-                const u32 *y0t = r1.transform[j], *y1t = r1.transform[2 + j];
-                if (keep) {
-                    u32* const to = out.transform[ij];
-                    t.multiply(x0t, y0t, to);
-                    t.multiply_add(to, x1t, y1t);
-                    const ntt::Term term[1] = {{to, nullptr}};
-                    t.inverse_product(term, work, Out(e, count));
-                    out.length[ij] = len;
-                } else {
-                    const ntt::Term terms[2] = {{x0t, y0t}, {x1t, y1t}};
-                    t.inverse_product(terms, work, Out(e, count));
-                }
+                std::copy_n(work, count, e);
                 if (p == len) e[len] = sub1(e[0], x0), e[0] = x0;
                 std::size_t size = p + 1;
                 while (size > 0 && e[size - 1] == 0) --size;
@@ -636,7 +715,7 @@ template <class Body>
 auto with_stack(std::size_t words, std::span<u32> scratch, const Body& body) {
     words += kAlignSlack;
     if (!scratch.empty()) {
-        if (scratch.size() < words) throw std::invalid_argument("fps::gcd: scratch too small");
+        if (scratch.size() < words) throw std::invalid_argument("fps::half_gcd: scratch too small");
         Stack stack(scratch.data(), scratch.size());
         return body(stack);
     }
@@ -646,7 +725,7 @@ auto with_stack(std::size_t words, std::span<u32> scratch, const Body& body) {
 }
 
 inline void check_length(std::size_t n) {
-    if (n > (std::size_t(1) << ntt::kMaxLog)) throw std::length_error("fps::gcd: longer than the transforms' 2^25 words");
+    if (n > (std::size_t(1) << ntt::kMaxLog)) throw std::length_error("fps::half_gcd: longer than the transforms' 2^25 words");
 }
 
 // gcd of a (na) and b (nb) words, trimmed, na >= nb >= 1, in the stack: out[0, t) monic.
@@ -668,12 +747,7 @@ inline std::size_t gcd_run(Stack& stack, Span a, Span b, Out out, std::ptrdiff_t
     }
     std::ptrdiff_t n = std::ptrdiff_t(nb) - 1, m = n - 1;
     while (m >= 0 && y[m] == 0) --m;
-    std::ptrdiff_t degree = 0;
-    const u32* const g = h.spine(x, n, y, m, degree);
-    const u32 scale = inverse(g[degree]);
-    for (std::ptrdiff_t i = 0; i < degree; ++i) out[std::size_t(i)] = mul(g[i], scale);
-    out[std::size_t(degree)] = 1;
-    return std::size_t(degree + 1);
+    return h.spine(x, n, y, m, out);
 }
 
 // inverse_mod of f by g (m >= 2 words, g[m - 1] != 0) in the stack.
@@ -709,7 +783,7 @@ inline std::size_t gcd(Span f, Span g, Out out, std::span<u32> scratch, std::ptr
     std::size_t nf = trimmed(f), ng = trimmed(g);
     if (nf < ng) std::swap(f, g), std::swap(nf, ng);
     const std::size_t need = ng ? ng : nf;
-    if (out.size() < need) throw std::invalid_argument("fps::gcd::gcd: out shorter than the gcd can be");
+    if (out.size() < need) throw std::invalid_argument("fps::half_gcd::gcd: out shorter than the gcd can be");
     if (nf == 0) return 0;
     check_length(nf);
     if (ng == 0) {  // gcd(f, 0) = f, monic
@@ -728,7 +802,7 @@ inline std::size_t gcd(Span f, Span g, Out out, std::span<u32> scratch, std::ptr
 inline std::ptrdiff_t inverse_mod(Span f, Span g, Out h, std::span<u32> scratch, std::ptrdiff_t direct) {
     const std::size_t m = g.size();
     if (m == 0 || g[m - 1] == 0 || h.size() != m - 1)
-        throw std::invalid_argument("fps::gcd::inverse_mod: g empty or g[m - 1] = 0, or h not m - 1 words");
+        throw std::invalid_argument("fps::half_gcd::inverse_mod: g empty or g[m - 1] = 0, or h not m - 1 words");
     if (m == 1) return 0;
     check_length(std::max(f.size(), m));
     f = f.first(trimmed(f));
@@ -762,4 +836,4 @@ inline std::ptrdiff_t inverse_mod(std::span<const u32> f, std::span<const u32> g
     return detail::inverse_mod(f, g, h, scratch, detail::kDirect);
 }
 
-}  // namespace fps::gcd
+}  // namespace fps::half_gcd
