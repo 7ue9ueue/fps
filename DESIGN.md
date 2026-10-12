@@ -153,6 +153,14 @@ coefficients and r has d (f's, then zeros, if `f.size()` <= d), so `f / x^k` dro
 coefficients and `f % x^k` is `f.truncate(k)`; neither is trimmed. g = 0, of any size, throws
 `std::domain_error`. `f / g` computes no remainder.
 
+`evaluate(f, points)` returns `points.size()` values, for any points (repeats too).
+`interpolate<P>(points, values)` returns m = `points.size()` coefficients; it needs as many values
+and distinct points (a repeat throws `std::domain_error`: it makes M'(x_i) = 0 for M =
+prod (x - x_i), which the algorithm divides by, so the check is free). `to_newton_basis(f, points)`
+returns c of `f.size()` = n coefficients with f = sum_k c_k prod_(i < k) (x - x_i); it reads the
+first n - 1 points, any of them (fewer throws `std::domain_error`). Points and values >= P throw
+`std::domain_error`; 2^25 or more points (n >= 2^25) throw `std::length_error`.
+
 `Factorials<P> fact(n)`, n <= P: `fact[i]` = i!, `fact.inverse(i)` = 1/i!, `fact.binomial(n, k)`
 = C(n, k) (0 for k > n), for i, n < `fact.size()`. n > P throws: P! = 0 has no inverse. Indices
 are not checked, as in `operator[]`.
