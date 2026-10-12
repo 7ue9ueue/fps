@@ -3,14 +3,14 @@
 Number-theoretic transforms and products modulo P = 998244353. API: `ntt.hpp` (`multiply`,
 `square`, `middle_product`, `Convolution`, `Transform`, the leaf form). Variants: `scalar.hpp` (every target; the model),
 `intrinsics.hpp` (`intrinsics<S>`, templates on any `backend/simd` struct S), `avx2.hpp` (lc-opt's
-`lib/ntt`).
+`lib/ntt`), `avx512.hpp` (intrinsics on zmm with generated asm kernels, issue #150).
 `select.hpp`: the variant per op and length, a tuned choice ("ntt.variant", issue #78): per target
 a list of candidates and a table of one per op (forward, inverse, multiply, product) and lg, with
 compiled defaults in `tuned.hpp` (`tools/tune.py ntt`, `tune.cpp`); `tune.hpp` measures it at run
 time. `memory.hpp`: `Convolution`'s memory, kept per thread. Tests: `test.cpp`,
 `test_no_tuner.cpp`; benches: `bench.cpp`.
 Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_product_kernels.hpp`
-(`gen_avx2_product_kernels.py`).
+(`gen_avx2_product_kernels.py`), `avx512_kernels.hpp` (`gen_avx512_kernels.py`).
 
 ## Design
 
@@ -239,12 +239,40 @@ the other variants' word for word.
   not read (zero quarters past the source): without it, Emerald Rapids ran multiply_dense at odd
   lg from 2^17 2% slower in the unified attempt (Log).
 
+### avx512 (issue #150)
+
+`variant::avx512` (`avx512.hpp`): `intrinsics<S>` on a struct of its own (`avx512::Zmm`, simd's
+Avx512 renamed), for which `intrinsics.hpp`'s hook `Generated<S>` swaps in generated asm
+(`avx512_kernels.hpp`, `gen_avx512_kernels.py`) for two kernels; every other path is the zmm
+intrinsics'. A candidate on the avx512 target only (Zen 5's tuning is issue #152).
+
+- Generator: gen_avx2_kernels.py's method on zmm. Dataflow graphs of EVEX instructions (memory
+  operands and `{1to16}` broadcasts folded where used once, vpermt2d/vpermi2d writing a source,
+  broadcasts merged under a mask), list-scheduled on `backend/simd/machines.py`'s measured model
+  of the target (pipes, latencies, uops; Emerald Rapids: 512-bit ops on p0 and p5, vpminud and
+  shifts p0 only, permutes p5 only, vpmulld 2 uops), with memory order kept (loads after stores
+  that overlap them, stores after loads), allocated on zmm0-31 by linear scan.
+- Forward groups k > 0 of 4 columns and more (`forward`, `forward_in2`, prefetching forms): 4
+  columns per iteration; the odd words of quarters 2 and 3 from loads 4 bytes on (2 shifts fewer
+  per column: p0 uops 452 -> 424 per 16 columns), so they read 4 bytes past a column, inside the
+  arrays' padding. Groups of 2 columns, group 0 and the inverse groups stay intrinsics: the asm
+  ran as fast (within 1%).
+- Product bottoms (`multiply_*`, `square_*`, `stored_*`): WideBottom's pair layout, in two stages
+  as gen_avx2_product_kernels.py's: first (forward butterflies of a pair into a leaf buffer: rows
+  w A and A, B) and last (leaf products, inverse butterflies, transposed stores); each statement
+  runs last of pair j and first of pair j + 1 interleaved. The windows x^(8-j) A of the leaf
+  products are vpermi2d of the two rows (indices loaded per use: vpermi2d overwrites them), so no
+  row is stored in halves. Kernel time 0.93 of WideBottom::multiply's on L1 data.
+- Constants: each statement loads its own (pure loads); masks are "Yk" operands, as a kmovw from
+  memory costs a p0/p5 uop (measured, notes/150-r1.md).
+
 ### Variant selection (issue #78)
 
 A tuned choice, "ntt.variant" (`backend/tune`): per target a list of candidates (`select.hpp`,
 `Selected`) and a table of one candidate per op and lg 6..25 (`Choices`, 80 bytes).
 
-- Candidates: avx512 and zen5 {avx2, intrinsics<Avx512Vl>, intrinsics<Avx512>}; avx2 {avx2,
+- Candidates: zen5 {avx2, intrinsics<Avx512Vl>, intrinsics<Avx512>}, avx512 the same and avx512
+  (issue #150); avx2 {avx2,
   intrinsics<Avx2>}; arm, sse, scalar intrinsics<Native> alone (no table read: `choice()` is a
   constant 0). Each is fastest somewhere on our machines (Log, issue #78).
 - Ops: forward and inverse (`Transform`), multiply (`Convolution::multiply`) and product
