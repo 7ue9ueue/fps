@@ -1,13 +1,13 @@
 // Polynomial gcd modulo P = 998244353 by half-gcd jumps, and the inverse modulo a polynomial
-// (backend kernel). From lc-opt's lib/poly/gcd.hpp (its issues #82, #85), rewritten on
-// ntt::Transform's fused ops and division::divide, so every target runs it. Design and
-// measurements: notes.md.
+// (backend kernel; namespace half_gcd, as fps::gcd is the frontend's function). From lc-opt's
+// lib/poly/gcd.hpp (its issues #82, #85), rewritten on ntt::Transform's values form and
+// division::divide, so every target runs it. Design and measurements: notes.md.
 //
 //   std::size_t t = fps::half_gcd::gcd(f, g, out);           // out[0, t) = monic gcd(f, g); t = 0 if both 0
 //   std::ptrdiff_t t = fps::half_gcd::inverse_mod(f, g, h);  // h = 1 / f mod g, deg h < deg g; -1 if
-//                                                       // gcd(f, g) != 1
-//   // The same in the caller's scratch (gcd_scratch(n, m), inverse_mod_scratch(n, m) words, any
-//   // alignment) instead of this thread's NTT region:
+//                                                            // gcd(f, g) != 1
+//   // The same in the caller's scratch (gcd_scratch(n, m), inverse_mod_scratch(n, m) words for f,
+//   // g of n, m words past their trailing zeros; any alignment) instead of this thread's NTT region:
 //   fps::half_gcd::gcd(f, g, out, scratch);
 //
 // f, g: words < P, any sizes; zeros at their ends are ignored. gcd: out needs as many words as the
@@ -15,8 +15,8 @@
 // (max(f.size(), g.size()) always suffices), else std::invalid_argument before anything is written.
 // inverse_mod: g of m >= 1 words with g[m - 1] != 0, h of m - 1 words; returns the number t of
 // coefficients of h past trailing zeros (h[t, m - 1) = 0; t = 0: h = 0, also for m = 1), or -1 if
-// gcd(f, g) != 1 (h unspecified). Throws std::invalid_argument for other sizes, std::length_error
-// past the transforms' 2^25 words.
+// gcd(f, g) != 1 (h unspecified). Throws std::invalid_argument for other sizes or a short scratch,
+// std::length_error past the transforms' 2^25 words.
 //
 // A jump of k on (a, b), deg a = n > deg b, is the matrix R = Q_h ... Q_1 of the Euclidean
 // quotients q_i of (a, b) with deg r_h >= n - k > deg r_(h+1): R (a, b) = (r_h, r_(h+1)). It
@@ -25,10 +25,14 @@
 // - jump(k): jump(k1) on the top 2 k1 + 1 coefficients (k1 = k / 2 for a power of two, else the
 //   largest power of two below k), apply R1 to (a, b) by cyclic products of length bit_ceil(n / 2),
 //   jump(k - progress) on the top of the result, combine R2 R1 by cyclic products of length
-//   bit_ceil(progress), keeping the product transforms (the parent doubles them by forward_upper).
-//   Jumps of k <= kDirect: Euclid's algorithm with fraction-free steps on the top coefficients.
+//   bit_ceil(progress), keeping the products' transforms (the parent doubles them by
+//   forward_upper). Jumps of k <= kDirect: Euclid's algorithm with fraction-free steps on the top
+//   coefficients (3 products per word in 64-bit sums, one Montgomery reduction).
+// - Products in the values form (ntt.hpp): a pointwise product per word instead of an 8 x 8 leaf
+//   product, for a split per forward and a join per inverse. The matrices' transforms are kept
+//   times 2^32, so a product of two takes one Montgomery reduction and stays in that form.
 // - gcd: the spine of a full jump without its matrix: jump(k1) on the top, apply to the whole of
-//   (a, b), repeat; Euclid (with inversions) below kDirect.
+//   (a, b), repeat; Euclid's fraction-free steps on whole remainders below kDirect.
 // - inverse_mod: b = f mod g, the full jump of deg g on (g, b) computing R[0][1] only (and every
 //   entry's coefficient 0): h = R[0][1] / c for c = R (g, b)[0], a constant iff gcd = 1.
 //
@@ -118,17 +122,19 @@ template <class T>
 constexpr bool kWideOf = requires(typename T::V a) { T::mul_even(a, a); } || requires(typename T::V a) { T::mul_wide_lo(a, a); };
 constexpr bool kWide = kWideOf<S>;
 
-// The factors of out = x u + y v x + z v (one fraction-free step), as combine3 wants them: times
-// 2^32 (Montgomery, kWide), else with their Shoup quotients.
+// The factors of e = alpha^2 c - (alpha beta x + gamma) d (one fraction-free step) as combine3
+// wants them: x = alpha^2, y = -alpha beta, z = -gamma, times 2^32 (Montgomery, kWide; alpha 2^32
+// first, so 4 products), else with their Shoup quotients.
 struct Step {
     u32 x, y, z;  // kWide: times 2^32 mod P
     u32 xq = 0, yq = 0, zq = 0;
-    Step(u32 x_, u32 y_, u32 z_) {
+    Step(u32 alpha, u32 beta, u32 gamma) {
         if constexpr (kWide) {
-            x = mul(x_, kR), y = mul(y_, kR), z = mul(z_, kR);
+            const u32 alpha_r = mul(alpha, kR);
+            x = mul(alpha, alpha_r), y = negate(mul(beta, alpha_r)), z = negate(mul(gamma, kR));
         } else {
-            x = x_, y = y_, z = z_;
-            xq = M::shoup_quotient(x_), yq = M::shoup_quotient(y_), zq = M::shoup_quotient(z_);
+            x = mul(alpha, alpha), y = negate(mul(alpha, beta)), z = negate(gamma);
+            xq = M::shoup_quotient(x), yq = M::shoup_quotient(y), zq = M::shoup_quotient(z);
         }
     }
 };
@@ -221,6 +227,21 @@ template <class T>
     }
 }
 
+// m 2^-32 mod P, canonical, for m < P: (m + q P) / 2^32 with q = -m P^-1 mod 2^32.
+template <class T>
+[[gnu::always_inline]] inline typename T::V from_montgomery(typename T::V m) {
+    using W = typename T::V;
+    using Ops = modarith::Ops<T, kP>;
+    if constexpr (requires { T::mul_even(m, m); }) {
+        const W ninv = T::broadcast(kNegPinv), p = T::broadcast(kP);
+        const auto reduce = [&](W s) { return T::add64(s, T::mul_even(T::mul_even(s, ninv), p)); };
+        const W even = reduce(T::template blend<0xaaaa>(m, T::broadcast(0))), odd = reduce(T::template shr64<32>(m));
+        return Ops::template reduce<kP>(T::join_high(even, odd));
+    } else {
+        return Ops::template reduce<kP>(Ops::montgomery(m, T::broadcast(1)));
+    }
+}
+
 // m = (x0 y0 + x1 y1) 2^-32 mod P word by word (canonical words, n a multiple of kLanes); kept[i] =
 // m if kept is not null; out[i] = m 2^-32 if twice, else m. A product of two forms times 2^32 is
 // then kept as such and goes to the inverse as the plain values (twice).
@@ -231,11 +252,10 @@ inline void products(const u32* x0, const u32* y0, const u32* x1, const u32* y1,
             S::store(out + i, products_vector<S>(S::load(x0 + i), S::load(y0 + i), S::load(x1 + i), S::load(y1 + i), twice));
         return;
     }
-    const V one = S::broadcast(1);
     for (std::size_t i = 0; i < n; i += kLanes) {
         const V m = products_vector<S>(S::load(x0 + i), S::load(y0 + i), S::load(x1 + i), S::load(y1 + i), false);
         S::store(kept + i, m);
-        S::store(out + i, twice ? M::template reduce<kP>(M::montgomery(m, one)) : m);
+        S::store(out + i, twice ? from_montgomery<S>(m) : m);
     }
 }
 
@@ -392,7 +412,7 @@ public:
             if (n - m == 1) {
                 const u32 alpha = b[m], beta = a[n];
                 const u32 gamma = sub1(mul(alpha, a[n - 1]), mul(beta, m ? b[m - 1] : 0));
-                combine3(a, b, e, 0, m, Step(mul(alpha, alpha), negate(mul(alpha, beta)), negate(gamma)));
+                combine3(a, b, e, 0, m, Step(alpha, beta, gamma));
             } else {
                 pseudo_remainder(a, n, b, m, e);
             }
@@ -474,7 +494,7 @@ private:
                 // e = alpha^2 c - (alpha beta x + gamma) d kills the coefficients c_deg and d_deg.
                 const u32 beta = c[c_deg];
                 const u32 gamma = sub1(mul(alpha, c[c_deg - 1]), mul(beta, d_deg ? d[d_deg - 1] : 0));
-                const Step step(mul(alpha, alpha), negate(mul(alpha, beta)), negate(gamma));
+                const Step step(alpha, beta, gamma);
                 combine3(c, d, e, lo, d_deg, step);
                 for (int i = 0; i < 2; ++i) {
                     const std::size_t sc = row_size[0][i], sd = row_size[1][i];
@@ -822,14 +842,14 @@ inline std::ptrdiff_t inverse_mod(Span f, Span g, Out h, std::span<u32> scratch,
 
 }  // namespace detail
 
-// Words of scratch gcd() takes for f of n and g of m words (trimmed or not; enough for any values).
+// Words of scratch gcd() takes for f of n and g of m words past their trailing zeros (any values).
 inline std::size_t gcd_scratch(std::size_t n, std::size_t m) {
     if (n < m) std::swap(n, m);
     if (m <= 1) return 0;
     return detail::kAlignSlack + detail::gcd_words(n, m);
 }
 
-// Words of scratch inverse_mod() takes for f of n and g of m words.
+// Words of scratch inverse_mod() takes for f of n words past its trailing zeros and g of m.
 inline std::size_t inverse_mod_scratch(std::size_t n, std::size_t m) {
     if (m <= 1) return 0;
     return detail::kAlignSlack + detail::inverse_mod_words(n, m);
