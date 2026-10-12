@@ -845,6 +845,58 @@ TU shifted by 0-3584 bytes (512-byte steps, a top-level `.skip`), 8 shifts (ntt 
   528 ns (499 before), new 501; ntt 1.0002. Judged on runs 2 and 3, PR 99's zen5 ntt is 1.0017,
   not 1.0291.
 
+### Zen 3 short products and code layout (issue #93)
+
+`lc-k68` (EPYC 7B13, Zen 3, the same CPU as `lc-bench`), GCC 15.2, `-O2 -march=x86-64-v3`, main
+4af6aad, 2026-10-12. Probe `probe93.cpp` (exploration folder): `product` = `ntt::multiply(f, g,
+out)`, `multiply` = `Convolution::multiply` in place, `square`, `fmul` = the frontend's `f * g`;
+factors of 2^lg / 2 words. Four programs (MIX 0-3: the products alone; + `Transform` cases; +
+`Values` and `middle_product`; + `exp`, `log`, `divmod`), each with the TU shifted 0-3584 bytes (8
+shifts): 32 binaries, 3 runs each. ns: median over binaries [min-max], max/min.
+
+| case | main | pins + placement (4 KiB anchor) | the same, the best of 8 orders (2 binaries) |
+|---|---|---|---|
+| product/6 | 124 [122-138] 1.13 | 134 [133-137] 1.03 | 130 [128-132] |
+| product/7 | 256 [250-266] 1.07 | 264 [257-276] 1.07 | 261 [260-262] |
+| product/8 | 535 [518-550] 1.06 | 520 [515-531] 1.03 | 515 [513-516] |
+| multiply/6 | 108 [108-132] 1.23 | 128 [127-130] 1.02 | 114 [113-114] |
+| multiply/7 | 230 [214-249] 1.17 | 222 [221-241] 1.09 | 223 [222-224] |
+| multiply/8 | 486 [472-498] 1.06 | 497 [494-503] 1.02 | 495 [484-507] |
+| square/6 | 107 [106-116] 1.09 | 110 [109-120] 1.10 | 112 [110-113] |
+| square/7 | 238 [224-242] 1.09 | 247 [245-258] 1.05 | 242 [239-244] |
+| square/8 | 454 [447-494] 1.11 | 485 [477-495] 1.04 | 485 [480-490] |
+| fmul/6 | 161 [140-186] 1.33 | 178 [167-203] 1.22 | 181 [162-200] |
+| 2^9-2^12, every case | 1.01-1.07 | 1.01-1.04 | |
+
+- On main, at 2^7-2^8 the program (MIX) decides and the shift barely matters (multiply/7 214-216
+  in MIX 2, 240-249 in MIX 1); at 2^6 both do.
+- Not data: f, g and out each at 32 page offsets (128-byte steps): product/6-8 flat within 3% (one
+  offset 7%); the heap moved 0-4080 bytes and the stack 0-4000 bytes before the cases: flat within
+  1% (two programs 148 and 126 ns at every offset); `kStaticTables` page aligned: no change. Not
+  the caller: 8 copies of the calling function 192 bytes apart in one binary, equal within 1%.
+- Two causes, both needed. (1) GCC compiles the same COMDAT functions differently per TU: with
+  `Transform` in the program, `product<GroupBottom>(const Product&)` is 7216 bytes instead of 7631,
+  `Tree<PairBottom>::visit` 940 instead of 2750, `forward_radix4_from` is out of line: inlining
+  depends on the TU's other callers. With every product function in one place at the same address
+  in two programs (sorted sections, below; 64 KiB anchor) product/6 still took 150 and 125 ns.
+  (2) Placement: with inlining pinned (always_inline or noinline on each function of the path) but
+  not placed, product/6 131-161 ns across programs.
+- Pinned and placed, a short product runs at the same speed in every program (2^6: 1.02-1.03
+  spread, against 1.13-1.23), with the group's start 64-byte or 4 KiB aligned alike. But that one
+  speed is a lottery: 8 orders of the group and 4 pinning variants each gave a fixed time per case,
+  moving by up to 10% between variants (multiply/6 108-145, product/7 254-294) with the same
+  instructions (traced, below). Geomean over the 9 cases at 2^6-2^8 against main's median:
+  1.02-1.05. `kernel.py bench ntt` (5 rounds, gated cases 2^6-2^12, `bench_leaves.cpp` too) with the
+  first pinned order: geomean 1.0013, convolution/6 1.12, convolution/7 0.82, product/7 1.06,
+  inverse_values/6 1.13 (the kernels pinned noinline).
+- noclone (needed for the sections, Log) costs squares 1-3%: pinned, not placed, with and without
+  it: square/8 474 against 461 ns, square/9 897 against 886.
+- The code one call runs (a ptrace single-stepper, `trace.hpp`): product/6 executes 1740-1830
+  instructions, 1550-1640 distinct, in 146-157 64-byte lines; product/8 7400, 2290-2340 distinct,
+  202-211 lines; square/8 5300, 2660-2710, 242-253 lines. An op-cache model of those lines (64
+  sets by address bits 6-11, or 32 or 128 sets, or 32-byte windows; 8 ways; 6 or 8 ops per entry)
+  does not order the variants by time. `lc-k68` and `lc-bench` have no PMU, so no counters (#94).
+
 
 2026-10-11, claude (issue #3, round 1): moved lc-opt `lib/ntt` (`ntt.hpp`, `product.hpp`, both
 generators and their output) here. Changes: namespaces `fps::ntt`; one `Convolution` picks the
