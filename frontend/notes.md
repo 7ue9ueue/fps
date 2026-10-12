@@ -485,3 +485,13 @@ belongs in `backend/`).
   - `product/<lg>`, ns per factor at lg 10 / 14 / 18: `lc-bench` 84 / 109 / 141, `lc-intel`
     63 / 86 / 117, `lc-zen5` 48 / 59 / 76, `lc-arm` 97 / 141 / 201 (were 130 / 155 / 189 on
     `lc-bench` before #37's tuned `small` and #79).
+  - Review of #59, round 1 (two findings), and what changed:
+    1. `test_results` assumed that NTT results keep spare words, which stopped being true with
+       `ntt::multiply`. It now copies, resizes and adds to the results that do keep them:
+       `mul` of 16 x 16 into 20 (`small::multiply` writes all 31 words) and middle products on
+       both paths (3000 by 1000 on the NTT, 3000 by 16 on `small`). The test asserts each path
+       with `beats_ntt`. A `resize` that reuses spare words without zeroing them fails it.
+    2. `product` copied every factor at the leaves (`return fs[0]` for a side of one). A side of
+       one factor is now multiplied by reference. `product/<lg>` against the PR's previous head
+       6001cc7, `lc-bench`, 11 rounds: lg 10 / 14 / 18 = 0.803 / 0.847 / 0.885 (IQR within
+       0.006). Now 69 / 93 / 127 ns per factor.

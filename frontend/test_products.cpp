@@ -250,23 +250,29 @@ void test_product() {
     }
 }
 
-// Results of the NTT path hold more memory than their size: copies, resizes and sums still see
-// size() coefficients only.
-void test_results() {
-    const Vec a = random_vec(700), b = random_vec(600);
-    const Vec want = naive_product(a, b);
-    Poly h = fps::mul(poly(a), poly(b), 1299);
-    CHECK(vec(h) == want);
+// Results that keep spare words past their size: mul on the small::multiply path with n below the
+// product (small::multiply writes all of it), and the middle product (f g mod x^n on the NTT path,
+// all of f g on small's). Copies, resizes and sums see size() coefficients only.
+void check_spare(Poly h, const Vec& want) {
+    CHECK(vec(h) == want, want.size());
     const Poly copy = h;
-    CHECK(vec(copy) == want);
-    h.resize(1000);
-    h.resize(1400);
-    CHECK(vec(h) == first(first(want, 1000), 1400));
-    h = poly(a) * poly(b);
-    h += Poly(1310);
-    CHECK(vec(h) == first(want, 1310));
-    h = fps::middle_product(poly(want), poly(b));
-    CHECK(h.size() == 700 && vec(h) == naive_middle(want, b));
+    CHECK(vec(copy) == want, want.size());
+    Poly sum = h;
+    sum += Poly(want.size() + 10);
+    CHECK(vec(sum) == first(want, want.size() + 10), want.size());
+    h.resize(want.size() / 2);
+    h.resize(want.size() + 20);
+    CHECK(vec(h) == first(first(want, want.size() / 2), want.size() + 20), want.size());
+}
+
+void test_results() {
+    const Vec a = random_vec(16), b = random_vec(16);
+    CHECK(fps::small::beats_ntt(16, 16));
+    check_spare(fps::mul(poly(a), poly(b), 20), first(naive_product(a, b), 20));
+    const Vec f = random_vec(3000), g = random_vec(1000), s = random_vec(16);
+    CHECK(!fps::small::beats_ntt(3000, 1000) && fps::small::beats_ntt(3000, 16));
+    check_spare(fps::middle_product(poly(f), poly(g)), naive_middle(f, g));
+    check_spare(fps::middle_product(poly(f), poly(s)), naive_middle(f, s));
 }
 
 void test_errors() {

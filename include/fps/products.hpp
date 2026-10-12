@@ -29,7 +29,7 @@
 //
 // product(fs) splits fs where the sums of sizes come closest to halves, and multiplies the two
 // halves' products with f * g. An empty factor makes the product empty, as with f * g. At 2^18
-// linear factors it takes 141 ns per factor on Zen 3; lc-opt's tree about 40 (backend issue #56).
+// linear factors it takes 127 ns per factor on Zen 3; lc-opt's tree about 40 (backend issue #56).
 //
 // raw::mul<P>(a, b, out): coefficients < P in, canonical out; out must not overlap a or b
 // (std::domain_error). It allocates nothing: ntt::multiply runs in this thread's region, kept
@@ -68,7 +68,12 @@ Polynomial<P> product(std::span<const Polynomial<P>> fs) {
     // The split k in [1, fs.size()) with 2 (sizes before k) closest to total.
     std::size_t k = 1, before = fs[0].size();
     while (k + 1 < fs.size() && 2 * before + fs[k].size() < total) before += fs[k++].size();
-    return product(fs.first(k)) * product(fs.subspan(k));
+    // A side of one factor is multiplied by reference: product() of it would copy the factor.
+    const auto left = fs.first(k), right = fs.subspan(k);
+    if (left.size() == 1 && right.size() == 1) return left[0] * right[0];
+    if (left.size() == 1) return left[0] * product(right);
+    if (right.size() == 1) return product(left) * right[0];
+    return product(left) * product(right);
 }
 
 template <std::uint32_t P>
