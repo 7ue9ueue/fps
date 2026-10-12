@@ -6,7 +6,7 @@ labels: ready
 ---
 Area: {what it touches, e.g. a tool, a brief, a doc}
 After: none (or issues whose task must be merged first: #n, #m)
-Rounds: 3
+Rounds: 1 (3 if it is speed work)
 
 Seen: {what is slow, fragile or wasteful, with the evidence: times, failures, how often}
 Task: {what to do; how to tell it worked}

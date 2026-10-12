@@ -28,7 +28,8 @@ For each round:
    close the pull request and edit the round's `Result: gain` to `Result: no gain`, with the reason.
 5. Relabel the issue once its pull request is merged or closed (or the round opened none). Leave it
    `blocked` if the agent asked for the user. Mark it `done` and close it after its round limit
-   (`Rounds:` line, default 3) or 2 `no gain` results in a row. Otherwise set it back to `ready`.
+   (`Rounds:` line; 3 for speed work, 1 for a feature) or 2 `no gain` results in a row. Otherwise
+   set it back to `ready`.
 6. Remove the round's worktree once its pull request is merged or closed.
 
 Keep starting rounds until no issue is `ready`, then report each issue's result in a few lines.

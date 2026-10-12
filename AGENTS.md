@@ -81,8 +81,8 @@ GitHub issues are the shared state. Agents talk through them and through pull re
 
 - **Issues** come from the templates. Labels: `ready` (waiting), `running` (an agent has it),
   `blocked` (needs the user), `done`, `backlog` (later; the user makes it `ready`), and `build`
-  (frontend). Fields: `Kernel:` and `Target:` (or `Area:` for a task), `Rounds:`, and `After:`
-  (issues to merge first).
+  (frontend). Fields: `Kernel:` and `Target:` (or `Area:` for a task), `Rounds:` (3 for speed
+  work, 1 for a feature, a move or a fix), and `After:` (issues to merge first).
 - **Backend and tasks**: `/work` starts one subagent per round, briefed with `tools/prompt.md`.
   The round ends with a comment on its issue whose last line is `Result: gain` or `Result: no gain`.
 - **Frontend**: `/build` starts an implementer (`tools/prompt_build.md`), then a fresh reviewer
