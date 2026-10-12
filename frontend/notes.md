@@ -561,3 +561,8 @@ belongs in `backend/`).
     1.00-1.01; element-wise 0.59-1.03, placement as before.
   - `polynomial.hpp`'s cutoff comment: the issue asked for 38-180 / 24-104; #59 rewrote that
     comment with its own ranges first, so this change keeps #59's.
+- 2026-10-12: issue #81 (round 1): the 25% `multiply/6` slowdown with `Values` in `bench.cpp`
+  (the PR #50 entry above) is code layout, not the NTT's inlining. With every function of the
+  product compiled identically in both programs the gap stayed (144 -> 175 ns on Zen 3), and
+  shifting the whole program's code moves 2^6 products by up to 25% (`backend/ntt/notes.md`,
+  #93). `bench_values.cpp` stays a binary of its own; its comment says why.
