@@ -1,7 +1,7 @@
 // Tests of fps/division.hpp: divmod, f / g, f % g, /= and %=, against long division on edge sizes
-// and random inputs, on every path (a monomial divisor; the recurrence for at most 16 terms of the
-// reversed divisor past its first; Newton), against f = q g + r at large sizes, with aliasing,
-// threads and every error.
+// and random inputs, on both paths (a monomial divisor in the frontend; every other divisor in
+// backend/division, here on divisors with trailing zeros, few terms, short and long quotients),
+// against f = q g + r at large sizes, with aliasing, threads and every error.
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -150,8 +150,32 @@ void test_small() {
         }
 }
 
-// The paths: monomials c x^k, constants, trailing zeros, the recurrence and Newton at t = 15 .. 18
-// terms of G mod x^k past G[0], sparse divisors such as x^d - x - 1.
+// The sparse path's bounds: g = c x^d plus t terms, the highest `gap` below d (the path needs
+// gap >= 8 (t + 1)), the others below it, near it or spread; t around kSparseTerms = 16. f of n
+// around d and around multiples of the gap (the blocks' edges), so terms reach the remainder from
+// inside a block.
+void test_sparse() {
+    for (const std::size_t d : {std::size_t(13), std::size_t(30), std::size_t(100), std::size_t(140), std::size_t(300)})
+        for (const std::size_t gap : {std::size_t(1), std::size_t(15), std::size_t(16), std::size_t(23), std::size_t(24),
+                                      std::size_t(127), std::size_t(128), std::size_t(135), std::size_t(136), d})
+            for (const std::size_t t : {1, 2, 15, 16, 17})
+                for (const bool spread : {false, true}) {
+                    const std::size_t top = d - gap;
+                    if (gap > d || t - 1 > top) continue;
+                    Vec g(d + 1);
+                    g[d] = nonzero(), g[top] = nonzero();
+                    std::vector<std::size_t> idx;  // t - 1 more terms below top
+                    for (std::size_t j = top; j-- > 0;) idx.push_back(j);
+                    if (spread) std::shuffle(idx.begin(), idx.end(), rng);
+                    for (std::size_t i = 0; i + 1 < t; ++i) g[idx[i]] = nonzero();
+                    for (const std::size_t n : {d - 1, d, d + 1, d + gap, d + gap + 1, d + 3 * gap - 1, 5 * d + 7})
+                        check_all(random_vec(n, int(t % 3)), g, d * 1000 + gap * 10 + t);
+                }
+}
+
+// The paths: monomials c x^k, constants, trailing zeros; divisors whose reversal G has t = 0 .. 18
+// terms past G[0] among its first k (the frontend's recurrence before #147, at most 16, and its
+// Newton path), sparse divisors such as x^d - x - 1.
 void test_paths() {
     for (const std::size_t n : std::vector<std::size_t>{0, 1, 10, 1000, 4097}) {
         const Vec f = random_vec(n, 0);
@@ -199,6 +223,7 @@ void test_paths() {
         h[0] = 1, h[d] = P - inv(2);
         check_all(random_vec(5 * d, 0), h, d);
     }
+    test_sparse();
 }
 
 // a = b up to trailing zeros.
@@ -228,11 +253,19 @@ void test_large() {
                                {500'000, 277'012},
                                {1 << 20, 4}})
         check_identity(random_vec(n, 0), random_divisor(m, 0));
-    // Sparse divisors: the recurrence for a long quotient, the remainder by the NTT.
+    // Sparse divisors (the sparse path): x^500000 - x - 1, x^(2^18) - 1, 16 terms spread below
+    // x^300000; then a kernel's: a sparse top over a dense rest.
     const std::size_t d = 500'000;
     Vec g(d + 1);
     g[0] = P - 1, g[1] = P - 1, g[d] = 1;
     check_identity(random_vec(1'000'000, 0), g);
+    Vec cyclic((1 << 18) + 1);
+    cyclic[0] = P - 1, cyclic.back() = 1;
+    check_identity(random_vec(1'000'003, 0), cyclic);
+    Vec spread(300'001);
+    spread.back() = nonzero();
+    for (int t = 0; t < 16; ++t) spread[rng() % 299'000] = nonzero();
+    check_identity(random_vec(700'000, 0), spread);
     Vec h = random_vec(d + 1, 0);
     for (std::size_t j = 0; j < 1000; ++j) h[d - j] = 0;
     h[d] = 5, h[d - 7] = 3;
@@ -297,16 +330,21 @@ void test_errors() {
         CHECK(throws<domain_error>([&] { h %= zero; }));
         CHECK(vec(h) == vec(f));
     }
-    // Past the backend's 2^25: the remainder q g mod x^d with d = 2^25 runs ntt::multiply on q of
-    // 2^20 words (the quotient by the recurrence: G mod x^k = g[d]) and throws std::length_error.
+    // Past 2^25 coefficients: the kernel's blocks split the work into transforms of at most 2^25
+    // words, so f of 2^25 + 2^10 by x^(2^25) + x + 1 (which threw std::length_error before #147)
+    // gives q and r. Checked at random points: f(c) = q(c) g(c) + r(c).
     {
-        const std::size_t d = std::size_t(1) << 25, k = std::size_t(1) << 20;
-        Poly big(d + k), g(d + 1);
-        big[d + k - 1] = 1, big[d + k - 2] = 1;
+        const std::size_t d = std::size_t(1) << 25, k = std::size_t(1) << 10;
+        const Poly big = poly(random_vec(d + k, 0));
+        Poly g(d + 1);
         g[0] = 1, g[1] = 1, g[d] = 1;
-        CHECK((big / g).size() == k);
-        CHECK(throws<std::length_error>([&] { (void)fps::divmod(big, g); }));
-        CHECK(throws<std::length_error>([&] { (void)(big % g); }));
+        const auto [q, r] = fps::divmod(big, g);
+        CHECK(q.size() == k && r.size() == d);
+        CHECK(vec(big / g) == vec(q));
+        for (int t = 0; t < 3; ++t) {
+            const u32 c = u32(rng() % P);
+            CHECK(big(c) == (u64(q(c)) * g(c) + r(c)) % P, c);
+        }
     }
 }
 
