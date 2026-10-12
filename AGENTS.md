@@ -42,7 +42,7 @@ Run from the checkout's root. Each script's `--help` has the details.
 | `tools/kernel.py bench <unit> [--base DIR]` | timing VM | Times each `bench*.cpp` (one binary each); with `--base`, old and new in the same run, as paired ratios (below 1 is faster). Holds the bench lock. |
 | `tools/kernel.py check` | anywhere | Generators and tuned tables match what is committed. |
 | `tools/tune.py <kernel>` | Mac | Measures a kernel's tuned choices on each target's timing machine; writes `tuned.json` and `tuned.hpp`. |
-| `tools/gate.py <pr> --merge` | Mac | Tests every affected unit on every target, times it against `main`, comments the report on the PR, and squash-merges on a pass. Always runs `origin/main`'s copy of `tools/`. |
+| `tools/gate.py <pr> --merge` | Mac | Tests every affected unit on every target, times it against `main`, comments the report on the PR, and squash-merges on a pass. Always runs `origin/main`'s copy of `tools/`; one gate at a time, the others wait. |
 
 ```
 python3 tools/vm.py lc-amd 'python3 tools/kernel.py test ntt --target avx2'
@@ -115,7 +115,8 @@ docs. You decide what is worth doing.
   code is never run. `gate.py` refuses pull requests by other accounts and from forks.
 - Write the code ourselves. Papers, docs and other code may be read for ideas, not copied; cite
   them in the module's `notes.md`. Code from lc-opt may move here.
-- `main` changes only through `gate.py`, which the coordinators run.
+- `main` changes only through `gate.py`, which the coordinators run. A merge by hand restarts a running
+  gate whose units it touches.
 - The VMs are shared: keep them running, never delete one you did not create, and leave `~/lc-opt`
   alone. Time only under `flock /tmp/bench.lock` (`kernel.py bench` takes it), and never time x86
   code on the Mac (Rosetta).
