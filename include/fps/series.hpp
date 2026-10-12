@@ -23,34 +23,35 @@
 // sqrt: the root of the polynomial f mod x^n = x^(2k) u, u[0] != 0: x^k s with s^2 = u mod
 // x^(n - k), s[0] the smaller of the two square roots of u[0] in [0, P); 0 if f mod x^n = 0;
 // nullopt if the lowest nonzero term has an odd index or a non-square coefficient (no root).
-// On the Newton path, n past 2^25 throws std::length_error from ntt::multiply in the first step
-// whose precision passes 2^25, after the earlier steps ran (out is then partly written); the
-// recurrence has no such limit. sqrt runs its recurrence only for s of at most P coefficients (it
-// divides by 1 .. n - k - 1), and Newton past that, which throws std::length_error.
+// On the Newton path, n past 2^25 throws std::length_error: inverse, log and exp before out is
+// written; pow after it wrote u / u[0] to out, sqrt from ntt::multiply in the first step whose
+// precision passes 2^25, after the earlier steps ran (out is then partly written). The recurrence has no such limit. sqrt runs
+// its recurrence only for s of at most P coefficients (it divides by 1 .. n - k - 1), and Newton
+// past that, which throws std::length_error.
 //
 // Paths. f mod x^n with at most kSparseTerms = 16 nonzero coefficients past f[0] runs a linear
 // recurrence with one tap per such term, O(n t) for t terms: inverse(1 - x, n) is O(n). Others run
-// Newton iteration on the products of fps/products.hpp (raw::mul: shift, small::multiply or
-// ntt::multiply), doubling the precision k each step:
-// - inverse: g[k, 2k) = -(g (f g mod x^2k)[k, 2k)) mod x^k, two products a step;
-// - log f = integral of f' (1 / f) mod x^(n-1): one inverse and one product;
-// - exp: g[k, 2k) = (g (f - log g)[k, 2k)) mod x^k: one log of g and one product a step;
+// Newton iteration:
+// - inverse, log, exp: the backend's (backend/series: lc-opt's steps on the NTT's leaf form,
+//   every transform of length 2k for precision k -> 2k, halves reused across steps);
 // - pow: u[0]^e exp(e log(u / u[0])) for u = f / x^z, cut to n - z e;
-// - sqrt: g[k, 2k) = h (u - g^2)[k, 2k) / 2 mod x^k, with h = 1 / g mod x^k carried across the
-//   steps (one inverse step on h, a square and a product a step).
+// - sqrt: on the products of fps/products.hpp (raw::mul), g[k, 2k) = h (u - g^2)[k, 2k) / 2 mod
+//   x^k, with h = 1 / g mod x^k carried across the steps (one inverse step on h, a square and a
+//   product a step).
 // The recurrences for pow and sqrt solve u g' = e u' g (e = 1/2 for sqrt), one tap per term.
-// The backend has no series kernels yet. From 2^13 coefficients on, in units of one ntt::multiply
-// of two factors of n into n words, on the four timed targets: inverse 2.6-2.9, log 4.1-4.8, exp
-// 7.6-9.8, pow 11.9-15.3, sqrt 3.0-3.6 (frontend/notes.md); lc-opt's, with transforms of length
-// 2k only and halves reused across steps, need about 1.7, 2, 2.6, 4.6 and 1.6 (a guess from its
-// transform counts): backend issue #87.
+// From 2^13 coefficients on, in units of one ntt::multiply of two factors of n into n words, on
+// the four timed targets: inverse 1.6-2.1, log 2.0-2.9, exp 2.7-3.7 (frontend/notes/87.md; 2.6-2.9,
+// 4.1-4.8 and 7.6-9.8 on the frontend's Newton before), sqrt 3.0-3.6 (frontend/notes.md); pow
+// was 11.9-15.3 and is now about log + exp (not measured). lc-opt's need about 4.6 for pow and
+// 1.6 for sqrt (a guess from its transform counts): backend issue #107.
 // The recurrences are plain scalar loops: 3.7 to 12.5 ns per coefficient for 2 or 3 terms (#87).
 // Divisions by 1 .. n - 1 take their reciprocals from the backend's factorials::tables:
 // 1 / i = (i - 1)! / i!.
 //
-// Memory: the results are new polynomials; the raw functions write only out. Both work in a
-// per-thread scratch kept across calls, of n words for inverse, 2 n for log and sqrt, 3 n for exp
-// and pow, f.size() + 1 for integral; the products use the backend's own per-thread memory.
+// Memory: the results are new polynomials; the raw functions write only out. The recurrences and
+// sqrt work in a per-thread scratch kept across calls, of n words for inverse, 2 n for log and
+// sqrt, 3 n for exp and pow, f.size() + 1 for integral; the backend's Newton path and the
+// products use the backend's own per-thread memory.
 #pragma once
 
 #include <algorithm>
@@ -61,6 +62,7 @@
 #include <span>
 #include <stdexcept>
 
+#include "backend/series/series.hpp"
 #include "fps/factorials.hpp"
 #include "fps/modular.hpp"
 #include "fps/polynomial.hpp"
@@ -173,55 +175,28 @@ void sparse_exp(Sparse s, Out g, Out tmp) {
 // The functions below: f is f mod x^n (at most n words), out has n >= 1 words, f's precondition
 // holds, and scratch has the words each states.
 
-// out = 1 / f mod x^n; out apart from f. scratch: n words.
+// out = 1 / f mod x^n; out apart from f. scratch: n words (the recurrence's; the Newton path
+// runs in the backend's own memory).
 template <u32 P>
 void inverse(Span f, Out out, Out scratch) {
-    const std::size_t n = out.size();
+    (void)scratch;
     if (const auto s = sparse(f)) return sparse_inverse<P>(f[0], *s, out);
-    out[0] = mod_inverse<P>(f[0]);
-    for (std::size_t k = 1; k < n;) {
-        const std::size_t m = std::min(2 * k, n);
-        // e = f g mod x^m = 1 + x^k e[k, m); then g[k, m) = -(g e[k, m) mod x^(m - k)).
-        const Out e = scratch.first(m), high = out.subspan(k, m - k);
-        raw::mul<P>(f.first(std::min(f.size(), m)), out.first(k), e);
-        raw::mul<P>(out.first(k), e.subspan(k), high);
-        for (u32& c : high) c = c ? P - c : 0;
-        k = m;
-    }
+    fps::series::inverse(f, out);
 }
 
 // out = log f mod x^n; out may overlap f, which is read before out is written. scratch: 2 n words.
 template <u32 P>
 void log(Span f, Out out, Out scratch) {
-    const std::size_t n = out.size();
     if (const auto s = sparse(f)) return sparse_log<P>(*s, out, scratch);
-    // f' / f mod x^(n - 1) into out[1, n), then divided by the index.
-    const Out h = scratch.first(n - 1), d = scratch.subspan(n, n - 1);
-    inverse<P>(f.first(std::min(f.size(), n - 1)), h, d);
-    for (std::size_t i = 0; i + 1 < n; ++i) d[i] = mod_mul<P>(u32((i + 1) % P), at(f, i + 1));
-    raw::mul<P>(d, h, out.subspan(1));
-    const Out r = scratch.first(n);
-    reciprocals<P>(r, scratch.subspan(n, n));
-    out[0] = 0;
-    for (std::size_t i = 1; i < n; ++i) out[i] = mod_mul<P>(out[i], r[i]);
+    fps::series::log(f, out);
 }
 
-// out = exp f mod x^n; out may be f (the same first word: step k reads f[k, 2k) before it writes
-// there), else apart from it. scratch: 3 n words.
+// out = exp f mod x^n; out may overlap f, which is read before out is written. scratch: 3 n
+// words.
 template <u32 P>
 void exp(Span f, Out out, Out scratch) {
-    const std::size_t n = out.size();
     if (const auto s = sparse(f)) return sparse_exp<P>(*s, out, scratch);
-    out[0] = 1;
-    for (std::size_t k = 1; k < n;) {
-        const std::size_t m = std::min(2 * k, n);
-        // h = f - log g mod x^m = x^k h[k, m); then g[k, m) = g h[k, m) mod x^(m - k).
-        const Out h = scratch.first(m);
-        log<P>(out.first(k), h, scratch.subspan(n, 2 * n));
-        for (std::size_t i = k; i < m; ++i) h[i] = at(f, i) >= h[i] ? at(f, i) - h[i] : at(f, i) + P - h[i];
-        raw::mul<P>(out.first(k), h.subspan(k), out.subspan(k, m - k));
-        k = m;
-    }
+    fps::series::exp(f, out);
 }
 
 // The index of f's first nonzero coefficient, f.size() if none.
