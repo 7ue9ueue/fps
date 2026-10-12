@@ -561,3 +561,11 @@ belongs in `backend/`).
     1.00-1.01; element-wise 0.59-1.03, placement as before.
   - `polynomial.hpp`'s cutoff comment: the issue asked for 38-180 / 24-104; #59 rewrote that
     comment with its own ranges first, so this change keeps #59's.
+- 2026-10-12: `product(fs)` runs the backend kernel `product_tree::product` (issue #56) into the
+  result's memory, through `product(items, out, proj)` with `proj = f.span()`: no array of spans
+  (4 MB at 2^18, fresh pages each call). `product/<lg>` against main a34ce14, 7 rounds,
+  new/base at lg 10 / 14 / 18: `lc-bench` 0.309 / 0.309 / 0.322 (21 / 29 / 41 ns per factor),
+  `lc-intel` 0.395 / 0.364 / 0.361, `lc-zen5` 0.355 / 0.329 / 0.333, `lc-arm` 0.372 / 0.353 / 0.348
+  (5 rounds).
+  New pair `product@kernel/<lg>`: the kernel on spans built in the setup, into new memory. API /
+  kernel, `lc-bench`, 5 rounds: 1.005 / 1.002 / 1.003.
