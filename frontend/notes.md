@@ -659,3 +659,28 @@ belongs in `backend/`).
 
   API / kernel (same runs, new medians): square 0.99-1.01 (`lc-intel` /22 0.96: the kernel case
   the slower), middle_product 0.99-1.01, on all four.
+
+- 2026-10-12: `Values` on the backend's leaf-form ops (backend issue #49; `backend/ntt/notes.md`,
+  Leaf-form ops). Changed in `values.hpp` only:
+  - A * B and `multiply_add` in the automatic layout: `ntt::Transform::multiply`/`multiply_add`
+    (the scalar `leaf_product` loop is gone). The pointwise layout's conversions:
+    `Transform::forward(w, Form::values)` and the inverse with `Form::values` (`split_leaf`,
+    `join_leaf` and the rho tables are gone; the words' order inside a block of 8 leaves is the
+    backend's, opaque as before). `to_coefficients` and the raw functions: the backend's inverse
+    into other memory (`inverse(A, out, form, {offset, add})`), A kept; L < 64 still goes
+    through the scratch and folds. `to_coefficients(Values&&)` is the const form now (it ran the
+    inverse in A's memory, then copied out). The pointwise products stay the frontend's stream.
+  - `Plan` is gone: a `Transform` per length (`detail::values::transform`), which also holds the
+    values form's tables (L / 16 words), about 5 L / 16 words in all, against L / 4 + 5 L / 16.
+  - `kernel.py bench frontend --base d16ca08`, 5 rounds, new/base at lg 10 / 14 / 18 / 22:
+    values_product 0.14 (Zen 3), 0.19 (Emerald Rapids), 0.14 (Zen 5), 0.29 (Neoverse V2) at
+    every lg; to_values_pointwise 0.13-0.22, 0.21-0.35, 0.13-0.19, 0.25-0.38;
+    to_coefficients_pointwise 0.11-0.18, 0.17-0.28, 0.10-0.15, 0.20-0.33; to_coefficients 0.88-1.01,
+    0.92-1.08 (1.08 at 2^14), 0.94-1.06 (1.06 at 2^22), 0.97-0.98; add_coefficients 0.98-1.04,
+    0.92-1.07, 0.98-1.10, 1.00-1.03 (the 2^10 losses ran the region path, which now copies on
+    the stack to 2^10). Geomean of the gated cases 0.534, 0.603, 0.517, 0.659.
+  - `bench_values.cpp`: @kernel pairs for every op but the pointwise products;
+    `to_coefficients@kernel` is the inverse into other memory, `to_coefficients@copy` what the
+    API did before.
+  - `multiply/6` (f * g, 32 x 32, bench.cpp) 1.13 on Zen 3 (152 -> 172 ns) with its @kernel at
+    1.00, 1.00 elsewhere: code placement (#81, #93).

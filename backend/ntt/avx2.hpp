@@ -12,6 +12,7 @@
 #include "backend/ntt/avx2_kernels.hpp"
 #include "backend/ntt/avx2_product_kernels.hpp"
 #include "backend/ntt/common.hpp"
+#include "backend/ntt/intrinsics.hpp"
 
 namespace fps::ntt::detail::avx2 {
 
@@ -626,6 +627,52 @@ inline void inverse_trees(Vec* f, std::size_t nv, std::size_t count, std::size_t
     }
 }
 
+// A tile hook: tile(f, total) runs on the total vectors (leaves) at f of a run of subtrees, after
+// their forward bottom level or before their inverse one (the values form, inverses from other
+// memory). A run has at least 8 leaves. NoTile: none.
+struct NoTile {
+    [[gnu::always_inline]] void operator()(u32*, std::size_t) const {}
+};
+
+// forward_trees and inverse_trees with a tile hook. Copies, not one template with NoTile: with the
+// in-place transforms on the template, bench.cpp's short products moved by code placement alone
+// (Zen 3 product/6 1.29 against main; notes.md, issue #49).
+template <class Tile>
+inline void forward_tiles(Vec* f, std::size_t nv, std::size_t count, std::size_t first, const u32* r, Tile tile) {
+    if (nv > kTile) {
+        for (std::size_t k = first; k < first + count; ++k, f += nv) {
+            forward_group(f, nv / 4, k, r);
+            forward_tiles(f, nv / 4, 4, 4 * k, r, tile);
+        }
+        return;
+    }
+    const std::size_t run = std::min(count, kTile / nv), total = run * nv;
+    for (std::size_t k = first; k < first + count; k += run, f += total) {
+        for (std::size_t h = nv / 4; h >= 4; h /= 4)
+            for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) forward_group(f + j, h, g, r);
+        forward_bottom(f, total / 4, k * (nv / 4), r);
+        tile(reinterpret_cast<u32*>(f), total);
+    }
+}
+
+template <class Tile>
+inline void inverse_tiles(Vec* f, std::size_t nv, std::size_t count, std::size_t first, const u32* ir, Tile tile) {
+    if (nv > kTile) {
+        for (std::size_t k = first; k < first + count; ++k, f += nv) {
+            inverse_tiles(f, nv / 4, 4, 4 * k, ir, tile);
+            inverse_group(f, nv / 4, k, ir);
+        }
+        return;
+    }
+    const std::size_t run = std::min(count, kTile / nv), total = run * nv;
+    for (std::size_t k = first; k < first + count; k += run, f += total) {
+        tile(reinterpret_cast<u32*>(f), total);
+        inverse_bottom(f, total / 4, k * (nv / 4), ir);
+        for (std::size_t h = 4; h < nv; h *= 4)
+            for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) inverse_group(f + j, h, g, ir);
+    }
+}
+
 // Below this length the radix-2 pass and the asm forward_identity beat forward_radix8_dense (it
 // spills); above, the saved pass over memory wins (notes.md, 2026-10-11).
 inline constexpr int kDenseRadix8MinLog = 16;
@@ -661,6 +708,72 @@ inline void inverse(u32* words, int lg, const u32* ir) {
     inverse_radix8(f, nv / 8, ir, leaf_scale(lg));
 }
 
+// Leaf-form operations (ntt.hpp, Transform), with the intrinsics on Avx2 for the leaf products and
+// the values form (intrinsics.hpp). lc-opt's asm leaf product, one leaf per step, ran 1.29x slower
+// than the intrinsics' 4 leaves per step on Zen 3 (notes.md).
+using Leaf = intrinsics::Bottom<simd::Avx2>;
+using Values = intrinsics::Values<simd::Avx2>;
+
+// The values form: the split runs on each run of subtrees after its bottom level, in cache.
+inline void forward_values(u32* words, int lg, const u32* r, const u32* rows) {
+    auto* f = reinterpret_cast<Vec*>(words);
+    const std::size_t nv = (std::size_t(1) << lg) / 8;
+    const auto tile = [words, rows] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
+        Values::split(t, t, leaves / 8, std::size_t(t - words) / 64, rows);
+    };
+    if (!has_radix2(lg)) {
+        kernels::forward_top(f, nv / 4, r);
+        return forward_tiles(f, nv / 4, 4, 0, r, tile);
+    }
+    if (lg < kDenseRadix8MinLog) {
+        forward_radix2(f, nv / 2, false);
+        return forward_tiles(f, nv / 2, 2, 0, r, tile);
+    }
+    const std::size_t q = nv / 8;
+    forward_radix8_dense(f, q, r);
+    forward_tiles(f, q, 8, 0, r, tile);
+}
+
+// inverse() through `words` with tile hooks, the top level writing count coefficients to out
+// (out = words: in place, count = 2^lg).
+template <class Tile>
+inline void inverse_into(u32* words, u32* out, std::size_t count, int lg, const u32* ir, Tile tile) {
+    auto* f = reinterpret_cast<Vec*>(words);
+    const std::size_t nv = (std::size_t(1) << lg) / 8;
+    const u32 s = leaf_scale(lg);
+    if (!has_radix2(lg)) {
+        inverse_tiles(f, nv / 4, 4, 0, ir, tile);
+        if (out == words) return inverse_radix4(f, nv / 4, ir, s);
+        return inverse_radix4_out(words, nv / 4, out, count, ir, s);
+    }
+    if (nv == 8) {
+        inverse_tiles(f, 4, 2, 0, ir, tile);
+        if (out == words) return scale_radix2(f, 4, s);
+        return scale_radix2_out(words, 4, out, count, s);
+    }
+    inverse_tiles(f, nv / 8, 8, 0, ir, tile);
+    if (out == words) return inverse_radix8(f, nv / 8, ir, s);
+    inverse_radix8_out(words, nv / 8, out, count, ir, s);
+}
+
+// The leaf form (rows null) or values form at `from` -> coefficients [0, count) to out, through
+// words (may be from). The runs of subtrees read their leaves from `from` (copied, or joined, into
+// words before their bottom level).
+inline void inverse(const u32* from, u32* words, u32* out, std::size_t count, int lg, const u32* ir, const u32* rows) {
+    if (rows) {
+        return inverse_into(words, out, count, lg, ir, [from, words, rows] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
+            const std::size_t at = std::size_t(t - words);
+            Values::join(from + at, t, leaves / 8, at / 64, rows);
+        });
+    }
+    if (from != words) {
+        return inverse_into(words, out, count, lg, ir, [from, words] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
+            std::memcpy(t, from + (t - words), 8 * leaves * sizeof(u32));
+        });
+    }
+    inverse_into(words, out, count, lg, ir, NoTile{});
+}
+
 }  // namespace fps::ntt::detail::avx2
 
 namespace fps::ntt::variant {
@@ -693,6 +806,23 @@ struct avx2 {
 
     static void square(const detail::Product& p, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
         detail::avx2::square<detail::avx2::PairSquareBottom>(p, roots, inverse_roots);
+    }
+
+    // Leaf-form operations (ntt.hpp, Transform): their contracts are the Transform calls'.
+    static void leaf_products(const std::uint32_t* a, const std::uint32_t* b, std::uint32_t* out, int lg,
+                              const std::uint32_t* roots, bool accumulate) {
+        const std::size_t groups = (std::size_t(1) << lg) / 32;
+        if (accumulate) return detail::avx2::Leaf::products<true>(a, b, out, groups, 0, roots);
+        detail::avx2::Leaf::products<false>(a, b, out, groups, 0, roots);
+    }
+
+    static void forward_values(std::uint32_t* f, int lg, const std::uint32_t* roots, const std::uint32_t* rows) {
+        detail::avx2::forward_values(f, lg, roots, rows);
+    }
+
+    static void inverse(const std::uint32_t* from, std::uint32_t* f, std::uint32_t* out, std::size_t count, int lg,
+                        const std::uint32_t* inverse_roots, const std::uint32_t* rows) {
+        detail::avx2::inverse(from, f, out, count, lg, inverse_roots, rows);
     }
 };
 

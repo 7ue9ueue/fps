@@ -74,12 +74,12 @@ inline void scale(u32* f, std::size_t count, u32 s) {
     for (std::size_t i = 0; i < count; ++i) f[i] = mul(f[i], s);
 }
 
-// a = a b mod x^8 - w_v in every leaf v, w_v = (-1)^v r(v / 2).
-inline void multiply_leaves(u32* a, const u32* b, int lg, const u32* r) {
+// out = a b mod x^8 - w_v in every leaf v, w_v = (-1)^v r(v / 2); out += a b if accumulate. out
+// may be a or b.
+inline void multiply_leaves(const u32* a, const u32* b, u32* out, int lg, const u32* r, bool accumulate = false) {
     for (std::size_t v = 0; v < (std::size_t(1) << lg) / 8; ++v) {
         const u32 w = v % 2 ? sub(0, r[slot(v / 2)]) : r[slot(v / 2)];
-        u32* x = a + 8 * v;
-        const u32* y = b + 8 * v;
+        const u32 *x = a + 8 * v, *y = b + 8 * v;
         u32 c[8];
         for (int l = 0; l < 8; ++l) {
             std::uint64_t low = 0, high = 0;  // each < 8 P^2 < 2^63
@@ -87,7 +87,53 @@ inline void multiply_leaves(u32* a, const u32* b, int lg, const u32* r) {
             for (int i = l + 1; i < 8; ++i) high += std::uint64_t(x[i]) * y[l + 8 - i];
             c[l] = add(u32(low % kP), mul(w, u32(high % kP)));
         }
-        std::copy(c, c + 8, x);
+        for (int l = 0; l < 8; ++l) out[8 * v + l] = accumulate ? add(out[8 * v + l], c[l]) : c[l];
+    }
+}
+inline void multiply_leaves(u32* a, const u32* b, int lg, const u32* r) { multiply_leaves(a, b, a, lg, r); }
+
+// The values form (common.hpp) of the leaf form at `from`, into `to` (may be from); rows:
+// build_value_rows(lg).
+inline void split(const u32* from, u32* to, int lg, const u32* rows) {
+    const u32* z = kStaticTables.words[0];  // z^k = r(eighth_root(k)), k < 4
+    for (std::size_t g = 0; g < (std::size_t(1) << lg) / 64; ++g) {
+        u32 c[64];
+        std::copy_n(from + 64 * g, 64, c);
+        const u32* a = rows + 32 * (g / 8);
+        const auto& b = kValueLanes.forward[g % 8];
+        for (int t = 0; t < 8; ++t) {
+            u32 x[8];
+            for (int k = 0; k < 8; ++k) x[k] = mul(mul(c[8 * t + k], b[k][t]), a[k]);
+            for (int half = 4; half >= 1; half /= 2)
+                for (int s = 0; s < 8; s += 2 * half)
+                    for (int k = 0; k < half; ++k) {
+                        const u32 u = x[s + k], v = x[s + k + half];
+                        x[s + k] = add(u, v), x[s + k + half] = mul(sub(u, v), z[slot(eighth_root(k * 4 / half))]);
+                    }
+            for (int i = 0; i < 8; ++i) to[64 * g + 8 * i + t] = x[i];
+        }
+    }
+}
+
+// split() undone.
+inline void join(const u32* from, u32* to, int lg, const u32* rows) {
+    const u32* z = kStaticTables.words[1];  // z^-k
+    for (std::size_t g = 0; g < (std::size_t(1) << lg) / 64; ++g) {
+        u32 c[64];
+        std::copy_n(from + 64 * g, 64, c);
+        const u32* a = rows + 32 * (g / 8) + 16;
+        const auto& b = kValueLanes.inverse[g % 8];
+        for (int t = 0; t < 8; ++t) {
+            u32 x[8];
+            for (int i = 0; i < 8; ++i) x[i] = c[8 * i + t];
+            for (int half = 1; half <= 4; half *= 2)
+                for (int s = 0; s < 8; s += 2 * half)
+                    for (int k = 0; k < half; ++k) {
+                        const u32 u = x[s + k], v = mul(x[s + k + half], z[slot(eighth_root(k * 4 / half))]);
+                        x[s + k] = add(u, v), x[s + k + half] = sub(u, v);
+                    }
+            for (int k = 0; k < 8; ++k) to[64 * g + 8 * t + k] = mul(mul(x[k], b[k][t]), a[k]);
+        }
     }
 }
 
@@ -140,6 +186,27 @@ struct scalar {
         detail::scalar::multiply_leaves(p.a, p.a, p.lg, roots);
         inverse(p.a, p.lg, inverse_roots);
         std::copy_n(p.a, p.count, p.out);
+    }
+
+    // Leaf-form operations (ntt.hpp, Transform): their contracts are the Transform calls'.
+    static void leaf_products(const std::uint32_t* a, const std::uint32_t* b, std::uint32_t* out, int lg,
+                              const std::uint32_t* roots, bool accumulate) {
+        detail::scalar::multiply_leaves(a, b, out, lg, roots, accumulate);
+    }
+
+    static void forward_values(std::uint32_t* f, int lg, const std::uint32_t* roots, const std::uint32_t* rows) {
+        forward(f, lg, roots);
+        detail::scalar::split(f, f, lg, rows);
+    }
+
+    // The leaf form (rows null) or values form at `from` -> its coefficients [0, count) to out,
+    // through f (64-byte aligned, 2^lg + kPadding words; may be from, out may be f).
+    static void inverse(const std::uint32_t* from, std::uint32_t* f, std::uint32_t* out, std::size_t count, int lg,
+                        const std::uint32_t* inverse_roots, const std::uint32_t* rows) {
+        if (rows) detail::scalar::join(from, f, lg, rows);
+        else if (from != f) std::copy_n(from, std::size_t(1) << lg, f);
+        inverse(f, lg, inverse_roots);
+        if (out != f) std::copy_n(f, count, out);
     }
 };
 

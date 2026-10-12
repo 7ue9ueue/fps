@@ -82,6 +82,30 @@ Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_produc
   took 1.03 of product/22 (factors of 2^21, sparse) on Zen 3.
 - `Transform`: tables built once; forward and inverse in place on caller arrays (32-byte aligned,
   16 words of padding: the AVX2 forward kernels read 4 bytes past their last vector).
+- `Transform`'s leaf-form ops (issue #49), for `fps::Values` and the product tree. Each variant
+  has `leaf_products`, `forward_values` and `inverse(from, f, out, count, ...)`; the API calls
+  `Native` by default (not the per-op selection, so `select.hpp` is untouched).
+  - Leaf products (`multiply`, `multiply_add`): `Bottom<N>::products`, a group of 4 leaves per
+    step: rows [w A, A] (one Shoup product per leaf), the 8 x 8 products of the fused bottoms
+    (64-bit sums), then on x86 an exact reduction (s = hi 2^32 + lo, hi (2^32 mod P) + lo by one
+    Shoup product), elsewhere Montgomery's and a Shoup product by 2^32. Group g + 1's rows are
+    filled before group g's products. avx2 runs `Bottom<Avx2>` too (lc-opt's asm was slower, Log).
+  - Values form (`Form::values`, L <= 2^23): leaf v = 8g + t at its 8 roots rho_v z^j, rho_v =
+    r(4v), word 64g + 8i + t at j = bitrev3(i) (common.hpp). Per block of 8 leaves (`Values<N>`):
+    a transpose (lanes = leaves), the twist c_k rho^k as two Shoup products, B(g % 8, t)^k per lane
+    (a constexpr table, 8 KiB) and A(g / 8)^k broadcast (a table per Transform, L / 16 words for
+    both directions), the 8-point transform (5 products), stores by value. The inverse: the
+    8-point inverse, the untwist with 1/8 in the lane table, a transpose back. 19 and 20 products
+    per 64 words. Fused into the transforms through tile hooks: `forward_tiles` (copies of
+    `forward_trees`/`forward_tree` with a hook) call the split on each run of subtrees after its
+    bottom level (in L1), `inverse_tiles` join before the bottom level. Below 2^8 the intrinsics' subtrees have 4 leaves (half a block):
+    there the split runs after the transform and the join before.
+  - Inverse into other memory (`inverse(F, out, form, {offset, add})`): the same tile hook copies
+    (or joins) each run of subtrees from F into the work array before its bottom level, so F is
+    read once and stays; the top level writes out with the product's `*_out` levels (any
+    alignment, count words). With an offset or add, the top level runs in place and one pass
+    copies or adds the range. Work array: the thread's region (`place` keeps it 256 bytes from
+    F's and out's page offsets), on the stack up to 2^10.
 
 ### avx2
 
@@ -719,6 +743,51 @@ convolution_into/7 1.025; Zen 3 forward/9, multiply/7, convolution/7-8 1.018-1.0
 before), convolution/10 1.019, convolution/11 0.978. The frontend's NTT shapes on Emerald Rapids
 multiply/7 and /8 1.036 and 1.029 (the variant is main's at both).
 
+### Leaf-form ops (issue #49)
+
+`lc-bench` (EPYC 7B13), GCC 15.2, `-O2 -march=x86-64-v3`, 3 rounds, 2026-10-12, the round's code
+(`bench_leaves.cpp`). ns per word; forward and inverse for scale (bench.cpp):
+
+| lg | forward | inverse | leaf_product | leaf_product_add | forward_values | inverse_values | inverse_to | inverse_to@copy |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 6 | 0.36 | 0.33 | 0.97 | 1.06 | 0.89 | 0.83 | 0.48 | 0.41 |
+| 8 | 0.39 | 0.41 | 0.94 | 1.00 | 0.85 | 0.83 | 0.52 | 0.49 |
+| 10 | 0.51 | 0.49 | 0.93 | 0.99 | 0.95 | 0.88 | 0.54 (region) | 0.57 |
+| 12 | 0.64 | 0.61 | 0.94 | 0.99 | 1.08 | 1.00 | 0.67 | 0.70 |
+| 16 | 0.92 | 0.88 | 0.94 | 1.01 | 1.36 | 1.27 | 1.04 | 1.07 |
+| 20 | 1.20 | 1.15 | 0.95 | 1.01 | 1.63 | 1.54 | 1.33 | 1.43 |
+| 22 | 1.33 | 1.29 | 0.95 | 1.02 | 1.77 | 1.68 | 1.58 | 1.72 |
+| 23 | 1.43 | 1.45 | 0.93 | 0.98 | 1.86 | 1.78 | 1.68 | 1.83 |
+
+- Leaf products: 0.93-0.97 ns per word at every length (about 26 cycles per leaf; muls are 24 per
+  leaf on 2 pipes, loads 25 on 3 ports: the floor is near 13-15 cycles, a guess). The frontend's
+  scalar loop took 6.9.
+- Values form: the split adds 0.4-0.45 ns per word to the forward (about 97 cycles per block of
+  64 words; 19 Shoup products, 2 x 8 x 8 transposes: about 60 cycles of 4-pipe ops, a guess),
+  the join as much to the inverse. The frontend's scalar loop took 7.6-10.
+- Inverse into other memory, against F copied, the inverse in place and the coefficients copied
+  out (`@copy`), same run: Zen 3 0.92-0.97 from 2^10 to 2^23; Emerald Rapids (`lc-intel`) 0.90
+  (2^14), 0.89 (2^18), 0.84 (2^22); Zen 5 (`lc-zen5`) 0.95 (2^14), 0.95 (2^18), 1.08 (2^22),
+  0.97 (2^23). Below 2^10 it was slower (Emerald Rapids 70 against 37 ns at 2^6: the region's
+  take and give, `place`, the span top level), so to 2^10 F is now copied into a stack buffer and
+  the inverse runs in place there: 1.19 (2^6), 1.17 (2^7), 1.07 (2^8), 1.02 (2^9) of `@copy` on
+  Zen 3, 1.06, 0.99, 1.05, 1.00 on Emerald Rapids.
+
+Frontend (`kernel.py bench frontend --base d16ca08`, 5 rounds, each target's machine), new/base:
+
+| case, lg 10 / 14 / 18 / 22 | Zen 3 | Emerald Rapids | Zen 5 | Neoverse V2 |
+|---|---|---|---|---|
+| values_product (leaf form) | 0.14 / 0.14 / 0.14 / 0.14 | 0.19 / 0.19 / 0.19 / 0.19 | 0.14 / 0.14 / 0.14 / 0.14 | 0.29 / 0.29 / 0.29 / 0.29 |
+| to_values_pointwise | 0.13 / 0.17 / 0.20 / 0.22 | 0.21 / 0.24 / 0.29 / 0.35 | 0.13 / 0.15 / 0.17 / 0.19 | 0.25 / 0.29 / 0.33 / 0.38 |
+| to_coefficients_pointwise | 0.11 / 0.13 / 0.17 / 0.18 | 0.17 / 0.19 / 0.24 / 0.28 | 0.10 / 0.11 / 0.13 / 0.15 | 0.20 / 0.24 / 0.28 / 0.33 |
+| to_coefficients | 1.01 / 0.94 / 0.96 / 0.88 | 1.00 / 1.08 / 0.92 / 0.92 | 1.00 / 0.94 / 0.95 / 1.06 | 0.97 / 0.97 / 0.98 / 0.98 |
+| add_coefficients | 1.04 / 1.01 / 0.98 / 0.98 | 1.07 / 0.97 / 1.03 / 0.92 | 1.09 / 0.98 / 1.00 / 1.10 | 1.03 / 1.00 / 1.00 / 1.02 |
+
+The lg 10 rows of to_coefficients and add_coefficients ran the region path; they now copy F on
+the stack (the backend's 2^10 above). `f * g` at 32 x 32 (`multiply/6`, frontend bench.cpp, whose
+calls are main's) 1.13 on Zen 3 (152 -> 172 ns), 1.00 on the other machines: code placement
+(#81, #93: main's own binary moves over 136-169 ns with the code shifted).
+
 2026-10-11, claude (issue #3, round 1): moved lc-opt `lib/ntt` (`ntt.hpp`, `product.hpp`, both
 generators and their output) here. Changes: namespaces `fps::ntt`; one `Convolution` picks the
 product path (lc-opt `Product`) when it fits, else the convolution path; one templated `Tree`
@@ -1202,6 +1271,58 @@ above (Squares and middle products); raw output in `~/Documents/hpc_library-expl
 - Unchanged paths, whole ntt bench on `lc-bench` against main, 7 rounds: geomean 1.0001 over 148
   gated cases; every case outside 0.98-1.02 is at 2^6-2^9 and both signs (multiply_dense/7 1.055,
   product/7 0.948, product_cut/7 0.924), code layout (issue #93).
+
+2026-10-12, claude (issue #49, round 1): `Transform`'s leaf-form ops for `fps::Values` and the
+product tree: `multiply` and `multiply_add` (leaf products), `Form::values` (forward and inverse,
+in place), and `inverse(F, out, form, {offset, add})` into other memory. Design: above; numbers:
+Measurements, Leaf-form ops. The frontend's `Values` now calls them (it had scalar loops).
+- Variant ops: `leaf_products`, `forward_values`, `inverse(from, f, out, count, ...)` on scalar
+  (the model: per leaf twist and 8-point transform, `multiply_leaves` with out and accumulate),
+  `intrinsics<S>` (on `Narrow<S>`: ymm on AVX-512) and avx2 (the intrinsics on Avx2 for leaf
+  products and the values form, tile hooks in its own trees). `Transform` calls `Native` by
+  default; `select.hpp` is untouched (PR #85 rewrites it).
+- Tile hooks: `forward_tiles` and `inverse_tiles` (intrinsics, avx2), copies of the in-place
+  trees that call a hook on each run of subtrees after its bottom level (forward) or before it
+  (inverse). Copies: with the in-place trees as one template and a `NoTile` hook (identical
+  code), bench.cpp's gated set came to 1.0083 on Zen 3 against d16ca08 (3 rounds; product/6 and
+  product_cut/6 1.29, convolution/6 1.09, multiply/7 1.06: placement, #93). The values form splits there in L1; the inverse into other memory copies (or
+  joins) its leaves from F there, so F is read once. The top level writes out through the
+  product's `*_out` levels (#38) with the leaf scale.
+- `Bottom::leaf_products` now takes the rows and B's 32 words (the fused bottoms pass their
+  `Leaves`); the standalone products fill rows per group (`fill_rows`) from A in memory.
+- Tried, not kept:
+  - lc-opt's asm `leaf_product` (lib/poly/transform.hpp `products`, one leaf per step, a window
+    pair, Montgomery and a Shoup product by 2^32), in the avx2 variant: 1.21-1.31 ns per word on
+    Zen 3 against 0.93-0.97 for `Bottom<Avx2>::products` (4 leaves per step), same binary. Its
+    0.7 ns per word in lc-opt's notes is a cost model's figure. Kept in the exploration folder.
+  - Exact reduction (hi (2^32 mod P) + lo, one Shoup product) against Montgomery plus the 2^32
+    fix on x86: 0.94 against 0.93 ns per word on Zen 3 (2^6-2^22): the 4 fewer multiplies per
+    vector do not show, so the products are not multiply bound. Kept (fewer multiplies; equal).
+  - The inverse into other memory through the region at every length: 2^6-2^9 slower than
+    copy, inverse in place, copy (Zen 3 39 against 26 ns at 2^6, Emerald Rapids 70 against 37).
+    To 2^10 F is now copied into a stack buffer (placed 256 bytes from F's and out's page
+    offsets, 4 candidates 1 KiB apart) and the in-place inverse runs there.
+  - The new bench cases in bench.cpp: the gated subset against d16ca08 (5 rounds) went to 1.0049
+    on Zen 3 (product/6 1.12, convolution/7 1.09, multiply/7 1.06: their code is unchanged) and
+    1.0052 on Zen 5 (2^10 products 1.03). They are in `bench_leaves.cpp`, a binary of its own.
+    With that and the tile copies, the whole gated set against d16ca08 (3 rounds): Zen 3 1.0029,
+    with Convolution and multiply at 2^7 1.16-1.21 and product/7 0.92-0.95 (main's code; the
+    2^6 cases now 1.00); the subset 0.9995 on Zen 5.
+- Not done (issue #98): the split at 19 products per block runs at about 97 cycles
+  against an estimated 60; leaf products at about 26 cycles per leaf against an estimated 13-15;
+  zmm leaf products (two leaves per vector, as `WideBottom`) on AVX-512; the values form's 1/8
+  folded into the inverse scale (1 product of 20 per block); a fused add for
+  `inverse(F, out, {offset, add})` (now one pass from the work array); Zen 5 at 2^22, where the
+  span top level writing out was 1.08 of a copy out.
+- Tests (`test_leaf_ops`, every variant, lg 6-23; scalar to 2^20): leaf products against the
+  model with out and acc on a, b or apart, and as cyclic products through the transforms against
+  schoolbook (lg <= 10); the values form against its definition (each leaf at rho_v z^bitrev(i),
+  lg <= 10), against the model (lg <= 18), and back, in place; the inverse into other memory, both
+  forms, counts 0, 1, 7, 1 to 40, L/2 + 1, L - 1, L, offsets, add, out at odd word offsets in its
+  page ending its allocation, F unchanged; the range and length errors. Caught on the way: z^k =
+  r(bitrev2(k)), not r(k) (`eighth_root`; the definition test, 15 failures). Pass at -O2 and
+  ASan/UBSan on `lc-amd` (avx2, sse, scalar), `lc-intel-test`, `lc-zen5-test`, `lc-arm` and the
+  Mac (arm), with the frontend's tests.
 
 ## Sources
 

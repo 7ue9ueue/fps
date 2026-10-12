@@ -23,6 +23,12 @@
 //   fps::ntt::Transform t(lg);                 // twiddle tables for the length L = 2^lg
 //   t.forward(f);                              // f: L coefficients -> leaf form
 //   t.inverse(f);                              // leaf form -> L coefficients
+//   t.multiply(a, b, out);                     // out = a b leaf by leaf; out may be a or b
+//   t.multiply_add(acc, a, b);                 // acc += a b leaf by leaf; acc may be a or b
+//   t.inverse(F, out);                         // out = the first out.size() coefficients; F kept
+//   t.inverse(F, out, Form::leaves, {.offset = k, .add = true});   // out[i] += coefficient k + i
+//   t.forward(f, Form::values);                // f -> values form (L <= 2^23); inverse(F, Form::values),
+//                                              // inverse(F, out, Form::values) undo it
 //
 // multiply(f, g, out): the product from and into the caller's memory, with nothing copied: the
 // first transform level reads f and g, the last writes out, the levels between run in this
@@ -64,8 +70,25 @@
 // product of 3^((P - 1) / 2^(j + 2)) over the set bits j of k. Multiplying two leaf forms leaf by
 // leaf mod x^8 - w_v, then inverse(), gives the cyclic product mod x^L - 1.
 //
+// multiply(a, b, out) and multiply_add: leaf products of two leaf forms (canonical out), each an
+// 8 x 8 product with Montgomery reductions and a Shoup product by 2^32 to undo their 2^-32.
+//
+// Values form (Form::values, L <= 2^kValuesMaxLog = 2^23, as 2^lg must divide P - 1): each leaf
+// taken on to its values at the 8 roots of x^8 - w_v, so a product of two values forms is one
+// modular product per word. Words in blocks of 64 (8 leaves): word 64g + 8i + t is leaf 8g + t at
+// rho z^bitrev3(i), rho = r(4(8g + t)) an 8th root of w_v, z = r(2) of order 8 (common.hpp). Per
+// leaf a twist by rho^k and an 8-point transform, run on each subtree of the transform while it is
+// in cache (after its bottom level forward, before it inverse).
+//
+// inverse(F, out, ...): into other memory, F kept. Its subtrees copy (or join) their leaves from F
+// into this thread's region before their bottom level, and the top level writes out: no copy of
+// the whole of F in, nor of the coefficients out (with an offset or add: one pass out).
+//
 // Arrays for Transform: 32-byte aligned, L + kPadding words (the padding is read, never written),
-// values < P in and out. No checks on these calls. Lengths: 2^kMinLog .. 2^kMaxLog.
+// values < P in and out. No checks on these calls but the ranges of inverse(F, out, ...) and the
+// values form's length. Lengths: 2^kMinLog .. 2^kMaxLog. The ops with a Form or a span run the
+// variant the tuned table picks for forward or inverse at that length (select.hpp); multiply and
+// multiply_add run Native.
 #pragma once
 
 #include <algorithm>
@@ -105,6 +128,18 @@ inline std::size_t place(const void* f, const void* g, const void* out, std::siz
     for (std::size_t a = 0; a < 4096; a += 64)
         if (apart(a, offset(f)) && apart(a, offset(out)) && apart((a + span) % 4096, offset(g))) return a;
     return 0;  // not reached: the three conditions exclude at most 3 x 512 of the 4096 bytes
+}
+
+// out[i] = out[i] + x[i] mod P for n words, both canonical, any alignment.
+inline void add_words(std::uint32_t* out, const std::uint32_t* x, std::size_t n) {
+    using S = simd::Native;
+    using M = modarith::Ops<S, kModulus>;
+    std::size_t i = 0;
+    for (; i + S::lanes <= n; i += S::lanes) S::store(out + i, M::add(S::load(out + i), S::load(x + i)));
+    for (; i < n; ++i) {
+        const std::uint32_t s = out[i] + x[i];
+        out[i] = s >= kP ? s - kP : s;
+    }
 }
 
 // The forward and inverse tables for length 2^lg: the compile-time ones up to 2^kStaticLog, then
@@ -242,12 +277,22 @@ private:
     std::uint32_t *a_, *b_;
 };
 
+// The forms of a transform: the leaf form, or the values form (lengths up to 2^kValuesMaxLog).
+enum class Form { leaves, values };
+
+// The coefficients an inverse into other memory writes (Transform::inverse), and how.
+struct Coefficients {
+    std::size_t offset = 0;  // out[i] is coefficient offset + i
+    bool add = false;        // out[i] += it, mod P (out canonical); else out[i] = it
+};
+
 // Forward and inverse transforms of length 2^lg, kMinLog <= lg <= kMaxLog, with their tables.
 class Transform {
 public:
-    explicit Transform(int lg) : lg_(checked(lg)), tables_(new Line[2 * lines(lg)]) {
+    explicit Transform(int lg) : lg_(checked(lg)), tables_(new Line[2 * lines(lg) + value_lines(lg)]) {
         Native::build_table(roots(), length() / 16, false);
         Native::build_table(inverse_roots(), length() / 16, true);
+        if (lg <= kValuesMaxLog) detail::build_value_rows(value_rows(), lg);
     }
 
     std::size_t length() const { return std::size_t(1) << lg_; }
@@ -260,6 +305,75 @@ public:
     template <class Variant = SelectedInverse>
     void inverse(std::uint32_t* f) const { Variant::inverse(f, lg_, inverse_roots()); }
 
+    // f -> its leaf form or values form. Throws std::length_error for the values form past
+    // 2^kValuesMaxLog.
+    template <class Variant = SelectedForward>
+    void forward(std::uint32_t* f, Form form) const {
+        if (form == Form::leaves) return Variant::forward(f, lg_, roots());
+        Variant::forward_values(f, lg_, roots(), checked_rows());
+    }
+
+    // F in that form -> its coefficients, in place.
+    template <class Variant = SelectedInverse>
+    void inverse(std::uint32_t* F, Form form) const {
+        if (form == Form::leaves) return Variant::inverse(F, lg_, inverse_roots());
+        Variant::inverse(F, F, F, length(), lg_, inverse_roots(), checked_rows());
+    }
+
+    // out[i] = coefficient c.offset + i of the polynomial whose leaf or values form is F, or
+    // out[i] += it (c.add); F kept. out: any memory apart from F, any alignment, no padding;
+    // c.offset + out.size() <= length(), else std::out_of_range. The work runs in this thread's
+    // region (Convolution's memory); the top level writes out when c is {} and the bottom level
+    // reads F, so nothing is copied whole. With an offset or add, one pass more from the region.
+    template <class Variant = SelectedInverse>
+    void inverse(const std::uint32_t* F, std::span<std::uint32_t> out, Form form = Form::leaves, Coefficients c = {}) const {
+        const std::size_t len = length();
+        if (c.offset > len || out.size() > len - c.offset)
+            throw std::out_of_range("fps::ntt::Transform::inverse: coefficients past the length");
+        const std::uint32_t* rows = form == Form::values ? checked_rows() : nullptr;
+        if (out.empty()) return;
+        const auto run = [&](std::uint32_t* f) {
+            if (c.offset == 0 && !c.add) return Variant::inverse(F, f, out.data(), out.size(), lg_, inverse_roots(), rows);
+            Variant::inverse(F, f, f, len, lg_, inverse_roots(), rows);
+            if (c.add) detail::add_words(out.data(), f + c.offset, out.size());
+            else std::copy_n(f + c.offset, out.size(), out.data());
+        };
+        if (lg_ <= kStackLog) {  // F copied whole, the inverse in place: faster to 2^10 (notes.md)
+            // f 256 bytes or more from F's and out's page offsets (place()): of 4 offsets 1 KiB
+            // apart, each of the two excludes at most one.
+            alignas(64) std::uint32_t buffer[(std::size_t(1) << kStackLog) + kPadding + 768];
+            const auto apart = [&buffer](std::size_t a, const void* p) {
+                const std::size_t x = (reinterpret_cast<std::uintptr_t>(buffer) + a) % 4096, y = reinterpret_cast<std::uintptr_t>(p) % 4096;
+                return (x - y + 256) % 4096 >= 512;
+            };
+            std::size_t a = 0;
+            while (!apart(a, F) || !apart(a, out.data())) a += 1024;
+            std::uint32_t* f = buffer + a / sizeof(std::uint32_t);
+            std::copy_n(F, len, f);
+            std::fill_n(f + len, kPadding, 0u);
+            if (rows) Variant::inverse(f, f, f, len, lg_, inverse_roots(), rows);
+            else Variant::inverse(f, lg_, inverse_roots());
+            if (c.add) detail::add_words(out.data(), f + c.offset, out.size());
+            else std::copy_n(f + c.offset, out.size(), out.data());
+            return;
+        }
+        const detail::Region region = detail::take_region(sizeof(std::uint32_t) * (len + kPadding) + 4096);
+        run(reinterpret_cast<std::uint32_t*>(region.start + detail::place(F, F, out.data(), 0)));
+        detail::give_region(region);
+    }
+
+    // out = a b leaf by leaf (leaf forms, mod x^8 - w_v); out may be a or b.
+    template <class Variant = Native>
+    void multiply(const std::uint32_t* a, const std::uint32_t* b, std::uint32_t* out) const {
+        Variant::leaf_products(a, b, out, lg_, roots(), false);
+    }
+
+    // acc += a b leaf by leaf; acc may be a or b.
+    template <class Variant = Native>
+    void multiply_add(std::uint32_t* acc, const std::uint32_t* a, const std::uint32_t* b) const {
+        Variant::leaf_products(a, b, acc, lg_, roots(), true);
+    }
+
 private:
     struct alignas(64) Line {
         std::uint32_t words[16];
@@ -268,10 +382,17 @@ private:
         if (lg < kMinLog || lg > kMaxLog) throw std::length_error("fps::ntt::Transform: lg out of range");
         return lg;
     }
+    static constexpr int kStackLog = 10;  // inverse(F, out, ...) on the stack, F copied, up to 2^kStackLog
     static std::size_t lines(int lg) { return (detail::table_words(lg) + 15) / 16; }
+    static std::size_t value_lines(int lg) { return lg <= kValuesMaxLog ? 2 * detail::value_row_count(lg) : 0; }
 
     std::uint32_t* roots() const { return tables_[0].words; }
     std::uint32_t* inverse_roots() const { return tables_[lines(lg_)].words; }
+    std::uint32_t* value_rows() const { return tables_[2 * lines(lg_)].words; }
+    const std::uint32_t* checked_rows() const {
+        if (lg_ > kValuesMaxLog) throw std::length_error("fps::ntt::Transform: the values form needs lg <= 23");
+        return value_rows();
+    }
 
     int lg_;
     std::unique_ptr<Line[]> tables_;

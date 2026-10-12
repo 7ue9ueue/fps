@@ -151,6 +151,22 @@ template <class... V>
     (void)((i++ == v && (V::square(p, r, ir), true)) || ...);
 }
 
+// Transform's leaf-form ops (ntt.hpp): the values form by the forward's choice, the inverse
+// from other memory (or of the values form) by the inverse's.
+template <class... V>
+[[gnu::always_inline]] inline void run_forward_values(Candidates<V...>, int v, std::uint32_t* f, int lg,
+                                                      const std::uint32_t* r, const std::uint32_t* rows) {
+    int i = 0;
+    (void)((i++ == v && (V::forward_values(f, lg, r, rows), true)) || ...);
+}
+template <class... V>
+[[gnu::always_inline]] inline void run_inverse_from(Candidates<V...>, int v, const std::uint32_t* from, std::uint32_t* f,
+                                                    std::uint32_t* out, std::size_t count, int lg,
+                                                    const std::uint32_t* ir, const std::uint32_t* rows) {
+    int i = 0;
+    (void)((i++ == v && (V::inverse(from, f, out, count, lg, ir, rows), true)) || ...);
+}
+
 }  // namespace detail
 
 namespace variant {
@@ -179,6 +195,21 @@ struct tuned {
     // The product row's candidate (ntt::square).
     static void square(const detail::Product& p, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
         detail::run_square(Selected{}, choice(kProduct, p.lg), p, roots, inverse_roots);
+    }
+
+    // Transform's leaf-form ops: leaf products have no row in the table (Native).
+    static void leaf_products(const std::uint32_t* a, const std::uint32_t* b, std::uint32_t* out, int lg,
+                              const std::uint32_t* roots, bool accumulate) {
+        Native::leaf_products(a, b, out, lg, roots, accumulate);
+    }
+
+    static void forward_values(std::uint32_t* f, int lg, const std::uint32_t* roots, const std::uint32_t* rows) {
+        detail::run_forward_values(Selected{}, choice(kForward, lg), f, lg, roots, rows);
+    }
+
+    static void inverse(const std::uint32_t* from, std::uint32_t* f, std::uint32_t* out, std::size_t count, int lg,
+                        const std::uint32_t* inverse_roots, const std::uint32_t* rows) {
+        detail::run_inverse_from(Selected{}, choice(kInverse, lg), from, f, out, count, lg, inverse_roots, rows);
     }
 };
 
