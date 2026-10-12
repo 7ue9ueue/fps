@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Test and time backend kernels, per target (see TARGETS and BACKEND.md).
 
-  kernel.py test UNIT [--target T]
-      Build every test*.cpp of the unit for target T at -O2 and with ASan/UBSan; run them all.
+  kernel.py test UNIT... [--target T] [-j N]
+      Build every test*.cpp of the units for target T at -O2 and with ASan/UBSan, at most N at a
+      time (default: every core), fewer if the machine is busy (build_slots); run each as soon as
+      it is built, one run at a time, in order.
   kernel.py bench UNIT [--target T] [--base DIR] [--rounds N] [--filter RE] [--json FILE]
       Time the unit's bench*.cpp, each its own binary (e.g. frontend/bench_values.cpp, whose
       code changes how GCC compiles bench.cpp's). Case names must be unique across a unit's
@@ -36,6 +38,7 @@ import socket
 import statistics
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 IMAGE = 'mirror.gcr.io/library/gcc:15.2.0@sha256:3ae15afe768b06d0c0fe088d822ba5f8045c26630bdacc8d8e7713cf5d8e7289'
@@ -175,37 +178,62 @@ def unit_dir(unit: str) -> str:
     return 'frontend' if unit == 'frontend' else f'backend/{unit}'
 
 
-def build(tree: Path, unit: str, source: str, target: str, sanitize: bool = False) -> Path:
+def compile_(tree: Path, unit: str, source: str, target: str, sanitize: bool = False) -> tuple[Path, str | None]:
     """Compile <unit folder>/<source> in tree, from relative paths, so the same sources give
-    byte-identical binaries in any tree."""
+    byte-identical binaries in any tree. Returns the binary and, on a failure, the output."""
     out = f'build/{target}/{unit}-{Path(source).stem}{"-san" if sanitize else ""}'
     # -g1: line numbers for sanitizer reports, without GCC's variable tracking, which doubled the
     # slowest builds (factorials test: 190 s with -g, 96 s with -g1).
     opt = '-O1 -g1 -fsanitize=address,undefined -fno-sanitize-recover=all' if sanitize else '-O2'
     result = sh({'w': tree}, lambda _: f'mkdir -p build/{target}\n'
                 f'{CXX} {opt} {flags(target)} {unit_dir(unit)}/{source} -o {out}')
-    if result.returncode:
-        sys.exit(f'build failed in {tree}:\n{result.stdout}{result.stderr}')
-    return tree / out
+    return tree / out, (result.stdout + result.stderr if result.returncode else None)
+
+
+def build(tree: Path, unit: str, source: str, target: str, sanitize: bool = False) -> Path:
+    binary, error = compile_(tree, unit, source, target, sanitize)
+    if error is not None:
+        sys.exit(f'build failed in {tree}:\n{error}')
+    return binary
+
+
+def build_slots() -> int:
+    """Builds this machine has room for now: its idle cores, and 2 GiB of available memory each
+    (a test build peaked at 0.94 GiB: factorials, ASan/UBSan, GCC 13). The VMs are shared."""
+    slots = (os.cpu_count() or 1) - int(os.getloadavg()[0])
+    if not MAC:
+        meminfo = Path('/proc/meminfo').read_text()
+        available_kib = int(next(line for line in meminfo.splitlines() if line.startswith('MemAvailable')).split()[1])
+        slots = min(slots, available_kib >> 21)
+    return max(1, slots)
 
 
 def test(args) -> int:
     require_cpu(args.target)
     tree = Path('.')
-    sources = sorted(p.name for p in Path(unit_dir(args.kernel)).glob('test*.cpp'))
-    if not sources:
-        print(f'FAIL {args.kernel}: no test*.cpp in {unit_dir(args.kernel)}')
-        return 1
-    for source in sources:
-        for sanitize in (False, True):
-            binary = build(tree, args.kernel, source, args.target, sanitize)
-            result = sh({'w': tree}, lambda _: './' + shlex.quote(str(binary.relative_to(tree))))
-            sys.stdout.write(result.stdout + result.stderr)
-            label = f'{source} {"ASan/UBSan" if sanitize else "-O2"}'
-            if result.returncode:
-                print(f'FAIL {args.kernel} {args.target} {label}')
+    jobs = []
+    for unit in args.kernel:
+        sources = sorted(p.name for p in Path(unit_dir(unit)).glob('test*.cpp'))
+        if not sources:
+            print(f'FAIL {unit}: no test*.cpp in {unit_dir(unit)}')
+            return 1
+        jobs += [(unit, source, sanitize) for source in sources for sanitize in (False, True)]
+    # Runs stay one at a time, in order: some tests time their kernel (tune.hpp).
+    with ThreadPoolExecutor(max(1, min(args.jobs, build_slots()))) as pool:
+        builds = [pool.submit(compile_, tree, unit, source, args.target, sanitize) for unit, source, sanitize in jobs]
+        for (unit, source, sanitize), built in zip(jobs, builds):
+            binary, error = built.result()
+            label = f'{unit} {args.target} {source} {"ASan/UBSan" if sanitize else "-O2"}'
+            if error is None:
+                result = sh({'w': tree}, lambda _: './' + shlex.quote(str(binary.relative_to(tree))))
+                sys.stdout.write(result.stdout + result.stderr)
+            if error is not None or result.returncode:
+                if error is not None:
+                    print(error)
+                print(f'FAIL {label}{" (build)" if error is not None else ""}')
+                pool.shutdown(wait=False, cancel_futures=True)
                 return 1
-            print(f'pass {args.kernel} {args.target} {label}')
+            print(f'pass {label}')
     return 0
 
 
@@ -215,9 +243,11 @@ def bench(args) -> int:
     if args.base:
         trees['base'] = Path(args.base)
     sources = sorted(p.name for p in Path(unit_dir(args.kernel)).glob('bench*.cpp'))
-    binaries = {name: [build(tree, args.kernel, source, args.target) for source in sources
-                       if (tree / unit_dir(args.kernel) / source).exists()]
-                for name, tree in trees.items()}
+    with ThreadPoolExecutor() as pool:  # base and new at once
+        builds = {name: [pool.submit(build, tree, args.kernel, source, args.target) for source in sources
+                         if (tree / unit_dir(args.kernel) / source).exists()]
+                  for name, tree in trees.items()}
+    binaries = {name: [b.result() for b in bs] for name, bs in builds.items()}
     report = {'kernel': args.kernel, 'target': args.target, 'flags': flags(args.target),
               'cpu': cpu_name(), 'compiler': 'clang++' if MAC else IMAGE, 'rounds': args.rounds,
               'identical': False, 'cases': {}}
@@ -286,8 +316,9 @@ def main() -> int:
     sub = parser.add_subparsers(dest='command', required=True)
     default = 'scalar' if MAC else 'avx2'
     p = sub.add_parser('test')
-    p.add_argument('kernel')
+    p.add_argument('kernel', nargs='+')
     p.add_argument('--target', choices=TARGETS, default=default)
+    p.add_argument('-j', '--jobs', type=int, default=os.cpu_count(), help='builds at a time, at most')
     p.set_defaults(run=test)
     p = sub.add_parser('bench')
     p.add_argument('kernel')
@@ -300,8 +331,10 @@ def main() -> int:
     p = sub.add_parser('check')
     p.set_defaults(run=check)
     args = parser.parse_args()
-    if args.command != 'check' and not Path(unit_dir(args.kernel)).is_dir():
-        sys.exit(f'no unit {unit_dir(args.kernel)}')
+    units = [] if args.command == 'check' else args.kernel if args.command == 'test' else [args.kernel]
+    for unit in units:
+        if not Path(unit_dir(unit)).is_dir():
+            sys.exit(f'no unit {unit_dir(unit)}')
     timing_host = socket.gethostname().split('.')[0] in {t['time'] for t in TARGETS.values()}
     with bench_lock() if timing_host or args.command == 'bench' else contextlib.nullcontext():
         return args.run(args)

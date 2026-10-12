@@ -38,11 +38,11 @@ Run from the checkout's root. Each script's `--help` has the details.
 | Tool | Runs on | What it does |
 |---|---|---|
 | `tools/vm.py <vm> [--base REV] '<cmd>'` | Mac | Copies your working tree (uncommitted changes too) to the VM and runs the command there. `--base` copies REV as well, as `$BASE`. |
-| `tools/kernel.py test <unit> --target <t>` | Mac, VM | Builds and runs every `test*.cpp` of a unit at -O2 and under ASan/UBSan. A unit is a kernel name or `frontend`. |
+| `tools/kernel.py test <unit>... --target <t>` | Mac, VM | Builds every `test*.cpp` of the units at -O2 and under ASan/UBSan, all cores at once (`-j`), and runs each once built. A unit is a kernel name or `frontend`. |
 | `tools/kernel.py bench <unit> [--base DIR]` | timing VM | Times each `bench*.cpp` (one binary each); with `--base`, old and new in the same run, as paired ratios (below 1 is faster). Holds the bench lock. |
 | `tools/kernel.py check` | anywhere | Generators and tuned tables match what is committed. |
 | `tools/tune.py <kernel>` | Mac | Measures a kernel's tuned choices on each target's timing machine; writes `tuned.json` and `tuned.hpp`. |
-| `tools/gate.py <pr> --merge` | Mac | Tests every affected unit on every target, times it against `main`, comments the report on the PR, and squash-merges on a pass. |
+| `tools/gate.py <pr> --merge` | Mac | Tests every affected unit on every target, times it against `main`, comments the report on the PR, and squash-merges on a pass. Always runs `origin/main`'s copy of `tools/`. |
 
 ```
 python3 tools/vm.py lc-amd 'python3 tools/kernel.py test ntt --target avx2'
