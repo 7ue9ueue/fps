@@ -8,10 +8,10 @@
 // instead of a page fault per page; on warm tables a load, or a load and a mincore). The variant
 // per size class is a tuned choice (select.hpp: `variants`, one load per call; tune.hpp measures it):
 //   model::tables<P>(fact, inverse, n)          the scalar loop (model.hpp), any n <= P
-//   Chains<S, K, P, step, prefetch>::run(fact, inverse, n)
+//   Chains<S, K, P, step, store>::run(fact, inverse, n)
 //                                               n >= Chains::kMinSize; W = K S::lanes lanes;
-//                                               step: the scan's chain product (Step); prefetch:
-//                                               the scan prefetches each lane's next line
+//                                               step: the scan's chain product (Step); store: its
+//                                               stores (Store: plain, prefetch, stream)
 //   run_variant<P>(v, fact, inverse, n)         variant v of select.hpp's list, n >= kMinSizes[v]
 // All are public, as the fast path for callers that pick their own variant; they do not prefault.
 //
@@ -27,7 +27,9 @@
 //   3. two chains: up from (a_s)! (times a_s + 1, a_s + 2, ...) and down from 1 / (a_s + C - 1)!
 //      (times a_s + C - 1, a_s + C - 2, ...). Every vector length of steps, an in-register
 //      transpose turns the lanes' terms into vectors of consecutive positions for the stores.
-//      With `prefetch`, each lane also prefetches the line after the one it stores.
+//      With Store::prefetch, each lane also prefetches the line after the one it stores; with
+//      Store::stream, from n = kStreamSize on, the aligned lanes' stores are non-temporal (then
+//      an sfence); below it, or if inverse has another offset than fact, it runs Store::plain.
 // Design and measurements: notes.md.
 #pragma once
 
@@ -68,7 +70,7 @@ inline constexpr auto kIota = [] {
 
 }  // namespace detail
 
-template <class S, int K, u32 P, Step kStep = Step::shoup, bool kPrefetch = false>
+template <class S, int K, u32 P, Step kStep = Step::shoup, Store kStore = Store::plain>
 class Chains {
 public:
     using M = modarith::Ops<S, P>;
@@ -93,6 +95,14 @@ public:
     }
 
     static void run(u32* fact, u32* inverse, std::size_t n) {
+        if constexpr (kStore == Store::stream) {
+            // Smaller tables stay cached for their reader (select.hpp); streaming into inverse needs
+            // fact's offset. From kStreamSize on, W C < n + 48 W and C >= n / W > 48 W + 15 give
+            // k >= W - 1: the lanes s < W - 1 store aligned.
+            static_assert(kStreamSize / kWidth > 48 * kWidth + 15);
+            const auto offset = [](const u32* p) { return reinterpret_cast<std::uintptr_t>(p) % (4 * kLanes); };
+            if (n < kStreamSize || offset(fact) != offset(inverse)) return Chains<S, K, P, kStep>::run(fact, inverse, n);
+        }
         const std::size_t c = chunk(n);
         const std::size_t h = (kLanes - reinterpret_cast<std::uintptr_t>(fact) / 4 % kLanes) % kLanes;
         const std::size_t k = (n - h) / c;  // lanes s < k start at h + s c, lanes s >= k at n - c
@@ -315,7 +325,8 @@ private:
     // A chain step is x <- x m, x < 2P. Step::montgomery: m in Montgomery form, base + u with
     // u = j 2^32 mod P shared by all lanes. Step::shoup: x m - floor(x q / 2^32) P with m plain and
     // q = floor(m_0 2^32 / P) + floor(j 2^32 / P) (down: minus, and 1 less), one below
-    // floor(m 2^32 / P) at most; with x < 2^31 the result is still in [0, 2P).
+    // floor(m 2^32 / P) at most; with x < 2^31 the result is still in [0, 2P). Store::stream: the
+    // lanes s < W - 1 store with non-temporal stores (aligned), the last lane plain.
     [[gnu::flatten]] static void scan(u32* fact, u32* inverse, std::size_t c, const Lanes& start, const Lanes& first,
                                       const Lanes& down) {
         V up[K], dn[K], ub[K], db[K], uq[K], dq[K];
@@ -361,14 +372,19 @@ private:
             detail::unrolled<K>([&](auto l) {
                 constexpr int e = decltype(t)::value * K + decltype(l)::value, v = e / kLanes, lane = e % kLanes;
                 if constexpr (lane == 0) transpose(up_block[b][v]), transpose(down_block[b][v]);
-                S::store(up_out[e] + i, M::template reduce<P>(up_block[b][v][lane]));
-                S::store(down_out[e] - i, M::template reduce<P>(down_block[b][v][lane]));
+                if constexpr (kStore == Store::stream && e < kWidth - 1) {
+                    stream_store<S>(up_out[e] + i, M::template reduce<P>(up_block[b][v][lane]));
+                    stream_store<S>(down_out[e] - i, M::template reduce<P>(down_block[b][v][lane]));
+                } else {
+                    S::store(up_out[e] + i, M::template reduce<P>(up_block[b][v][lane]));
+                    S::store(down_out[e] - i, M::template reduce<P>(down_block[b][v][lane]));
+                }
             });
         };
         detail::unrolled<kLanes>([&](auto t) { advance(0, t); });
         std::size_t i = 0;
         int cur = 0;
-        if constexpr (kPrefetch) {
+        if constexpr (kStore == Store::prefetch) {
             // The lanes of step t also prefetch their line `ahead` words on, in their ranges: 64
             // write streams (32 lanes) are more than Emerald Rapids' L2 prefetcher follows (notes.md).
             const auto prefetch = [&](auto t, std::size_t ahead) {
@@ -387,11 +403,12 @@ private:
                 detail::unrolled<kLanes>([&](auto t) { advance(cur ^ 1, t), emit(cur, i, t); });
         }
         detail::unrolled<kLanes>([&](auto t) { emit(cur, i, t); });
+        if constexpr (kStore == Store::stream) stream_fence<S>();
     }
 };
 
 template <class V, u32 P>
-using ChainsOf = Chains<typename V::Isa, V::vectors, P, V::scan, V::prefetch>;
+using ChainsOf = Chains<typename V::Isa, V::vectors, P, V::scan, V::stores>;
 
 // Variant v of Selected (0 the loop, i the candidate i - 1), for n >= kMinSizes[v].
 template <u32 P>

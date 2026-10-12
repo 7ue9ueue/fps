@@ -5,7 +5,7 @@
 //   factorials::measure(start, budget[, log])  // Choices: per class the fastest variant, else start's
 //   factorials::points(c, count)               // the sizes a dense class is timed at
 //   factorials::text(choices), parse(text)     // wisdom: kSignature, then the variant per class
-//   factorials::variant_names()                // "loop", then "<isa>.<K>.<step>[.prefetch]" per candidate
+//   factorials::variant_names()                // "loop", then "<isa>.<K>.<step>[.prefetch|.stream]" per candidate
 //
 // Dense part: a class (e, e + w] ending at most 2^dense_lg is timed at `points` sizes:
 // e + j w / points + 1 for 0 < j < points (just past a round size: the most lanes' slack) and e + w
@@ -14,6 +14,8 @@
 // geometric mean of time / fastest over its points, unless start's is within budget.margin of it.
 // A variant more than 2x the fastest, and narrower than it (fewer lanes; the loop has 1), is
 // dropped for the larger sizes (wider variants only gain with n), except where start has it.
+// A Store::stream variant runs its plain twin below kStreamSize: it is timed only for classes up to
+// one that reaches kStreamSize, or where start has it.
 // Sparse part: one size per octave, 2^k for dense_lg < k <= sparse_lg, decides the octave's
 // classes (2^(k-1), 2^k], each keeping start's variant when within budget.sparse_margin there;
 // 2^sparse_lg also decides every larger class. One size cannot place a change inside an octave,
@@ -50,6 +52,11 @@ struct Budget {
 // octaves on our machines), samples of 10 us (20 us decided within 0.1%), margins 3% and 5%:
 // 37-90 ms per run (backend/tune/notes.md).
 inline constexpr Budget kRunTime = {17, 20, 2, 3, 1e4, 0.03, 0.05};
+
+// Which variants stream (Store::stream).
+inline constexpr auto kStreams = []<class... V>(Candidates<V...>) {
+    return std::array<bool, sizeof...(V) + 1>{false, V::stores == Store::stream...};
+}(Selected{});
 
 // The lanes of each variant (W = K S::lanes; the loop 1).
 inline constexpr auto kWidths = []<class... V>(Candidates<V...>) {
@@ -92,7 +99,7 @@ inline Choices measure(const Choices& start, const Budget& budget, std::vector<C
     const auto variants_for = [&](int first, int last) {
         std::vector<int> ids;
         for (int v = 0; v < int(kMinSizes.size()); ++v) {
-            bool timed = !dropped[v];
+            bool timed = !dropped[v] && (!kStreams[v] || class_end(last - 1) >= kStreamSize);
             for (int c = first; c < last; ++c) timed |= v == start[c];
             if (timed && kMinSizes[v] <= class_start(first)) ids.push_back(v);
         }
@@ -140,7 +147,7 @@ inline Choices measure(const Choices& start, const Budget& budget, std::vector<C
 inline std::vector<std::string> variant_names() {
     return []<class... V>(Candidates<V...>) {
         return std::vector<std::string>{"loop", (std::string(V::Isa::name) + "." + std::to_string(V::vectors) + "." +
-                                                 std::string(step_name<V>) + std::string(prefetch_name<V>))...};
+                                                 std::string(step_name<V>) + std::string(store_name<V>))...};
     }(Selected{});
 }
 

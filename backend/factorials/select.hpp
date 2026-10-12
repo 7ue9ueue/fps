@@ -31,13 +31,27 @@ namespace fps::factorials {
 // with the multiplier plain and its quotient stepped along.
 enum class Step { montgomery, shoup };
 
-// prefetch: the scan prefetches each lane's next line (Chains).
-template <class S, int K, Step step, bool prefetching = false>
+// The scan's stores (Chains): plain; plain, and each lane prefetches its next line; or
+// non-temporal (streaming) where aligned (Avx512 only), from n = kStreamSize on.
+enum class Store { plain, prefetch, stream };
+
+// Store::stream stores smaller tables plain: they stay cached for their reader. From 2^22 words
+// the two tables fill Zen 5's L3 (32 MiB), and a reader of streamed tables loses 0-2.4%
+// (notes.md, issue #70 round 3).
+inline constexpr std::size_t kStreamSize = std::size_t(1) << 22;
+
+// prefetch: Store::prefetch, else Store::plain.
+template <class S, int K, Step step, bool prefetch = false>
 struct Variant {
     using Isa = S;
     static constexpr int vectors = K;
     static constexpr Step scan = step;
-    static constexpr bool prefetch = prefetching;
+    static constexpr Store stores = prefetch ? Store::prefetch : Store::plain;
+};
+// A variant with Store::stream.
+template <class S, int K, Step step>
+struct Streaming : Variant<S, K, step> {
+    static constexpr Store stores = Store::stream;
 };
 template <class... V>
 struct Candidates {};
@@ -53,7 +67,13 @@ struct Candidates {};
 #define FPS_FACTORIALS_MIN_CHAINS 64
 #endif
 using Selected = Candidates<Variant<simd::FPS_FACTORIALS_ISA, FPS_FACTORIALS_VECTORS, Step::FPS_FACTORIALS_STEP>>;
-#elif defined(__AVX512F__) && defined(__AVX512BW__)  // avx512 and zen5
+#elif defined(__znver5__)  // zen5: avx512's, and streaming zmm Shoup (issue #70 round 3)
+using Selected = Candidates<Variant<simd::Sse, 1, Step::shoup>, Variant<simd::Avx512Vl, 1, Step::shoup>,
+                            Variant<simd::Avx512Vl, 1, Step::montgomery>, Variant<simd::Avx512Vl, 2, Step::montgomery>,
+                            Variant<simd::Avx512, 1, Step::shoup>, Variant<simd::Avx512, 1, Step::montgomery>,
+                            Variant<simd::Avx512, 2, Step::shoup, true>, Variant<simd::Avx512, 2, Step::montgomery>,
+                            Variant<simd::Avx512, 2, Step::montgomery, true>, Streaming<simd::Avx512, 1, Step::shoup>>;
+#elif defined(__AVX512F__) && defined(__AVX512BW__)  // avx512
 using Selected = Candidates<Variant<simd::Sse, 1, Step::shoup>, Variant<simd::Avx512Vl, 1, Step::shoup>,
                             Variant<simd::Avx512Vl, 1, Step::montgomery>, Variant<simd::Avx512Vl, 2, Step::montgomery>,
                             Variant<simd::Avx512, 1, Step::shoup>, Variant<simd::Avx512, 1, Step::montgomery>,
@@ -94,15 +114,16 @@ using Choices = std::array<std::uint8_t, kClasses>;
 template <class V>
 constexpr std::string_view step_name = V::scan == Step::shoup ? "shoup" : "montgomery";
 template <class V>
-constexpr std::string_view prefetch_name = V::prefetch ? ".prefetch" : "";
+constexpr std::string_view store_name =
+    V::stores == Store::prefetch ? ".prefetch" : V::stores == Store::stream ? ".stream" : "";
 template <class... V>
 constexpr std::uint32_t signature(Candidates<V...>) {
-    std::uint32_t h = 2166136261u;  // FNV-1a over "isa.K.step[.prefetch];" per candidate
+    std::uint32_t h = 2166136261u;  // FNV-1a over "isa.K.step[.prefetch|.stream];" per candidate
     const auto add = [&h](std::string_view s) {
         for (const char c : s) h = (h ^ std::uint8_t(c)) * 16777619u;
     };
     ((add(V::Isa::name), add("."), add(std::string_view("0123456789").substr(V::vectors, 1)), add("."),
-      add(step_name<V>), add(prefetch_name<V>), add(";")),
+      add(step_name<V>), add(store_name<V>), add(";")),
      ...);
     return h >> 1;  // fits an int
 }
