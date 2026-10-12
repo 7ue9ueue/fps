@@ -1,12 +1,13 @@
-// Tests the small kernel against the O(n m) model: every Schoolbook<S, R, P, U, Solo> of the
+// Tests the small kernel against the O(n m) model: every Schoolbook<S, R, P, U, Solo, T> of the
 // target's struct S = simd::Native (the others are tested on their own targets; R = 1, 2, 4, 6, 8;
-// R = 4, U = 2; R = 6, U = 4; R = 8, U = 2; Solo with R = 4, U = 1 and R = 6, U = 4; six primes)
-// and every candidate of select.hpp's list (run_variant) on all shapes up to 40 x 40, term counts
-// at the bounds of the 64-bit sums, 0, 1, powers of two and their neighbours up to 1025, panels
-// (m > 1024) and long factors; multiply() with its argument orders and empty factors, and with each
-// candidate set for every shape class. Inputs random, or making the largest sums or sums near them.
-// Words past the product must stay untouched. Then beats_ntt on the compiled defaults, measure_ntt
-// and measure_variants (tune.hpp), and both choices through wisdom. Exits nonzero on a failure.
+// R = 4, U = 2; R = 6, U = 4; R = 8, U = 2; Solo with R = 4, U = 1 and R = 6, U = 4; the tiny path
+// up to T = 3 and 4 vectors; six primes) and every candidate of select.hpp's list (run_variant) on
+// all shapes up to 40 x 40, term counts at the bounds of the 64-bit sums, 0, 1, powers of two and
+// their neighbours up to 1025, panels (m > 1024) and long factors; multiply() with its argument
+// orders and empty factors, and with each candidate set for every shape class. Inputs random, or
+// making the largest sums or sums near them. Words past the product must stay untouched. Then
+// beats_ntt on the compiled defaults, measure_ntt and measure_variants (tune.hpp), and both choices
+// through wisdom. Exits nonzero on a failure.
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -86,15 +87,16 @@ void check(const std::string& name, const Vec& a, const Vec& b, const Vec& want,
         if (out[k] != kGuard) return fail(where + ": wrote past the product");
 }
 
-// Every Schoolbook<S, R, P, U, Solo> on one pair of factors, n >= m: R = 1, 2, 4, 6, 8 with U = 1,
-// and unrolled loops and vector-at-a-time edges. The target's candidates: candidates().
+// Every Schoolbook<S, R, P, U, Solo, T> on one pair of factors, n >= m: R = 1, 2, 4, 6, 8 with
+// U = 1, unrolled loops, vector-at-a-time edges and the tiny path up to 3 and 4 vectors. The
+// target's candidates: candidates().
 template <class S, u32 P>
 void schoolbooks(const Vec& a, const Vec& b, const Vec& want) {
-    const auto one = [&]<int R, int U = 1, bool Solo = false> {
+    const auto one = [&]<int R, int U = 1, bool Solo = false, int T = 2> {
         check(std::string("Schoolbook<") + S::name + ", " + std::to_string(R) + ", " + std::to_string(P) + ", " +
-                  std::to_string(U) + ", " + (Solo ? "true" : "false") + ">",
+                  std::to_string(U) + ", " + (Solo ? "true" : "false") + ", " + std::to_string(T) + ">",
               a, b, want, [](const u32* x, std::size_t n, const u32* y, std::size_t m, u32* out) {
-                  fps::small::Schoolbook<S, R, P, U, Solo>::run(x, n, y, m, out);
+                  fps::small::Schoolbook<S, R, P, U, Solo, T>::run(x, n, y, m, out);
               });
     };
     one.template operator()<1>();
@@ -107,6 +109,8 @@ void schoolbooks(const Vec& a, const Vec& b, const Vec& want) {
     one.template operator()<8, 2>();
     one.template operator()<4, 1, true>();
     one.template operator()<6, 4, true>();
+    one.template operator()<4, 1, false, 3>();
+    one.template operator()<4, 2, true, 4>();
 }
 
 // Every candidate of select.hpp's list through run_variant, n >= m.

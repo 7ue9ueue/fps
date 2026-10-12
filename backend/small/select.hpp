@@ -1,5 +1,5 @@
 // The small kernel's variant per target and shape, a tuned choice (backend/tune): Schoolbook<S, R,
-// P, U, Solo> of one of the target's candidates, per shape class; and the costs behind beats_ntt
+// P, U, Solo, T> of one of the target's candidates, per shape class; and the costs behind beats_ntt
 // (small.hpp).
 //
 //   shape_class(n, m)    n >= m >= 1: the octave of m, (2^(k-1), 2^k] for k <= 9 and m > 512 the
@@ -8,8 +8,8 @@
 //   kDefaults            compiled defaults: tools/tune.py small (tune.cpp, tuned.hpp)
 //
 // backend/small/tune.hpp measures the table on this machine. -DFPS_SMALL_ISA=<struct> forces one
-// variant, with -DFPS_SMALL_VECTORS=<R> (default 4), -DFPS_SMALL_UNROLL=<U> (1) and
-// -DFPS_SMALL_SOLO=<0 or 1> (0). Measurements: notes.md.
+// variant, with -DFPS_SMALL_VECTORS=<R> (default 4), -DFPS_SMALL_UNROLL=<U> (1),
+// -DFPS_SMALL_SOLO=<0 or 1> (0) and -DFPS_SMALL_TINY=<T> (2). Measurements: notes.md.
 #pragma once
 
 #include <algorithm>
@@ -26,12 +26,12 @@
 
 namespace fps::small {
 
-// Schoolbook<S, R, P, U, Solo> without P: R vectors per block, the loop with all R unrolled U times,
-// Solo the edges one vector at a time.
-template <class S, int R, int U, bool Solo>
+// Schoolbook<S, R, P, U, Solo, T> without P: R vectors per block, the loop with all R unrolled U
+// times, Solo the edges one vector at a time, products of at most T vectors on the tiny path.
+template <class S, int R, int U, bool Solo, int T = 2>
 struct Variant {
     using Isa = S;
-    static constexpr int vectors = R, unroll = U;
+    static constexpr int vectors = R, unroll = U, tiny = T;
     static constexpr bool solo = Solo;
 };
 template <class... V>
@@ -49,28 +49,35 @@ struct Candidates {};
 #if !defined(FPS_SMALL_SOLO)
 #define FPS_SMALL_SOLO 0
 #endif
-using Selected =
-    Candidates<Variant<simd::FPS_SMALL_ISA, FPS_SMALL_VECTORS, FPS_SMALL_UNROLL, bool(FPS_SMALL_SOLO)>>;
+#if !defined(FPS_SMALL_TINY)
+#define FPS_SMALL_TINY 2
+#endif
+using Selected = Candidates<
+    Variant<simd::FPS_SMALL_ISA, FPS_SMALL_VECTORS, FPS_SMALL_UNROLL, bool(FPS_SMALL_SOLO), FPS_SMALL_TINY>>;
 #elif defined(__znver5__)  // zen5 (tune::kTarget)
 using Selected = Candidates<Variant<simd::Avx512, 6, 1, false>, Variant<simd::Avx512, 4, 1, false>,
                             Variant<simd::Avx512, 8, 2, false>, Variant<simd::Avx512, 6, 1, true>,
-                            Variant<simd::Avx512, 4, 1, true>, Variant<simd::Avx512Vl, 4, 1, true>>;
+                            Variant<simd::Avx512, 4, 1, true>, Variant<simd::Avx512Vl, 4, 1, true>,
+                            Variant<simd::Avx512, 4, 1, true, 4>, Variant<simd::Avx512Vl, 4, 1, true, 4>>;
 #elif defined(__AVX512F__) && defined(__AVX512BW__)  // avx512
 using Selected = Candidates<Variant<simd::Avx512, 6, 1, false>, Variant<simd::Avx512, 4, 1, false>,
                             Variant<simd::Avx512, 6, 2, false>, Variant<simd::Avx512, 8, 1, false>,
                             Variant<simd::Avx512, 8, 2, false>, Variant<simd::Avx512Vl, 6, 2, false>,
-                            Variant<simd::Avx512Vl, 4, 1, true>>;
+                            Variant<simd::Avx512Vl, 4, 1, true>, Variant<simd::Avx512, 4, 1, false, 4>,
+                            Variant<simd::Avx512Vl, 4, 1, true, 4>>;
 #elif defined(__AVX2__)
 using Selected = Candidates<Variant<simd::Avx2, 4, 2, false>, Variant<simd::Avx2, 4, 4, false>,
                             Variant<simd::Avx2, 4, 1, false>, Variant<simd::Avx2, 5, 2, false>,
-                            Variant<simd::Avx2, 4, 2, true>, Variant<simd::Sse, 4, 1, true>>;
+                            Variant<simd::Avx2, 4, 2, true>, Variant<simd::Sse, 4, 1, true>,
+                            Variant<simd::Avx2, 4, 2, true, 4>, Variant<simd::Sse, 4, 1, true, 4>>;
 #elif defined(__ARM_NEON) && defined(__aarch64__)
 using Selected = Candidates<Variant<simd::Neon, 6, 4, false>, Variant<simd::Neon, 6, 4, true>,
                             Variant<simd::Neon, 4, 1, false>, Variant<simd::Neon, 8, 4, false>,
-                            Variant<simd::Neon, 8, 1, false>>;
+                            Variant<simd::Neon, 8, 1, false>, Variant<simd::Neon, 6, 4, true, 4>,
+                            Variant<simd::Neon, 8, 1, false, 4>>;
 #elif defined(__SSE4_1__)
 using Selected = Candidates<Variant<simd::Sse, 4, 1, false>, Variant<simd::Sse, 4, 2, false>,
-                            Variant<simd::Sse, 4, 1, true>>;
+                            Variant<simd::Sse, 4, 1, true>, Variant<simd::Sse, 4, 1, true, 4>>;
 #else
 using Selected = Candidates<Variant<simd::Scalar, 4, 1, false>, Variant<simd::Scalar, 6, 1, false>,
                             Variant<simd::Scalar, 8, 1, false>, Variant<simd::Scalar, 4, 2, false>,
@@ -88,12 +95,13 @@ constexpr int shape_class(std::size_t n, std::size_t m) {  // n >= m >= 1
 
 using Choices = std::array<std::uint8_t, kClasses>;
 
-// "<isa>.r<R>.u<U>", and ".solo" with Solo, e.g. "avx512.r8.u2"; and a hash of the list that
-// tuned.hpp records, so a table measured for another list does not compile.
+// "<isa>.r<R>.u<U>", ".solo" with Solo and ".t<T>" for T other than 2, e.g. "avx512.r4.u1.solo.t4";
+// and a hash of the list that tuned.hpp records, so a table measured for another list does not
+// compile.
 template <class V>
 std::string variant_name() {
     return std::string(V::Isa::name) + ".r" + std::to_string(V::vectors) + ".u" + std::to_string(V::unroll) +
-           (V::solo ? ".solo" : "");
+           (V::solo ? ".solo" : "") + (V::tiny != 2 ? ".t" + std::to_string(V::tiny) : "");
 }
 template <class... V>
 constexpr std::uint32_t signature(Candidates<V...>) {
@@ -104,7 +112,10 @@ constexpr std::uint32_t signature(Candidates<V...>) {
          .add(digits.substr(V::vectors, 1))
          .add(".u")
          .add(digits.substr(V::unroll, 1))
-         .add(V::solo ? ".solo;" : ";"),
+         .add(V::solo ? ".solo" : "")
+         .add(V::tiny != 2 ? ".t" : "")
+         .add(V::tiny != 2 ? digits.substr(V::tiny, 1) : "")
+         .add(";"),
      ...);
     return h.value >> 1;  // fits an int
 }

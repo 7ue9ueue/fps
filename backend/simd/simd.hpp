@@ -40,6 +40,8 @@
 //                              high word of lane i of o. Sse, Avx2: shr64 + blend; AVX-512: vpermt2d
 // Avx512Vl, Avx512:
 //   permute2(a, idx, b)        lane i = idx[i] < lanes ? a[idx[i]] : b[idx[i] - lanes] (vpermt2d)
+//   load_mask(p, mask)         lane i = p[i] if bit i of mask is set, else 0; the other lanes are
+//                              not read, so they may lie outside any object (vmovdqu32 {k}{z})
 // Avx512 only, its two halves of 8 lanes from or to memory:
 //   load_halves(p, q)          lanes 0-7 from p, 8-15 from q (ymm load, vinserti64x4 from memory)
 //   store_half<h>(p, a)        lanes 8h .. 8h + 7 of a to p (ymm store, vextracti64x4 to memory)
@@ -239,6 +241,7 @@ struct Avx512Vl : Avx2 {
     static constexpr int registers = 32;
     static constexpr const char* name = "avx512vl";
     static void store_first(u32* p, V a, int k) { _mm256_mask_storeu_epi32(p, __mmask8((1u << k) - 1), a); }
+    static V load_mask(const u32* p, unsigned mask) { return _mm256_maskz_loadu_epi32(__mmask8(mask), p); }
     static V permute2(V a, Index idx, V b) { return _mm256_permutex2var_epi32(a, idx, b); }
     static V join_high(V e, V o) { return permute2(e, _mm256_setr_epi32(1, 9, 3, 11, 5, 13, 7, 15), o); }
     static V mulhi(V a, V b);
@@ -261,6 +264,7 @@ struct Avx512 {
     static V load(const u32* p) { return _mm512_loadu_si512(p); }
     static void store(u32* p, V a) { _mm512_storeu_si512(p, a); }
     static void store_first(u32* p, V a, int k) { _mm512_mask_storeu_epi32(p, __mmask16((1u << k) - 1), a); }
+    static V load_mask(const u32* p, unsigned mask) { return _mm512_maskz_loadu_epi32(__mmask16(mask), p); }
     static V broadcast(u32 x) { return _mm512_set1_epi32(int(x)); }
     static V broadcast64(u64 x) { return _mm512_set1_epi64(std::int64_t(x)); }
     static V add(V a, V b) { return _mm512_add_epi32(a, b); }
