@@ -788,6 +788,47 @@ the stack (the backend's 2^10 above). `f * g` at 32 x 32 (`multiply/6`, frontend
 calls are main's) 1.13 on Zen 3 (152 -> 172 ns), 1.00 on the other machines: code placement
 (#81, #93: main's own binary moves over 136-169 ns with the code shifted).
 
+### Zen 5 products at 2^9-2^12 and code layout (issue #101)
+
+`lc-zen5` (EPYC 9B45), GCC 15.2, `-O2 -march=znver5`, 2026-10-12. Commits: b9e53c4 (before #99),
+529d281 (#99: square, middle product), ad1e1b4 (#100). The zmm product path (every function from
+`ntt::multiply` down: `Ntt<Avx512>::multiply`, `multiply_tree`, `forward_group<4>`,
+`WideBottom::multiply`, the `*_part` levels, the boundary functions) is the same instruction stream
+in all three (objdump with addresses and jump targets normalized), except register allocation in
+`ntt::multiply<tuned>` (region, `place`, dispatch: about 250 scalar instructions) and in the
+in-place even-lg `multiply_tree<2>`. What differs is where each function sits.
+
+ns, median over binaries of the median of 3-5 runs [min-max over binaries]; each binary the whole
+TU shifted by 0-3584 bytes (512-byte steps, a top-level `.skip`), 8 shifts (ntt bench) or 4:
+
+| case | b9e53c4 | 529d281 | ad1e1b4 |
+|---|---|---|---|
+| ntt multiply/11 (in place) | 2156 [2148-2160] | 2180 [2172-2191] | 2200 [2193-2213] |
+| ntt product/11 | 2199 [2193-2220] | 2210 [2203-2269] | 2205 [2196-2223] |
+| ntt product/9 | 526 [523-527] | 526 [523-577] | 524 [522-528] |
+| frontend multiply/9 | 540 [538-550] | 554 [540-570] | 561 [549-590] |
+| frontend multiply/11 | 2258 [2229-2282] | 2333 [2300-2392] | 2302 [2266-2336] |
+| frontend multiply/12 | 4894 [4875-4903] | 4980 [4954-5021] | 4979 [4964-5027] |
+| same, product path first in .text (ld `--section-ordering-file`): ntt multiply/11 | 2180 | 2168 | 2170 |
+| ordered: ntt product/11 | 2248 | 2226 | 2230 |
+| ordered: frontend multiply@kernel/12 | 4890 | 4956 | 4944 |
+
+- The shifts move a binary by about 1% (one shift of 529d281: product/9 and square/9 +10%); the
+  binaries differ by more than that and in the same direction at every shift, so it is the
+  functions' relative layout, not their absolute addresses. With the zmm product path contiguous
+  at the start of .text the three ntt benches agree within 0.5% (b9e53c4 is then no faster). The
+  frontend's kernel calls stay 1-1.5% apart at 2^10 and 2^12 (its own code was not ordered).
+- Not data placement: tables, f, g, out and a each at 64 page offsets (64-byte steps, the others
+  fixed; `probe_place.cpp`): within 1% at 2^9-2^12 (one offset of out 8% at 2^9).
+- The gate's 1.34-1.36 at 2^9 (PR #99): its two 21-round runs of the same binary (the build is
+  deterministic) gave multiply/9 861 and 501 ns, base 499 and 499. In the slow run every product
+  whose subtrees call `multiply_tree<4>` (odd lg 9, 11, 13; every lg from 14) took 90-150 ns more
+  per call of it (2^9: 4 calls, +360 ns; 2^20: 680 calls, +74 us; 2^25: 21844 calls, +2.6 ms), and
+  nothing else moved (even lg 10 and 12, square, transforms). Not reproduced: 16 more runs of
+  `kernel.py bench` (each a fresh build) and 52 processes of fresh copies of the binary all ran
+  multiply/9 at 499-513 ns. The only such run in the saved gates (all pooled runs, every target).
+
+
 2026-10-11, claude (issue #3, round 1): moved lc-opt `lib/ntt` (`ntt.hpp`, `product.hpp`, both
 generators and their output) here. Changes: namespaces `fps::ntt`; one `Convolution` picks the
 product path (lc-opt `Product`) when it fits, else the convolution path; one templated `Tree`
@@ -1323,6 +1364,40 @@ Measurements, Leaf-form ops. The frontend's `Values` now calls them (it had scal
   r(bitrev2(k)), not r(k) (`eighth_root`; the definition test, 15 failures). Pass at -O2 and
   ASan/UBSan on `lc-amd` (avx2, sse, scalar), `lc-intel-test`, `lc-zen5-test`, `lc-arm` and the
   Mac (arm), with the frontend's tests.
+
+2026-10-12, claude (issue #101, round 1): the Zen 5 products at 2^9 and 2^11 that PR #99's gate
+read as 1.34 and 1.06-1.13 slower. Code layout, and one slow run of the gate; no ntt code changed.
+Numbers: Measurements, Zen 5 products at 2^9-2^12 and code layout. Probes, scripts and raw output:
+`~/Documents/hpc_library-explore/ntt/issue101/` (`src/`: `build_shift.sh`, `build_ordered.sh` and
+`order.py` for the ordered builds, `fdiff.py` for the normalized objdump diff, `probe_place.cpp`,
+`hunt.sh`; `lc-zen5/`: the runs). `lc-zen5` has no PMU (`/sys/bus/event_source/devices` has no
+cpu), so no counters.
+- The gate's numbers are two runs pooled: in the first, every product calling `multiply_tree<4>`
+  was slow by about 100 ns per call; in the second, the same binary ran at base speed. Not
+  reproduced in 16 runs and 52 fresh processes. The fixed cost per call (not per word) points at
+  something outside the code's work (a guess: a few lines of that function fetched from far away
+  each call); the per-run (not per-process: stack, heap and mmap are randomized per process)
+  pattern points at the run's machine state or the binary file's physical pages. Unknown. Issue
+  #110: the gate should notice when its two runs of one binary disagree.
+- What is left is layout: identical instructions, 1% (ntt bench, 2^11 in place) to 2-4% (frontend
+  bench, 2^9-2^12) between the three commits, at every one of 8 code shifts, and gone in the ntt
+  bench when the product path is laid out contiguously by the linker. Data placement is flat.
+- Tried, not kept: `[[gnu::hot]]` on the product path (intrinsics' levels, groups, bottoms, trees,
+  the span levels, the boundary functions, `ntt::multiply`/`square`/`middle_product`), which
+  groups those functions in `.text.hot` whatever else the program holds. GCC also inlined more
+  (`Ntt<Avx512>::multiply(Product)` 2358 -> 3935 bytes), and the group holds every candidate's
+  product functions (zmm and ymm interleaved), so the zmm path still spans about 125 KB. Against
+  main, same run, 5 rounds, 4 shifts: ntt product/10 1.015, product/11 1.011, square/10-11
+  1.014-1.016, multiply/10 1.017, product/9 and /12 1.00; frontend multiply/9 0.977, /10 1.046,
+  /11 1.024, /12 0.991. Diff in the exploration folder (`hot2.diff`).
+- Tried, no effect: `-falign-functions=64` (b9e53c4 stays fastest: frontend multiply/9 552 against
+  574 ns), with `-falign-loops=64` too up to 8% slower; `WideBottom`'s chunk of 2 or 8 pairs
+  instead of 4 (square/9-16 within 0.5%; multiply/10 1.014 with 2).
+- The hot zmm code of a 2^9 product is about 24 KB (`WideBottom::multiply` 4.7 KB,
+  `inverse_group_scaled` 3.7 KB, `inverse_radix4_part<3>` and `<4>` 6.9 KB, `forward_group<4>`
+  2.4 KB, `Ntt::multiply(Product)` 2.4 KB, ...), spread over about 120 KB of .text between the
+  ymm instantiations: against Zen 5's 32 KiB L1I and 6K-op op cache, a guess for why the relative
+  layout matters (issue #93's lead: a smaller or contiguous hot path).
 
 ## Sources
 
