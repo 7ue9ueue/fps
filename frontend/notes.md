@@ -637,6 +637,11 @@ belongs in `backend/`).
       faster (`square`, `raw_mul`, `mul`, `multiply` /11: 0.82-0.83) with `series.hpp` in
       bench.cpp's program; codegen, as #81 (guess, not inspected). Elsewhere 0.955 (`add/22`,
       `lc-arm`) to 1.035 (`neg/22`, `lc-arm`): placement, as in earlier entries.
+- 2026-10-12: issue #81 (round 1): the 25% `multiply/6` slowdown with `Values` in `bench.cpp`
+  (the PR #50 entry above) is code layout, not the NTT's inlining. With every function of the
+  product compiled identically in both programs the gap stayed (144 -> 175 ns on Zen 3), and
+  shifting the whole program's code moves 2^6 products by up to 25% (`backend/ntt/notes.md`,
+  #93). `bench_values.cpp` stays a binary of its own; its comment says why.
 - 2026-10-12: `square` and `middle_product` on the backend's new kernels (backend issue #55,
   `backend/ntt/notes.md`). `detail::Products::square`: as `multiply(a, a, 2n - 1)` (shift,
   `small::multiply`), with `ntt::square` (one forward transform) on the NTT path.

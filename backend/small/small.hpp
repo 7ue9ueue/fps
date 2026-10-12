@@ -9,7 +9,7 @@
 // select.hpp): one table lookup per call, then a chain of compares on the variant's index. The
 // variants are public, as the fast path for callers that pick their own:
 //   model::multiply<P>(a, n, b, m, out)                the O(n m) reference (model.hpp)
-//   Schoolbook<S, R, P, U, Solo>::run(a, n, b, m, out) n >= m >= 1; blocks of R vectors (schoolbook.hpp)
+//   Schoolbook<S, R, P, U, Solo, T>::run(a, n, b, m, out)  n >= m >= 1 (schoolbook.hpp)
 //   run_variant<P>(v, a, n, b, m, out)                 candidate v of select.hpp's list, n >= m >= 1
 //
 // beats_ntt(n, m), for factors of n and m coefficients: true where multiply() is expected to run
@@ -41,7 +41,7 @@
 namespace fps::small {
 
 template <class V, u32 P>
-using SchoolbookOf = Schoolbook<typename V::Isa, V::vectors, P, V::unroll, V::solo>;
+using SchoolbookOf = Schoolbook<typename V::Isa, V::vectors, P, V::unroll, V::solo, V::tiny>;
 
 // A chain of compares on v, inlined into the caller: a lambda with captures here cost 6 ns per call
 // on Zen 3 (its closure went through the stack, and the call was not inlined; notes.md).

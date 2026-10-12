@@ -159,6 +159,19 @@ void test_x86() {
     check<S>("join_high", S::join_high(va, vb), [&](int i) { return i % 2 ? b[i] : a[i + 1]; });
 }
 
+// load_mask: every lane pattern of a window at every offset of a buffer; masked-out lanes read 0.
+template <class S>
+void test_load_mask() {
+    u32 buffer[3 * S::lanes];
+    for (u32& x : buffer) x = word();
+    for (int offset = 0; offset <= 2 * S::lanes; ++offset)
+        for (unsigned mask : {0u, 1u, (1u << S::lanes) - 1, (1u << S::lanes) - 2, unsigned(word())}) {
+            mask &= (1u << S::lanes) - 1;
+            check<S>("load_mask", S::load_mask(buffer + offset, mask),
+                     [&](int i) { return mask >> i & 1 ? buffer[offset + i] : 0u; });
+        }
+}
+
 template <class S>
 void test_permute2() {
     const Lanes<S> a = random_lanes<S>(), b = random_lanes<S>();
@@ -232,6 +245,7 @@ void test_isa() {
         test_common<S>();
         if constexpr (requires(typename S::V v) { S::mul_even(v, v); }) test_x86<S>();
         if constexpr (requires(typename S::V v) { S::permute2(v, v, v); }) test_permute2<S>();
+        if constexpr (requires(const u32* p) { S::load_mask(p, 0u); }) test_load_mask<S>();
         if constexpr (requires(const u32* p) { S::load_halves(p, p); }) test_halves<S>();
         if constexpr (requires(typename S::V v) { S::madd52lo(v, v, v); }) test_ifma<S>();
         if constexpr (requires(typename S::V v) { S::qdmulh(v, v); }) test_neon<S>();

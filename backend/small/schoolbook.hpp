@@ -1,10 +1,17 @@
 // Schoolbook products on a simd struct S, modulo P, 2^12 < P < 2^30 (variant of the small kernel).
 //
-//   Schoolbook<S, R, P, U, Solo>::run(a, n, b, m, out);  // out = a b: n + m - 1 words; n >= m >= 1
+//   Schoolbook<S, R, P, U, Solo, T>::run(a, n, b, m, out);  // out = a b: n + m - 1 words; n >= m >= 1
 //
 // Inputs below P, output in [0, P). out must not overlap a or b. No allocation: scratch is on the
 // stack (about 9 KiB). R: vectors per block; U: unrolling of the loop with all R vectors; Solo:
-// the blocks at the ends of the product run one vector at a time, without phases.
+// the blocks at the ends of the product run one vector at a time, without phases; T (2 to 4):
+// products of at most T vectors take the tiny path.
+//
+// Tiny path (n + m - 1 <= T W): every vector of the product runs every step j < m, zero terms
+// where its own range is shorter (none for one vector, at most one for two), so there are no
+// phases, no blocks and no 9 KiB frame. Windows come from a small zero-padded copy of a, or on
+// AVX-512 for one or two vectors by masked loads of a itself (load_mask): no copy, so no load
+// waits for the copy's stores to reach the cache.
 //
 // Outputs go in blocks of R vectors (R S::lanes words), their sums held in registers. For each j,
 // every vector r of the block adds a[k - j] b'[j] for its words k: one load of a at k0 + r W - j
@@ -148,14 +155,17 @@ using Lanes = std::conditional_t<HasMulEven<S>, EvenOdd<S, P>,
 
 }  // namespace detail
 
-template <class S, int R, u32 P, int U = 1, bool Solo = false>
+template <class S, int R, u32 P, int U = 1, bool Solo = false, int T = 2>
 class Schoolbook {
 public:
+    static_assert(T >= 2 && T <= 4);
     static constexpr std::size_t kWidth = S::lanes, kBlock = R * kWidth;
     static constexpr std::size_t kPanel = 1024;  // words of b per panel
 
-    // One call for b of at most one panel: callers inline it once per candidate (small.hpp).
+    // One call for a tiny product or b of at most one panel: callers inline it once per candidate
+    // (small.hpp).
     static void run(const u32* a, std::size_t n, const u32* b, std::size_t m, u32* out) {
+        if (n + m - 1 <= T * kWidth) return tiny(a, n, b, m, out);
         if (m <= kPanel) return panel(a, n, b, m, out, false);
         panels(a, n, b, m, out);
     }
@@ -171,6 +181,99 @@ private:
         std::fill(out + n + kPanel - 1, out + n + m - 1, 0u);
         for (std::size_t first = 0; first < m; first += kPanel)
             panel(a, n, b + first, std::min(kPanel, m - first), out + first, first > 0);
+    }
+
+    static constexpr bool kMasked = requires(const u32* p) { S::load_mask(p, 0u); };
+
+    // The tiny path: count <= T vectors, n <= T W, m <= T W / 2 + 1 (n >= m).
+    [[gnu::noinline]] static void tiny(const u32* a, std::size_t n, const u32* b, std::size_t m, u32* out) {
+        const std::size_t total = n + m - 1;
+        const int count = int((total + kWidth - 1) / kWidth);
+        alignas(64) u32 scaled[T * kWidth];
+        if constexpr (kMasked) {
+            if (count <= 2) {
+                to_montgomery(b, m, scaled);
+                if (count == 1) return group_masked<1>(a, n, scaled, m, out, total);
+                return group_masked<2>(a, n, scaled, m, out, total);
+            }
+        }
+        // copy: 2W zeros, a, T W zeros: windows reach a[-(m - 1)] >= a[-2W] .. a[count W] <= a[n + T W)
+        alignas(64) u32 copy[(2 + 2 * T) * kWidth];
+        u32* const src = copy + 2 * kWidth;
+        S::store(copy, V{});
+        S::store(copy + kWidth, V{});
+        std::size_t x = 0;
+        for (; x + kWidth <= n; x += kWidth) {
+            asm("" : "+r"(x));  // a loop of vector copies, not a call of memcpy
+            S::store(src + x, S::load(a + x));
+        }
+        copy_short(src + x, a + x, n - x);
+#pragma GCC unroll 4
+        for (int r = 0; r < T; ++r) S::store(src + n + r * kWidth, V{});
+        to_montgomery(b, m, scaled);
+        if (count == 1) return group<1>(src, scaled, m, out, total);
+        if (T == 2 || count == 2) return group<2>(src, scaled, m, out, total);
+        if constexpr (T >= 3) {
+            if (T == 3 || count == 3) return group<3>(src, scaled, m, out, total);
+        }
+        if constexpr (T >= 4) return group<4>(src, scaled, m, out, total);
+    }
+
+    // The C vectors of a tiny product, every step j < m: windows at src + r W - j (zero-padded).
+    template <int C>
+    [[gnu::always_inline]] static void group(const u32* src, const u32* b, std::size_t m, u32* out,
+                                             std::size_t total) {
+        Acc acc[C];
+#pragma GCC unroll 4
+        for (int r = 0; r < C; ++r) L::start(acc[r], src + r * kWidth);
+        for (std::size_t j = 0;;) {
+            const std::size_t stop = std::min(m, j + Sums<P>::kFold);
+            for (; j < stop; ++j) {
+                const V bj = S::broadcast(b[j]);
+                const u32* base = src - j;
+                if constexpr (detail::HasMulWide<S>) asm("" : "+r"(base));  // as in step()
+#pragma GCC unroll 4
+                for (int r = 0; r < C; ++r) L::step(acc[r], base + r * kWidth, bj);
+            }
+            if (j == m) break;
+            fold(acc, C);
+        }
+        finish<C>(acc, C, m, out, total, false);
+    }
+
+    // group() for C <= 2 with windows by masked loads of a (AVX-512; EvenOdd sums), n <= 2W.
+    template <int C>
+    [[gnu::always_inline]] static void group_masked(const u32* a, std::size_t n, const u32* b, std::size_t m,
+                                                    u32* out, std::size_t total) {
+        const u64 strip = ((u64(1) << n) - 1) << kWidth;  // bit W + x: a[x] exists, for x >= -W
+        const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(a);
+        // a[x0 - j ..] with zeros outside a; x0 - j in [-W, 2W]: masked-out lanes are not read.
+        const auto window = [&](std::size_t x0, std::size_t j) {
+            return S::load_mask(reinterpret_cast<const u32*>(base + (x0 - j) * sizeof(u32)),
+                                unsigned(strip >> (kWidth + x0 - j)));
+        };
+        Acc acc[C];
+#pragma GCC unroll 2
+        for (int r = 0; r < C; ++r) {
+            acc[r].even = acc[r].odd = V{};
+            acc[r].next = window(r * kWidth + 1, 0);
+        }
+        for (std::size_t j = 0;;) {
+            const std::size_t stop = std::min(m, j + Sums<P>::kFold);
+            for (; j < stop; ++j) {
+                const V bj = S::broadcast(b[j]);
+#pragma GCC unroll 2
+                for (int r = 0; r < C; ++r) {
+                    const V v = window(r * kWidth, j);
+                    acc[r].odd = S::add64(acc[r].odd, S::mul_even(acc[r].next, bj));
+                    acc[r].even = S::add64(acc[r].even, S::mul_even(v, bj));
+                    acc[r].next = v;
+                }
+            }
+            if (j == m) break;
+            fold(acc, C);
+        }
+        finish<C>(acc, C, m, out, total, false);
     }
 
     // The terms of one output vector: j in [lo, hi).
