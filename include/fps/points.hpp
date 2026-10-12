@@ -28,7 +28,9 @@
 // O(M(m) log m) for m points (M a product's cost), as lc-opt's, but with a Newton inverse in each
 // division and every node's product kept. lc-opt's tuned versions (transposed evaluation, kept
 // transforms) are backend issue #104, on backend/product_tree (whose product() returns only the
-// root, not the kept nodes these need). Times at 2^10 to 2^20 points: frontend/notes.md.
+// root, not the kept nodes these need). At 2^17 points on the timed targets, ns per point: evaluate
+// 300-720, interpolate 440-990, to_newton_basis 190-460; lc-opt's Newton basis is about 3.7x
+// faster on Zen 3, and the descent's divisions take about 80% of evaluate (frontend/notes.md).
 //
 // Memory: the tree keeps every node's T, about m log2(m / 32) words, for the call; the results are
 // new polynomials and vectors.
