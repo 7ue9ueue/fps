@@ -126,8 +126,19 @@ struct scalar {
     static void multiply(const detail::Product& p, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
         const std::size_t len = std::size_t(1) << p.lg;
         std::fill(std::copy_n(p.f, p.n, p.a), p.a + len, 0u);
-        std::fill(std::copy_n(p.g, p.m, p.b), p.b + len, 0u);
+        if (p.g != p.b) std::copy_n(p.g, p.m, p.b);  // g may be b (in place)
+        std::fill(p.b + p.m, p.b + len, 0u);
         multiply(p.a, p.b, len, len, p.lg, roots, inverse_roots);
+        std::copy_n(p.a, p.count, p.out);
+    }
+
+    // The square of p.f (g, m and b unused): one forward transform.
+    static void square(const detail::Product& p, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
+        const std::size_t len = std::size_t(1) << p.lg;
+        std::fill(std::copy_n(p.f, p.n, p.a), p.a + len, 0u);
+        forward(p.a, p.lg, roots);
+        detail::scalar::multiply_leaves(p.a, p.a, p.lg, roots);
+        inverse(p.a, p.lg, inverse_roots);
         std::copy_n(p.a, p.count, p.out);
     }
 };

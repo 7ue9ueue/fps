@@ -1,7 +1,7 @@
 # backend/ntt
 
 Number-theoretic transforms and products modulo P = 998244353. API: `ntt.hpp` (`multiply`,
-`Convolution`, `Transform`, the leaf form). Variants: `scalar.hpp` (every target; the model),
+`square`, `middle_product`, `Convolution`, `Transform`, the leaf form). Variants: `scalar.hpp` (every target; the model),
 `intrinsics.hpp` (`intrinsics<S>`, templates on any `backend/simd` struct S), `avx2.hpp` (lc-opt's
 `lib/ntt`).
 `select.hpp`: the variant per op and length, a tuned choice ("ntt.variant", issue #78): per target
@@ -65,6 +65,21 @@ Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_produc
   - Products in place (`Convolution`) and `Transform` keep their own top levels and kernels,
     unchanged. Through the span levels (one implementation for both) they ran 2-4% slower at
     2^6-2^7 on Emerald Rapids and Zen 5 (Log, issue #38 round 2).
+- `square(f, out)` (issue #55): `multiply(f, f, out)` with one forward transform. Variant op
+  `square(const detail::Product&)` (g, m, b unused): the first level reads f into a, the tree
+  transforms a alone, and the bottom stage takes a's leaves as both factors (intrinsics: `kSquare`
+  in `multiply_tree`, `Bottom` and `WideBottom`, whose leaf products read B from A's rows; avx2:
+  `PairSquareBottom`, generated kernels `bottom_square_*` without b's forward half, at every
+  length). The variant per length is the product row's (`variant::tuned::square`, `kProduct`):
+  no row of its own, none measured to pay.
+- `middle_product(f, g, out)` (issue #55): out[i] = (f g)[m - 1 + i], out.size() <= n - m + 1.
+  A cyclic product of length 2^lg >= n' = m - 1 + out.size() (only f[0, n') is read): the terms
+  that wrap land at i + j - 2^lg <= m - 2, below the result. g is copied into b turned by
+  x^-(m - 1) (b[0] = g[m - 1], g[0, m - 1) at the top, zeros between), so the result starts at
+  word 0 and the variants' `multiply(const Product&)` runs unchanged with g = b, m = 2^lg (the
+  first level reads b in place; scalar skips its copy then). Costs a dense first level for b and
+  the staging pass (one write of 2^lg words): middle_product/22 (f of 2^22 words, transform 2^22)
+  took 1.03 of product/22 (factors of 2^21, sparse) on Zen 3.
 - `Transform`: tables built once; forward and inverse in place on caller arrays (32-byte aligned,
   16 words of padding: the AVX2 forward kernels read 4 bytes past their last vector).
 
@@ -577,6 +592,44 @@ with the unshifted q too 1919; one group of 64 columns 1810. Inverse: 2055, 2100
 1840. Quarters of 128 words: 1860 per call, 1873 in a loop (kept: no gain, no loss). Unshifted q
 in the bottoms: forward 820 -> 815-827 (p0 + p5 uops 1464 -> 1415), inverse 626-667 -> 598-633,
 products 4430 -> 4377 per 32 groups.
+
+### Squares and middle products (issue #55)
+
+`kernel.py bench ntt --base` main a536462, 7 rounds, GCC 15.2, each target's flags, 2026-10-12;
+ratios between cases of the new binary, median of the per-round ratios. `square/<lg>`:
+`square(f, out)`, f of 2^lg / 2 words, out of 2^lg - 1; `square@multiply`: `multiply(f, f, out)`
+on the same spans. `middle_product/<lg>`: f of 2^lg words, g of 2^lg / 2, out of 2^lg / 2 + 1 (a
+transform of 2^lg); `middle_product@multiply`: what `fps::middle_product` ran before, `multiply(f,
+g, out)` into 2^lg words (a transform of 2^(lg + 1)), then the 2^lg / 2 + 1 words moved down.
+
+| lg | square / @multiply: Zen 3, EMR, Zen 5, V2 | middle_product / @multiply |
+|---:|---|---|
+| 6 | 0.85, 0.91, 0.89, 0.86 | 0.55, 0.58, 0.59, 0.52 |
+| 7 | 0.96*, 0.82, 0.84, 0.84 | 0.54, 0.64, 0.77, 0.52 |
+| 8 | 0.87*, 0.86, 0.89, 0.80 | 0.50, 0.51, 0.51, 0.48 |
+| 9 | 0.79, 0.84, 0.89, 0.79 | 0.53, 0.48, 0.52, 0.50 |
+| 10 | 0.79, 0.82, 0.84, 0.79 | 0.50, 0.49, 0.49, 0.48 |
+| 12 | 0.77, 0.78, 0.81, 0.77 | 0.48, 0.49, 0.50, 0.48 |
+| 14 | 0.76, 0.78, 0.79, 0.75 | 0.49, 0.49, 0.50, 0.48 |
+| 16 | 0.74, 0.77, 0.76, 0.75 | 0.48, 0.50, 0.49, 0.48 |
+| 18 | 0.73, 0.73, 0.76, 0.73 | 0.50, 0.50, 0.50, 0.49 |
+| 20 | 0.73, 0.72, 0.75, 0.73 | 0.49, 0.52, 0.50, 0.49 |
+| 22 | 0.72, 0.72, 0.70, 0.72 | 0.48, 0.52, 0.48, 0.49 |
+
+\* Zen 3 at 2^7 and 2^8: ratio of medians from the run of the pair bottom against `GroupBottom`
+(below); the table's run had `GroupBottom` with b = a there, 0.91 and 0.95.
+
+- square: 0.70-0.81 of `multiply(f, f, out)` from 2^12 on every machine, 0.70-0.72 at 2^22; three transforms become two plus the leaf products, so 2/3 is the floor (guess: the leaf
+  products and the first and last levels' traffic keep it above). 2^6-2^11 0.77-0.96, the
+  shortest lengths inside the spread of code layout (up to 25% on short products, issue #93):
+  the unchanged `product/6` and `product/7` moved 1.06 and 1.04 on Zen 3 in the same run.
+- middle_product: 0.45-0.52 of the old flow from 2^8, half the transform length; 2^6-2^7
+  0.52-0.77 (Zen 5 2^7 0.77: its multiply runs the asm below 2^8, and the new transform is 2^7).
+- avx2 bottom of a square at 2^7 and 2^8, where products run `GroupBottom`: `GroupBottom` with b =
+  a (its kernels read both batches before they write, so a's forward half ran twice) against
+  `PairSquareBottom`, Zen 3, 9 rounds, paired: the pair bottom took 0.96 (2^7) and 0.93 (2^8) of
+  the time, the unchanged `square@multiply` 0.91 and 1.01 in the same run (layout).
+  The pair bottom runs at every length.
 
 ### Products from spans (issue #38, round 2)
 
@@ -1114,6 +1167,41 @@ spread below (Zen 3 over 8 code shifts, 2^6 153 against 164 ns, 2^7 290 and 290,
   on `lc-bench` and `lc-arm` (#94).
 - So `frontend/bench_values.cpp` stays a separate binary; its comment now gives this cause. A
   guard on the codegen would not catch it; smaller hot code for short products might (#93).
+
+2026-10-12, claude (issue #55, round 1): `square(f, out)` and `middle_product(f, g, out)` into
+caller memory, and the frontend's `fps::square` and `fps::middle_product` on them. Measurements
+above (Squares and middle products); raw output in `~/Documents/hpc_library-explore/ntt/issue55/`.
+- Built: variant op `square(const detail::Product&)` in scalar, intrinsics (`kSquare` through
+  `multiply_tree`, `Bottom`, `WideBottom`; B read from A's rows in the leaf products) and avx2
+  (`PairSquareBottom`, `square<Bottom>`); `variant::tuned` dispatches it on the product row
+  (`select.hpp`, after #85; no row of its own). `gen_avx2_product_kernels.py`:
+  `bottom_square_first`, `_last`, `_both` (`first` without b; `last` broadcasts b_j from the
+  window row's second half, A_t). The scheduler deadlocked on its register budget for the square
+  `both` with the product's knobs (window 20, shift -0.05); window 16 and shift 0 schedule
+  (window 12 with shift -0.05 or -0.1 too; not timed against each other). The product kernels'
+  text is unchanged.
+- middle_product: g staged turned in b, the product path unchanged (Design). Not built: a first
+  level reading g turned (two pieces of the source: g[m - 1] at word 0, g[0, m - 1) at the top),
+  which would drop the staging pass; at most the 3% middle_product/22 takes over product/22.
+- Frontend (`include/fps/polynomial.hpp`, `products.hpp`): `Products::square` (as `multiply(a, a,
+  2n - 1)`, `ntt::square` on the NTT path) and `Products::middle` (`ntt::middle_product` into the
+  result: no spare words, no move; `small::multiply` path unchanged). `frontend/bench.cpp`:
+  `square@kernel` and `middle_product@kernel` call the new kernels. The middle product now runs up
+  to f of 2^25 words: `test_products.cpp` checks the length error with 2^25 + 1. DESIGN.md: square
+  and middle_product costs.
+- Tests: `square` per variant on every size to 40 (outputs 0, 1, n, 2n - 1 and past it) and at
+  every lg (4 sizes to 2^16, 2 above; 5 output sizes) against schoolbook or `multiply` checked by
+  evaluation, f unchanged, out = f; `middle_product` on every n <= 30, m <= n with 4 output sizes,
+  and at every lg to 2^23 on 7 shapes (f of 2^lg, 2^lg + 1, 2^lg - 1; g of 1, 5, a quarter, half,
+  all of f), f cut to the words it may read and each span ending its allocation (ASan), out over
+  f and over g, the invalid_argument cases; the square bottoms against the lane model (intrinsics
+  `Bottom`, `WideBottom`; avx2 `PairBottom` and `PairSquareBottom`, new) with b filled with
+  garbage. Mutation caught: the intrinsics leaf products reading B from the unwritten rows (Mac,
+  every leaf). Pass at -O2 and ASan/UBSan on `lc-amd` (scalar, sse, avx2; frontend avx2, scalar),
+  `lc-intel-test` and `lc-zen5-test` (ntt, frontend), `lc-arm` and the Mac (ntt, frontend).
+- Unchanged paths, whole ntt bench on `lc-bench` against main, 7 rounds: geomean 1.0001 over 148
+  gated cases; every case outside 0.98-1.02 is at 2^6-2^9 and both signs (multiply_dense/7 1.055,
+  product/7 0.948, product_cut/7 0.924), code layout (issue #93).
 
 ## Sources
 

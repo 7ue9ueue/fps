@@ -332,6 +332,126 @@ void test_multiply_spans(const char* name, int max_lg) {
     test_spans_overlap<V>(name, 1000, 700);
 }
 
+// The product of f and g: schoolbook below 2^12 words, else multiply<V> checked by evaluation.
+template <class V>
+std::vector<u32> reference_product(const char* name, const std::vector<u32>& f, const std::vector<u32>& g) {
+    if (f.size() + g.size() <= 4096) return schoolbook(f, g);
+    std::vector<u32> c(f.size() + g.size() - 1);
+    multiply<V>(f, g, c);
+    for (int i = 0; i < 2; ++i) {
+        const u32 x = random_below(P);
+        expect(evaluate(c, x) == mul(evaluate(f, x), evaluate(g, x)), name, f.size());
+    }
+    return c;
+}
+
+// square(f, out) against `product` (f^2), as test_spans; and out = f.
+template <class V>
+void test_square(const char* name, const std::vector<u32>& f, const std::vector<u32>& product,
+                 std::initializer_list<std::size_t> counts, std::size_t offset) {
+    PageWords fw(f.size(), offset, 0);
+    std::copy(f.begin(), f.end(), fw.begin());
+    for (const std::size_t count : counts) {
+        PageWords out(count, offset + 3, 0);
+        for (u32& w : out.span()) w = u32(rng());
+        square<V>(fw.span(), out.span());
+        bool ok = std::ranges::equal(out.span(), cut(product, count)) && std::ranges::equal(fw.span(), f);
+        expect(ok, name, f.size() * 1000 + count % 1000);
+    }
+    std::vector<u32> in_place(f);
+    square<V>(in_place, in_place);
+    expect(in_place == cut(product, f.size()), name, f.size());
+}
+
+// square(f, out): every size to 40, then shapes around each length's levels.
+template <class V>
+void test_squares(const char* name, int max_lg) {
+    for (std::size_t n = 0; n <= 40; ++n) {
+        const auto f = random_poly(n, n % 4);
+        const std::size_t size = n ? 2 * n - 1 : 0;
+        test_square<V>(name, f, schoolbook(f, f), {0, 1, n, size, size + 5}, n % 4);
+    }
+    for (int lg = kMinLog; lg <= max_lg; ++lg) {
+        const std::size_t len = std::size_t(1) << lg;
+        const std::vector<std::size_t> sizes = lg <= 16 ? std::vector<std::size_t>{len / 2, len / 2 - 1, len / 4 + 1, len / 8 + 3}
+                                                        : std::vector<std::size_t>{len / 2, len / 4 + 1};
+        for (const std::size_t n : sizes) {
+            const auto f = random_poly(n, lg % 2);
+            const std::size_t size = 2 * n - 1, offset = lg % 3 == 0 ? 0 : lg % 3 == 1 ? 1 : 16 + lg;
+            const auto product = reference_product<V>(name, f, f);
+            if (lg <= 16) test_square<V>(name, f, product, {size, n, n / 2 + 1, 9, size + 3}, offset);
+            else test_square<V>(name, f, product, {size, n + 7}, offset);
+        }
+    }
+}
+
+// middle_product(f, g, out) for out of each count, against `product` (f g): out[i] = product[m - 1
+// + i]. Spans as test_spans; f is cut to the words the call may read (ASan sees any read past
+// them). Then out at f and at g.
+template <class V>
+void test_middle(const char* name, const std::vector<u32>& f, const std::vector<u32>& g,
+                 const std::vector<u32>& product, std::initializer_list<std::size_t> counts, std::size_t offset) {
+    const std::size_t n = f.size(), m = g.size();
+    for (const std::size_t count : counts) {
+        const std::size_t read = m - 1 + std::max<std::size_t>(count, 1);
+        PageWords fw(read, offset, 0), gw(m, offset + 5, 0), out(count, offset + 3, 0);
+        std::copy_n(f.begin(), read, fw.begin());
+        std::copy(g.begin(), g.end(), gw.begin());
+        for (u32& w : out.span()) w = u32(rng());
+        middle_product<V>(fw.span(), gw.span(), out.span());
+        bool ok = std::ranges::equal(out.span(), std::span(product).subspan(m - 1, count));
+        ok &= std::ranges::equal(gw.span(), g) && std::ranges::equal(fw.span(), std::span(f).first(read));
+        expect(ok, name, (n * 100000 + m) * 1000 + count % 1000);
+    }
+    const std::size_t count = n - m + 1;
+    std::vector<u32> both(f);
+    both.insert(both.end(), g.begin(), g.end());
+    const auto want = std::span(product).subspan(m - 1, count);
+    middle_product<V>(std::span(both).first(n), std::span(both).subspan(n, m), std::span(both).first(count));
+    expect(std::ranges::equal(std::span(both).first(count), want), name, 1);
+    std::copy(f.begin(), f.end(), both.begin());  // out over the end of f and all of g
+    middle_product<V>(std::span(both).first(n), std::span(both).subspan(n, m), std::span(both).subspan(n + m - count, count));
+    expect(std::ranges::equal(std::span(both).subspan(n + m - count, count), want), name, 2);
+}
+
+// middle_product(f, g, out): every n <= 30 and m <= n, then shapes around each length: f of the
+// whole length and one word past it, g of 1, half and all of f; the errors.
+template <class V>
+void test_middles(const char* name, int max_lg) {
+    for (std::size_t n = 1; n <= 30; ++n)
+        for (std::size_t m = 1; m <= n; ++m) {
+            const auto f = random_poly(n, (n + m) % 4), g = random_poly(m, (n + m) % 4);
+            const std::size_t all = n - m + 1;
+            test_middle<V>(name, f, g, schoolbook(f, g), {0, 1, all, all / 2}, (n + m) % 4);
+        }
+    for (int lg = kMinLog; lg <= std::min(max_lg, 23); ++lg) {  // the reference product to 2^25
+        const std::size_t len = std::size_t(1) << lg;
+        using Shapes = std::vector<std::pair<std::size_t, std::size_t>>;
+        const Shapes shapes = lg <= 16 ? Shapes{{len, len / 2}, {len, 1}, {len, len}, {len + 1, len / 2}, {len - 1, len / 4 + 3},
+                                                {len, len - 1}, {len / 2 + 1, len / 2}}
+                                       : Shapes{{len, len / 2}, {len + 1, len / 4}, {len - 3, 5}};
+        for (const auto& [n, m] : shapes) {
+            const auto f = random_poly(n, lg % 2), g = random_poly(m, lg % 2);
+            const auto product = reference_product<V>(name, f, g);
+            const std::size_t all = n - m + 1, offset = lg % 3 == 0 ? 0 : lg % 3 == 1 ? 1 : 16 + lg;
+            if (lg <= 16) test_middle<V>(name, f, g, product, {all, all / 2 + 1, 1, all - 1 ? all - 1 : 1}, offset);
+            else test_middle<V>(name, f, g, product, {all}, offset);
+        }
+    }
+    const std::vector<u32> f(10, 1), g(4, 1);
+    std::vector<u32> out(8);
+    const auto throws = [&](std::span<const u32> a, std::span<const u32> b, std::span<u32> o) {
+        try {
+            middle_product<V>(a, b, o);
+        } catch (const std::invalid_argument&) {
+            return true;
+        }
+        return false;
+    };
+    expect(throws(f, {}, {}) && throws(g, f, {}) && throws(f, g, out) && !throws(f, g, std::span(out).first(7)),
+           name, 0);
+}
+
 // a in the caller's memory at offsets of 0 to 1008 words in a page, full of garbage: the product
 // comes back in it, its padding is not written.
 template <class V>
@@ -369,6 +489,8 @@ void test_variant(const char* name, int max_lg) {
     }
     test_caller_memory<V>(name, 0, 5);
     test_multiply_spans<V>(name, max_lg);
+    test_squares<V>(name, max_lg);
+    test_middles<V>(name, max_lg);
 }
 
 // Products on one thread, inputs from its own generator: the number of wrong ones. Lengths cross
@@ -574,6 +696,9 @@ struct IntrinsicsKernels {
         test_multiply(name + " leaf products", t, 1, [&](u32* a, u32* b, std::size_t count, std::size_t k) {
             Leaf::multiply(a, b, count, k, t.r(), t.ir());
         });
+        test_multiply(name + " leaf squares", t, 1, [&](u32* a, u32* b, std::size_t count, std::size_t k) {
+            Leaf::template multiply<true>(a, b, count, k, t.r(), t.ir());
+        }, true);
         if constexpr (S::lanes == 16) {  // pairs of groups on S
             using W = detail::intrinsics::WideBottom<S>;
             for (int round = 0; round < 30; ++round) {
@@ -586,21 +711,27 @@ struct IntrinsicsKernels {
             test_multiply(name + " wide leaf products", t, 2, [&](u32* a, u32* b, std::size_t count, std::size_t k) {
                 W::multiply(a, b, count, k, t.r(), t.ir());
             });
+            test_multiply(name + " wide leaf squares", t, 2, [&](u32* a, u32* b, std::size_t count, std::size_t k) {
+                W::template multiply<true>(a, b, count, k, t.r(), t.ir());
+            }, true);
         }
     }
 
     // run(a, b, count, first): Leaf::multiply or a variant of it on groups of 32 words, count and
     // first multiples of step: forward butterfly, products of the leaves mod x^8 - w (with the
     // Montgomery factor 2^-32), inverse butterfly.
+    // square: b = a, which run must not read (a times a).
     template <class Run>
-    static void test_multiply(const std::string& name, Tables& t, std::size_t step, Run run) {
+    static void test_multiply(const std::string& name, Tables& t, std::size_t step, Run run, bool square = false) {
         const u32 r_inverse = power(u32((u64(1) << 32) % P), P - 2);
         for (int round = 0; round < 50; ++round) {
             const std::size_t count = step * (1 + random_below(4 / step)), k0 = step * random_below(kGroups / step - 4);
             Words a(32 * count), b(32 * count);
             fill(a.begin(), 32 * count, 4 * u64(P));
             fill(b.begin(), 32 * count, 4 * u64(P));
+            if (square) std::copy_n(a.begin(), 32 * count, b.begin());
             const std::vector<u32> a0(a.begin(), a.begin() + 32 * count), b0(b.begin(), b.begin() + 32 * count);
+            if (square) std::fill_n(b.begin(), 32 * count, u32(rng()));
             run(a.begin(), b.begin(), count, k0);
             for (std::size_t j = 0; j < count; ++j) {
                 const std::size_t k = k0 + j;
@@ -727,6 +858,7 @@ struct avx2_bottom : variant::avx2 {
 };
 using avx2_group = avx2_bottom<impl::GroupBottom>;
 using avx2_pair = avx2_bottom<impl::PairBottom>;
+
 
 void test_bottoms() {
     for (int lg = kMinLog; lg <= kMaxLog; ++lg) {
@@ -948,7 +1080,20 @@ void test_group_bottom() {
     }
 }
 
+// PairBottom and PairSquareBottom on pairs of groups, as the intrinsics bottoms (test_multiply).
+void test_pair_bottoms() {
+    Tables t(kTableLog);
+    using K = IntrinsicsKernels<fps::simd::Scalar>;
+    K::test_multiply("avx2 pair bottom", t, 2, [&](u32* a, u32* b, std::size_t count, std::size_t k) {
+        impl::PairBottom::run(reinterpret_cast<Vec*>(a), reinterpret_cast<Vec*>(b), 4 * count, k, t.r(), t.ir());
+    });
+    K::test_multiply("avx2 pair square bottom", t, 2, [&](u32* a, u32* b, std::size_t count, std::size_t k) {
+        impl::PairSquareBottom::run(reinterpret_cast<Vec*>(a), reinterpret_cast<Vec*>(b), 4 * count, k, t.r(), t.ir());
+    }, true);
+}
+
 void test_avx2() {
+    test_pair_bottoms();
     test_loops();
     test_caller_levels();
     test_bottom_levels();

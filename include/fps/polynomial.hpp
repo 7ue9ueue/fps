@@ -328,7 +328,7 @@ namespace detail {
 // a b mod x^n for f * g, mul, square and product, the middle product, and raw::mul. Factors are
 // cut to n coefficients first. A factor with at most one nonzero term (c x^k) makes a shift, O(n);
 // a product small::beats_ntt gives to the backend's small::multiply runs it; the rest runs
-// ntt::multiply, which writes a b mod x^n into the caller's memory.
+// ntt::multiply (ntt::square, ntt::middle_product), which writes into the caller's memory.
 template <std::uint32_t P>
 struct Products {
     using Poly = Polynomial<P>;
@@ -354,6 +354,16 @@ struct Products {
         return h;
     }
 
+    // a^2: as multiply(a, a, 2 a.size() - 1), with ntt::square on the NTT path.
+    static Poly square(Span a) {
+        const std::size_t n = a.empty() ? 0 : 2 * a.size() - 1;
+        if (a.empty() || small::beats_ntt(a.size(), a.size())) return multiply(a, a, n);
+        if (const auto t = single_term(a)) return shifted(a, *t, n);
+        Poly h(n, Poly::kUnwritten);
+        ntt::square(a, h.span());
+        return h;
+    }
+
     // out = a b mod x^out.size(); out apart from a and b.
     static void multiply_into(Span a, Span b, Out out) {
         const std::size_t n = out.size();
@@ -370,19 +380,18 @@ struct Products {
         ntt::multiply(a, b, out);
     }
 
-    // Coefficients m - 1 .. n - 1 of f g, for n = f.size() >= m = g.size() >= 1: f g mod x^n by
-    // ntt::multiply (all of f g by small::multiply) in the result's own memory, then the n - m + 1
-    // coefficients moved down.
+    // Coefficients m - 1 .. n - 1 of f g, for n = f.size() >= m = g.size() >= 1: ntt::middle_product
+    // into the result (a cyclic product of length >= n), or all of f g by small::multiply in the
+    // result's own memory, then the n - m + 1 coefficients moved down.
     static Poly middle(Span f, Span g) {
         const std::size_t n = f.size(), m = g.size(), count = n - m + 1;
-        Poly h;
-        if (small::beats_ntt(n, m)) {
-            h = Poly(count, n + m - 1, Poly::kUnwritten);
-            small::multiply<P>(f, g, {h.data(), n + m - 1});
-        } else {
-            h = Poly(count, n, Poly::kUnwritten);
-            ntt::multiply(f, g, {h.data(), n});
+        if (!small::beats_ntt(n, m)) {
+            Poly h(count, Poly::kUnwritten);
+            ntt::middle_product(f, g, h.span());
+            return h;
         }
+        Poly h(count, n + m - 1, Poly::kUnwritten);
+        small::multiply<P>(f, g, {h.data(), n + m - 1});
         std::memmove(h.data(), h.data() + (m - 1), count * sizeof(std::uint32_t));
         return h;
     }

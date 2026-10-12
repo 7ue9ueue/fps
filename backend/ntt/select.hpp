@@ -2,7 +2,8 @@
 // the target's candidates (Selected) per op and lg.
 //
 //   Op: forward, inverse (Transform), multiply (Convolution::multiply, factors in place), product
-//   (multiply(f, g, out), factors from spans and the product into out)
+//   (multiply(f, g, out), factors from spans and the product into out; also square(f, out) and
+//   middle_product(f, g, out), which have no row of their own)
 //   variants.get()[op][lg - kMinLog]   the candidate: an index into Selected
 //   kDefaults                          compiled defaults: tools/tune.py ntt (tune.cpp, tuned.hpp)
 //   variant::tuned                     the selected variant: one table read per call (SelectedForward ...)
@@ -143,6 +144,12 @@ template <class... V>
     int i = 0;
     (void)((i++ == v && (V::multiply(p, r, ir), true)) || ...);
 }
+template <class... V>
+[[gnu::always_inline]] inline void run_square(Candidates<V...>, int v, const Product& p, const std::uint32_t* r,
+                                              const std::uint32_t* ir) {
+    int i = 0;
+    (void)((i++ == v && (V::square(p, r, ir), true)) || ...);
+}
 
 }  // namespace detail
 
@@ -167,6 +174,11 @@ struct tuned {
 
     static void multiply(const detail::Product& p, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
         detail::run_product(Selected{}, choice(kProduct, p.lg), p, roots, inverse_roots);
+    }
+
+    // The product row's candidate (ntt::square).
+    static void square(const detail::Product& p, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
+        detail::run_square(Selected{}, choice(kProduct, p.lg), p, roots, inverse_roots);
     }
 };
 
