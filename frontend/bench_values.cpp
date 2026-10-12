@@ -3,10 +3,11 @@
 // products of value forms and the pointwise layout wrap no backend kernel yet (frontend/notes.md),
 // so their cases have no @kernel pair.
 //
-// A binary of its own: with ntt::Transform's forward and inverse in the program, GCC 15.2 inlines
-// the avx2 Convolution differently, and bench.cpp's f * g ran 25% slower at 32 x 32 coefficients on
-// Zen 3 (multiply/6; frontend/notes.md). Its own binary keeps bench.cpp's cases as main compiles
-// them. The library keeps the tables and scratch of value forms, so cases here run in that state.
+// A binary of its own: with these cases in bench.cpp, its f * g ran 25% slower at 32 x 32
+// coefficients on Zen 3 (multiply/6). Not the NTT's inlining: with the product's functions
+// compiled identically it stayed (issue #81, backend/ntt/notes.md); products of 2^6-2^8 move by
+// up to 25% with the program's code layout. Its own binary keeps bench.cpp laid out as on main.
+// The library keeps the tables and scratch of value forms, so cases here run in that state.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>

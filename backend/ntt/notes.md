@@ -1075,6 +1075,46 @@ ntt.variant). Probes and raw output in `~/Documents/hpc_library-explore/tune/ntt
   ntt` takes 260 s on `lc-zen5-test` against main's 231 (builds included; `test_no_tuner.cpp` is
   two builds more).
 
+2026-10-12, claude (issue #81, round 1): `f * g` at 32 x 32 (`multiply/6`) ran 1.13-1.25x slower
+on Zen 3 in a program that also calls `Transform` (`Values`). Not the NTT's inlining; code layout.
+No ntt code changed. The round's speed change, `f * g` past 512 words through `multiply(f, g,
+out)` (0.93-1.00 of the time from 2^10 on the four machines, 1.02-1.03 at 2^14 and 2^16 on
+Emerald Rapids, 1.06 at 480 x 480 on Zen 5), was dropped on the rebase: #59 had moved every NTT
+product of the frontend onto `multiply(f, g, out)` with the same numbers. Keeping the Convolution
+below 512 words on top of #59 was not done: at 2^6-2^8 the two differ by less than the layout
+spread below (Zen 3 over 8 code shifts, 2^6 153 against 164 ns, 2^7 290 and 290, 2^8 535 and
+546). `lc-bench`, GCC 15.2, `-O2 -march=x86-64-v3`, main 0d51f2f. Probes and raw output: `~/Documents/hpc_library-explore/ntt/issue81/`
+(`probe81-src/`: mix0 = `frontend/bench.cpp`, mix1 = the same with PR #50's `Values` cases).
+- Reproduced: mix1/mix0 `multiply/6` 1.129 (140 -> 158 ns), `multiply@kernel/6` 0.974, 2^7-2^9
+  0.96-1.03; 11 rounds alternating.
+- Tried, no effect: every function on the avx2 product path pinned (`always_inline` on
+  `forward_group(s)`, `inverse_group`, `forward_radix2`, `scale_radix2`, `inverse_radix4`,
+  `forward_radix8`, `Tree::visit` as a switch over a `noinline` `descend`; `noinline` on
+  `product<Bottom>`, `Bottom::run`, the top levels, `forward_trees`, `inverse_trees`, `forward`,
+  `inverse`). The product's symbols are then the same in both binaries, names and sizes, and the
+  gap stayed: 144 -> 175 ns (1.211) in the same run. Diff kept in the exploration folder
+  (`pins.diff`); not merged.
+- Not data placement, for the same pair of binaries: the static tables at page offset 0, 704 or
+  3264 (alignas(4096) plus padding; 1.21 at each), the heap shifted by 1-3072 bytes before main,
+  1-1000 bytes more TLS before `thread_memory`, the stack moved 0-4080 bytes in 16-byte steps
+  (environment padding: mix0 140-145, mix1 170-175 at all 256 offsets).
+- Code layout: the whole translation unit shifted 0-3840 bytes in 256-byte steps (top-level asm
+  `.skip`): mix1 `multiply/6` 154-180 ns, `multiply@kernel/6` 112-150. `-falign-functions=64`:
+  `multiply@kernel/6` 146 in one binary, 112 in the other. Median over 8 shifts (0-3584, 512
+  steps), [min-max]: main mix0 153 [136-169], mix1 157 [144-187]: the Transform effect is within
+  the spread of layouts. `multiply@kernel/6`, the same source in two programs (main's frontend
+  bench and this round's), 115 [115-116] against 131 [131-145]. Neoverse V2 likewise: main's
+  frontend bench 229 ns, the same code over 8 shifts 260 [252-264].
+- Emerald Rapids (`lc-intel`, the avx2 build) is layout-sensitive too: mix1 135 or 152 ns by the
+  length of the bench's filter argument. `perf stat`, a slow run (146.8 ns) against a fast one
+  (133.0): `idq.mite_uops` 39.2M against 22.2M, `idq.dsb_uops` 338M against 353M, the other
+  counters within 10% (`ld_blocks.store_forward` 643k, 676k). Guess: the hot code of a 2^6
+  product (the unrolled asm bottom kernels, `PairBottom::run` 11.6 KB) is near the uop cache's
+  capacity, and which lines share sets decides. Not measured on Zen 3: `perf_event_paranoid` is 4
+  on `lc-bench` and `lc-arm` (#94).
+- So `frontend/bench_values.cpp` stays a separate binary; its comment now gives this cause. A
+  guard on the codegen would not catch it; smaller hot code for short products might (#93).
+
 ## Sources
 
 - lc-opt `lib/ntt` (ours): the avx2 variant and the generators, moved and renamed. Its sources:
