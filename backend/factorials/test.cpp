@@ -1,12 +1,12 @@
-// Tests the factorials kernel: the model against the definition (fact[i] = fact[i - 1] i, fact[i]
-// inverse[i] = 1), then every Chains variant of the target's struct (simd::Native; the others are
-// tested on their own targets: K = 1, 2, 4, 8, both chain products) and every candidate of
-// select.hpp, and the selected `tables` against the model: with the compiled defaults, and with
-// each candidate set for every class it runs at. Sizes: every n up to 1100, powers of two and their
-// neighbours up to 2^20, both sides of every change of the lane length C up to 2^14 and of every
-// size class up to 2^13, random n, and n = P - 1, P for small P; 32 lanes with the scan's prefetch
-// also at 2^k - 1, 2^k, 2^k + 1 up to 2^22. Placements: tables 64-byte aligned, and at word offsets
-// 0-15 from it, the same or different for the two. Words before and after the tables must stay
+// Tests the factorials kernel: the model against the definition (fact[i] = fact[i - 1] i,
+// fact[i] inverse[i] = 1), then every Chains variant this machine can run (every simd struct,
+// K = 1, 2, 4, 8, both chain products, and every candidate of select.hpp) and the selected
+// `tables` against the model: with the compiled defaults, and with each candidate set for every
+// class it runs at. Sizes: every n up to 1100, powers of two and their neighbours up to 2^20, both
+// sides of every change of the lane length C up to 2^14 and of every size class up to 2^13, random
+// n, and n = P - 1, P for small P; 32 lanes with the scan's prefetch also at 2^k - 1, 2^k, 2^k + 1
+// up to 2^22. Placements: tables 64-byte aligned, and at word offsets 0-15
+// from it, the same or different for the two. Words before and after the tables must stay
 // untouched. Then the size classes, and tune.hpp: measure() at a small budget, wisdom text and
 // "factorials.variant" through tune::save / load. Then fresh (never written) tables in their own
 // mappings, which `tables` prefaults, and prefault() alone. The sanitizer build runs a subset
@@ -384,7 +384,7 @@ void fresh() {
 int main() {
     for (std::size_t n : {0, 1, 2, 3, 100, 4099}) model<4099>(n);
     for (std::size_t n : {0, 1, 2, 1000, 1 << 16}) model<998244353>(n);
-    fps::simd::for_each(fps::simd::List<fps::simd::Native>{}, []<class S> { test_isa<S>(); });
+    fps::simd::for_each(fps::simd::All{}, []<class S> { test_isa<S>(); });
     candidates(fx::Selected{});
     for (std::size_t n : sizes(1 << 20, 0)) check<998244353>("tables", n, selected);
     for (int c = 0; c < fx::kClasses && fx::class_end(c) <= 1 << 22; ++c)  // where the variant changes

@@ -1,4 +1,4 @@
-// Tests for backend/ntt. The variants of this target (scalar, intrinsics<simd::Native>, avx2): tables, transforms against the leaf form
+// Tests for backend/ntt. Every variant this machine runs: tables, transforms against the leaf form
 // computed directly and against the scalar model, products against schoolbook multiplication and,
 // for long ones, evaluation at random points. AVX2: each asm kernel against a scalar model of its
 // butterfly, with inputs at the edges of its lazy ranges. Convolution's memory: kept per thread,
@@ -29,14 +29,11 @@ using namespace fps::ntt;
 constexpr u32 P = kModulus;
 constexpr int kScalarMaxLog = 20;  // the scalar variant is slow; ASan makes it slower
 // Under ASan every variant stops at 2^20: above it the run took 4x as long (156 s against 36 s on
-// lc-zen5-test). -O2 builds run every check on the vector variants up to 2^22, then one product
-// per length up to 2^kMaxLog (all the roots): 2^23-2^25 took 99 of 150 s with every check.
+// lc-zen5-test). -O2 builds test the vector variants up to 2^kMaxLog.
 #if __has_feature(address_sanitizer)  // GCC 14+ and clang
 constexpr int kVectorMaxLog = 20;
-constexpr int kVectorTopLog = 20;
 #else
-constexpr int kVectorMaxLog = 22;
-constexpr int kVectorTopLog = kMaxLog;
+constexpr int kVectorMaxLog = kMaxLog;
 #endif
 
 std::mt19937_64 rng(2026);
@@ -356,9 +353,8 @@ void test_caller_memory(const char* name, std::size_t n, std::size_t m) {
     }
 }
 
-// Every check up to 2^max_lg, then one product per length up to 2^top_lg.
 template <class V>
-void test_variant(const char* name, int max_lg, int top_lg) {
+void test_variant(const char* name, int max_lg) {
     test_tables<V>(name);
     test_transforms<V>(name, max_lg);
     test_products<V>(name, max_lg);
@@ -372,8 +368,6 @@ void test_variant(const char* name, int max_lg, int top_lg) {
     }
     test_caller_memory<V>(name, 0, 5);
     test_multiply_spans<V>(name, max_lg);
-    for (int lg = max_lg + 1; lg <= top_lg; ++lg)
-        test_product<V>(name, (std::size_t(1) << (lg - 1)) + 1, (std::size_t(1) << (lg - 1)) - 1, lg % 2, false);
 }
 
 // Products on one thread, inputs from its own generator: the number of wrong ones. Lengths cross
@@ -638,13 +632,13 @@ struct IntrinsicsKernels {
     }
 };
 
-// The target's simd struct; the others are tested on their own targets. Scalar is slow, so shorter.
+// Every simd struct this machine runs; Scalar is slow, so shorter.
 void test_intrinsics() {
-    using S = fps::simd::Native;
-    const std::string name = std::string("intrinsics ") + S::name;
-    IntrinsicsKernels<S>::run(name);
-    if (S::lanes == 1) test_variant<variant::intrinsics<S>>(name.c_str(), kScalarMaxLog, kScalarMaxLog);
-    else test_variant<variant::intrinsics<S>>(name.c_str(), kVectorMaxLog, kVectorTopLog);
+    fps::simd::for_each(fps::simd::All{}, []<class S> {
+        const std::string name = std::string("intrinsics ") + S::name;
+        IntrinsicsKernels<S>::run(name);
+        test_variant<variant::intrinsics<S>>(name.c_str(), S::lanes == 1 ? kScalarMaxLog : kVectorMaxLog);
+    });
 }
 
 #ifdef __AVX2__
@@ -665,7 +659,7 @@ using avx2_group = avx2_bottom<impl::GroupBottom>;
 using avx2_pair = avx2_bottom<impl::PairBottom>;
 
 void test_bottoms() {
-    for (int lg = kMinLog; lg <= kVectorMaxLog; ++lg) {
+    for (int lg = kMinLog; lg <= kMaxLog; ++lg) {
         const std::size_t len = std::size_t(1) << lg;
         const bool exact = lg <= 11;
         for (const auto& [n, m] : {std::pair{len / 2, len / 2}, {len / 2, std::size_t(2)}, {len / 4 + 1, len / 4 + 1},
@@ -890,7 +884,7 @@ void test_avx2() {
     test_bottom_levels();
     test_group_bottom();
     test_bottoms();
-    test_variant<variant::avx2>("avx2", kVectorMaxLog, kVectorTopLog);
+    test_variant<variant::avx2>("avx2", kVectorMaxLog);
 }
 
 #endif
@@ -899,7 +893,7 @@ void test_avx2() {
 
 int main() {
     test_memory();
-    test_variant<variant::scalar>("scalar", kScalarMaxLog, kScalarMaxLog);
+    test_variant<variant::scalar>("scalar", kScalarMaxLog);
     test_intrinsics();
 #ifdef __AVX2__
     test_avx2();

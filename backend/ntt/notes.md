@@ -972,14 +972,6 @@ GCC 15.2, `tools/kernel.py` flags.
   skipping T = 1 (4), a misplaced by 4 bytes (crash). Pass at -O2 and ASan/UBSan on `lc-amd`
   (scalar, sse, avx2), `lc-intel-test`, `lc-zen5-test`, `lc-arm` and the Mac (scalar, arm).
 
-2026-10-12, claude (issue #63, gate time): the test builds `intrinsics<simd::Native>` only; each
-other struct is tested on its own target, and every variant select.hpp can pick here still is. -O2
-runs every check on the vector variants up to 2^22, then one product per length from 2^23 to 2^25
-(the top roots); the avx2 bottoms stop at 2^22 (2^20 under ASan, was 2^25). The -O2 run took 150 s
-with every check up to 2^25, 99 s of it on 2^23-2^25; build and run now 32 s (was 163 s). Measured
-with clang 18 in a 4-core x86 cloud container (-march=x86-64-v3, one run each, not a timing
-machine; the gate builds with GCC 15.2).
-
 ## Sources
 
 - lc-opt `lib/ntt` (ours): the avx2 variant and the generators, moved and renamed. Its sources:
