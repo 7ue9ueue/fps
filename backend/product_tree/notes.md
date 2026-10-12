@@ -52,31 +52,34 @@ both also over any span of items with a projection to their words). Trees: `tree
 
 ## Measurements
 
-Bench (`bench.cpp`), GCC 15.2, medians of 5 rounds, ns per factor, branch head 43a68fc (arm: the
-same code but `kMinLaneFactors` 64, d6.. see Log). `product/<lg>`: 2^lg factors x - r;
-`product_mixed`: degrees 0 .. 8, a quarter constants (sum about 3.4 2^lg).
+Bench (`bench.cpp`), GCC 15.2, medians of 5 rounds, ns per factor, commit 43a68fc (`lc-arm`: 3
+rounds of cd70b24, the same trees with `kMinLaneFactors` 64 and no cases below 2^10).
+`product/<lg>`: 2^lg factors x - r; `product_mixed`: degrees 0 .. 8, a quarter constants (sum
+about 3.4 2^lg); `product_few/<lg>`: 8 factors of 2^lg / 8 or 2^lg / 8 + 1 coefficients.
 
 | case | `lc-bench` (Zen 3, avx2) | `lc-intel` (Emerald Rapids, avx512) | `lc-zen5` (zen5) | `lc-arm` (Neoverse V2) |
 |---|---:|---:|---:|---:|
 | product/4 | 34.0 | 26.2 | 22.7 | |
 | product/6 | 20.7 | 17.4 | 13.0 | |
 | product/8 | 19.1 | 18.6 | 13.3 | |
-| product/10 | 20.5 | 20.5 | 13.5 | ARM10 |
-| product/14 | 28.4 | 27.3 | 16.9 | ARM14 |
-| product/18 | 39.8 | 38.8 | 22.0 | ARM18 |
-| product@standard/18 | 67.4 | 60.4 | 41.4 | ARMS18 |
-| product_mixed/18 | 175 | 156 | 93 | ARMM18 |
-| product_few/20 (ms) | 11.66 | 10.70 | 5.73 | ARMF20 |
+| product/10 | 20.5 | 20.5 | 13.5 | 30.3 |
+| product/14 | 28.4 | 27.3 | 16.9 | 44.5 |
+| product/18 | 39.8 | 38.8 | 22.0 | 64.6 |
+| product@standard/18 | 67.4 | 60.4 | 41.4 | 86.5 |
+| product_mixed/18 | 175 | 156 | 93 | 281 |
+| product_few/20 (ms) | 11.66 | 10.70 | 5.73 | 20.26 |
 
 Against the frontend's former tree of `f * g` (main a34ce14), frontend `product/<lg>`, 7 rounds,
-new/base (IQR): `lc-bench` 0.309 / 0.309 / 0.322 at lg 10 / 14 / 18 (40.6 ns per factor at 2^18,
-was 126); `lc-intel` 0.395 / 0.364 / 0.361; `lc-zen5` 0.355 / 0.329 / 0.333; `lc-arm` ARMFE.
+new/base at lg 10 / 14 / 18: `lc-bench` 0.309 / 0.309 / 0.322 (40.6 ns per factor at 2^18, was
+126); `lc-intel` 0.395 / 0.364 / 0.361; `lc-zen5` 0.355 / 0.329 / 0.333; `lc-arm` (5 rounds,
+cd70b24) 0.372 / 0.353 / 0.348.
 
 Zen 3 (`lc-bench`), 2^18 linear factors, phases (`explore_profile.cpp`, Log): all 10.39 ms; lane
 tree 6.87 (slot loads 0.87, base schoolbook about 0.4, base forwards 0.2, 11 levels of
 pointwise + inverse + twist + forward 5.4); standard tree on the 8 lane products 2.54; the rest
-(three passes over the factors, the counting sort, the output pass) about 1.0. Per word: forward /
-inverse 0.36 (2^6) to 1.06 (2^18) ns, pointwise2 0.18, twist 0.17, leaf products 0.83.
+about 0.9 (three passes over the factors with the counting sort; one pass alone, `size()`, 0.15;
+the output pass 0.04). Per word: forward / inverse 0.36 (2^6) to 1.06 (2^18) ns, pointwise2
+0.18, twist 0.17, leaf products 0.83.
 lc-opt (issue #56): lane tree 14.4 ms and top tree 5.7 ms for 500000 factors on `lc-amd`, about
 40 ns per factor; here 39.8 ns at 2^18 (not the same machine, input or count).
 
@@ -105,12 +108,15 @@ lc-opt (issue #56): lane tree 14.4 ms and top tree 5.7 ms for 500000 factors on 
       slot loads lose locality; product_mixed unchanged.
     - The 8 lane products moved to 8 arrays in one pass before the standard tree, instead of
       loads of every 8th word at each leaf: geomean 1.0001 (5 rounds, cases at lg >= 10).
+    - The counting sort's counts and positions for a run of one degree kept in registers (the
+      increments of one counter in memory looked like a chain): geomean 1.0080, 5 rounds
+      (product/10 1.016, product_mixed/14 1.016). Not the cost.
   - `kMinLaneFactors` 64 -> 16: lanes against standard, linear factors, `lc-bench`: 16 factors
     416 / 530 ns, 32 factors 714 / 1146, 8 factors 317 / 278 (lanes lose with one slot).
   - Products near 2^25 coefficients (2^22 linear factors; 4 of degree 2^23; 2^24 and 2^20
     quadratics) checked at random points on the Mac, `lc-amd` avx2 and scalar; one more linear
     factor throws std::length_error.
-- Next (issue NEXT): ntt's `forward_upper` (the subtree of group 1) and an inverse out of place
+- Next: ntt's `forward_upper` (the subtree of group 1) and an inverse out of place
   would remove the twist pass and the product pass's copy (Zen 3: about 0.35 ns per word per
   node, 1.4 ms of 10.4 at 2^18); one twiddle table for all of ntt's `Transform` lengths (memory);
   slot loads (0.87 ms) by gathers or wider loads; the top tree's 8 forwards of the lane products

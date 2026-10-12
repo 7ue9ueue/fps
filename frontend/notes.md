@@ -565,6 +565,7 @@ belongs in `backend/`).
   result's memory, through `product(items, out, proj)` with `proj = f.span()`: no array of spans
   (4 MB at 2^18, fresh pages each call). `product/<lg>` against main a34ce14, 7 rounds,
   new/base at lg 10 / 14 / 18: `lc-bench` 0.309 / 0.309 / 0.322 (21 / 29 / 41 ns per factor),
-  `lc-intel` 0.395 / 0.364 / 0.361, `lc-zen5` 0.355 / 0.329 / 0.333, `lc-arm` ARMFE.
+  `lc-intel` 0.395 / 0.364 / 0.361, `lc-zen5` 0.355 / 0.329 / 0.333, `lc-arm` 0.372 / 0.353 / 0.348
+  (5 rounds).
   New pair `product@kernel/<lg>`: the kernel on spans built in the setup, into new memory. API /
   kernel, `lc-bench`, 5 rounds: 1.005 / 1.002 / 1.003.
