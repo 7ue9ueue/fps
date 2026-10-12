@@ -38,8 +38,13 @@ def ssh(vm: str, command: str, stdin: bytes | None = None, capture: bool = False
     cmd = ['gcloud', 'compute', 'ssh', vm, f'--zone={zone(vm)}', '--quiet', f'--command={command}',
            '--', '-o', 'LogLevel=ERROR', '-o', 'ConnectTimeout=20']
     for attempt in range(3):
-        result = subprocess.run(cmd, input=stdin, capture_output=capture)
-        crashed = capture and b'gcloud crashed' in (result.stderr or b'')
+        # stderr always read, so a gcloud crash is seen on uncaptured calls too (ship: PR 156's gate)
+        result = subprocess.run(cmd, input=stdin, stdout=subprocess.PIPE if capture else None,
+                                stderr=subprocess.PIPE)
+        if not capture and result.stderr:
+            sys.stderr.buffer.write(result.stderr)
+            sys.stderr.flush()
+        crashed = b'gcloud crashed' in (result.stderr or b'')
         if result.returncode != 255 and not crashed:
             return result
         print(f'ssh to {vm} failed (exit {result.returncode}), attempt {attempt + 1} of 3', file=sys.stderr)
