@@ -139,6 +139,14 @@ Polynomial<P> remainder(Span f, const Divisor& D, Span q) {
     return r;
 }
 
+// The remainder of f by D.g, with the quotient only where the remainder reads it.
+template <u32 P>
+Polynomial<P> modulo(Span f, const Divisor& D) {
+    if (f.size() <= D.d || D.monomial) return remainder<P>(f, D, {});
+    const Polynomial<P> q = quotient<P>(f, D);
+    return remainder<P>(f, D, q.span());
+}
+
 }  // namespace detail::division
 
 template <std::uint32_t P>
@@ -154,13 +162,9 @@ Polynomial<P> operator/(const Polynomial<P>& f, const Polynomial<P>& g) {
     return detail::division::quotient<P>(f.span(), detail::division::divisor(g));
 }
 
-// The quotient only where the remainder reads it.
 template <std::uint32_t P>
 Polynomial<P> operator%(const Polynomial<P>& f, const Polynomial<P>& g) {
-    const detail::division::Divisor D = detail::division::divisor(g);
-    if (f.size() <= D.d || D.monomial) return detail::division::remainder<P>(f.span(), D, {});
-    const Polynomial<P> q = detail::division::quotient<P>(f.span(), D);
-    return detail::division::remainder<P>(f.span(), D, q.span());
+    return detail::division::modulo<P>(f.span(), detail::division::divisor(g));
 }
 
 template <std::uint32_t P>

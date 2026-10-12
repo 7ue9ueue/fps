@@ -5,6 +5,7 @@
 #include "fps/division.hpp"
 #include "fps/factorials.hpp"
 #include "fps/modular.hpp"
+#include "fps/points.hpp"
 #include "fps/polynomial.hpp"
 #include "fps/products.hpp"
 #include "fps/series.hpp"

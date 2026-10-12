@@ -752,6 +752,70 @@ belongs in `backend/`).
     rip-relative offsets of constants (32 bytes later in .rodata); the instruction addresses are
     the same. Clang's assembly of `bench.cpp` is identical. `mul@kernel/<lg>` against main in the
     same runs: 0.999-1.005.
+
+- 2026-10-12: points (#24): `evaluate(f, points)`, `interpolate<P>(points, values)`,
+  `to_newton_basis(f, points)` on any span of points, in `include/fps/points.hpp`. The prototype's
+  `points.hpp` wraps its private lc-opt (`include/fps/lcopt/points.hpp`); here the algorithms are
+  written plainly on product trees and #21's division. lc-opt's tuned versions are backend issue
+  #104 (opened by the backend coordinator).
+  - Tree: node [l, r) holds prod (x - x_i), split at (l + r) / 2, heap-indexed; a node of <= 32
+    points is a leaf multiplied out by a loop, the others are `f * g` of their children (small or
+    NTT, as `small::beats_ntt` picks). The backend's `product_tree::product` returns only the root,
+    and these need every node, so it is not used: keeping the nodes is #104's (its brief says to
+    add tree API to `backend/product_tree` if needed).
+  - evaluate: down the tree, f mod T per node (`detail::division::modulo`, a new span form of `%`
+    that `operator%` now calls; skipped while f is shorter than T, so few coefficients at many
+    points divide only near the leaves), then Horner on the leaf's remainder with its points side
+    by side (independent chains). interpolate: c_i = y_i / M'(x_i) by the same descent and one
+    inversion, then up: leaf sums of c_i T / (x - x_i) by synthetic division, nodes f_L T_R + f_R T_L.
+    A zero M'(x_i) means a repeated point: `std::domain_error`, at no extra cost, so DESIGN.md's
+    "distinct points" is checked. to_newton_basis: g = (g mod T_L) + T_L (g / T_L) per node (one
+    divmod), synthetic division by x - x_i at the leaves; the tree has n points, the last (never
+    read) set to 0.
+  - DESIGN.md: one paragraph on sizes, preconditions and errors, which it did not state: m
+    coefficients from interpolate; to_newton_basis reads the first n - 1 points; points or values
+    >= P throw `std::domain_error`; 2^25 points or more throw `std::length_error` before any work
+    (the root would pass the NTT's 2^25 coefficients; without the check the tree was built, about
+    2.7 GB, before the root's product threw).
+  - Tests (`test_points.cpp`): evaluate on every pair of edge sizes (0, 1, 2^k +- 1, k <= 10) for n
+    and m, random, all P - 1 and mostly-zero f, random and repeated points, all-zero points (nodes
+    x^k: the monomial division) and P - 1, against Horner; long f by 5 and 33 points, 3 and 40
+    coefficients by 2^16 points, and 2^15 to 2^17 both ways at 300 random points; interpolate on
+    every edge size, random and 0 .. m / P - 1 .. points, against Lagrange (O(m^2)), at 2^14 and
+    2^17 + 1 back through evaluate and Horner, and a polynomial of degree < m back exactly;
+    to_newton_basis on every edge size, random, repeated and zero points, with a spare point,
+    against expanding the basis, and at 2^15 + 1 and 100000 at 20 points; 4 threads; every
+    error, repeats next to each other, in one leaf, across leaves, all equal. 14 mutations: 9 fail
+    it; 5 are equivalent (a monic T's top word; the zero fill of outputs that start zeroed; extra
+    zero words in the leaf loop; a dropped repeat check, which `mod_inverse(0)` then reports as
+    the same `domain_error`). A precondition bound one point short only fails under ASan, so the
+    test also asks n = 2 with no points. Pass at -O2 and ASan/UBSan on the Mac (scalar, arm),
+    `lc-amd` (scalar, sse, avx2), `lc-intel-test`, `lc-zen5-test` and `lc-arm`.
+  - Bench (`frontend/bench_points.cpp`, its own binary as for series and division): `evaluate`,
+    `interpolate`, `newton` for n = m = 2^lg, lg 10, 14, 17, random points (distinct for
+    interpolate). No `@kernel` pairs: no backend call is wrapped (#104). Median of 7 rounds, GCC
+    15.2, ns per point, lg 10 / 14 / 17:
+
+    | case | `lc-bench` (avx2) | `lc-intel` (avx512) | `lc-zen5` (zen5) | `lc-arm` (arm) |
+    |---|---|---|---|---|
+    | evaluate | 214 / 338 / 460 | 179 / 289 / 397 | 175 / 239 / 303 | 266 / 495 / 720 |
+    | interpolate | 370 / 522 / 664 | 303 / 444 / 566 | 286 / 365 / 443 | 446 / 722 / 987 |
+    | newton | 152 / 226 / 296 | 120 / 186 / 249 | 119 / 157 / 194 | 189 / 326 / 459 |
+
+    - Where the time goes at 2^17 (a phase timer, not committed; best of 7, the same
+      build): the tree alone 13.7 ms of evaluate's 60.0 on `lc-bench` (10.9 of 52.5 `lc-intel`,
+      6.7 of 39.2 `lc-zen5`, 19.1 of 94.1 `lc-arm`): the descent is 78-83%. Each node's division
+      runs its own Newton inverse of the reversed child and two products (fps/division.hpp,
+      about 7 units of a product of its size); lc-opt's transposed descent needs no division.
+    - Against lc-opt (#104's brief, `lc-bench`, n = 2^17): its Newton basis takes about 10.4 ms
+      (trees 4.45, division 2.06, descent 3.9); `newton/17` here 38.8 ms, 3.7x; the tree 13.7 ms
+      against 4.45, 3.1x.
+  - The other bench binaries against main 52521ca, 7 rounds: geomean of the gated cases 1.0004
+    (`lc-bench`), 1.0000 (`lc-intel`), 1.0021 (`lc-zen5`), 1.0004 (`lc-arm`); division, which now
+    runs `%` through `modulo`, 0.994-1.007 everywhere. On `lc-zen5` `multiply/8`-`/10` and
+    `to_values/10` came out 1.03-1.10 in that run (code this change does not touch); rerun alone
+    (11 rounds) they gave 0.994-1.003: placement, as in earlier entries.
+
 - 2026-10-12: series (#22): `pow(f, e, n)` (any f, any e < 2^64, 0^0 = 1), `sqrt(f, n)` (a
   `std::optional`), n defaulting to `f.size()`, and `raw::pow`, `raw::sqrt` in
   `include/fps/series.hpp`; `detail::mod_sqrt<P>` (Tonelli-Shanks, the smaller root) in
