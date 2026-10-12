@@ -15,6 +15,7 @@ inline constexpr std::uint32_t kModulus = 998244353;  // 119 * 2^23 + 1
 inline constexpr int kMinLog = 6;                     // transform lengths 2^6 .. 2^25
 inline constexpr int kMaxLog = 25;
 inline constexpr std::size_t kPadding = 16;  // words after each array: the AVX2 kernels read 4 bytes past
+inline constexpr int kValuesMaxLog = 23;     // the values form: 2^lg divides P - 1 = 119 2^23
 
 namespace detail {
 
@@ -116,6 +117,62 @@ constexpr std::uint32_t product_scale(int lg) { return kLeafScales[1][lg]; }
 // Radix-4 levels run on groups of 4 quarters. nv = 4^j leaves start with one group; nv = 2 * 4^j
 // start with a radix-2 level and two groups.
 constexpr bool has_radix2(int lg) { return (lg - 3) % 2 == 1; }
+
+// The values form (ntt.hpp): leaf v = 8g + t, in block g of 64 words, taken on to its values at
+// rho_v z^j (j < 8), with rho_v = r(4v), an 8th root of w_v, and z = r(2), of order 8; word
+// 64g + 8i + t holds the value at j = bitrev3(i). Per leaf: the twist c_k -> c_k rho_v^k, then an
+// 8-point transform with twiddles z^k = r(eighth_root(k)). rho_v = A(g / 8) B(g % 8, t) with
+// A(h) = r(256 h) and B(l, t) = r(32 l + 4 t) (disjoint bits): the B powers are a table of 8 rows
+// per l, the A powers a table per transform (value_rows).
+
+// The table index of z^k, k < 4: z = r(2), z^2 = r(1) = sqrt(-1), z^3 = r(3).
+constexpr std::size_t eighth_root(int k) { return std::size_t((k & 1) << 1 | (k >> 1 & 1)); }
+
+// Rows of 16 words: 8 values w, then their Shoup quotients. forward[l][k]: B(l, t)^k for lanes
+// t < 8 (k = 0 unused); inverse[l][k]: B(l, t)^-k / 8 (1/8: the 8-point transform's gain).
+struct alignas(64) ValueLanes {
+    std::uint32_t forward[8][8][16];
+    std::uint32_t inverse[8][8][16];
+};
+inline constexpr ValueLanes kValueLanes = [] {
+    ValueLanes v{};
+    const std::uint32_t eighth = power(8, kP - 2);
+    for (int l = 0; l < 8; ++l) {
+        for (int t = 0; t < 8; ++t) {
+            std::uint32_t b = 1, bi = 1;  // B(l, t) and its inverse: bits j of 32 l + 4 t
+            for (int j = 0; j < 8; ++j)
+                if ((32 * l + 4 * t) >> j & 1) b = multiply_mod(b, kRoots[0][j]), bi = multiply_mod(bi, kRoots[1][j]);
+            std::uint32_t x = 1, y = eighth;
+            for (int k = 0; k < 8; ++k, x = multiply_mod(x, b), y = multiply_mod(y, bi)) {
+                v.forward[l][k][t] = x, v.forward[l][k][8 + t] = quotient(x);
+                v.inverse[l][k][t] = y, v.inverse[l][k][8 + t] = quotient(y);
+            }
+        }
+    }
+    return v;
+}();
+
+// Rows of A(h) per h < value_row_count(lg), 32 words each: A(h)^k for k < 8, their quotients,
+// A(h)^-k, their quotients.
+constexpr std::size_t value_row_count(int lg) { return lg > 9 ? (std::size_t(1) << lg) / 512 : 1; }
+inline void build_value_rows(std::uint32_t* rows, int lg) {
+    std::uint32_t root[26], inverse_root[26];  // orders 2^(j + 2): bit j of 256 h is bit j - 8 of h
+    for (int j = 0; j < 26; ++j) root[j] = j < 22 ? power(3, (kP - 1) >> (j + 2)) : 1, inverse_root[j] = power(root[j], kP - 2);
+    std::uint32_t a = 1, ai = 1;
+    for (std::size_t h = 0; h < value_row_count(lg); ++h) {
+        if (h) {
+            const std::uint32_t* prior = rows + 32 * (h & (h - 1));  // A(h) = A(h without its low bit) r(256 lowbit)
+            const int j = std::countr_zero(h) + 8;
+            a = multiply_mod(prior[1], root[j]), ai = multiply_mod(prior[17], inverse_root[j]);
+        }
+        std::uint32_t* row = rows + 32 * h;
+        std::uint32_t x = 1, y = 1;
+        for (int k = 0; k < 8; ++k, x = multiply_mod(x, a), y = multiply_mod(y, ai)) {
+            row[k] = x, row[8 + k] = quotient(x);
+            row[16 + k] = y, row[24 + k] = quotient(y);
+        }
+    }
+}
 
 // A product from spans for the variants (ntt::multiply): words [0, count) of f g into out. f: n
 // words, g: m words, values < P, in caller memory of any alignment, read only there; n, m >= 1,

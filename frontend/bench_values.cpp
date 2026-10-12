@@ -1,7 +1,6 @@
 // Times fps::Values modulo P = 998244353; tools/kernel.py runs it next to bench.cpp, with the same
-// case names ("<op>/<lg>" through the API, "<op>@kernel/<lg>" the backend call it wraps). The
-// products of value forms and the pointwise layout wrap no backend kernel yet (frontend/notes.md),
-// so their cases have no @kernel pair.
+// case names ("<op>/<lg>" through the API, "<op>@kernel/<lg>" the backend call it wraps).
+// Products in the pointwise layout are the frontend's own stream: no @kernel pair.
 //
 // A binary of its own: with these cases in bench.cpp, its f * g ran 25% slower at 32 x 32
 // coefficients on Zen 3 (multiply/6). Not the NTT's inlining: with the product's functions
@@ -47,21 +46,22 @@ struct Leaves {
         : words(static_cast<std::uint32_t*>(::operator new((L + fps::ntt::kPadding) * 4, std::align_val_t(64)))) {
         std::fill_n(words.get() + L, fps::ntt::kPadding, 0u);
     }
-    // f, zeros up to L, then the forward transform.
-    Leaves(const Poly& f, std::size_t L, const fps::ntt::Transform& t) : Leaves(L) {
+    // f, zeros up to L, then the forward transform into the leaf or values form.
+    Leaves(const Poly& f, std::size_t L, const fps::ntt::Transform& t, fps::ntt::Form form = fps::ntt::Form::leaves)
+        : Leaves(L) {
         std::ranges::copy(f.span(), words.get());
         std::fill(words.get() + f.size(), words.get() + L, 0u);
-        t.forward(words.get());
+        if (form == fps::ntt::Form::leaves) t.forward(words.get());
+        else t.forward(words.get(), form);
     }
 };
 
 // fps::Values against ntt::Transform on L = 2^lg words. to_values: f of L / 2 coefficients (an
 // exact product's factor) into new memory; the kernel builds its tables in setup, as the API
-// keeps them per length. to_coefficients: a value form of L coefficients back into new memory;
-// the kernel copies the leaf form and runs the inverse in place. add_coefficients: the upper half
-// added into the same kept array, ABC222 H's step; the kernel copies into a kept array, runs the
-// inverse and adds with modarith. The products and the pointwise layout's conversions have no
-// backend kernel (frontend/notes.md): no @kernel pair.
+// keeps them per length. to_coefficients: a value form of L coefficients back into new memory, by
+// the inverse into other memory (@copy: what the API did before it, a copy of the leaf form, the
+// inverse in place, a copy out). add_coefficients: the upper half added into the same kept array,
+// ABC222 H's step. values_product: A * B into new memory, leaf products.
 void values(bench::Suite& suite) {
     for (int lg : {10, 14, 18, 22}) {
         const std::size_t L = std::size_t(1) << lg;
@@ -83,9 +83,19 @@ void values(bench::Suite& suite) {
             auto A = std::make_shared<Leaves>(random_poly(L, seed), L, *t);
             return [A, L, t] {
                 Leaves C(L);
+                t->inverse(A->words.get(), std::span(C.words.get(), L));
+                bench::keep(C);
+            };
+        }, L);
+        suite.add("to_coefficients@copy" + size, [L, lg, seed] {
+            auto t = std::make_shared<fps::ntt::Transform>(lg);
+            auto A = std::make_shared<Leaves>(random_poly(L, seed), L, *t);
+            return [A, L, t] {
+                Leaves C(L), D(L);
                 std::copy_n(A->words.get(), L, C.words.get());
                 t->inverse(C.words.get());
-                bench::keep(C);
+                std::copy_n(C.words.get(), L, D.words.get());
+                bench::keep(D);
             };
         }, L);
         suite.add("add_coefficients" + size, [L, seed] {
@@ -97,13 +107,8 @@ void values(bench::Suite& suite) {
         suite.add("add_coefficients@kernel" + size, [L, lg, seed] {
             auto t = std::make_shared<fps::ntt::Transform>(lg);
             auto A = std::make_shared<Leaves>(random_poly(L, seed), L, *t);
-            auto C = std::make_shared<Leaves>(L);
-            return [A, C, h = random_poly(L / 2, seed + 1), L, t]() mutable {
-                std::copy_n(A->words.get(), L, C->words.get());
-                t->inverse(C->words.get());
-                std::uint32_t* out = h.span().data();
-                fps::detail::lanewise(out, C->words.get() + L / 2, out, L / 2,
-                                      []<class S>(typename S::V x, typename S::V y) { return Ops<S>::add(x, y); });
+            return [A, h = random_poly(L / 2, seed + 1), L, t]() mutable {
+                t->inverse(A->words.get(), h.span(), fps::ntt::Form::leaves, {L / 2, true});
                 bench::keep(h);
             };
         }, L);
@@ -114,12 +119,37 @@ void values(bench::Suite& suite) {
                         B = fps::to_values(random_poly(L / 2, seed + 1), L, layout)] { bench::keep(A * B); };
             }, L);
         }
+        suite.add("values_product@kernel" + size, [L, lg, seed] {
+            auto t = std::make_shared<fps::ntt::Transform>(lg);
+            auto A = std::make_shared<Leaves>(random_poly(L / 2, seed), L, *t);
+            auto B = std::make_shared<Leaves>(random_poly(L / 2, seed + 1), L, *t);
+            return [A, B, L, t] {
+                Leaves C(L);
+                t->multiply(A->words.get(), B->words.get(), C.words.get());
+                bench::keep(C);
+            };
+        }, L);
+        if (lg > fps::ntt::kValuesMaxLog) continue;
         suite.add("to_values_pointwise" + size, [L, seed] {
             return [f = random_poly(L / 2, seed), L] { bench::keep(fps::to_values(f, L, fps::Layout::pointwise)); };
+        }, L);
+        suite.add("to_values_pointwise@kernel" + size, [L, lg, seed] {
+            return [f = random_poly(L / 2, seed), L, t = std::make_shared<fps::ntt::Transform>(lg)] {
+                bench::keep(Leaves(f, L, *t, fps::ntt::Form::values));
+            };
         }, L);
         suite.add("to_coefficients_pointwise" + size, [L, seed] {
             return [A = fps::to_values(random_poly(L, seed), L, fps::Layout::pointwise)] {
                 bench::keep(fps::to_coefficients(A));
+            };
+        }, L);
+        suite.add("to_coefficients_pointwise@kernel" + size, [L, lg, seed] {
+            auto t = std::make_shared<fps::ntt::Transform>(lg);
+            auto A = std::make_shared<Leaves>(random_poly(L, seed), L, *t, fps::ntt::Form::values);
+            return [A, L, t] {
+                Leaves C(L);
+                t->inverse(A->words.get(), std::span(C.words.get(), L), fps::ntt::Form::values);
+                bench::keep(C);
             };
         }, L);
     }
