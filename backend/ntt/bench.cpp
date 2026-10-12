@@ -2,7 +2,8 @@
 //   forward/<lg>, inverse/<lg>   Transform::forward and inverse, in place, tables built.
 //   multiply/<lg>                Convolution::multiply, factors of 2^lg / 2 coefficients each.
 //   multiply_dense/<lg>          factors of 3 2^lg / 4 and 2^lg / 4 + 1 coefficients.
-//   <op>@<variant>/<lg>          one variant: scalar, intrinsics_<simd struct>, avx2 (if not selected).
+//   <op>@<variant>/<lg>          one variant: scalar, intrinsics_<simd struct>, avx2 (unless the
+//                                target's one candidate, select.hpp).
 //   convolution/<lg>             a Convolution of 2^lg / 2 and 2^lg / 2 coefficients constructed,
 //                                multiplied and destroyed, to 2^22: construction against multiply/<lg>.
 //   convolution_into/<lg>        the same with a in the caller's memory, 64 bytes past a page boundary.
@@ -135,8 +136,7 @@ void add_product_cases(bench::Suite& suite) {
 }
 
 template <class V>
-constexpr bool selected_everywhere =
-    std::is_same_v<V, SelectedForward> && std::is_same_v<V, SelectedInverse> && std::is_same_v<V, SelectedMultiply>;
+constexpr bool only_candidate = std::is_same_v<Selected, Candidates<V>>;
 
 template <class Forward, class Inverse, class Multiply>
 void add_cases(bench::Suite& suite, const std::string& suffix, int max_lg) {
@@ -176,17 +176,17 @@ int main(int argc, char** argv) {
     add_cases<SelectedForward, SelectedInverse, SelectedMultiply>(suite, "", native_scalar ? kScalarMaxLog : kMaxLog);
     if (!native_scalar) add_cases<variant::scalar, variant::scalar, variant::scalar>(suite, "@scalar", 12);
     // intrinsics<S> for the vector structs worth timing here (8 lanes and more, or the native one;
-    // not Avx2 where Avx512Vl runs the same code on 32 registers), and avx2, unless selected for
-    // every op.
+    // not Avx2 where Avx512Vl runs the same code on 32 registers), and avx2, unless it is the
+    // target's one candidate (select.hpp).
     fps::simd::for_each(fps::simd::All{}, [&]<class S> {
         using V = variant::intrinsics<S>;
         constexpr bool worth = S::lanes > 1 && (S::lanes >= 8 || std::is_same_v<S, fps::simd::Native>) &&
                                !(S::lanes == 8 && S::registers < fps::simd::Native::registers);
-        if constexpr (worth && !selected_everywhere<V>)
+        if constexpr (worth && !only_candidate<V>)
             add_cases<V, V, V>(suite, std::string("@intrinsics_") + S::name, kVariantMaxLog);
     });
 #ifdef __AVX2__
-    if constexpr (!selected_everywhere<variant::avx2>)
+    if constexpr (!only_candidate<variant::avx2>)
         add_cases<variant::avx2, variant::avx2, variant::avx2>(suite, "@avx2", kVariantMaxLog);
 #endif
     add_convolution_cases(suite);

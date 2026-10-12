@@ -178,12 +178,12 @@ int check_results(const std::vector<Case>& products, const Vec& fact, const std:
 // Every registered choice is in the wisdom, after the format, CPU and target lines.
 void test_format(const std::string& wisdom) {
     const std::vector<std::string> l = lines(wisdom);
-    CHECK(l.size() == 6, std::to_string(l.size()) + " lines");
+    CHECK(l.size() == 7, std::to_string(l.size()) + " lines");
     if (l.size() < 3) return;
     CHECK(l[0] == "fps wisdom 1", l[0]);
     CHECK(l[1] == "cpu " + fps::tune::cpu_name(), l[1]);
     CHECK(l[2] == "target " + std::string(fps::tune::target_name()), l[2]);
-    for (const std::string name : {"small.variant ", "small.ntt ", "factorials.variant "})
+    for (const std::string name : {"ntt.variant ", "small.variant ", "small.ntt ", "factorials.variant "})
         CHECK(std::ranges::count_if(l, [&](const std::string& line) { return line.starts_with(name); }) == 1, name);
 }
 
