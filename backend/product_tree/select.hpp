@@ -31,7 +31,8 @@ using Wide = simd::Native;
 inline constexpr std::uint32_t kLaneBase = 16;
 inline constexpr std::uint32_t kStandardBase = 32;
 
-// Lanes run when at least this many factors are small (degree at most 1/64 of the small ones' sum).
-inline constexpr std::size_t kMinLaneFactors = 64;
+// Lanes run when at least this many factors are small (degree at most 1/64 of the sum of all
+// degrees): from 16 linear factors on Zen 3 (notes.md).
+inline constexpr std::size_t kMinLaneFactors = 16;
 
 }  // namespace fps::product_tree
