@@ -2,7 +2,7 @@
 
 Power series modulo P = 998244353: inverse, log and exp into caller memory. API: `series.hpp`
 (`inverse`, `log`, `exp`, each `(f, out)` in this thread's memory or `(f, out, scratch)` with
-`*_scratch(n)` words). Tests: `test.cpp`; bench: `bench.cpp`. From lc-opt's
+`*_scratch(n)` words). Tests: `test.cpp`; bench: `bench.cpp`. Attempts: `notes/` (one file per issue round). From lc-opt's
 `lib/poly/{inverse,log,exp,calculus}.hpp` (its `lib/poly/notes.md`: Inverse, Log, Exp), rewritten
 on `ntt::Transform`'s leaf form and `backend/simd`, so every target runs it (lc-opt's transform
 layer is AVX2 asm on Zen 3). One variant per op: no `select.hpp` yet.
@@ -95,25 +95,3 @@ ns per coefficient at lg 22 (n = 2^21), inverse / log / exp: `lc-bench` 16.7 / 2
 - Ragged sizes (`_ragged`, n = 1.25 2^(lg-1)): inverse and exp run their half-length last steps;
   ns per coefficient against the power of two at lg 18 on Zen 3: inverse 19.0 / 13.5, log 21.9 /
   18.1, exp 27.1 / 23.4. Before the inverse's half step: inverse_ragged/18 3.72 ms, after 3.12.
-
-## Log
-
-2026-10-12, claude (issue #87, round 1): the kernel, from lc-opt's inverse, log and exp, on
-`ntt::Transform` (every target). Commits on `agent/series-all-r1`.
-- Tests (`test.cpp`): each op against O(n^2) recurrences on 1 .. 64, 2^k +- 1 to 4097, 3 2^k,
-  12 random sizes, random / mostly zero / all P - 1 inputs, f of n, n + 3 and n / 2 words;
-  identities (f / f = 1 by `ntt::multiply`, log exp, exp log) at 2^14 +- 1, 2^17, 300001, 2^20,
-  2^20 + 3, 2^22 + 1 (to 300001 under ASan); 1 / (1 - x), log 1 / (1 - x), exp x at 10^6; the
-  caller's scratch at 6 offsets, garbage in it, words past it untouched, too small a scratch;
-  log and exp with out overlapping f (in place, shifted both ways); 4 threads; n = 2^25 + 1
-  throws `std::length_error` before writing; the twist against T_2L's upper half. Mutations
-  (each caught): the h update's sign, the residual's multiply_add, E's lower half not zeroed,
-  the twist one entry off, s not cut to c, h's upper half not stored, the inverse half step's
-  constant term, its f_hi product, its e not cut to c. Pass at -O2 and ASan/UBSan on `lc-amd`
-  (scalar, sse, avx2), `lc-intel-test`, `lc-zen5-test`, `lc-arm` and the Mac (arm).
-- First run (commit 0573e10): the x86 tests segfaulted in the twist test, whose arrays were
-  std::vectors (16-byte aligned; the asm transforms need 32). Test fixed.
-- Recurrences with `power(i, P - 2)` per coefficient: exp/7 9.1 us on Zen 3; with a constexpr
-  table of 1 / i and 16-product dots, 1.47 us (log/7 9.2 -> 0.95 us). exp/11 25.9 -> 18.3 us.
-- Measured against the frontend's plain Newton on `raw::mul`: see frontend/notes.md (this
-  round's entry).
