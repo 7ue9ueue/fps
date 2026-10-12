@@ -59,8 +59,9 @@ Each kernel is tuned per CPU target and tested on every one:
 - The NTT moved from lc-opt costs no speed. A product of two polynomials of 2^24 coefficients takes 193 ms on Zen 3,
   192.8 ms in lc-opt. From transform length 2^9 up the two stay within 0.6% on Zen 3 and Emerald Rapids
   ([`backend/ntt/notes.md`](backend/ntt/notes.md)).
-- A call through the API runs as fast as the kernel it wraps. Where it does not (`f * g` is 1-6% slower than the raw
-  kernel on x86), `frontend/notes.md` says why.
+- A call through the API runs as fast as the kernel it wraps: `f * g`, `mul`, `square` and `raw::mul` are within 0.5%
+  of `ntt::multiply` on all four timed machines (2^10 to 2^22). `middle_product` is 0.3-2.3% slower, and products of
+  16 x 16 coefficients 7-13%; `frontend/notes.md` says why.
 - Choices a CPU makes differently (variants, cutoffs) are tuned values: compiled defaults per target, replaced at run
   time by `fps::tune_all()` or a saved `fps::load_wisdom(path)`, as in FFTW. Tuning changes speed, never a result.
 
