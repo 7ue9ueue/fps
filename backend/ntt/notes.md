@@ -827,6 +827,11 @@ TU shifted by 0-3584 bytes (512-byte steps, a top-level `.skip`), 8 shifts (ntt 
   nothing else moved (even lg 10 and 12, square, transforms). Not reproduced: 16 more runs of
   `kernel.py bench` (each a fresh build) and 52 processes of fresh copies of the binary all ran
   multiply/9 at 499-513 ns. The only such run in the saved gates (all pooled runs, every target).
+- Since issue #110 the gate flags two runs that disagree (a case's new/base moved more than 5%,
+  out of both IQRs), times a third and judges on the pair that agrees best. A third gate run of
+  PR 99 on lc-zen5 (2026-10-12) found the slow state on the base side this time: base multiply/9
+  528 ns (499 before), new 501; ntt 1.0002. Judged on runs 2 and 3, PR 99's zen5 ntt is 1.0017,
+  not 1.0291.
 
 
 2026-10-11, claude (issue #3, round 1): moved lc-opt `lib/ntt` (`ntt.hpp`, `product.hpp`, both
