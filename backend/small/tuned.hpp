@@ -10,7 +10,7 @@
 
 namespace fps::small::tuned {
 
-inline constexpr int signature[] = {1704353439, 366953214, 1226725547, 440639268, 1550588397, 1790837844};
+inline constexpr int signature[] = {1704353439, 366953214, 1226725547, 1442862803, 1812215027, 1790837844};
 
 inline constexpr int variant[][44] = {
     {  // scalar

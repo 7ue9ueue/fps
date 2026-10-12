@@ -58,13 +58,13 @@ using Selected = Candidates<
 using Selected = Candidates<Variant<simd::Avx512, 6, 1, false>, Variant<simd::Avx512, 4, 1, false>,
                             Variant<simd::Avx512, 8, 2, false>, Variant<simd::Avx512, 6, 1, true>,
                             Variant<simd::Avx512, 4, 1, true>, Variant<simd::Avx512Vl, 4, 1, true>,
-                            Variant<simd::Avx512, 6, 1, false, 4>, Variant<simd::Avx512Vl, 4, 1, true, 4>>;
+                            Variant<simd::Avx512, 6, 1, false, 3>, Variant<simd::Avx512Vl, 4, 1, true, 4>>;
 #elif defined(__AVX512F__) && defined(__AVX512BW__)  // avx512
 using Selected = Candidates<Variant<simd::Avx512, 6, 1, false>, Variant<simd::Avx512, 4, 1, false>,
                             Variant<simd::Avx512, 6, 2, false>, Variant<simd::Avx512, 8, 1, false>,
                             Variant<simd::Avx512, 8, 2, false>, Variant<simd::Avx512Vl, 6, 2, false>,
-                            Variant<simd::Avx512Vl, 4, 1, true>, Variant<simd::Avx512, 4, 1, false, 4>,
-                            Variant<simd::Avx512Vl, 4, 1, true, 4>, Variant<simd::Avx512, 6, 1, false, 4>>;
+                            Variant<simd::Avx512Vl, 4, 1, true>, Variant<simd::Avx512, 4, 1, false, 3>,
+                            Variant<simd::Avx512Vl, 4, 1, true, 4>, Variant<simd::Avx512, 6, 1, false, 3>>;
 #elif defined(__AVX2__)
 using Selected = Candidates<Variant<simd::Avx2, 4, 2, false>, Variant<simd::Avx2, 4, 4, false>,
                             Variant<simd::Avx2, 4, 1, false>, Variant<simd::Avx2, 5, 2, false>,
