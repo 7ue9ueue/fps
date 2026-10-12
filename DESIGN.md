@@ -148,6 +148,11 @@ sum over j of f[i + j] g[j]. It runs a cyclic product of length >= n (the wrappe
 below m - 1), not n + m - 1. `product(fs)` runs the backend's product tree (small factors 8 at a
 time in lanes, one transform of each length per node); it also takes a `std::vector`.
 
+`divmod(f, g)`, `f / g`, `f % g`: f = q g + r with deg r < d = deg g. q has max(`f.size()` - d, 0)
+coefficients and r has d (f's, then zeros, if `f.size()` <= d), so `f / x^k` drops the lowest k
+coefficients and `f % x^k` is `f.truncate(k)`; neither is trimmed. g = 0, of any size, throws
+`std::domain_error`. `f / g` computes no remainder.
+
 `Factorials<P> fact(n)`, n <= P: `fact[i]` = i!, `fact.inverse(i)` = 1/i!, `fact.binomial(n, k)`
 = C(n, k) (0 for k > n), for i, n < `fact.size()`. n > P throws: P! = 0 has no inverse. Indices
 are not checked, as in `operator[]`.
