@@ -71,7 +71,8 @@
 // leaf mod x^8 - w_v, then inverse(), gives the cyclic product mod x^L - 1.
 //
 // multiply(a, b, out) and multiply_add: leaf products of two leaf forms (canonical out), each an
-// 8 x 8 product with Montgomery reductions and a Shoup product by 2^32 to undo their 2^-32.
+// 8 x 8 product in 64-bit sums, reduced exactly (x86: hi (2^32 mod P) + lo) or by Montgomery and
+// a Shoup product by 2^32. Zen 3: 0.93-0.97 ns per word at every length (notes.md).
 //
 // Values form (Form::values, L <= 2^kValuesMaxLog = 2^23, as 2^lg must divide P - 1): each leaf
 // taken on to its values at the 8 roots of x^8 - w_v, so a product of two values forms is one
@@ -82,7 +83,9 @@
 //
 // inverse(F, out, ...): into other memory, F kept. Its subtrees copy (or join) their leaves from F
 // into this thread's region before their bottom level, and the top level writes out: no copy of
-// the whole of F in, nor of the coefficients out (with an offset or add: one pass out).
+// the whole of F in, nor of the coefficients out (with an offset or add: one pass out). Against
+// a copy in, the inverse in place and a copy out: 0.84-0.97 from 2^11 on Zen 3 and Emerald Rapids
+// (Zen 5 1.08 at 2^22). To 2^10, where that was slower, F is copied into a stack buffer.
 //
 // Arrays for Transform: 32-byte aligned, L + kPadding words (the padding is read, never written),
 // values < P in and out. No checks on these calls but the ranges of inverse(F, out, ...) and the
@@ -323,8 +326,8 @@ public:
     // out[i] = coefficient c.offset + i of the polynomial whose leaf or values form is F, or
     // out[i] += it (c.add); F kept. out: any memory apart from F, any alignment, no padding;
     // c.offset + out.size() <= length(), else std::out_of_range. The work runs in this thread's
-    // region (Convolution's memory); the top level writes out when c is {} and the bottom level
-    // reads F, so nothing is copied whole. With an offset or add, one pass more from the region.
+    // region (Convolution's memory), on the stack to 2^kStackLog; the top level writes out when c
+    // is {}. With an offset or add, one pass more from the work array.
     template <class Variant = SelectedInverse>
     void inverse(const std::uint32_t* F, std::span<std::uint32_t> out, Form form = Form::leaves, Coefficients c = {}) const {
         const std::size_t len = length();
