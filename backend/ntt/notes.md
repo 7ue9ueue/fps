@@ -270,6 +270,18 @@ A tuned choice, "ntt.variant" (`backend/tune`): per target a list of candidates 
 - Before (`by_length`, by hand from the bench's @ cases): avx512 asm below 2^8 for forward and
   at 2^7 for multiply, ymm intrinsics below 2^8 for inverse; zen5 asm below 2^7 (forward) and 2^8
   (inverse, multiply). The data behind it: issue #5 round 2 and issue #4 round 2 (Log).
+- `Transform::forward_upper(h)` (issue #91, for the product tree's transform doubling): on a
+  Transform of length 2L, h = p mod (x^L + 1) (L words, canonical) -> leaves L/8 .. L/4 - 1 of
+  p's leaf form. Under a radix-2 top level (has_radix2(lg)) that is the subtree of group 1 at
+  the first radix-4 level; under a radix-4 top (group 0 = x^(2L) - 1, children x^(L/2) -+ 1, -+
+  r(1)) the subtrees of groups 2 and 3, after one radix-2 level with r(1) (out < 3P). Every
+  variant: scalar (`forward_levels` from a group offset), intrinsics (`forward_tree` of groups
+  1, or 2 and 3), avx2 (`forward_trees` of the same); the tuned dispatch uses the forward's
+  candidate at L. Cost against `forward` of L words (ns per word, lg 8 / 12 / 18): Zen 3 0.49 /
+  0.71 / 1.13 against 0.42 / 0.65 / 1.07; Emerald Rapids 0.43 / 0.65 / 1.04 against 0.36 / 0.57 /
+  0.93; Zen 5 0.27 / 0.32 / 0.50 against 0.23 / 0.29 / 0.48; Neoverse V2 0.76 / 1.22 / 1.96
+  against 0.64 / 1.11 / 1.86: its top group has twiddles where the forward's is the identity
+  (Zen 3 2^9: 0.54 against 0.42). A twist pass (one product per word) cost 0.12-0.26.
 
 ## Measurements
 
@@ -1403,6 +1415,17 @@ cpu), so no counters.
   2.4 KB, `Ntt::multiply(Product)` 2.4 KB, ...), spread over about 120 KB of .text between the
   ymm instantiations: against Zen 5's 32 KiB L1I and 6K-op op cache, a guess for why the relative
   layout matters (issue #93's lead: a smaller or contiguous hot path).
+
+2026-10-12, claude (issue #91, round 1, product_tree): `Transform::forward_upper` (Design), for
+the product tree; nothing else here changed. Tests: `test_transforms`, every variant and length
+2^7 .. 2^max: forward_upper of f mod (x^(L/2) + 1) equals the upper half of f's forward (the
+scalar model's too). Pass on every target (lc-amd avx2, sse, scalar; lc-intel-test; lc-zen5-test;
+lc-arm; the Mac). Tried for the tree and not kept: `inverse(F, f)` into an aligned array without
+the region (the variants' inverse from other memory, whose subtrees copy their leaves from F):
+1.08-1.12x the in-place inverse on Zen 3 at 2^8 .. 2^21 (the copy's stores allocate lines of f that the
+in-place inverse reads anyway), so the tree's copy (stores into lines just read, 1-12% of the
+product pass) stays. `Transform::inverse(F, out)` itself takes this thread's region, which a
+caller like the tree holds: it would map a region per call.
 
 ## Sources
 

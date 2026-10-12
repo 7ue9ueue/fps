@@ -693,6 +693,21 @@ inline void forward(u32* words, int lg, const u32* r) {
     forward_trees(f, q, 8, 0, r);
 }
 
+// The upper half of the leaf form of length 2L, L = 2^lg, from words = p mod (x^L + 1), canonical;
+// r: the table of length 2L. Below a radix-2 level that is group 1's subtree; below group 0
+// (radix 4) those of groups 2 and 3, from the residues mod x^(L/2) -+ r(1) (out < 3P).
+inline void forward_upper(u32* words, int lg, const u32* r) {
+    auto* f = reinterpret_cast<Vec*>(words);
+    const std::size_t nv = (std::size_t(1) << lg) / 8, h = nv / 2;
+    if (has_radix2(lg + 1)) return forward_trees(f, nv, 1, 1, r);
+    const Factor z = entry(r, 1);
+    for (std::size_t i = 0; i < h; ++i) {
+        const Vec x = f[i], y = multiply(f[i + h], z);
+        f[i] = add(x, y), f[i + h] = diff(x, y);
+    }
+    forward_trees(f, h, 2, 2, r);
+}
+
 inline void inverse(u32* words, int lg, const u32* ir) {
     auto* f = reinterpret_cast<Vec*>(words);
     const std::size_t nv = (std::size_t(1) << lg) / 8;
@@ -784,6 +799,10 @@ struct avx2 {
     }
 
     static void forward(std::uint32_t* f, int lg, const std::uint32_t* roots) { detail::avx2::forward(f, lg, roots); }
+
+    static void forward_upper(std::uint32_t* f, int lg, const std::uint32_t* roots) {
+        detail::avx2::forward_upper(f, lg, roots);
+    }
 
     static void inverse(std::uint32_t* f, int lg, const std::uint32_t* inverse_roots) {
         detail::avx2::inverse(f, lg, inverse_roots);

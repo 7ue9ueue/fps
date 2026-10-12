@@ -25,6 +25,23 @@ inline std::size_t top_quarter(int lg) { return std::size_t(1) << (lg - (has_rad
 // Group k of a level with quarters of q words is f[4qk, 4q(k + 1)): a polynomial mod X^4 - r(k)^2,
 // X = x^q, quarter t the coefficient of X^t. Its children 4k + t are the residues mod X - r(2k),
 // X + r(2k), X - r(2k + 1), X + r(2k + 1); quarters of 8 words are the leaves.
+inline void forward_group(u32* g, std::size_t q, std::size_t k, const u32* r) {
+    const u32 x = r[slot(k)], y = r[slot(2 * k)], z = r[slot(2 * k + 1)];
+    for (std::size_t j = 0; j < q; ++j) {
+        const u32 xc = mul(x, g[j + 2 * q]), xd = mul(x, g[j + 3 * q]);
+        const u32 a = add(g[j], xc), c = sub(g[j], xc);
+        const u32 yb = mul(y, add(g[j + q], xd)), zd = mul(z, sub(g[j + q], xd));
+        g[j] = add(a, yb), g[j + q] = sub(a, yb), g[j + 2 * q] = add(c, zd), g[j + 3 * q] = sub(c, zd);
+    }
+}
+
+// The levels with quarters q = top .. 8 on f, which starts at group `first` of the level with
+// quarters of `top` words (and spans `count` of them).
+inline void forward_levels(u32* f, std::size_t top, std::size_t first, std::size_t count, const u32* r) {
+    for (std::size_t q = top, n = count, k0 = first; q >= 8; q /= 4, n *= 4, k0 *= 4)
+        for (std::size_t k = 0; k < n; ++k) forward_group(f + 4 * q * k, q, k0 + k, r);
+}
+
 inline void forward(u32* f, int lg, const u32* r) {
     const std::size_t len = std::size_t(1) << lg;
     if (has_radix2(lg)) {
@@ -33,18 +50,21 @@ inline void forward(u32* f, int lg, const u32* r) {
             f[i] = add(x, y), f[i + len / 2] = sub(x, y);
         }
     }
-    for (std::size_t q = top_quarter(lg); q >= 8; q /= 4) {
-        for (std::size_t k = 0; k < len / (4 * q); ++k) {
-            const u32 x = r[slot(k)], y = r[slot(2 * k)], z = r[slot(2 * k + 1)];
-            u32* g = f + 4 * q * k;
-            for (std::size_t j = 0; j < q; ++j) {
-                const u32 xc = mul(x, g[j + 2 * q]), xd = mul(x, g[j + 3 * q]);
-                const u32 a = add(g[j], xc), c = sub(g[j], xc);
-                const u32 yb = mul(y, add(g[j + q], xd)), zd = mul(z, sub(g[j + q], xd));
-                g[j] = add(a, yb), g[j + q] = sub(a, yb), g[j + 2 * q] = add(c, zd), g[j + 3 * q] = sub(c, zd);
-            }
-        }
+    forward_levels(f, top_quarter(lg), 0, len / (4 * top_quarter(lg)), r);
+}
+
+// The upper half of the leaf form of length 2L, L = 2^lg, from f = p mod (x^L + 1) (canonical);
+// r: the table of length 2L. Below a radix-2 level the upper half is group 1; below group 0 (radix
+// 4) groups 2 and 3, the residues mod x^(L/2) -+ r(1).
+inline void forward_upper(u32* f, int lg, const u32* r) {
+    const std::size_t len = std::size_t(1) << lg;
+    if (has_radix2(lg + 1)) return forward_levels(f, len / 4, 1, 1, r);
+    const u32 i1 = r[slot(1)];
+    for (std::size_t j = 0; j < len / 2; ++j) {
+        const u32 x = f[j], y = mul(i1, f[j + len / 2]);
+        f[j] = add(x, y), f[j + len / 2] = sub(x, y);
     }
+    forward_levels(f, len / 8, 2, 2, r);
 }
 
 // forward() undone, times nv = len / 8 (the scale is left to the caller).
@@ -149,6 +169,10 @@ struct scalar {
     }
 
     static void forward(std::uint32_t* f, int lg, const std::uint32_t* roots) { detail::scalar::forward(f, lg, roots); }
+
+    static void forward_upper(std::uint32_t* f, int lg, const std::uint32_t* roots) {
+        detail::scalar::forward_upper(f, lg, roots);
+    }
 
     static void inverse(std::uint32_t* f, int lg, const std::uint32_t* inverse_roots) {
         detail::scalar::inverse_unscaled(f, lg, inverse_roots);

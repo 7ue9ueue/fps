@@ -12,14 +12,12 @@
 // - Lanes: 8 polynomials side by side, word 8 j + l = coefficient j of polynomial l. A transform of
 //   8 m words (ntt::Transform's leaf form) then holds polynomial l at the m roots w_v of X^m - 1
 //   in word l of leaf v, so products are pointwise. The parent's length 2L: the lower half is the
-//   node's own product transform; the upper half is the transform of p mod (X^L + 1) twisted to
-//   p(rho X) mod (X^L - 1), rho = r(L/2) of order 2L (ntt's tables: w_(L+u) = rho w_u), so its
-//   leaves are p at rho w_u, the upper leaves of the transform of 2L. Per node: one pointwise
-//   pass, one inverse and one forward of length L, and a twist pass.
-// - Standard: one polynomial per node, leaf products mod (x^8 - w_v). The transform acts on the
-//   8 words of a leaf as on 8 lanes (word j of leaf v is C_j(w_v) for p = sum_j x^j C_j(x^8)), so
-//   the upper half is the lanes' twist with one factor per 8 words (rho = r(L/16)) and a forward
-//   of length L. Per node: leaf products, one inverse and one forward of length L, a twist pass.
+//   node's own product transform; the upper half is ntt's forward_upper of p mod (X^L + 1) (8 L
+//   words: the words' polynomial mod x^(8L) + 1 is each lane's mod X^L + 1). Per node: one
+//   pointwise pass (which also writes the copy the inverse runs on), one inverse and one
+//   forward_upper of length L.
+// - Standard: one polynomial per node, leaf products mod (x^8 - w_v), the upper half as the
+//   lanes'. Per node: leaf products (and the copy), one inverse and one forward_upper of length L.
 #pragma once
 
 #include <algorithm>
@@ -87,6 +85,12 @@ inline const ntt::Transform& transform(std::size_t words) {
 
 inline void forward(u32* f, std::size_t words) { transform(words).forward(f); }
 inline void inverse(u32* f, std::size_t words) { transform(words).inverse(f); }
+// h: words / 2 words of p mod (x^(words/2) + 1) -> the upper half of p's transform of `words` words.
+inline void forward_upper(u32* h, std::size_t words) { transform(words).forward_upper(h); }
+
+// x - y and x + y mod P, canonical in and out.
+constexpr u32 subtract(u32 x, u32 y) { return x >= y ? x - y : x + kP - y; }
+constexpr u32 add(u32 x, u32 y) { return x >= kP - y ? x - (kP - y) : x + y; }
 
 // w_v 2^32 mod P for the leaves v < count of the standard layout: w_v = (-1)^v r(v / 2), r(k) the
 // product of ntt's roots[j] over the set bits j of k. This thread's, kept for the most leaves yet.
@@ -102,21 +106,6 @@ inline const u32* leaf_weights(std::size_t count) {
         for (std::size_t v = 0; v < 2 * half; ++v) weights[v] = multiply_mod(v % 2 ? kP - r[v / 2] : r[v / 2], kR);
     }
     return weights.data();
-}
-
-// Twists of the lanes: for m a power of two, 8 <= m <= the largest yet, t[m + j] = rho_m^j 2^32
-// mod P for j < m, rho_m = ntt's roots[log2(m) - 1] (order 2m); rho_m = rho_2m^2. This thread's.
-inline const u32* twiddles(std::size_t m) {
-    thread_local std::vector<u32> t;
-    if (t.size() < 2 * m) {
-        t.assign(2 * m, 0);
-        const u32 rho = ntt::detail::kRoots[0][std::countr_zero(m) - 1];
-        t[m] = kR;
-        for (std::size_t j = 1; j < m; ++j) t[m + j] = multiply_mod(t[m + j - 1], rho);
-        for (std::size_t h = m / 2; h >= 8; h /= 2)
-            for (std::size_t j = 0; j < h; ++j) t[h + j] = t[2 * h + 2 * j];
-    }
-    return t.data();
 }
 
 // The leaf of a tree's leaves where node [lo, hi) splits, from prefix[k] = degree(0) + ... +
@@ -164,7 +153,6 @@ public:
     LaneTree(const Leaves& leaves, Stack& stack) : leaves_(leaves), stack_(stack), prefix_(stack.take(leaves.count() + 1)) {
         prefix_[0] = 0;
         for (std::size_t k = 0; k < leaves.count(); ++k) prefix_[k + 1] = prefix_[k] + leaves.degree(k);
-        twiddles_ = twiddles(length(prefix_[leaves.count()]));
     }
 
     // The product of all leaves. Its coefficients stay in the stack; what root() takes past them
@@ -254,26 +242,26 @@ private:
         if (out_length == len) {
             pointwise<Wide>(a, c, out, words);
         } else {
-            pointwise2<Wide>(a, c, out, c, words);
-            inverse(c, words);
-            // c = p mod (X^L - 1) = p + top (1 - X^L), top = p[L] or 0; first p mod (X^L + 1).
+            // a = out + words, the upper half: the forward_upper of p mod (X^L + 1). Longer
+            // extensions (out_length > 2L) need p itself: then c keeps it.
+            const bool longer = out_length > 2 * len;
+            u32* const h = longer ? c : a;
+            pointwise2<Wide>(a, c, out, h, words);
+            inverse(h, words);
+            // h = p mod (X^L - 1) = p + top (1 - X^L), top = p[L] or 0.
             alignas(32) u32 top[8];
-            for (int l = 0; l < 8; ++l) {
-                top[l] = node.degree[l] == len ? node.lead[l] : 0;
-                const u32 twice = top[l] >= kP - top[l] ? 2 * top[l] - kP : 2 * top[l];
-                c[l] = c[l] >= twice ? c[l] - twice : c[l] + kP - twice;
+            for (int l = 0; l < 8; ++l) top[l] = node.degree[l] == len ? node.lead[l] : 0;
+            if (longer) {
+                for (int l = 0; l < 8; ++l) c[l] = subtract(c[l], top[l]), c[words + l] = top[l];
+                std::copy_n(c, words, a);
+                for (int l = 0; l < 8; ++l) a[l] = subtract(a[l], top[l]);
+            } else {
+                for (int l = 0; l < 8; ++l) a[l] = subtract(a[l], add(top[l], top[l]));
             }
-            twist<Lanes>(c, len, twiddles_ + len, out + words, len);
-            forward(out + words, words);
-            if (out_length > 2 * len) {
-                for (int l = 0; l < 8; ++l) {
-                    c[l] = c[l] + top[l] >= kP ? c[l] + top[l] - kP : c[l] + top[l];
-                    c[words + l] = top[l];
-                }
-                for (std::size_t m = 2 * len; m < out_length; m *= 2) {
-                    twist<Lanes>(c, len + 1, twiddles_ + m, out + 8 * m, m);
-                    forward(out + 8 * m, 8 * m);
-                }
+            forward_upper(a, 2 * words);
+            for (std::size_t m = 2 * len; m < out_length; m *= 2) {  // p mod (X^m + 1) = p
+                std::fill(std::copy_n(c, words + 8, out + 8 * m), out + 16 * m, 0u);
+                forward_upper(out + 8 * m, 16 * m);
             }
         }
         stack_.release(mark);
@@ -283,7 +271,6 @@ private:
     const Leaves& leaves_;
     Stack& stack_;
     u32* prefix_;  // prefix_[k] = degree(0) + ... + degree(k - 1)
-    const u32* twiddles_;
 };
 
 // One polynomial per node. A leaf: degree >= 1, coefficient j < P at p[stride j], in Montgomery
@@ -308,7 +295,6 @@ public:
         for (std::size_t k = 0; k < leaves.size(); ++k) prefix_[k + 1] = prefix_[k] + leaves[k].degree;
         const std::size_t len = length(prefix_[leaves.size()]);
         weights_ = leaf_weights(len / 8);
-        twiddles_ = twiddles(std::max<std::size_t>(8, len / 16));
     }
 
     // The degree + 1 coefficients of the product of all leaves, in the stack.
@@ -410,21 +396,24 @@ private:
         if (out_length == len) {
             leaf_products<Lanes>(a, c, out, len / 8, weights_);
         } else {
-            leaf_products<Lanes>(a, c, out, len / 8, weights_, c);
-            inverse(c, len);
-            // As the lanes' (LaneTree::build), with 8 words per twiddle: p mod (x^L + 1) first.
-            const u32 top = d == len ? node.lead : 0, twice = top >= kP - top ? 2 * top - kP : 2 * top;
-            c[0] = c[0] >= twice ? c[0] - twice : c[0] + kP - twice;
-            twist<Lanes>(c, len / 8, twiddles_ + len / 8, out + len, len / 8);
-            forward(out + len, len);
-            if (out_length > 2 * len) {
-                c[0] = c[0] + top >= kP ? c[0] + top - kP : c[0] + top;
-                c[len] = top;
-                std::fill(c + len + 1, c + len + 8, 0u);
-                for (std::size_t m = 2 * len; m < out_length; m *= 2) {
-                    twist<Lanes>(c, len / 8 + 1, twiddles_ + m / 8, out + m, m / 8);
-                    forward(out + m, m);
-                }
+            // As the lanes' (LaneTree::build): a = out + len gets the forward_upper of p mod
+            // (x^L + 1); c keeps p for longer extensions.
+            const bool longer = out_length > 2 * len;
+            u32* const h = longer ? c : a;
+            leaf_products<Lanes>(a, c, out, len / 8, weights_, h);
+            inverse(h, len);
+            const u32 top = d == len ? node.lead : 0;
+            if (longer) {
+                c[0] = subtract(c[0], top), c[len] = top;
+                std::copy_n(c, len, a);
+                a[0] = subtract(a[0], top);
+            } else {
+                a[0] = subtract(a[0], add(top, top));
+            }
+            forward_upper(a, 2 * len);
+            for (std::size_t m = 2 * len; m < out_length; m *= 2) {  // p mod (x^m + 1) = p
+                std::fill(std::copy_n(c, len + 1, out + m), out + 2 * m, 0u);
+                forward_upper(out + m, 2 * m);
             }
         }
         stack_.release(mark);
@@ -435,7 +424,6 @@ private:
     Stack& stack_;
     u32* prefix_;
     const u32* weights_;
-    const u32* twiddles_;
 };
 
 }  // namespace fps::product_tree::detail

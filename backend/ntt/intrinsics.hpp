@@ -1462,6 +1462,21 @@ struct Ntt : Butterflies<S> {
         forward_tree<2>(f + len / 2, nv / 2, 1, r);
     }
 
+    // The upper half of the leaf form of length 2L, L = 2^lg, from f = p mod (x^L + 1), canonical;
+    // r: the table of length 2L. Below a radix-2 level that is group 1's subtree; below group 0
+    // (radix 4) those of groups 2 and 3, from the residues mod x^(L/2) -+ r(1) (out < 3P).
+    static void forward_upper(u32* f, int lg, const u32* r) {
+        const std::size_t len = std::size_t(1) << lg, nv = len / 8, half = len / 2;
+        if (has_radix2(lg + 1)) return forward_tree<1>(f, nv, 1, r);
+        const F z = B::entry(r, 1);
+        for (std::size_t i = 0; i < half; i += S::lanes) {
+            const V x = S::load(f + i), y = B::mul(S::load(f + i + half), z);
+            S::store(f + i, add(x, y)), S::store(f + i + half, diff(x, y));
+        }
+        forward_tree<4>(f, nv / 2, 2, r);
+        forward_tree<4>(f + half, nv / 2, 3, r);
+    }
+
     static void inverse(u32* f, int lg, const u32* ir, u32 s) {
         const std::size_t len = std::size_t(1) << lg, nv = len / 8;
         if (!has_radix2(lg)) {
@@ -1629,6 +1644,8 @@ struct intrinsics {
     static void build_table(std::uint32_t* t, std::size_t count, bool inverse) { Ntt::build_table(t, count, inverse); }
 
     static void forward(std::uint32_t* f, int lg, const std::uint32_t* roots) { Ntt::forward(f, lg, roots); }
+
+    static void forward_upper(std::uint32_t* f, int lg, const std::uint32_t* roots) { Ntt::forward_upper(f, lg, roots); }
 
     static void inverse(std::uint32_t* f, int lg, const std::uint32_t* inverse_roots) {
         Ntt::inverse(f, lg, inverse_roots, detail::leaf_scale(lg));
