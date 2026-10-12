@@ -24,11 +24,12 @@
 // product truncated in x and a middle product in y. At the bottom the window is f reversed.
 // Power projection is Bostan and Mori's [x^N] P / Q with y carried along, P = 1. Each step is a
 // product of Kronecker-packed bivariates (x^i y^j at word i Y + j) on raw::mul, cut to its rows:
-// for n a power of two, 2 n to 3 n words in compose's levels and 3 n in the power projection's
-// first step (fewer after), so transforms of 8 n. A product past 2^25 words throws
-// std::length_error; both functions check every level's size before any work: up to about 6 n
-// words for compose (3 n for n a power of two, so 2^23 passes and 2^23 + 1 throws), 3 n for
-// compositional_inverse (2^23 passes, 2^24 throws).
+// two factors of S words, S up to 3 n for n a power of two (about 6 n at most otherwise).
+// ntt::multiply transforms all 2 S - 1 words of such a product, so transforms of 8 n words for n
+// a power of two. Both functions check every level's S against 2^24 before any work and throw
+// std::length_error past it: they run for n up to 2^22 and throw from 2^22 + 1, where the last
+// levels have 2 rows of y-length 3 2^22 (compose) or 2^23 + 1 (the power projection). The Taylor
+// shift is a cyclic product of f.size() + t - 1 words, t = min(n, f.size()); it throws past 2^25.
 // The tuned versions are backend issues: #105 (Kinoshita and Li, lc-opt's), #124 (Taylor
 // shift). Times against ntt::multiply: frontend/notes/26.md.
 //
@@ -58,7 +59,10 @@ using u32 = std::uint32_t;
 using Span = std::span<const u32>;
 using Out = std::span<u32>;
 
-inline constexpr std::size_t kMaxProduct = std::size_t(1) << ntt::kMaxLog;
+// The NTT's longest transform, 2^25 words. ntt::multiply transforms the whole product of its
+// factors, even one cut to fewer words: two factors of S words need 2 S - 1 <= 2^25, so S <= 2^24.
+inline constexpr std::size_t kMaxTransform = std::size_t(1) << ntt::kMaxLog;
+inline constexpr std::size_t kMaxFactor = kMaxTransform / 2;
 
 inline u32 at(Span f, std::size_t i) { return i < f.size() ? f[i] : 0; }
 
@@ -129,7 +133,7 @@ Grid lift(const Grid& q, const Grid& b) {
     return r;
 }
 
-// The longest product of compose's levels (graeffe and lift), in words.
+// The longest factor of compose's levels (graeffe and lift), in words: both factors have its size.
 inline std::size_t compose_longest(std::size_t n) {
     std::size_t longest = 0;
     for (std::size_t rows = n, k = 1; rows > 1; rows = (rows + 1) / 2, k *= 2)
@@ -155,7 +159,7 @@ void kinoshita_li(Span f, Span g, Out out) {
     for (std::size_t i = 0; i < n; ++i) out[i] = b.row(i)[0];
 }
 
-// The longest product of the power projection's steps, in words.
+// The longest factor of the power projection's steps, in words: both factors have its size.
 inline std::size_t projection_longest(std::size_t N) {
     std::size_t longest = 0;
     for (std::size_t k = 1; N > 0; N /= 2, k *= 2) longest = std::max(longest, (N + 1) * (2 * k + 1));
@@ -191,7 +195,8 @@ template <u32 P>
 void taylor_shift(Span f, u32 a, Out out) {
     const std::size_t m = f.size(), t = out.size();
     if (t == 0) return;
-    if (m - 1 + t > kMaxProduct) throw std::length_error("fps::compose: Taylor shift past 2^25 words");
+    // ntt::middle_product: a cyclic product of length >= m - 1 + t.
+    if (m - 1 + t > kMaxTransform) throw std::length_error("fps::compose: Taylor shift past 2^25 words");
     const Factorials<P> fact(m);
     Polynomial<P> weighted(m + t - 1), e(m);
     for (std::size_t i = 0; i < m; ++i) weighted[i] = mod_mul<P>(f[i], fact[i]);
@@ -211,10 +216,10 @@ Polynomial<P> compose(const Polynomial<P>& f, const Polynomial<P>& g, std::size_
     const std::uint32_t a = c::at(gs, 0);
     std::size_t terms = gs.size();  // g mod x^n has degree terms - 1
     while (terms > 0 && gs[terms - 1] == 0) --terms;
-    if (terms > 2 && c::compose_longest(n) > c::kMaxProduct)
-        throw std::length_error("fps::compose: a product past 2^25 words");
+    if (n == 0 || f.size() == 0) return Polynomial<P>(n);
+    if (terms > 2 && c::compose_longest(n) > c::kMaxFactor)
+        throw std::length_error("fps::compose: a product past 2^25 words (n > 2^22)");
     Polynomial<P> h(n);
-    if (n == 0 || f.size() == 0) return h;
     if (terms <= 1) {
         h[0] = f(a);
         return h;
@@ -249,8 +254,8 @@ Polynomial<P> compositional_inverse(const Polynomial<P>& f, std::size_t n) {
     if (n >= 1 && f.coeff(0) != 0) throw std::domain_error("fps::compositional_inverse: f[0] != 0");
     if (n >= 2 && f.coeff(1) == 0) throw std::domain_error("fps::compositional_inverse: f[1] = 0");
     if (n > P) throw std::domain_error("fps::compositional_inverse: n > P");
-    if (n >= 3 && c::projection_longest(n - 1) > c::kMaxProduct)
-        throw std::length_error("fps::compositional_inverse: a product past 2^25 words");
+    if (n >= 3 && c::projection_longest(n - 1) > c::kMaxFactor)
+        throw std::length_error("fps::compositional_inverse: a product past 2^25 words (n > 2^22)");
     Polynomial<P> g(n);
     if (n <= 1) return g;
     const std::uint32_t f1 = f[1], inverse1 = mod_inverse<P>(f1);

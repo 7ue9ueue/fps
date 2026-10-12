@@ -7,6 +7,7 @@
 #include <random>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -33,6 +34,29 @@ void check(bool ok, const char* what, int line, u64 a = 0, u64 b = 0, u64 c = 0)
                     (unsigned long long)c);
 }
 #define CHECK(cond, ...) check(bool(cond), #cond, __LINE__ __VA_OPT__(, ) __VA_ARGS__)
+
+#if defined(__SANITIZE_ADDRESS__)
+constexpr bool kSanitized = true;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+constexpr bool kSanitized = true;
+#else
+constexpr bool kSanitized = false;
+#endif
+#else
+constexpr bool kSanitized = false;
+#endif
+
+// f throws an Exception whose message contains where.
+template <class Exception, class F>
+bool throws_from(const char* where, F f) {
+    try {
+        f();
+    } catch (const Exception& e) {
+        return std::string(e.what()).find(where) != std::string::npos;
+    }
+    return false;
+}
 
 template <class Exception, class F>
 bool throws(F f) {
@@ -288,10 +312,67 @@ void test_errors() {
     CHECK(fps::compositional_inverse(Poly{1, 1}, 0).size() == 0);
     CHECK(fps::compositional_inverse(Poly{0, 0, 1}, 1) == Poly{0});
     CHECK(fps::compositional_inverse(Poly{}, 1) == Poly{0});
-    // Past 2^25 words in a product: thrown before anything is allocated.
-    CHECK(throws<std::length_error>([] { (void)fps::compositional_inverse(Poly{0, 1, 1}, std::size_t(1) << 24); }));
-    CHECK(throws<std::length_error>([] { (void)fps::compose(Poly{1, 2}, Poly{0, 1, 1}, std::size_t(1) << 24); }));
-    CHECK(throws<std::length_error>([] { (void)fps::compose(Poly{1, 2}, Poly{0, 1, 1}, (std::size_t(1) << 23) + 1); }));
+    // Past the NTT's 2^25 words: thrown by the composition's own check, before any work, from
+    // n = 2^22 + 1 (test_limits runs n = 2^22).
+    constexpr std::size_t past = (std::size_t(1) << 22) + 1;
+    CHECK(throws_from<std::length_error>("fps::compose", [] { (void)fps::compose(Poly{1, 2}, Poly{0, 1, 1}, past); }));
+    CHECK(throws_from<std::length_error>("fps::compose", [] { (void)fps::compose(Poly{1, 2}, Poly{0, 1, 1}, std::size_t(1) << 24); }));
+    CHECK(throws_from<std::length_error>("fps::compositional_inverse",
+                                         [] { (void)fps::compositional_inverse(Poly{0, 1, 1}, past); }));
+    CHECK(throws_from<std::length_error>("fps::compositional_inverse",
+                                         [] { (void)fps::compositional_inverse(Poly{0, 1, 1}, std::size_t(1) << 24); }));
+    // An empty f runs no product: n zeros, whatever n.
+    const Poly zeros = fps::compose(Poly{}, Poly{0, 1, 1}, std::size_t(1) << 24);
+    CHECK(zeros.size() == std::size_t(1) << 24 && zeros.degree() == -1);
+    // The Taylor shift: a cyclic product of f.size() + t - 1 words, t = min(n, f.size()); past 2^25
+    // it throws before its tables are built.
+    Poly top((std::size_t(1) << 24) + 1);
+    top[top.size() - 1] = 1;
+    CHECK(throws_from<std::length_error>("Taylor shift", [&top] { (void)fps::compose(top, Poly{1, 1}); }));
+    // On the general path n <= 2^22 (the check above), so f needs more than 2^25 - 2^22 words.
+    Poly longer((std::size_t(1) << 25) - (std::size_t(1) << 22) + 2);
+    longer[longer.size() - 1] = 1;
+    CHECK(throws_from<std::length_error>("Taylor shift",
+                                         [&longer] { (void)fps::compose(longer, Poly{1, 1, 1}, std::size_t(1) << 22); }));
+}
+
+// At the limits (-O2 only: seconds each, and gigabytes under ASan): the largest sizes the checks
+// above pass run through every product.
+void test_limits() {
+    if (kSanitized) return;
+    const std::size_t n = std::size_t(1) << 22;
+    const fps::Factorials<P> fact(2 * n + 1);
+    // compose: f = 1 + y, g of n random words, g[0] = 0, gives 1 + g.
+    {
+        Poly g = poly(random_vec(n));
+        g[0] = 0;
+        Poly want = g;
+        want[0] = 1;
+        CHECK(fps::compose(Poly{1, 1}, g) == want);
+    }
+    // compositional_inverse of x + x^2: sum over k >= 1 of (-1)^(k-1) C(k-1) x^k, C the Catalan
+    // numbers.
+    {
+        const Poly g = fps::compositional_inverse(Poly{0, 1, 1}, n);
+        CHECK(g.size() == n && g[0] == 0);
+        for (const std::size_t k : {std::size_t(1), std::size_t(2), std::size_t(3), std::size_t(1000), n / 2 + 1, n - 1}) {
+            const std::size_t j = k - 1;  // C(j) = (2j)! / (j! (j + 1)!)
+            const u32 c = mul(fact[2 * j], mul(fact.inverse(j), fact.inverse(j + 1)));
+            CHECK(g[k] == (j % 2 ? (c ? P - c : 0) : c), k);
+        }
+    }
+    // The Taylor shift at exactly 2^25 words: f = x^(2^24), n = 2^24, so f(x + 1) = (x + 1)^(2^24),
+    // coefficient k C(2^24, k).
+    {
+        const std::size_t m = (std::size_t(1) << 24) + 1, t = std::size_t(1) << 24;
+        const fps::Factorials<P> big(m);
+        Poly f(m);
+        f[m - 1] = 1;
+        const Poly h = fps::compose(f, Poly{1, 1}, t);
+        CHECK(h.size() == t);
+        for (const std::size_t k : {std::size_t(0), std::size_t(1), std::size_t(12345), t / 2, t - 1})
+            CHECK(h[k] == mul(big[m - 1], mul(big.inverse(k), big.inverse(m - 1 - k))), k);
+    }
 }
 
 }  // namespace
@@ -304,6 +385,7 @@ int main() {
     test_inverse();
     test_threads();
     test_errors();
+    test_limits();
     if (failures) {
         std::printf("composition: %d failures\n", failures);
         return 1;

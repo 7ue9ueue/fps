@@ -3,8 +3,8 @@
 #pragma once
 
 #include "fps/algebra.hpp"
-#include "fps/division.hpp"
 #include "fps/composition.hpp"
+#include "fps/division.hpp"
 #include "fps/factorials.hpp"
 #include "fps/fraction.hpp"
 #include "fps/modular.hpp"
