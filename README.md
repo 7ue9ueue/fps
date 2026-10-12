@@ -81,9 +81,9 @@ every attempt that lost, are in each module's `notes.md` and `notes/`.
   [`tools/kernel.py`](tools/kernel.py) tests a unit on a target (at `-O2`, and under ASan and UBSan) and times it
   against another checkout in the same run. [`tools/tune.py`](tools/tune.py) measures the tuned choices on each
   target's timing machine.
-- **The gate.** [`tools/gate.py`](tools/gate.py) tests every affected unit on every target and times it against
-  `main`. It merges a pull request only if every target passes and none gets slower beyond noise (geomean of
-  new/base at most 1.005).
+- **The gate.** [`tools/gate.py`](tools/gate.py) tests every affected unit on every target and merges a pull
+  request if every test passes. It does not time: each pull request carries its own `Speed` section (base hash,
+  geomean of new/base per target, at most 1.005, and the time against lc-opt), which the reviewer or coordinator checks.
 
 **The agent side.** Work is GitHub issues. Backend kernels and tasks go through `/work`
 ([`.claude/commands/work.md`](.claude/commands/work.md)): one subagent per issue, briefed with

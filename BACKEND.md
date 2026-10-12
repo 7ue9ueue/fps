@@ -93,10 +93,11 @@ Kernels to start with: `simd` (per-ISA vector wrappers), `modarith`, `ntt`, `mul
   Copy VM folders to the Mac before the round ends.
 - On a VM, wrap every timing and profiling run in `flock /tmp/bench.lock`. Build and test on the
   test machine, not the timing machine.
-- A change merges only if every target's tests pass and no target gets slower beyond noise
-  (geomean of new/base at most 1.005; `TOLERANCE` in `tools/gate.py`). The agent opens the pull
-  request and returns; the coordinator runs the gate and sends failures back (AGENTS.md, How work
-  flows).
+- A change merges only if every target's tests pass (`tools/gate.py`, which does not time) and the
+  pull request's `Speed` section shows no target slower beyond noise (geomean of new/base at most
+  1.005, measured by the author with `kernel.py bench --base`, next to lc-opt's time; `tools/prompt.md`). The agent opens
+  the pull request and returns; the coordinator checks the section, runs the gate and sends
+  failures back (AGENTS.md, How work flows).
 - A round ends with a comment on its issue: what was tried, the numbers, and a last line that is
   exactly `Result: gain` or `Result: no gain`. Speed work stops after 3 rounds, or 2 in a row
   without gain; a feature (a new API, a move, a fix) gets 1 round.
