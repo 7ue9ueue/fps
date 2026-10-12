@@ -1,9 +1,11 @@
 # backend/series
 
-Power series modulo P = 998244353: inverse, log and exp into caller memory. API: `series.hpp`
-(`inverse`, `log`, `exp`, each `(f, out)` in this thread's memory or `(f, out, scratch)` with
-`*_scratch(n)` words). Tests: `test.cpp`; bench: `bench.cpp`. Attempts: `notes/` (one file per issue round). From lc-opt's
-`lib/poly/{inverse,log,exp,calculus}.hpp` (its `lib/poly/notes.md`: Inverse, Log, Exp), rewritten
+Power series modulo P = 998244353: inverse, log, exp, pow and sqrt into caller memory. API:
+`series.hpp` (`inverse`, `log`, `exp` as `(f, out)`, `pow(f, e, c, out)`, `sqrt(f, c, out)`, in
+this thread's memory or with a last `scratch` argument of `*_scratch(n)` words). Tests: `test.cpp`,
+`test_pow_sqrt.cpp`; bench: `bench.cpp`, `bench_pow_sqrt.cpp`. Attempts: `notes/` (one file per
+issue round). From lc-opt's `lib/poly/{inverse,log,exp,pow,sqrt,calculus}.hpp` (its
+`lib/poly/notes.md`: Inverse, Log, Exp, Power, Sqrt), rewritten
 on `ntt::Transform`'s leaf form and `backend/simd`, so every target runs it (lc-opt's transform
 layer is AVX2 asm on Zen 3). One variant per op: no `select.hpp` yet.
 
@@ -78,6 +80,43 @@ B = m/2: block 2 as before (t = h0 r mod x^B, g_2 = g0 s), and for n > 3m/2 bloc
 4B) for G = g mod x^(3B) is r[B, 2B) - x G'[B, 2B) plus the upper half of T(Q) T(g_2) + T(q_2)
 T(g mod x^m) (one inverse_product), times h0, then g_3 = g0 s_3. 14 transforms and 7 leaf
 products of m against 16 and 7 for a full step (exp of 2^21 words: 1.08 -> 1.01 of lc-opt).
+`exp_steps(q, c, g, ...)` runs the steps from any q (q[0] = 0) and g[0] = c (they do not depend
+on the scale of g); `QTransforms` hands the last step T_m(q mod x^m) and T_m(q[m, 3m/2)) when the
+caller has them (pow), which saves its forwards of them.
+
+### pow
+
+g = c (f / f[0])^e for residues e, c and f[0] != 0 (f^M = pow(f, M mod P, f[0]^M) for n <= P;
+the frontend handles leading zeros). lc-opt's power: g solves x g' = q g with q = e x f' / f,
+from log's blocked division (`divide()`, which log and pow share), then exp's steps from q
+(`exp_steps`); no integral of f'/f, no derivative in exp, no passes for f / f[0], e and c.
+Different from lc-opt: the division runs on N = e x f' (`index_block` with the factor e) over n
+coefficients, not on f' over n - 1, so its blocks q_j are q's own, written in place in q (lc-opt
+scales each block of f'/f by e and shifts it by one into q, a pass), and its kept transforms give
+the last exp step's directly: the division's k is m/2 for m = bit_ceil(n) / 2 at every n >
+kExpBase, T_m(q mod x^m) = T(q_0) + s T(q_1) with s = x^k = 1 on the lower half of the leaves
+and -1 on the upper (one add/sub pass, `add_lower_sub_upper`), and T_m(q[m, 3m/2)) = T(q_2),
+which exists (4 blocks) exactly when exp's block 3 runs. lc-opt gets them from T(f'/f) by a
+product with x per leaf (`times_x`: a lane rotation and w_p a_7), and only when n - 1 is not a
+power of two. Arrays: q (n words) and the Q_j first, then the division's other arrays, which
+exp's reuse. Below kExpBase + 1 coefficients: i g_i = sum_j ((e + 1) j - i) a_j g_(i-j), a = f /
+f[0] (`pow_direct`).
+
+### sqrt
+
+lc-opt's: Newton m -> 2m with h = -1 / g mod x^(m/2) and H = T_m(h) (the sign makes both updates
+plain products): G = T_m(g); e = (g h)[m/2, m) (inverse_product, upper half) and h[m/2, m) = e h
+mod x^(m/2) (cyclic product, in place); s = g^2 mod (x^m - 1) = f mod x^m + (g^2)[m, 2m) by an
+inverse_product of G G, r = (s - f[0, m) - f[m, 2m)) / 2 (`half_residual`); H = T_2m(h) (also the
+next step's); g[m, 2m) = h r mod x^m (cyclic product of length 2m). 11 transforms and 5 leaf
+products of m a step. The last step, to n <= 2m, at length m: d = h r mod x^(n-m) for n - m <=
+m/2 (4 transforms, 2 leaf products), else Karp and Markstein's split: d0 = h r0 mod x^(m/2), d1 =
+h (r + g d0)[m/2, n - m) with (g d0)[m/2, m) the upper half of a cyclic product with G (8
+transforms, 4 leaf products). Below kSqrtBase + 1 coefficients: 2 c g_i = f_i - sum g_j g_(i-j).
+Arrays: G, H, R, h, then W (the fused ops' work array) last: an output 320 bytes past W (mod 4
+KiB) made the last step's inverse_product of G G at 2^18 cost 590-685 us against 465-500 behind
+it (Zen 3, notes/107-r1.md); `half_residual` halves by a shift and a product of the low bit by
+(P + 1) / 2, with a fast path when f covers the block.
 
 ## Measurements
 

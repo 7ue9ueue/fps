@@ -1,19 +1,25 @@
-// Power series modulo P = 998244353: inverse, log and exp into caller memory (backend kernel).
-// From lc-opt's lib/poly/{inverse,log,exp}.hpp, rewritten on ntt::Transform's leaf form, so every
-// target runs it. Design and measurements: notes.md.
+// Power series modulo P = 998244353: inverse, log, exp, pow and sqrt into caller memory (backend
+// kernel). From lc-opt's lib/poly/{inverse,log,exp,pow,sqrt}.hpp, rewritten on ntt::Transform's
+// leaf form, so every target runs it. Design and measurements: notes.md.
 //
 //   fps::series::inverse(f, out);    // out = 1 / f mod x^n, n = out.size(); f[0] != 0; out apart from f
 //   fps::series::log(f, out);        // out = log f mod x^n; f[0] = 1, n <= P; out may overlap f
 //   fps::series::exp(f, out);        // out = exp f mod x^n; f[0] = 0, n <= P; out may overlap f
+//   fps::series::pow(f, e, c, out);  // out = c (f / f[0])^e mod x^n; f[0] != 0, e, c < P, n <= P;
+//                                    // out may overlap f. f^M for an integer M >= 0 (n <= P):
+//                                    // pow(f, M mod P, f[0]^M, out)
+//   fps::series::sqrt(f, c, out);    // out = g with g^2 = f mod x^n, g[0] = c; c^2 = f[0] != 0;
+//                                    // out may overlap f
 //
-//   // The same in the caller's scratch, of inverse_scratch(n) (log_scratch, exp_scratch) words,
-//   // any alignment, instead of this thread's memory (a shorter one: std::invalid_argument):
+//   // The same in the caller's scratch, of inverse_scratch(n) (log_scratch, exp_scratch,
+//   // pow_scratch, sqrt_scratch) words, any alignment, instead of this thread's memory (a shorter
+//   // one: std::invalid_argument):
 //   fps::series::inverse(f, out, scratch);
 //
 // f: words < P, of which f mod x^n is read (a shorter f has zeros past its end). The preconditions
-// on f[0] and n are not checked (the frontend checks them); n past kMaxSize throws
-// std::length_error before out is written. If out overlaps f, log copies f first, and exp reads
-// all of f before it writes out.
+// on f[0], c and n are not checked (the frontend checks them); n past kMaxSize throws
+// std::length_error before out is written. If out overlaps f, log and sqrt copy f first, and exp
+// and pow read all of f before they write out.
 //
 // Newton iteration on ntt::Transform's fused ops (ntt.hpp: sources and outputs in caller memory, a
 // cyclic product or an inverse of leaf products in one depth-first pass, half outputs), in units
@@ -23,20 +29,29 @@
 //   place, negated): 5 transforms and 2 leaf products of 2k a step, 10 T(n) + 4 LP(n). A last step
 //   to n <= 3k/2 runs at length k: 6 T(k) + 3 LP(k). Below kInverseBase coefficients, the recurrence.
 // - log f = integral of f' / f mod x^(n-1) in B <= 4 blocks of k coefficients (lc-opt's blocked
-//   division): h = 1 / f mod x^k, then q_j = h (f' - f Q)[jk, (j+1)k) mod x^k, Q = q mod x^(jk),
-//   (f Q)[jk, (j+1)k) = sum over i < j of (W_(j-i) q_i)[k, 2k), W_t = f[(t-1)k, (t+1)k), as one
-//   inverse of a sum of leaf products of kept transforms of length 2k. About 11.5 T(n) + 6 LP(n).
+//   division, divide()): h = 1 / f mod x^k, then q_j = h (f' - f Q)[jk, (j+1)k) mod x^k, Q = q mod
+//   x^(jk), (f Q)[jk, (j+1)k) = sum over i < j of (W_(j-i) q_i)[k, 2k), W_t = f[(t-1)k, (t+1)k),
+//   as one inverse of a sum of leaf products of kept transforms of length 2k. About 11.5 T(n) + 6
+//   LP(n).
 // - exp: m -> 2m keeping h = 1 / g mod x^(m/2) and H = T_m(h), q = x f' (lc-opt's step, notes.md);
 //   8 transforms and 3.5 leaf products of 2m a step. The last step, to n <= 2m, runs at length m
 //   in two blocks of m/2 (lc-opt's exp_last_step): 14 transforms and 7 leaf products of m.
+// - pow: g = c (f / f[0])^e solves x g' = q g, q = e x f' / f (lc-opt's power): q by the division
+//   of N = e x f' by f (over n coefficients, so its blocks are q's and its kept transforms give T(q
+//   mod x^m) and T(q[m, 3m/2)) of exp's last step), then exp's steps from q with g[0] = c. No
+//   integral, derivative or passes for f / f[0], e and c: about log + exp - 1 T(n).
+// - sqrt: m -> 2m keeping h = -1 / g mod x^(m/2) and H = T_m(h) (lc-opt's step): 11 transforms and
+//   5 leaf products of m a step; the last step, to n <= 2m, at length m (Karp and Markstein's
+//   split): 8 transforms and 4 leaf products of m. About 9.5 T(n) + 4.5 LP(n).
 // - Divisions by indices (log's integral, exp's s): Montgomery's batch inversion (lc-opt's
 //   divide_by_index), divisors below 2^13 from a table.
-// Against lc-opt in the same run (Zen 3, n = 2^14 .. 2^21), and against main: notes/112-r1.md.
+// Against lc-opt in the same run (Zen 3, n = 2^14 .. 2^21): notes/112-r1.md (inverse, log, exp),
+// notes/107-r1.md (pow, sqrt).
 //
 // Memory: this thread's region of the NTT (ntt::detail::take_region, kept across calls), or the
 // caller's scratch: with N = bit_ceil(n), 2 N words for inverse, about n + 2 B (n / 2 + 80) for
-// log (B <= 4 blocks) and n + 5.5 N for exp. The transforms' tables: one ntt::Transform per
-// length, kept per thread, 2^lg bytes each.
+// log (B <= 4 blocks), n + 5.5 N for exp, n + 7 N for pow and n + 2.25 N for sqrt. The
+// transforms' tables: one ntt::Transform per length, kept per thread, 2^lg bytes each.
 #pragma once
 
 #include <algorithm>
@@ -47,6 +62,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 #include "backend/modarith/modarith.hpp"
@@ -221,18 +237,20 @@ inline void index_block(Span f, std::size_t from, u32 a, std::size_t count, cons
     const std::size_t avail = f.size() > from ? std::min(count, f.size() - from) : 0;
     const u32* src = avail ? f.data() + from : f.data();
     std::size_t c = 0;
+    const u32 ar = a == 1 ? kR : mul(a, kR);  // a 2^32: Montgomery products by (i a 2^32) give i a x
     if (count >= kLanes) {
         alignas(64) u32 start[kLanes];
-        for (std::size_t l = 0; l < kLanes; ++l) start[l] = mul(mul(u32((from + l) % kP), a), kR);
+        for (std::size_t l = 0; l < kLanes; ++l) start[l] = mul(u32((from + l) % kP), ar);
         V index = S::load(start);
-        const V step = S::broadcast(mul(mul(u32(kLanes), a), kR));
+        const V step = S::broadcast(mul(u32(kLanes), ar));
         for (; c + kLanes <= count; c += kLanes, index = M::add(index, step)) {
             const V d = M::template reduce<kP>(M::montgomery(load_part(src, c, avail), index));
             S::store(out + c, s ? M::sub(d, S::load(s + c)) : d);
         }
     }
     for (; c < count; ++c) {
-        const u32 d = c < avail ? mul(mul(u32((from + c) % kP), a), src[c]) : 0;
+        u32 d = c < avail ? mul(u32((from + c) % kP), src[c]) : 0;
+        if (a != 1) d = mul(d, a);
         out[c] = s ? (d >= s[c] ? d - s[c] : d + kP - s[c]) : d;
     }
 }
@@ -317,8 +335,8 @@ inline void log_direct(Span f, Out g) {
 }
 
 // g = exp f mod x^n, n = g.size() <= kExpBase, from q = x f': i g_i = sum_(0<k<=i) q_k g_(i-k).
-inline void exp_direct(const u32* q, Out g) {
-    g[0] = 1;
+inline void exp_direct(const u32* q, Out g, u32 g0 = 1) {
+    g[0] = g0;
     for (std::size_t i = 1; i < g.size(); ++i) g[i] = mul(dot(q, g.data(), i, 1, i + 1), kSmallInverses[i]);
 }
 
@@ -515,10 +533,12 @@ struct ExpState {
 };
 
 // Transforms of length m of the last step (n <= 2m) that a caller already has (pow: from the
-// division), or null: low = T_m(q mod x^m), block2 = T_m(q[m, 3m/2)).
+// division): low = T_m(q mod x^m), block2 = T_m(q[m, 3m/2)) or null. exp has none
+// (NoQTransforms): its steps compile as they did before pow.
 struct QTransforms {
-    const u32 *low = nullptr, *block2 = nullptr;
+    const u32 *low, *block2;
 };
+struct NoQTransforms {};
 
 // e.s[i] = (q[m + i] + t[i] - q[i]) / (m + i), i < c: (f - log g)[m, m + c). t apart from e.s.
 inline void exp_residual(const ExpState& e, std::size_t m, const u32* t, std::size_t c) {
@@ -568,12 +588,14 @@ inline void exp_full_step(ExpState& e, std::size_t m, std::size_t c) {
 // 2 and 1 transforms fewer with given's (pow). Arrays: G_lo = T_m(g mod x^m) at X, T(Q) at X + m
 // + 64 (X has 2m + kGap words; 64 words apart against 4K aliasing), T(g_2) at Gt + m + 64, T(q_2)
 // at H + m + 64; t and t_3 in h (no longer read).
-inline void exp_last_step(ExpState& e, std::size_t m, std::size_t c, bool first, QTransforms given) {
+template <class Given>
+void exp_last_step(ExpState& e, std::size_t m, std::size_t c, bool first, const Given& given) {
     const ntt::Transform& tm = transform(std::countr_zero(m));
     const std::size_t half = m / 2, c2 = std::min(c, half);
     u32 *const Gt = e.Gt, *const H = e.H, *const X = e.X, *const W = e.W, *const R = e.R, *const t = e.h;
     u32 *const G2 = Gt + m + 64;
-    const u32* TQ = given.low;
+    const u32 *TQ = nullptr, *Q2 = nullptr;
+    if constexpr (std::is_same_v<Given, QTransforms>) TQ = given.low, Q2 = given.block2;
     if (first) tm.forward(Span(e.g.data(), half), Gt);  // no full step before: Gt = T_m(g0)
     tm.forward(Span(e.g.data(), m), X);
     if (c > half || TQ) {  // r at R[0, m) (R[0, B) if c <= B), T(Q) kept
@@ -594,7 +616,6 @@ inline void exp_last_step(ExpState& e, std::size_t m, std::size_t c, bool first,
     // Block 3: S = (q mod x^(3B) g mod x^(3B))[3B, 4B) at t[0, B)
     const std::size_t c3 = c - half;
     tm.forward(Span(e.g.data() + m, half), G2);
-    const u32* Q2 = given.block2;
     if (!Q2) {
         tm.forward(Span(e.q + m, half), H + m + 64);
         Q2 = H + m + 64;
@@ -628,15 +649,14 @@ inline std::size_t exp_step_words(std::size_t n) {
     return 3 * footprint(len / 2) + 4 * footprint(len);
 }
 
-// g mod x^n, n = g.size() > kExpBase, for x g' = q g with g[0] = c != 0 (q: n words, q[0] = 0):
+// g mod x^n, n = g.size() > kExpBase, for x g' = q g with g[0] = g0 != 0 (q: n words, q[0] = 0):
 // exp's Newton steps, which do not depend on the scale of g. given: for the last step.
-inline void exp_steps(const u32* q, u32 c, Out g, Arena arena, QTransforms given) {
+template <class Given>
+void exp_steps(const u32* q, u32 g0, Out g, Arena arena, const Given& given) {
     const std::size_t n = g.size(), len = std::bit_ceil(n);
     ExpState e{g, q, arena.take(len / 2), arena.take(len), arena.take(len), arena.take(len), arena.take(len),
                arena.take(len / 2), arena.take(len / 2)};
-    exp_direct(q, g.first(kExpBase));
-    if (c != 1)
-        for (u32& x : g.first(kExpBase)) x = mul(x, c);
+    exp_direct(q, g.first(kExpBase), g0);
     inverse_direct(Span(g.data(), kExpBase / 2), Out(e.h, kExpBase / 2));
     transform(std::countr_zero(kExpBase)).forward(Span(e.h, kExpBase / 2), e.H);
     for (std::size_t m = kExpBase; m < n; m *= 2) {
@@ -654,7 +674,7 @@ inline void exp_newton(Span f, Out g, Arena arena) {
     multiply_by_index(f.data(), 0, q, fl);  // q = x f'
     zero(q + fl, n - fl);
     // f is not read from here on.
-    exp_steps(q, 1, g, arena, {});
+    exp_steps(q, 1, g, arena, NoQTransforms{});
 }
 
 // ---- pow --------------------------------------------------------------------------------------
@@ -700,7 +720,7 @@ inline void pow_newton(Span f, u32 e, u32 c, Out g, Arena arena) {
         [q, k](std::size_t j) { return q + j * k; }, [](std::size_t, std::size_t, std::size_t) {});
     // f is not read from here on.
     add_lower_sub_upper(a.Q[0], a.Q[1], len);  // T(q mod x^2k)
-    exp_steps(q, c, g, arena, {a.Q[0], blocks == 4 ? a.Q[2] : nullptr});
+    exp_steps(q, c, g, arena, QTransforms{a.Q[0], blocks == 4 ? a.Q[2] : nullptr});
 }
 
 // ---- sqrt -------------------------------------------------------------------------------------
