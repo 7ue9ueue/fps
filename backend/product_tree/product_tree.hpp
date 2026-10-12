@@ -92,16 +92,20 @@ struct Slots {
             }
             full &= node.degree[l] == d;
         }
-        if (full) {
-            for (u32 j = 0; j <= d; ++j)
-                for (std::size_t l = 0; l < 8; ++l) c[8 * j + l] = p[l][j];
+        if (kLinearSlots && full && d == 1) {
+            load_linear<Lanes>(p, c);
         } else {
-            for (std::size_t l = 0; l < 8; ++l) {
-                for (u32 j = 0; j <= node.degree[l]; ++j) c[8 * j + l] = p[l][j];
-                for (u32 j = node.degree[l] + 1; j <= d; ++j) c[8 * j + l] = 0;
+            if (full) {
+                for (u32 j = 0; j <= d; ++j)
+                    for (std::size_t l = 0; l < 8; ++l) c[8 * j + l] = p[l][j];
+            } else {
+                for (std::size_t l = 0; l < 8; ++l) {
+                    for (u32 j = 0; j <= node.degree[l]; ++j) c[8 * j + l] = p[l][j];
+                    for (u32 j = node.degree[l] + 1; j <= d; ++j) c[8 * j + l] = 0;
+                }
             }
+            scale<Wide>(c, kR2, c, 8 * (d + 1));
         }
-        scale<Wide>(c, kR2, c, 8 * (d + 1));
         for (std::size_t l = 0; l < 8; ++l) node.lead[l] = c[8 * node.degree[l] + l];
         return node;
     }
@@ -113,10 +117,16 @@ struct RegionGuard {
     ~RegionGuard() { ntt::detail::give_region(region); }
 };
 
+// Degrees below this are counted in the driver's first pass (a histogram on the stack), so the
+// counting sort needs no pass of its own when its cut is below it.
+inline constexpr u32 kCounted = 1024;
+
 template <class F>
 void product(const F& fs, std::span<u32> out, Mode mode) {
-    // The constants' product; the other factors' count, degree sum and largest degree.
-    u32 constant = 1, top = 0;
+    // The constants' product; the other factors' count, degree sum and largest degree; counts of
+    // the degrees d < kCounted in counted[d], for d <= seen (the rest of counted is not written).
+    u32 constant = 1, top = 0, seen = 0;
+    u32 counted[kCounted];
     std::size_t count = 0, last = 0;
     u64 total = 0;
     bool empty = false;
@@ -127,8 +137,13 @@ void product(const F& fs, std::span<u32> out, Mode mode) {
             else constant = multiply_mod(constant, fs[i][0]);
             continue;
         }
-        total += s - 1, ++count, last = i;
-        top = u32(std::min<u64>(std::max<u64>(top, s - 1), u64(1) << 31));
+        const std::size_t d = s - 1;
+        total += d, ++count, last = i;
+        top = u32(std::min<u64>(std::max<u64>(top, d), u64(1) << 31));
+        if (d < kCounted) {
+            if (d > seen) std::fill(counted + seen + 1, counted + d + 1, 0u), seen = u32(d);
+            ++counted[d];
+        }
     }
     const std::size_t n = empty ? 0 : total + 1;
     if (out.size() != n) throw std::invalid_argument("fps::product_tree::product: out.size() != size(fs)");
@@ -163,9 +178,13 @@ void product(const F& fs, std::span<u32> out, Mode mode) {
     u32* const start = stack.take(cut + 2);
     std::fill(start, start + cut + 2, 0u);
     std::size_t small = 0;
-    for (std::size_t i = 0; i < fs.size(); ++i) {
-        const std::size_t s = fs[i].size();
-        if (s >= 2 && s - 1 <= cut) ++start[cut - (s - 1) + 1], ++small;
+    if (cut < kCounted) {
+        for (u32 d = 1; d <= std::min(cut, seen); ++d) start[cut - d + 1] = counted[d], small += counted[d];
+    } else {
+        for (std::size_t i = 0; i < fs.size(); ++i) {
+            const std::size_t s = fs[i].size();
+            if (s >= 2 && s - 1 <= cut) ++start[cut - (s - 1) + 1], ++small;
+        }
     }
     if (mode == Mode::automatic && small < kMinLaneFactors) small = 0;
     static_assert(sizeof(Leaf) % sizeof(u32) == 0 && alignof(Leaf) <= 64);

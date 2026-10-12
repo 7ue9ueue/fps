@@ -1,11 +1,12 @@
 // The product tree's kernels, as templates on backend/simd structs: 64-bit sums of products with
 // one Montgomery step, the lanes' schoolbook, the standard layout's leaf products, pointwise
-// products, twists and conversions. Words below P; "Montgomery form" is x 2^32 mod P.
+// products and conversions. Words below P; "Montgomery form" is x 2^32 mod P.
 #pragma once
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <type_traits>
 
 #include "backend/modarith/modarith.hpp"
@@ -188,7 +189,7 @@ template <class L>
 void leaf_products(const u32* a, const u32* b, u32* out, std::size_t count, const u32* weights, u32* copy = nullptr) {
     using S = Sums<L>;
     using V = typename L::V;
-    constexpr int kVectors = 8 / L::lanes, kBatch = 8;
+    constexpr int kVectors = 8 / L::lanes, kBatch = 16;
     // Row t: [w A, A, 0 ...] for leaf A: x^i A mod (x^8 - w) is the 8 words from 8 - i. Loads read
     // one word past the 16 (EvenOdd::load).
     alignas(64) u32 window[kBatch][24] = {};
@@ -223,25 +224,108 @@ void leaf_products(const u32* a, const u32* b, u32* out, std::size_t count, cons
     }
 }
 
-// Standard layout: out[i] = c[i] t[i] 2^-32 for i < count, zero for count <= i < m (t: twiddles
-// in Montgomery form).
-template <class S>
-void twist_words(const u32* c, std::size_t count, const u32* t, u32* out, std::size_t m) {
-    each<S>(count, [&](std::size_t i) { S::store(out + i, montgomery_canonical<S>(S::load(c + i), S::load(t + i))); },
-            [&](std::size_t i) { out[i] = montgomery(c[i], t[i]); });
-    std::fill(out + count, out + m, 0u);
+// Rows r[0 .. L::lanes): word t of r[i] <-> word i of r[t].
+template <class L>
+[[gnu::always_inline]] inline void transpose(typename L::V* r) {
+    using V = typename L::V;
+    if constexpr (L::lanes == 1) {
+        return;
+#if defined(__AVX2__)
+    } else if constexpr (L::lanes == 8 && sizeof(V) == 32) {
+        V t[8], u[8];
+#pragma GCC unroll 8
+        for (int i = 0; i < 8; i += 2) t[i] = _mm256_unpacklo_epi32(r[i], r[i + 1]), t[i + 1] = _mm256_unpackhi_epi32(r[i], r[i + 1]);
+#pragma GCC unroll 8
+        for (int i = 0; i < 8; i += 4) {
+            u[i] = _mm256_unpacklo_epi64(t[i], t[i + 2]), u[i + 1] = _mm256_unpackhi_epi64(t[i], t[i + 2]);
+            u[i + 2] = _mm256_unpacklo_epi64(t[i + 1], t[i + 3]), u[i + 3] = _mm256_unpackhi_epi64(t[i + 1], t[i + 3]);
+        }
+#pragma GCC unroll 8
+        for (int i = 0; i < 4; ++i) {
+            r[i] = _mm256_permute2x128_si256(u[i], u[i + 4], 0x20);
+            r[i + 4] = _mm256_permute2x128_si256(u[i], u[i + 4], 0x31);
+        }
+#endif
+#if defined(__SSE4_1__)
+    } else if constexpr (L::lanes == 4 && sizeof(V) == 16) {
+        const V t0 = _mm_unpacklo_epi32(r[0], r[1]), t1 = _mm_unpackhi_epi32(r[0], r[1]);
+        const V t2 = _mm_unpacklo_epi32(r[2], r[3]), t3 = _mm_unpackhi_epi32(r[2], r[3]);
+        r[0] = _mm_unpacklo_epi64(t0, t2), r[1] = _mm_unpackhi_epi64(t0, t2);
+        r[2] = _mm_unpacklo_epi64(t1, t3), r[3] = _mm_unpackhi_epi64(t1, t3);
+#endif
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    } else if constexpr (L::lanes == 4) {
+        const V t0 = vtrn1q_u32(r[0], r[1]), t1 = vtrn2q_u32(r[0], r[1]);
+        const V t2 = vtrn1q_u32(r[2], r[3]), t3 = vtrn2q_u32(r[2], r[3]);
+        const auto wide = [](V v) { return vreinterpretq_u64_u32(v); };
+        r[0] = vreinterpretq_u32_u64(vtrn1q_u64(wide(t0), wide(t2)));
+        r[1] = vreinterpretq_u32_u64(vtrn1q_u64(wide(t1), wide(t3)));
+        r[2] = vreinterpretq_u32_u64(vtrn2q_u64(wide(t0), wide(t2)));
+        r[3] = vreinterpretq_u32_u64(vtrn2q_u64(wide(t1), wide(t3)));
+#endif
+    } else {
+        static_assert(L::lanes == 1, "product_tree: no transpose for this struct");
+    }
 }
 
-// Standard layout: word j of each leaf of f (n words) times z[j] 2^-32 (z: 8 words, Montgomery form).
+// The 8 coefficients of the L::lanes leaves at p (8 words each), as vectors: x[j] word t is
+// coefficient j of leaf t. store_columns undoes it.
 template <class L>
-void scale_leaves(u32* f, std::size_t n, const u32* z) {
-    constexpr int kVectors = 8 / L::lanes;
-    typename L::V w[kVectors];
-    for (int u = 0; u < kVectors; ++u) w[u] = L::load(z + u * L::lanes);
-    for (std::size_t i = 0; i < n; i += 8) {
+[[gnu::always_inline]] inline void load_columns(const u32* p, typename L::V (&x)[8]) {
+    constexpr int W = L::lanes;
 #pragma GCC unroll 8
-        for (int u = 0; u < kVectors; ++u)
-            L::store(f + i + u * L::lanes, montgomery_canonical<L>(L::load(f + i + u * L::lanes), w[u]));
+    for (int u = 0; u < 8 / W; ++u) {
+        typename L::V r[W];
+#pragma GCC unroll 8
+        for (int t = 0; t < W; ++t) r[t] = L::load(p + 8 * t + u * W);
+        transpose<L>(r);
+#pragma GCC unroll 8
+        for (int i = 0; i < W; ++i) x[u * W + i] = r[i];
+    }
+}
+
+template <class L>
+[[gnu::always_inline]] inline void store_columns(u32* p, const typename L::V (&x)[8]) {
+    constexpr int W = L::lanes;
+#pragma GCC unroll 8
+    for (int u = 0; u < 8 / W; ++u) {
+        typename L::V r[W];
+#pragma GCC unroll 8
+        for (int i = 0; i < W; ++i) r[i] = x[u * W + i];
+        transpose<L>(r);
+#pragma GCC unroll 8
+        for (int t = 0; t < W; ++t) L::store(p + 8 * t + u * W, r[t]);
+    }
+}
+
+// leaf_products, L::lanes leaves at a time in columns (word t of a vector: leaf t): coefficient
+// j of the product is sum_{i <= j} a_i b_(j-i) + sum_{i > j} (w a_i) b_(j-i+8), lane by lane, so
+// no window, broadcasts or shifted loads; count a multiple of L::lanes.
+template <class L>
+void leaf_products_columns(const u32* a, const u32* b, u32* out, std::size_t count, const u32* weights, u32* copy = nullptr) {
+    using S = Sums<L>;
+    using V = typename L::V;
+    constexpr int W = L::lanes;
+    for (std::size_t v = 0; v < count; v += W) {
+        V x[8], y[8], wx[8];
+        load_columns<L>(a + 8 * v, x);
+        load_columns<L>(b + 8 * v, y);
+        const V w = L::load(weights + v);
+#pragma GCC unroll 8
+        for (int i = 1; i < 8; ++i) wx[i] = montgomery_canonical<L>(x[i], w);
+        typename S::Op xo[8], wo[8], yo[8];
+#pragma GCC unroll 8
+        for (int i = 0; i < 8; ++i) xo[i] = S::of(x[i]), yo[i] = S::of(y[i]), wo[i] = S::of(i ? wx[i] : x[0]);
+        V z[8];
+#pragma GCC unroll 8
+        for (int j = 0; j < 8; ++j) {
+            typename S::Acc s = S::mul(xo[0], yo[j]);
+#pragma GCC unroll 8
+            for (int i = 1; i < 8; ++i) S::mac(s, i <= j ? xo[i] : wo[i], yo[(j - i) & 7]);
+            z[j] = S::reduce(s);
+        }
+        store_columns<L>(out + 8 * v, z);
+        if (copy) store_columns<L>(copy + 8 * v, z);
     }
 }
 
@@ -260,18 +344,37 @@ void pointwise2(const u32* a, const u32* b, u32* out, u32* copy, std::size_t n) 
     }
 }
 
-// Lanes: coefficient j of out (8 words) = coefficient j of c times t[j] 2^-32 for j < count, zero
-// for count <= j < m. t: twiddles in Montgomery form.
+// Lanes: 8 linear factors, two words at each p[l], into rows c[0, 8) and c[8, 16) in Montgomery
+// form. AVX2 and Neon: the factors' words loaded in pairs and transposed in registers; a vector
+// load of words just stored one by one (the generic path) waits for the stores (notes.md).
 template <class L>
-void twist(const u32* c, std::size_t count, const u32* t, u32* out, std::size_t m) {
-    constexpr int kVectors = 8 / L::lanes;
-    for (std::size_t j = 0; j < count; ++j) {
-        const typename L::V w = L::broadcast(t[j]);
-#pragma GCC unroll 8
-        for (int u = 0; u < kVectors; ++u)
-            L::store(out + 8 * j + u * L::lanes, montgomery_canonical<L>(L::load(c + 8 * j + u * L::lanes), w));
+void load_linear(const u32* const* p, u32* c) {
+    using V = typename L::V;
+    const V r2 = L::broadcast(kR2);
+#if defined(__AVX2__)
+    if constexpr (L::lanes == 8 && sizeof(V) == 32) {
+        u64 w[8];
+        for (int l = 0; l < 8; ++l) std::memcpy(&w[l], p[l], 8);
+        const V idx = _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);  // pairs -> [c0 of 4 | c1 of 4]
+        const V x = _mm256_permutevar8x32_epi32(_mm256_setr_epi64x(w[0], w[1], w[2], w[3]), idx);
+        const V y = _mm256_permutevar8x32_epi32(_mm256_setr_epi64x(w[4], w[5], w[6], w[7]), idx);
+        L::store(c, montgomery_canonical<L>(_mm256_permute2x128_si256(x, y, 0x20), r2));
+        L::store(c + 8, montgomery_canonical<L>(_mm256_permute2x128_si256(x, y, 0x31), r2));
+        return;
     }
-    std::fill(out + 8 * count, out + 8 * m, 0u);
+#endif
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    if constexpr (L::lanes == 4 && std::is_same_v<V, uint32x4_t>) {
+        for (int h = 0; h < 8; h += 4) {
+            const V x = vcombine_u32(vld1_u32(p[h]), vld1_u32(p[h + 1])), y = vcombine_u32(vld1_u32(p[h + 2]), vld1_u32(p[h + 3]));
+            L::store(c + h, montgomery_canonical<L>(vuzp1q_u32(x, y), r2));
+            L::store(c + 8 + h, montgomery_canonical<L>(vuzp2q_u32(x, y), r2));
+        }
+        return;
+    }
+#endif
+    for (int l = 0; l < 8; ++l) c[l] = p[l][0], c[8 + l] = p[l][1];
+    for (int i = 0; i < 16; i += L::lanes) L::store(c + i, montgomery_canonical<L>(L::load(c + i), r2));
 }
 
 // out[i] = in[i] y 2^-32 (canonical) for i < n; in[i] < P, y < P. out may be in.

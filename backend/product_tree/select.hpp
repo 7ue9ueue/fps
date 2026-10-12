@@ -23,8 +23,17 @@ using Lanes = simd::Neon;
 using Lanes = simd::Scalar;
 #endif
 
-// Pointwise products, twists and conversions: the target's widest struct.
+// Pointwise products and conversions: the target's widest struct.
 using Wide = simd::Native;
+
+// Slots of 8 linear factors loaded in pairs and transposed in registers (load_linear): 1-5%
+// faster on Emerald Rapids, Zen 5 and Neoverse V2; on Zen 3 the generic path was 1-2% faster
+// (notes.md, issue #91). Sse and Scalar run the generic path either way.
+#if defined(__AVX2__) && !defined(__AVX512VL__)
+inline constexpr bool kLinearSlots = false;
+#else
+inline constexpr bool kLinearSlots = true;
+#endif
 
 // Nodes of the lane tree up to this degree are multiplied out by schoolbook (at most 9 terms per
 // sum: Montgomery's step needs no fold); the standard tree's by small::multiply.

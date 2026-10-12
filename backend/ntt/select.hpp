@@ -127,6 +127,11 @@ template <class... V>
     (void)((i++ == v && (V::forward(f, lg, r), true)) || ...);
 }
 template <class... V>
+[[gnu::always_inline]] inline void run_forward_upper(Candidates<V...>, int v, std::uint32_t* f, int lg, const std::uint32_t* r) {
+    int i = 0;
+    (void)((i++ == v && (V::forward_upper(f, lg, r), true)) || ...);
+}
+template <class... V>
 [[gnu::always_inline]] inline void run_inverse(Candidates<V...>, int v, std::uint32_t* f, int lg, const std::uint32_t* ir) {
     int i = 0;
     (void)((i++ == v && (V::inverse(f, lg, ir), true)) || ...);
@@ -177,6 +182,11 @@ struct tuned {
 
     static void forward(std::uint32_t* f, int lg, const std::uint32_t* roots) {
         detail::run_forward(Selected{}, choice(kForward, lg), f, lg, roots);
+    }
+
+    // The forward's candidate at the length it runs, 2^lg (its table is the one of 2^(lg + 1)).
+    static void forward_upper(std::uint32_t* f, int lg, const std::uint32_t* roots) {
+        detail::run_forward_upper(Selected{}, choice(kForward, lg), f, lg, roots);
     }
 
     static void inverse(std::uint32_t* f, int lg, const std::uint32_t* inverse_roots) {

@@ -152,6 +152,13 @@ void test_transforms(const char* name, int max_lg) {
                 const auto g = random_poly(t.length(), kind);
                 expect(run_inverse(t, g, V{}) == run_inverse(t, g, variant::scalar{}), name, lg);
             }
+            if (lg > kMinLog) {  // forward_upper: from f mod (x^(L/2) + 1), the upper half of f's leaves
+                const std::size_t half = t.length() / 2;
+                Words h(half);
+                for (std::size_t i = 0; i < half; ++i) h.begin()[i] = sub(f[i], f[i + half]);
+                t.forward_upper<V>(h.begin());
+                expect(std::equal(h.begin(), h.begin() + half, leaves.begin() + half), name, 100 + lg);
+            }
         }
     }
 }
