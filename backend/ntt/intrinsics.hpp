@@ -47,6 +47,7 @@ struct Generated {
 //   inverse_scaled(f, q, k, ir, scaled) -> bool            inverse_group_scaled
 //   inverse_top<kStore, kUpper>(from, f, q, words, ir, s)  inverse_radix4, inverse_radix4_part; -> bool
 //   inverse_radix2<kStore, kUpper>(from, f, half, words, s) inverse_radix2, inverse_radix2_part; -> bool
+//   inverse_terms(out, terms, n, count, first, r, ir) -> bool  Bottom::inverse_terms; count even
 
 // Lazy arithmetic mod P on S: values < 4P in forward transforms, < 2P in inverse ones.
 template <class S>
@@ -1336,6 +1337,8 @@ struct Ntt : Butterflies<S> {
     }
     static void bottom_inverse_terms(u32* out, const LeafTerm* terms, int n, std::size_t count, std::size_t first,
                                      const u32* r, const u32* ir) {
+        if constexpr (requires { Generated<S>::inverse_terms(out, terms, n, count, first, r, ir); })
+            if (count % 2 == 0 && Generated<S>::inverse_terms(out, terms, n, count, first, r, ir)) return;
         if constexpr (kWideBottom)
             if (count % 2 == 0) return WideBottom<S>::inverse_terms(out, terms, n, count, first, r, ir);
         Leaf::inverse_terms(out, terms, n, count, first, r, ir);

@@ -276,13 +276,14 @@ LEAVES = 384  # leaf buffer bytes per group: rows[4][16] words ([w_t A_t, A_t]),
 def forward_half(g, m, tw, kind):
     """Group m (at a + 128 m bytes, and b): forward butterflies, inputs < 4P; the canonical leaf
     rows of a, and for a product the leaves of b, into the leaf buffer of group m (buf + LEAVES m).
-    kind: 'product' (a and b), 'square' or 'stored' (a alone)."""
+    kind: 'product' (a and b), 'square' or 'stored' (a alone), 'fill' (a holds canonical leaves:
+    the rows alone, no butterflies)."""
     at = LEAVES * m
     for name in ('a', 'b') if kind == 'product' else ('a',):
         for u in range(2):
             f = [g.load(name, 128 * m + 32 * t + 16 * u) for t in range(4)]
-            for t, v in enumerate(forward4(g, f, tw)):
-                leaf = g.canonical(g.low(v))
+            for t, v in enumerate(f if kind == 'fill' else forward4(g, f, tw)):
+                leaf = v if kind == 'fill' else g.canonical(g.low(v))
                 if name == 'b':
                     g.store(leaf, 'buf', at + 256 + 32 * t + 16 * u)
                     continue
@@ -335,7 +336,7 @@ def bottom(g, part, kind='product', groups=2, shift=0.0):
     """The bottom stage of `groups` groups k + m (k even) per statement, in two halves: first
     (forward_half of the batch at a, b into buf) and last (product_half of the batch in cur0,
     cur1 into out); both: last for the current batch interleaved with first for the next one.
-    Returns the source order."""
+    kind 'fill': rows from leaves, then the stored form's last half. Returns the source order."""
     ops = {}
     for half in ('last', 'first'):
         if part not in (half, 'both'):
@@ -348,9 +349,10 @@ def bottom(g, part, kind='product', groups=2, shift=0.0):
         else:
             iw = Twiddles('ix', 'iyz')
             for m in range(groups):
-                product_half(g, m, iw, kind)
+                product_half(g, m, iw, 'stored' if kind == 'fill' else kind)
         ops[half] = g.ops[start:]
-    return interleave(ops['last'], ops['first'], shift) if part == 'both' else g.ops
+    seq = interleave(ops['last'], ops['first'], shift) if part == 'both' else g.ops
+    return prune(seq) if kind == 'fill' else seq  # fill: x's twiddle unused
 
 
 def transform_bottom(g, direction, groups=2):
@@ -708,6 +710,13 @@ def bottom_kernels():
                               copy.deepcopy(BOTTOM_KNOBS[part])))
     out += [Kernel(f'bottom_{d}_pair', (lambda g, d=d: transform_bottom(g, d)), ['f', 'x', 'yz'],
                    TRANSFORM_BOTTOM_DOC[d], copy.deepcopy(BOTTOM_KNOBS['first'])) for d in ('forward', 'inverse')]
+    # Transform::inverse_product of one term a b: rows from a's leaves (no butterflies), the stored
+    # form's products and inverse butterflies.
+    out += [Kernel('bottom_fill_first', (lambda g: bottom(g, 'first', 'fill', **BOTTOM_MERGE)), first['rows'],
+                   'bottom_rows_first() from the canonical leaves of groups k, k + 1 at a (no butterflies). x unused.',
+                   copy.deepcopy(BOTTOM_KNOBS['first'])),
+            Kernel('bottom_fill_both', (lambda g: bottom(g, 'both', 'fill', **BOTTOM_MERGE)), first['rows'] + last['stored'],
+                   BOTH_DOC.format(last='bottom_stored_last', first='bottom_fill_first'), copy.deepcopy(BOTTOM_KNOBS['both']))]
     return out
 
 
@@ -764,7 +773,7 @@ def function(k):
     body = ['dup v29.4s, %w[p]', 'dup v30.4s, %w[p2]', 'dup v31.4s, %w[ni]'] + [emit(o, reg) for o in seq]
     params = ', '.join(f'{"std::uint32_t*" if a in ("out", "buf", "f") else "const std::uint32_t*"} {a}' for a in k.args)
     lines = [f'// {line}' for line in k.doc.split('\n')]
-    lines += [f'// {counts(g.ops)}; {cycles} cycles modeled.']
+    lines += [f'// {counts(seq)}; {cycles} cycles modeled.']
     lines += [f'[[gnu::always_inline]] inline void {k.name}({params}) {{', '    asm volatile(']
     lines += asm_lines(body)
     lines += ['        :', '        : ' + ', '.join(f'[{a}] "r"({a})' for a in k.args) + ',',

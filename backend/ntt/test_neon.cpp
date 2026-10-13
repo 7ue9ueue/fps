@@ -62,6 +62,36 @@ void test_bottom(Kind kind, const char* name) {
     }
 }
 
+// Bottom::inverse_terms of one term a b (canonical leaves of groups from `first`, into out) against
+// Bottom<Neon>: out < 2P and equal mod P; two terms run the intrinsics in both.
+void test_terms() {
+    const std::size_t leaves = std::size_t(1) << 13;
+    Words r(leaves), ir(leaves);
+    Plain::build_table(r.begin(), leaves / 2, false);
+    Plain::build_table(ir.begin(), leaves / 2, true);
+    for (const int n : {1, 2}) {
+        for (std::size_t count : {2, 4, 16, 64}) {
+            for (int trial = 0; trial < 12; ++trial) {
+                const std::size_t first = trial < 2 ? trial * count : count * random_below(leaves / 4 / count);
+                const int pick = trial % 3;
+                const std::size_t words = 32 * (first + count);
+                Words a0(words), b0(words), a1(words), out(32 * count), expected(32 * count);
+                for (std::size_t i = 0; i < words; ++i) {
+                    const auto word = [&] { return pick == 0 ? random_below(P) : pick == 1 ? P - 1 : u32(random_below(2) * (P - 1)); };
+                    a0.begin()[i] = word(), b0.begin()[i] = word(), a1.begin()[i] = word();
+                }
+                const fps::ntt::detail::LeafTerm terms[] = {{a0.begin(), b0.begin()}, {a1.begin(), nullptr}};
+                Plain::bottom_inverse_terms(expected.begin(), terms, n, count, first, r.begin(), ir.begin());
+                Asm::bottom_inverse_terms(out.begin(), terms, n, count, first, r.begin(), ir.begin());
+                bool ok = true;
+                for (std::size_t i = 0; i < 32 * count; ++i)
+                    ok &= out.begin()[i] < 2 * P && out.begin()[i] % P == expected.begin()[i] % P;
+                expect(ok, "neon: inverse_terms bottom against Bottom<Neon>", n * 10000000 + count * 10000 + first);
+            }
+        }
+    }
+}
+
 // The group loops: group k on quarters of q words, against Butterflies<Neon>: forward in < 4P in
 // place, or in < 2P from other memory or in place, out < 4P; inverse in < 2P, out < 2P; equal
 // mod P. Then the bottom level of transforms (Bottom::forward, canonical out; Bottom::inverse).
@@ -276,6 +306,7 @@ int main() {
     test_bottom(Kind::product, "neon: product bottom against Bottom<Neon>");
     test_bottom(Kind::square, "neon: square bottom against Bottom<Neon>");
     test_bottom(Kind::stored, "neon: stored bottom against Bottom<Neon>");
+    test_terms();
     test_groups();
     test_tops();
 #else

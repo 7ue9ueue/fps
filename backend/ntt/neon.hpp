@@ -50,7 +50,7 @@ struct Generated<neon::Vec> {
     [[gnu::always_inline]] static bool forward_from(const u32* from, u32* f, std::size_t q, std::size_t words, std::size_t k,
                                                     const u32* r) {
         if constexpr (kIn > 2) return false;
-        return by16(from, f, words, [&](const u32* a, u32* b, std::size_t n) {
+        return by16(from, f, words, [&] [[gnu::always_inline]] (const u32* a, u32* b, std::size_t n) {
             if (kIn == 1 && k == 0) {
                 if (a == b) neon_kernels::forward_top_group(b, q, n, r + slot(1));
                 else neon_kernels::forward_top_group_from(a, b, q, n, r + slot(1));
@@ -83,12 +83,16 @@ struct Generated<neon::Vec> {
     // The top levels below: columns [0, words) of `from` into f (may be from) by run(from, f, n), 16
     // words per loop iteration. From other memory, words a multiple of 8 from 16 on: the last 16
     // again if needed (they read `from` only). False if not run.
+    // A loop of one or two calls, so that each kernel is inlined once (two calls in a row cost
+    // forward/8 3%: twice the code).
     template <class Run>
     [[gnu::always_inline]] static bool by16(const u32* from, u32* f, std::size_t words, Run run) {
         if (words < 16 || (words % 16 != 0 && from == f)) return false;
-        const std::size_t main = words / 16 * 16;
-        run(from, f, main);
-        if (main < words) run(from + words - 16, f + words - 16, std::size_t(16));
+        const std::size_t main = words / 16 * 16, calls = main < words ? 2 : 1;
+        for (std::size_t i = 0; i < calls; ++i) {
+            const std::size_t at = i ? words - 16 : 0;
+            run(from + at, f + at, i ? std::size_t(16) : main);
+        }
         return true;
     }
     // The inverse top group (inverse_radix4, inverse_radix4_part), times s if s != 0: in < 2P,
@@ -106,7 +110,7 @@ struct Generated<neon::Vec> {
             block[0] = s, block[1] = sz, block[8] = quotient(s), block[9] = quotient(sz);
             tw = block;
         }
-        return by16(from, f, words, [&](const u32* a, u32* b, std::size_t n) {
+        return by16(from, f, words, [&] [[gnu::always_inline]] (const u32* a, u32* b, std::size_t n) {
             namespace k = neon_kernels;
             if constexpr (kStore == 2) {
                 if (s) kUpper ? k::inverse_top_group_upper_to(a, b, q, n, tw) : k::inverse_top_group_lower_to(a, b, q, n, tw);
@@ -125,7 +129,7 @@ struct Generated<neon::Vec> {
     [[gnu::always_inline]] static bool inverse_radix2(const u32* from, u32* f, std::size_t half, std::size_t words, u32 s) {
         if (kStore == 1 && from == f) return false;
         const u32 tw[16] = {s, 0, 0, 0, 0, 0, 0, 0, s ? quotient(s) : 0};
-        return by16(from, f, words, [&](const u32* a, u32* b, std::size_t n) {
+        return by16(from, f, words, [&] [[gnu::always_inline]] (const u32* a, u32* b, std::size_t n) {
             namespace k = neon_kernels;
             if constexpr (kStore == 1) {
                 if (s) kUpper ? k::inverse_radix2_level_scaled_differences_to(a, b, half, n, tw)
@@ -167,6 +171,24 @@ struct Generated<neon::Vec> {
                 if (g + 2 == count) return neon_kernels::bottom_last(a + 32 * g, cur, cur + 96, ix, iyz);
                 neon_kernels::bottom_both(a + 32 * (g + 2), b + 32 * (g + 2), next, x, yz, a + 32 * g, cur, cur + 96, ix, iyz);
             }
+        }
+    }
+
+    // Bottom::inverse_terms for one term a b (Transform::inverse_product): the rows from a's leaves,
+    // no butterflies, then multiply_stored's products and inverse butterflies, into out (group g of
+    // out is group first + g of a and b). Other terms: false.
+    static bool inverse_terms(u32* out, const LeafTerm* terms, int n, std::size_t count, std::size_t first, const u32* r,
+                              const u32* ir) {
+        if (n != 1 || !terms[0].b) return false;
+        const u32 *a = terms[0].a + 32 * first, *b = terms[0].b + 32 * first;
+        alignas(64) u32 leaves[2][2 * 96];
+        neon_kernels::bottom_fill_first(a, leaves[0], r + slot(first), r + slot(2 * first));
+        for (std::size_t g = 0, k = first;; g += 2, k += 2) {
+            u32 *cur = leaves[g / 2 % 2], *next = leaves[(g / 2 + 1) % 2];
+            const u32 *ix = ir + slot(k), *iyz = ir + slot(2 * k);
+            if (g + 2 == count) return neon_kernels::bottom_stored_last(out + 32 * g, cur, cur + 96, b + 32 * g, ix, iyz), true;
+            neon_kernels::bottom_fill_both(a + 32 * (g + 2), next, r + slot(k + 2), r + slot(2 * k + 4), out + 32 * g, cur,
+                                           cur + 96, b + 32 * g, ix, iyz);
         }
     }
 
