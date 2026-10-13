@@ -323,10 +323,15 @@ memory with inputs < 2P; inverse).
   leaves, no butterflies). At 2^6 and 2^7 the subtrees are single groups:
   `Generated::kJoinBottoms` makes the top levels run all their bottoms in one call, so the pair
   kernels take them (products 0.74-0.81 there).
+- Round 3 (`notes/151-r3.md`): `inverse_product` of 2 to 4 product terms and at most one plain
+  term in passes, one per product term, adding into out (the last with the butterflies; 10
+  kernels for every list, not one per list); the leaf sums reduced per kernel, as Montgomery's
+  (s + m P) / 2^32 (squares, stored leaves) or as H - umulh(L P^-1, P) (products, the passes:
+  one multiply fewer, two other ops more; it cost squares and stored leaves 1-3%).
 - Against `intrinsics<Neon>` on L1 data: product bottom 0.74, group loops 0.84-0.91, transform
   bottoms 0.83 (forward) and 0.95 (inverse). Whole ops, same binary, 2^8-2^22: multiply and
   products 0.80-0.84, forward 0.84-0.89, inverse 0.90-0.98 (round 1; 2^6-2^7 then unchanged).
-  `Native` is neon on arm. Attempts and numbers: `notes/151-r1.md`, `notes/151-r2.md`.
+  `Native` is neon on arm. Attempts and numbers: `notes/151-r1.md` to `notes/151-r3.md`.
 
 ### Variant selection (issue #78)
 
