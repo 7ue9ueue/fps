@@ -154,7 +154,12 @@ time in lanes, one transform of each length per node); it also takes a `std::vec
 `divmod(f, g)`, `f / g`, `f % g`: f = q g + r with deg r < d = deg g. q has max(`f.size()` - d, 0)
 coefficients and r has d (f's, then zeros, if `f.size()` <= d), so `f / x^k` drops the lowest k
 coefficients and `f % x^k` is `f.truncate(k)`; neither is trimmed. g = 0, of any size, throws
-`std::domain_error`. `f / g` computes no remainder.
+`std::domain_error`. `f / g` computes no remainder. Divisors of few terms are detected (#147),
+each O(n t) for t terms below the leading one: g = c x^d is a shift; t <= 16 terms, the highest at
+least 8 (t + 1) below the leading one (`x^L - 1`, `x^d - x - 1` for d >= 25), run long division in
+vector passes; else t <= 2 (`x^3 + 2x + 5`) runs a recurrence. Every other g runs the backend's
+blocked division, whose transforms stay within 2^25 words (f of 2^25 + 2^10 by a dense g of
+2^25 + 1 runs, checked by hand: about 1 GB); the sparse paths have no length limit.
 
 `evaluate(f, points)` returns `points.size()` values, for any points (repeats too).
 `interpolate<P>(points, values)` returns m = `points.size()` coefficients; it needs as many values

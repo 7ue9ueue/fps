@@ -9,40 +9,42 @@
 // zeros, when n <= d). Nothing is trimmed: q and r may end in zeros. g with no nonzero coefficient
 // (of any size) throws std::domain_error.
 //
-// Paths. g = c x^d (one nonzero coefficient) is a shift and a scaling, O(n): f / x^k drops the
-// lowest k coefficients, f % x^k is f.truncate(k). Otherwise, with k = n - d, F = x^(n-1) f(1/x)
-// and G = x^d g(1/x) (G[0] = g[d] != 0), the reversed quotient is F / G mod x^k:
-// - G mod x^k with at most 16 nonzero terms past G[0] (fps/series.hpp's kSparseTerms: divisors of
-//   degree <= 16, quotients of <= 17 coefficients, divisors such as x^d - x - 1): the recurrence
-//   G[0] Q[i] = F[i] - sum_j G[j] Q[i - j], O(k t) for t terms;
-// - else F (1 / G mod x^k) mod x^k: fps/series.hpp's inverse (backend/series), then one product;
-// and the remainder is f - (q g mod x^d), one product. The products are fps/products.hpp's
-// (raw::mul: shift, small::multiply or ntt::multiply, as small::beats_ntt picks).
-// The backend has no division kernel yet: lc-opt's blocked division (quotient blocks against one
-// inverse of G, the remainder from a cyclic product of length >= d) is backend issue #102. f of 2n
-// by g of n coefficients from 2^10 on, in units of one ntt::multiply of two factors of n into n
-// words: divmod and f % g 6.9-8.5, f / g 5.9-7.4, on the timed targets (frontend/notes.md). The
-// recurrence: 2.9-4.2 ns per coefficient of f for 2 terms.
+// Paths, by one scan of g from the top (it stops at the 17th nonzero coefficient below g[d]):
+// - g = c x^d: a shift and a scaling, O(n): f / x^k drops the lowest k coefficients, f % x^k is
+//   f.truncate(k).
+// - g with t <= 16 nonzero coefficients below g[d], all at least 8 (t + 1) below it (x^d - 1 for
+//   d >= 16, x^d - x - 1 for d >= 25): long division by those terms, in blocks of quotient words
+//   that do not reach each other, O(n t) in vector passes.
+// - Else g with t <= 2 such terms (x^3 + 2 x + 5, x^d - x^(d-1) - 1): the recurrence q[i] =
+//   (f[d + i] - sum g[j] q[i + d - j]) / g[d] word by word, then r likewise, O(n t).
+// - Every other g: one call into the backend's kernel, fps::division::divide
+//   (backend/division/division.hpp: long division for k d <= 2^12, else lc-opt's blocked division
+//   on ntt::Transform with a tuned plan per target), on g trimmed to its degree (the kernel needs
+//   g[m - 1] != 0). f / g asks it for no remainder; f % g gives it a quotient in this thread's
+//   scratch (k words).
+// Every path writes q and r into the returned memory. Times: backend/division/notes.md (the kernel
+// against lc-opt) and frontend/notes/147.md (API against kernel, and against the frontend's own
+// Newton division and few-term recurrence before #147).
 //
-// A product or inverse past 2^25 coefficients throws std::length_error from the backend
-// (fps/series.hpp, fps/products.hpp); the recurrence and the shift have no such limit.
-//
-// Memory: q and r are new polynomials; the quotient works in fps/series.hpp's per-thread scratch
-// (3 k words on the Newton path, min(k, d + 1) on the recurrence).
+// Long inputs: the kernel splits the quotient into blocks and the remainder into products of at
+// most 2^25 words (f of 2^25 + 2^10 by a dense g of 2^25 + 1 runs, checked by hand); it throws
+// std::length_error for the shapes no such plan covers (longer divisors). The other paths have no
+// limit.
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
 #include <stdexcept>
 #include <utility>
 
+#include "backend/division/division.hpp"
 #include "backend/modarith/modarith.hpp"
 #include "backend/simd/select.hpp"
 #include "fps/modular.hpp"
 #include "fps/polynomial.hpp"
-#include "fps/products.hpp"
 #include "fps/series.hpp"
 
 namespace fps {
@@ -53,98 +55,158 @@ using u32 = std::uint32_t;
 using Span = std::span<const u32>;
 using Out = std::span<u32>;
 
-// g, d = deg g, and whether g = c x^d (g[0, d) is zero). Throws for g = 0.
+// Few terms below g[d], t of them, the highest gap below d (frontend/notes/147.md):
+// - blocks: t <= kSparseTerms and gap >= kSparseGap (t + 1). About t + 1 vector passes per quotient
+//   word plus (t + 1) / gap calls; the kernel's is a few products' worth.
+// - recurrence: else t <= kRecurrenceTerms. Word by word, t products and one reduction each; the
+//   kernel takes 1.2-2.1 times as long for x^3 + 2x + 5, but 0.75-0.85 on Zen 5. Moving both into
+//   the kernel's plan, picked per target by its cost model: backend issue #158.
+inline constexpr std::size_t kSparseTerms = 16;
+inline constexpr std::size_t kSparseGap = 8;
+inline constexpr std::size_t kRecurrenceTerms = 2;
+
+// g trimmed to d + 1 words, d = deg g, and its nonzero coefficients below g[d] from the top down,
+// if at most kSparseTerms (count = kSparseTerms + 1: more). Throws for g = 0.
 struct Divisor {
     Span g;
     std::size_t d;
-    bool monomial;
+    std::array<std::size_t, kSparseTerms> terms;
+    std::size_t count;
+
+    bool monomial() const { return count == 0; }
+    bool blocks() const { return count > 0 && count <= kSparseTerms && d - terms[0] >= kSparseGap * (count + 1); }
+    bool recurrence() const { return count > 0 && count <= kRecurrenceTerms; }  // when not blocks()
 };
 
 template <u32 P>
 Divisor divisor(const Polynomial<P>& g) {
-    const int d = g.degree();
-    if (d < 0) throw std::domain_error("fps: division by zero");
-    const Span low = g.span().first(std::size_t(d));
-    return {g.span(), std::size_t(d), std::ranges::all_of(low, [](u32 c) { return c == 0; })};
+    static_assert(P == ntt::kModulus, "fps: v1 supports P = 998244353 only (DESIGN.md, Moduli)");
+    const int deg = g.degree();
+    if (deg < 0) throw std::domain_error("fps: division by zero");
+    const std::size_t d = std::size_t(deg);
+    Divisor D{g.span().first(d + 1), d, {}, 0};
+    for (std::size_t hi = d; hi > 0;) {  // chunks of 64 words, zero ones skipped by one vector OR
+        const std::size_t lo = hi > 64 ? hi - 64 : 0;
+        u32 any = 0;
+        for (std::size_t j = lo; j < hi; ++j) any |= D.g[j];
+        for (std::size_t j = hi; any && j-- > lo;) {
+            if (D.g[j] == 0) continue;
+            if (D.count == kSparseTerms) {
+                D.count = kSparseTerms + 1;
+                return D;
+            }
+            D.terms[D.count++] = j;
+        }
+        hi = lo;
+    }
+    return D;
 }
 
-// out[i] = c a[i] (Shoup's product); a copy for c = 1.
+inline std::size_t quotient_size(std::size_t n, const Divisor& D) { return n > D.d ? n - D.d : 0; }
+
+// out[i] = c a[i] (Shoup's product); out may be a.
 template <u32 P>
 void scale(Span a, u32 c, Out out) {
-    if (c == 1) return void(std::ranges::copy(a, out.begin()));
-    const u32 q = modarith::Ops<simd::Scalar, P>::shoup_quotient(c);
-    lanewise(a.data(), a.data(), out.data(), a.size(), [c, q]<class S>(typename S::V x, typename S::V) {
+    const u32 s = modarith::Ops<simd::Scalar, P>::shoup_quotient(c);
+    lanewise(a.data(), a.data(), out.data(), a.size(), [c, s]<class S>(typename S::V x, typename S::V) {
         using Ops = modarith::Ops<S, P>;
-        return Ops::template reduce<P>(Ops::shoup(x, S::broadcast(c), S::broadcast(q)));
+        return Ops::template reduce<P>(Ops::shoup(x, S::broadcast(c), S::broadcast(s)));
     });
 }
 
-// out[i] = a[i] - out[i].
+// out[i] -= c a[i], i < a.size(); out apart from a.
 template <u32 P>
-void subtract_from(Span a, Out out) {
-    lanewise(a.data(), out.data(), out.data(), a.size(),
-             []<class S>(typename S::V x, typename S::V y) { return modarith::Ops<S, P>::sub(x, y); });
+void subtract_multiple(Span a, u32 c, Out out) {
+    const u32 s = modarith::Ops<simd::Scalar, P>::shoup_quotient(c);
+    lanewise(out.data(), a.data(), out.data(), a.size(), [c, s]<class S>(typename S::V x, typename S::V y) {
+        using Ops = modarith::Ops<S, P>;
+        return Ops::sub(x, Ops::template reduce<P>(Ops::shoup(y, S::broadcast(c), S::broadcast(s))));
+    });
 }
 
-// q = the quotient of f (n words) by g (deg g = d < n, not a monomial), k = n - d = q.size()
-// words. scratch: 3 k words.
+// r = f mod x^d for g = c x^d (or n <= d): f's words, then zeros.
+inline void copy_remainder(Span f, Out r) {
+    const std::size_t m = std::min(f.size(), r.size());
+    std::copy_n(f.begin(), m, r.begin());
+    std::fill(r.begin() + std::ptrdiff_t(m), r.end(), 0u);
+}
+
+// g = c x^d: q = f[d, n) / c (a copy for c = 1), r = f mod x^d.
 template <u32 P>
-void quotient(Span f, Span g, std::size_t d, Out q, Out scratch) {
-    const std::size_t n = f.size(), k = q.size();
-    // G mod x^k, then Q = F / G mod x^k into q, then q = Q reversed.
-    const Out G = scratch.first(std::min(k, d + 1));
-    for (std::size_t i = 0; i < G.size(); ++i) G[i] = g[d - i];
-    if (auto s = series::sparse(G)) {
-        // Q[i] = c F[i] - sum over terms (j, b) of (c b) Q[i - j], c = 1 / G[0].
-        const u32 c = mod_inverse<P>(G[0]);
-        for (std::size_t t = 0; t < s->count; ++t) s->terms[t].a = mod_mul<P>(s->terms[t].a, c);
-        for (std::size_t i = 0; i < k; ++i) {
-            const u32 a = mod_mul<P>(c, f[n - 1 - i]), sum = series::tap_sum<P>(*s, q, i);
-            q[i] = a >= sum ? a - sum : a + P - sum;
+void divide_monomial(Span f, const Divisor& D, Out q, Out r) {
+    const u32 c = mod_inverse<P>(D.g[D.d]);
+    copy_remainder(f, r);
+    if (q.empty()) return;
+    if (c == 1) std::ranges::copy(f.subspan(D.d), q.begin());
+    else scale<P>(f.subspan(D.d), c, q);
+}
+
+// D.blocks(). The rest of f, f - g (q's words found so far), lives in q (its word d + i in q[i])
+// and r (its words below d). Quotient words i in [lo, hi) with hi - lo <= gap = d - terms[0] do
+// not reach each other: word i + j of the rest, j <= terms[0], is below lo + d. So each block is
+// final once the blocks above it are subtracted: scale it by 1 / g[d], then subtract it times each
+// term from the rest below it.
+template <u32 P>
+void divide_blocks(Span f, const Divisor& D, Out q, Out r) {
+    const std::size_t d = D.d, k = q.size();
+    const u32 c = mod_inverse<P>(D.g[d]);
+    copy_remainder(f, r);
+    if (k == 0) return;
+    std::ranges::copy(f.subspan(d), q.begin());
+    const std::size_t gap = d - D.terms[0];
+    for (std::size_t hi = k; hi > 0;) {
+        const std::size_t lo = hi > gap ? hi - gap : 0;
+        const Out block = q.subspan(lo, hi - lo);
+        scale<P>(block, c, block);
+        for (std::size_t t = 0; t < D.count; ++t) {
+            const std::size_t j = D.terms[t];
+            const u32 a = D.g[j];
+            // Rest words [lo + j, hi + j): those >= d in q, those below d in r.
+            const std::size_t split = std::clamp(d, lo + j, hi + j);
+            if (split < hi + j) subtract_multiple<P>(Span(block).subspan(split - lo - j), a, q.subspan(split - d));
+            if (!r.empty() && lo + j < split) subtract_multiple<P>(Span(block).first(split - lo - j), a, r.subspan(lo + j));
         }
-    } else {
-        const Out h = scratch.subspan(k, k), F = scratch.first(k);
-        series::inverse<P>(G, h, scratch.subspan(2 * k, k));
-        std::reverse_copy(f.end() - std::ptrdiff_t(k), f.end(), F.begin());  // G is no longer needed
-        Products<P>::multiply_into(F, h, q);
+        hi = lo;
+    }
+}
+
+// D.recurrence(): q[i] = (f[d + i] - sum over terms j of g[j] q[i + d - j]) / g[d] from the top
+// down, as Q[p] = c F[p] - sum (c g[j]) Q[p - (d - j)] for Q = rev(q), F = rev(f), c = 1 / g[d];
+// then q = rev(Q) and r[m] = f[m] - sum g[j] q[m - j]. Each word is one reduction of a 64-bit
+// sum: 2 P^2 plus one product minus at most 2, below 3 P^2 < 2^62 (no compare: GCC turned one
+// into a mispredicted branch, 2 times as slow).
+template <u32 P>
+void divide_recurrence(Span f, const Divisor& D, Out q, Out r) {
+    using u64 = std::uint64_t;
+    const std::size_t d = D.d, k = q.size(), t = D.count, n = f.size();
+    if (k == 0) return copy_remainder(f, r);
+    constexpr u64 kBias = 2 * u64(P) * P;
+    const u32 c = mod_inverse<P>(D.g[d]);
+    std::array<u32, kRecurrenceTerms> a{}, ca{};
+    std::array<std::size_t, kRecurrenceTerms> e{};  // distances d - j
+    for (std::size_t u = 0; u < t; ++u) a[u] = D.g[D.terms[u]], ca[u] = mod_mul<P>(c, a[u]), e[u] = d - D.terms[u];
+    for (std::size_t p = 0; p < k; ++p) {
+        u64 s = kBias + u64(c) * f[n - 1 - p];
+        for (std::size_t u = 0; u < t; ++u)
+            if (e[u] <= p) s -= u64(ca[u]) * q[p - e[u]];
+        q[p] = u32(s % P);
     }
     std::ranges::reverse(q);
-}
-
-// The quotient of f by D.g.
-template <u32 P>
-Polynomial<P> quotient(Span f, const Divisor& D) {
-    const std::size_t n = f.size(), d = D.d, k = n > d ? n - d : 0;
-    Polynomial<P> q = unwritten_polynomial<P>(k);
-    if (k == 0) return q;
-    if (D.monomial) scale<P>(f.subspan(d), mod_inverse<P>(D.g[d]), q.span());
-    else quotient<P>(f, D.g, d, q.span(), series::scratch(3 * k));
-    return q;
-}
-
-// The remainder of f by D.g from the quotient q (unread for a monomial D.g or f.size() <= D.d).
-template <u32 P>
-Polynomial<P> remainder(Span f, const Divisor& D, Span q) {
-    const std::size_t d = D.d;
-    Polynomial<P> r = unwritten_polynomial<P>(d);
-    if (f.size() <= d || D.monomial) {
-        const std::size_t m = std::min(f.size(), d);
-        std::copy_n(f.begin(), m, r.span().begin());
-        std::fill(r.span().begin() + std::ptrdiff_t(m), r.span().end(), 0u);
-        return r;
+    for (std::size_t m = 0; m < r.size(); ++m) {
+        u64 s = kBias + f[m];
+        for (std::size_t u = 0; u < t; ++u)
+            if (m >= D.terms[u] && m - D.terms[u] < k) s -= u64(a[u]) * q[m - D.terms[u]];
+        r[m] = u32(s % P);
     }
-    // r = f - q g mod x^d: the coefficients of q g past d are f's.
-    Products<P>::multiply_into(q, D.g.first(d), r.span());
-    subtract_from<P>(f.first(d), r.span());
-    return r;
 }
 
-// The remainder of f by D.g, with the quotient only where the remainder reads it.
+// q of quotient_size(n, D) words and r of D.d words or none (no remainder).
 template <u32 P>
-Polynomial<P> modulo(Span f, const Divisor& D) {
-    if (f.size() <= D.d || D.monomial) return remainder<P>(f, D, {});
-    const Polynomial<P> q = quotient<P>(f, D);
-    return remainder<P>(f, D, q.span());
+void divide(Span f, const Divisor& D, Out q, Out r) {
+    if (D.monomial()) return divide_monomial<P>(f, D, q, r);
+    if (D.blocks()) return divide_blocks<P>(f, D, q, r);
+    if (D.recurrence()) return divide_recurrence<P>(f, D, q, r);
+    fps::division::divide(f, D.g, q, r);
 }
 
 }  // namespace detail::division
@@ -152,19 +214,31 @@ Polynomial<P> modulo(Span f, const Divisor& D) {
 template <std::uint32_t P>
 std::pair<Polynomial<P>, Polynomial<P>> divmod(const Polynomial<P>& f, const Polynomial<P>& g) {
     const detail::division::Divisor D = detail::division::divisor(g);
-    Polynomial<P> q = detail::division::quotient<P>(f.span(), D);
-    Polynomial<P> r = detail::division::remainder<P>(f.span(), D, q.span());
+    Polynomial<P> q = detail::unwritten_polynomial<P>(detail::division::quotient_size(f.size(), D));
+    Polynomial<P> r = detail::unwritten_polynomial<P>(D.d);
+    detail::division::divide<P>(f.span(), D, q.span(), r.span());
     return {std::move(q), std::move(r)};
 }
 
 template <std::uint32_t P>
 Polynomial<P> operator/(const Polynomial<P>& f, const Polynomial<P>& g) {
-    return detail::division::quotient<P>(f.span(), detail::division::divisor(g));
+    const detail::division::Divisor D = detail::division::divisor(g);
+    Polynomial<P> q = detail::unwritten_polynomial<P>(detail::division::quotient_size(f.size(), D));
+    detail::division::divide<P>(f.span(), D, q.span(), {});
+    return q;
 }
 
 template <std::uint32_t P>
 Polynomial<P> operator%(const Polynomial<P>& f, const Polynomial<P>& g) {
-    return detail::division::modulo<P>(f.span(), detail::division::divisor(g));
+    const detail::division::Divisor D = detail::division::divisor(g);
+    Polynomial<P> r = detail::unwritten_polynomial<P>(D.d);
+    if (D.monomial()) {
+        detail::division::copy_remainder(f.span(), r.span());
+        return r;
+    }
+    const std::span<std::uint32_t> q = detail::series::scratch(detail::division::quotient_size(f.size(), D));
+    detail::division::divide<P>(f.span(), D, q, r.span());
+    return r;
 }
 
 template <std::uint32_t P>
