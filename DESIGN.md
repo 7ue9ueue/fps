@@ -200,7 +200,7 @@ deg f < 2^24 (its transforms have 2 bit_ceil(d + 1) words; trailing zeros do not
 x^z does) and throws `std::length_error` past it, before any work; its workspace is kept per
 thread, 32 to 45 d words (up to 3 GiB near 2^24). The frontend's own path (gcd with x^(P-1) - 1,
 Cantor and Zassenhaus) stopped near the same degree (its squares mod u, f = x^z u, pass 2^25
-words for deg u > 2^24) and ran 6 to 112 times slower, so it was not kept for the inputs in
+words for deg u > 2^24) and ran 6 to 114 times slower, so it was not kept for the inputs in
 between (deg u = 2^24, or a factor x^z that takes deg f to 2^24 or more) (#192).
 
 `compose(f, g, n)`: a constant g mod x^n gives f(g[0]) (Horner), a linear one a Taylor shift by
