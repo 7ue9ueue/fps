@@ -1,35 +1,37 @@
 // Coefficient k of p / q modulo P = 998244353, by Bostan and Mori (backend kernel), for
 // fps::Fraction<P>::operator[].
 //
-//   fps::bostan_mori::coefficient(p, q, k)        // [x^k] p / q; spans of words < P, q[0] != 0
+//   fps::bostan_mori::coefficient(p, q, k)   // [x^k] p / q: spans of words < P, q[0] != 0, any k
 //
 // The variants, public as the fast path for callers that pick their own (same contract):
-//   variant::schoolbook(p, q, k)                   p and q cut to k + 1 words: at most kSchoolbookMax
-//   variant::values(p, q, k, small)                transforms in the values form, schoolbook from
-//                                                  `small` words on (0: never); any size
-//   variant::products(p, q, k)                     two ntt::multiply per step (the frontend's loop)
+//   variant::schoolbook(p, q, k)          p and q cut to k + 1 words: at most kSchoolbookCapacity
+//                                         (256), else std::length_error
+//   variant::values(p, q, k, small)       transforms in the values form; schoolbook once p and q
+//                                         fit in `small` words (0: never); any size
+//   variant::products(p, q, k)            two ntt::multiply per step (the frontend's loop)
+// coefficient() is values(p, q, k, kSchoolbookMax): schoolbook while p and q have at most
+// kSchoolbookMax words (select.hpp: 76 to 96 by target), the values form beyond. Throws
+// std::domain_error for an empty q or q[0] = 0. No allocation per call: each thread keeps two
+// arrays of 2N words, its transforms and a table of N words, for its longest call so far.
 //
 // Bostan and Mori: with p(x) q(-x) = U_0(x^2) + x U_1(x^2) and q(x) q(-x) = V(x^2),
-// [x^k] p / q = [x^(k / 2)] U_(k mod 2) / V. Only p and q mod x^(k + 1) matter, so both are cut
-// to k + 1 words first and after each step. coefficient() runs schoolbook while p and q have at
-// most kSchoolbookMax words (select.hpp, per target), values otherwise. Throws std::domain_error
-// for an empty q or q[0] = 0. No allocation per call: each thread keeps its buffers, transforms
-// and a table of inverse points, sized for its longest call so far.
+// [x^k] p / q = [x^(k / 2)] U_(k mod 2) / V. Only p and q mod x^(k + 1) matter: both are cut to
+// k + 1 words first and after each step.
 //
 // values: p and q in the values form of length L = 2N (ntt.hpp; N > deg q, 2N > deg p + deg q).
-// The words of a pair of points w, -w sit 8 apart (rows 2m and 2m + 1 of a block), and w^2 is a
-// point of the values form of length N, so one pass gives U(w^2) = (A(w) +- A(-w)) / (2 w^r),
-// A = p(x) q(-x), and V(w^2) = q(w) q(-w), in the length-N layout: no transform of q(-x) and no
-// product transform. The next step needs U and V at the other N points: one inverse of N (values
-// form, into the upper half) and forward_upper of L (doubling), each. So a step is four
-// transforms of N words where the frontend's two products run six of 2N. Steps shrink the
-// length when the cut lets them. The pass's scale (Montgomery's 2^-32, the 2 of A(w) + A(-w)) is
-// the same for U and V but for the 2, so the ratio [x^k] U / V only picks up 1/2 per step.
-// The last step needs only U(0) / V(0) = sum of U's values / sum of V's: no transform.
+// The words of w and -w are 8 apart (rows 2m and 2m + 1 of a block), and w^2 is a point of the
+// values form of length N, so one pass gives U(w^2) = (A(w) +- A(-w)) / w^r, A = p(x) q(-x), and
+// V(w^2) = q(w) q(-w) in the length-N layout: no transform of q(-x), no product transform. The
+// next step needs U and V at the other N points: an inverse of N (into the upper half) and
+// forward_upper of 2N (doubling), each. A step: four transforms of N words, where two products
+// run six of 2N. The cut shortens the transforms when it lets them. Scale: U comes out times
+// 2^-31 and V times 2^-32 (Montgomery's 2^-32, and A(w) + A(-w) = 2 U(w^2)), so the ratio picks
+// up 1/2 per step. The last step needs only U(0) / V(0) = (sum of U's values) / (sum of V's).
 //
 // schoolbook: per step U_0 = qe pe - x qo po, U_1 = qe po - qo pe, V = qe qe - x qo qo, with
-// pe, po, qe, qo the even and odd parts (p = pe(x^2) + x po(x^2)): 64-bit sums of products
-// (backend/small's lanes), vectors of outputs, one Montgomery reduction per output word.
+// pe, po, qe, qo the even and odd halves (p = pe(x^2) + x po(x^2)): vectors of U's and V's words,
+// 64-bit sums of products (backend/small's lanes), one Montgomery reduction per word. At most
+// kTinyMax (4) words: scalar sums by the definition.
 //
 // Design and measurements: notes.md.
 #pragma once
@@ -467,8 +469,7 @@ inline u32 products(std::span<const u32> p, std::span<const u32> q, u64 k) {
 }
 
 // [x^k] p / q by steps in the values form (above); schoolbook once p and q fit in `small` words
-// (at most kSchoolbookCapacity; 0: never). p or q longer than the values form allows (2^23 for
-// both): products.
+// (at most kSchoolbookCapacity; 0: never). Past the values form's 2^23 words: products.
 inline u32 values(std::span<const u32> p, std::span<const u32> q, u64 k, std::size_t small = kSchoolbookMax) {
     using namespace detail;
     const auto [a, b] = trim(p, q, k);
