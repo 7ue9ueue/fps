@@ -1,12 +1,13 @@
 // Times fps/composition.hpp modulo P = 998244353; tools/kernel.py runs it, a binary of its own.
 // Items are coefficients of the result, n = 2^(lg-1) as mul/<lg> in bench.cpp.
-//   "<op>/<lg>"   through the API (gated)
-//   "compose_linear@kernel/<lg>"   the middle product that compose's Taylor shift runs
-//                                  (ntt::middle_product of the same shapes into new memory)
-// There is no composition kernel yet (backend issue #105), so compose and compositional_inverse
-// have no "@kernel" pairs: they run on ntt::multiply (raw::mul), whose own pair is
-// mul / mul@kernel in bench.cpp. frontend/notes/26.md gives each case in units of
-// mul@kernel/<lg> from the same run.
+//   "<op>/<lg>"          through the API (gated)
+//   "<op>@kernel/<lg>"   the backend call it wraps, on the same inputs:
+//     compose_linear@kernel   the middle product that compose's Taylor shift runs
+//                             (ntt::middle_product of the same shapes into new memory)
+//     compose@kernel          fps::composition::compose on the same f and g into kept memory; it
+//                             reads g[0] as 0, so it times what compose runs after its Taylor shift
+//     compose_g0@kernel       the same with g[0] = 0, where compose is the kernel call alone
+//     compositional_inverse@kernel   fps::composition::compositional_inverse into kept memory
 #include <cstddef>
 #include <cstdint>
 #include <random>
@@ -15,6 +16,7 @@
 #include <vector>
 
 #include "backend/bench.hpp"
+#include "backend/composition/composition.hpp"
 #include "fps/fps.hpp"
 
 namespace {
@@ -53,7 +55,16 @@ void linear(bench::Suite& suite) {
     }
 }
 
-// compose(f, g) with g[0] != 0 (Taylor shift, then Kinoshita and Li); compositional_inverse(f).
+// The kernel's compose into kept memory.
+auto compose_kernel(std::size_t n, unsigned seed, std::uint32_t g0) {
+    return [f = random_poly(n, 3, seed), g = random_poly(n, g0, seed + 1), out = std::vector<std::uint32_t>(n)]() mutable {
+        fps::composition::compose(f.span(), g.span(), out);
+        bench::keep(out);
+    };
+}
+
+// compose(f, g) with g[0] != 0 (Taylor shift, then the kernel) and g[0] = 0 (the kernel alone);
+// compositional_inverse(f).
 void general(bench::Suite& suite) {
     for (int lg : {11, 14, 18}) {
         const std::size_t n = std::size_t(1) << (lg - 1);
@@ -62,10 +73,23 @@ void general(bench::Suite& suite) {
         suite.add("compose" + size, [n, seed] {
             return [f = random_poly(n, 3, seed), g = random_poly(n, 5, seed + 1)] { bench::keep(fps::compose(f, g)); };
         }, n);
+        suite.add("compose@kernel" + size, [n, seed] { return compose_kernel(n, seed, 5); }, n);
+        suite.add("compose_g0" + size, [n, seed] {
+            return [f = random_poly(n, 3, seed), g = random_poly(n, 0, seed + 1)] { bench::keep(fps::compose(f, g)); };
+        }, n);
+        suite.add("compose_g0@kernel" + size, [n, seed] { return compose_kernel(n, seed, 0); }, n);
         suite.add("compositional_inverse" + size, [n, seed] {
             Poly f = random_poly(n, 0, seed);
             f[1] = 2;
             return [f] { bench::keep(fps::compositional_inverse(f)); };
+        }, n);
+        suite.add("compositional_inverse@kernel" + size, [n, seed] {
+            Poly f = random_poly(n, 0, seed);
+            f[1] = 2;
+            return [f, out = std::vector<std::uint32_t>(n)]() mutable {
+                fps::composition::compositional_inverse(f.span(), out);
+                bench::keep(out);
+            };
         }, n);
     }
 }

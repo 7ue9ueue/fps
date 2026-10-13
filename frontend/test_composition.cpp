@@ -313,10 +313,12 @@ void test_errors() {
     CHECK(fps::compositional_inverse(Poly{1, 1}, 0).size() == 0);
     CHECK(fps::compositional_inverse(Poly{0, 0, 1}, 1) == Poly{0});
     CHECK(fps::compositional_inverse(Poly{}, 1) == Poly{0});
-    // Past the NTT's 2^25 words: thrown by the composition's own check, before any work, from
-    // n = 2^22 + 1 (test_limits runs n = 2^22).
-    constexpr std::size_t past = (std::size_t(1) << 22) + 1;
+    // Past the kernel's kMaxSize = 2^23: thrown by the frontend's own check, before any work, from
+    // n = 2^23 + 1 (test_limits runs n = 2^23). g[0] != 0 too: the check comes before the shift.
+    constexpr std::size_t past = fps::composition::kMaxSize + 1;
+    static_assert(past == (std::size_t(1) << 23) + 1);
     CHECK(throws_from<std::length_error>("fps::compose", [] { (void)fps::compose(Poly{1, 2}, Poly{0, 1, 1}, past); }));
+    CHECK(throws_from<std::length_error>("fps::compose", [] { (void)fps::compose(Poly{1, 2}, Poly{5, 1, 1}, past); }));
     CHECK(throws_from<std::length_error>("fps::compose", [] { (void)fps::compose(Poly{1, 2}, Poly{0, 1, 1}, std::size_t(1) << 24); }));
     CHECK(throws_from<std::length_error>("fps::compositional_inverse",
                                          [] { (void)fps::compositional_inverse(Poly{0, 1, 1}, past); }));
@@ -330,30 +332,34 @@ void test_errors() {
     Poly top((std::size_t(1) << 24) + 1);
     top[top.size() - 1] = 1;
     CHECK(throws_from<std::length_error>("Taylor shift", [&top] { (void)fps::compose(top, Poly{1, 1}); }));
-    // On the general path n <= 2^22 (the check above), so f needs more than 2^25 - 2^22 words.
-    Poly longer((std::size_t(1) << 25) - (std::size_t(1) << 22) + 2);
+    // On the general path n <= 2^23 (the check above), so f needs more than 2^25 - 2^23 words.
+    Poly longer((std::size_t(1) << 25) - (std::size_t(1) << 23) + 2);
     longer[longer.size() - 1] = 1;
     CHECK(throws_from<std::length_error>("Taylor shift",
-                                         [&longer] { (void)fps::compose(longer, Poly{1, 1, 1}, std::size_t(1) << 22); }));
+                                         [&longer] { (void)fps::compose(longer, Poly{1, 1, 1}, std::size_t(1) << 23); }));
 }
 
-// At the limits: the largest sizes the checks above pass run through every product. Vector
-// targets at -O2 only: 17 s on the Mac (arm), 192 s on lc-amd's scalar target, gigabytes under ASan.
+// At the limits: the largest sizes the checks above pass, n = 2^23, through every level of the
+// kernel. Vector targets at -O2 only (scalar: minutes; ASan: gigabytes more). The kernel keeps its
+// work per thread (about 3.3 GiB for compose at n = 2^23), so each part runs in a thread of its
+// own, which frees it on exit.
+void in_thread(auto f) { std::thread(f).join(); }
+
 void test_limits() {
     if (kSanitized || std::is_same_v<fps::simd::Native, fps::simd::Scalar>) return;
-    const std::size_t n = std::size_t(1) << 22;
-    const fps::Factorials<P> fact(2 * n + 1);
-    // compose: f = 1 + y, g of n random words, g[0] = 0, gives 1 + g.
-    {
-        Poly g = poly(random_vec(n));
-        g[0] = 0;
-        Poly want = g;
-        want[0] = 1;
-        CHECK(fps::compose(Poly{1, 1}, g) == want);
-    }
+    constexpr std::size_t n = fps::composition::kMaxSize;
+    // compose: f = 1 + y + y^2, g of n random words with g[0] != 0 (the Taylor shift, then the
+    // kernel): 1 + g + g^2.
+    Poly g = poly(random_vec(n));
+    g[0] = nonzero();
+    in_thread([&g] {
+        const Poly want = 1 + g + fps::mul(g, g, n);
+        CHECK(fps::compose(Poly{1, 1, 1}, g) == want);
+    });
     // compositional_inverse of x + x^2: sum over k >= 1 of (-1)^(k-1) C(k-1) x^k, C the Catalan
     // numbers.
-    {
+    in_thread([] {
+        const fps::Factorials<P> fact(2 * n + 1);
         const Poly g = fps::compositional_inverse(Poly{0, 1, 1}, n);
         CHECK(g.size() == n && g[0] == 0);
         for (const std::size_t k : {std::size_t(1), std::size_t(2), std::size_t(3), std::size_t(1000), n / 2 + 1, n - 1}) {
@@ -361,7 +367,7 @@ void test_limits() {
             const u32 c = mul(fact[2 * j], mul(fact.inverse(j), fact.inverse(j + 1)));
             CHECK(g[k] == (j % 2 ? (c ? P - c : 0) : c), k);
         }
-    }
+    });
     // The Taylor shift at exactly 2^25 words: f = x^(2^24), n = 2^24, so f(x + 1) = (x + 1)^(2^24),
     // coefficient k C(2^24, k).
     {
