@@ -4,6 +4,8 @@
 //   "<op>@kernel/<lg>"   gcd, inverse_mod: fps::half_gcd (backend/gcd); roots, roots_split,
 //                        roots_repeated: fps::root_finding::roots (backend/roots); on the same
 //                        inputs, into kept memory
+//   "<op>@api/<lg>"      through the API, outside the gate's verdict: roots_split at 2^20, 1-5 s a
+//                        call, timed for reports only (it would add minutes to every gate)
 // factor has no kernel yet (backend issue #123 moves lc-opt's): it runs on gcd, f % g and f * g.
 #include <cstddef>
 #include <cstdint>
@@ -83,7 +85,8 @@ int main(int argc, char** argv) {
         const std::size_t n = std::size_t(1) << lg;
         const std::string size = "/" + std::to_string(lg);
         const auto add = [&](const std::string& name, auto make) {
-            suite.add(name + size, [make] { return [f = make()] { bench::keep(fps::roots(f)); }; }, n);
+            const std::string api = name == "roots_split" && lg == 20 ? name + "@api" : name;
+            suite.add(api + size, [make] { return [f = make()] { bench::keep(fps::roots(f)); }; }, n);
             suite.add(name + "@kernel" + size, [make] {
                 Poly f = make();
                 std::vector<std::uint32_t> out(f.size());
