@@ -7,8 +7,9 @@
 // t = min(n, f.size()) (for a = 0, F = f; else one call into the backend's Taylor shift,
 // fps::taylor_shift::shift, on f without its trailing zeros):
 // - g mod x^n constant: f(a), then zeros. O(f.size()).
-// - g mod x^n = a + b x, b != 0: h[k] = F[k] b^k (b = 1: F itself). O(n log n). The scaling is a
-//   serial loop here, 3-4 ns a coefficient, up to the shift's own time (backend issue #186).
+// - g mod x^n = a + b x, b != 0: h[k] = F[k] b^k (b = 1: F itself). O(n log n). The scaling is
+//   one vector pass, chirp::multiply_chirp(1, b, 1), from F into h (into the kernel: backend
+//   issue #186).
 // - else f(g) = F(g - a): one call into the backend's fps::composition::compose (Kinoshita and Li
 //   with lc-opt's layout), which reads g[0] as 0. O(n log^2 n).
 // compositional_inverse needs f[0] = 0 for n >= 1 and f[1] != 0 for n >= 2 (only f mod x^n is
@@ -32,6 +33,7 @@
 #include <span>
 #include <stdexcept>
 
+#include "backend/chirp/chirp.hpp"
 #include "backend/composition/composition.hpp"
 #include "backend/taylor_shift/taylor_shift.hpp"
 #include "fps/modular.hpp"
@@ -85,13 +87,12 @@ Polynomial<P> compose(const Polynomial<P>& f, const Polynomial<P>& g, std::size_
         throw std::length_error("fps::compose: Taylor shift of f of degree 2^24 or more (the shift kernel's kMaxSize)");
     if (terms == 2) {  // h = F(b y): F written into h, then scaled by b^k
         Polynomial<P> h = detail::unwritten_polynomial<P>(n);
-        if (a != 0) c::shift(fs, a, h.span().first(t));
-        else std::copy(fs.begin(), fs.end(), h.span().begin());
+        const std::span<std::uint32_t> head = h.span().first(t);
+        const std::uint32_t b = gs[1];
+        if (a != 0) c::shift(fs, a, head);
+        if (b != 1) chirp::multiply_chirp(1, b, 1, a != 0 ? std::span<const std::uint32_t>(head) : fs, head);
+        else if (a == 0) std::copy(fs.begin(), fs.end(), head.begin());
         std::fill(h.span().begin() + std::ptrdiff_t(t), h.span().end(), 0);
-        if (const std::uint32_t b = gs[1]; b != 1) {
-            std::uint32_t power = b;
-            for (std::size_t k = 1; k < t; ++k, power = mod_mul<P>(power, b)) h[k] = mod_mul<P>(h[k], power);
-        }
         return h;
     }
     Polynomial<P> shifted;
