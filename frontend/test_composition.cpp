@@ -177,11 +177,20 @@ void test_compose_large() {
     for (const std::size_t n : kSizes) {
         if (n <= 65) continue;
         for (const Vec& g : inner_functions(n)) {
-            // Short f against the schoolbook; f of n + 3 against Horner on fps::mul.
+            // Short f against the schoolbook; f of n + 3 against Horner on fps::mul up to 257, and
+            // above (Horner's n products cost seconds on the scalar target) by its split at k:
+            // F(g) = F_lo(g) + g^k F_hi(g), each part through compose on its own f.
             const Vec f = random_vec(1 + rng() % 6);
             CHECK(vec(fps::compose(poly(f), poly(g), n)) == naive_compose(f, g, n), n, f.size(), g.size());
-            const Poly F = poly(random_vec(n + 3));
-            CHECK(fps::compose(F, poly(g), n) == horner(F, poly(g), n), n, g.size());
+            const Poly F = poly(random_vec(n + 3)), G = poly(g);
+            if (n <= 257) {
+                CHECK(fps::compose(F, G, n) == horner(F, G, n), n, g.size());
+                continue;
+            }
+            const std::size_t k = 1 + rng() % (n + 2);
+            const Poly lo = F.truncate(k), hi = F / Poly::x(k);
+            const Poly want = fps::compose(lo, G, n) + fps::mul(fps::pow(G.truncate(n), k, n), fps::compose(hi, G, n), n);
+            CHECK(fps::compose(F, G, n) == want, n, g.size(), k);
         }
     }
 }
@@ -206,7 +215,7 @@ void test_defaults() {
 // Identities at large n, every path: f(g) for f the series of exp and of log(1 + y); a Taylor
 // shift there and back; a scaling there and back; long f with short n.
 void test_identities() {
-    for (const std::size_t n : {std::size_t(1) << 14, (std::size_t(1) << 14) + 1, std::size_t(100003)}) {
+    for (const std::size_t n : {std::size_t(1) << 14, (std::size_t(1) << 14) + 1, std::size_t(30011)}) {
         const fps::Factorials<P> fact(n + 1);
         Poly e(n), l(n);
         for (std::size_t i = 0; i < n; ++i) e[i] = fact.inverse(i);  // exp(y)
@@ -251,9 +260,12 @@ void test_inverse() {
                 if (n <= 129) {
                     CHECK(naive_compose(f, vec(g), n) == x_mod(n), n, m, kind);
                     CHECK(naive_compose(vec(g), f, n) == x_mod(n), n, m, kind);
-                } else {
+                } else if (n <= 257) {
                     CHECK(vec(horner(poly(f), g, n)) == x_mod(n), n, m, kind);
                     CHECK(vec(horner(g, poly(f), n)) == x_mod(n), n, m, kind);
+                } else {  // compose is tested against Horner above
+                    CHECK(vec(fps::compose(poly(f), g, n)) == x_mod(n), n, m, kind);
+                    CHECK(vec(fps::compose(g, poly(f), n)) == x_mod(n), n, m, kind);
                 }
             }
     // Closed forms: x / (1 - x) has inverse x / (1 + x); x e^x (Lambert): [x^k] = (-k)^(k-1) / k!.
@@ -270,7 +282,7 @@ void test_inverse() {
     // The default n, and n past f.size().
     CHECK(fps::compositional_inverse(Poly{0, 3}).size() == 2);
     CHECK(fps::compositional_inverse(Poly{0, 3}, 6) == poly(Vec{0, fps::mod_inverse<P>(3), 0, 0, 0, 0}));
-    for (const std::size_t big : {std::size_t(1) << 14, (std::size_t(1) << 14) + 1, std::size_t(100003)}) {
+    for (const std::size_t big : {std::size_t(1) << 14, (std::size_t(1) << 14) + 1, std::size_t(30011)}) {
         Poly f = poly(random_vec(big));
         f[0] = 0, f[1] = nonzero();
         const Poly gi = fps::compositional_inverse(f);
@@ -313,10 +325,12 @@ void test_errors() {
     CHECK(fps::compositional_inverse(Poly{1, 1}, 0).size() == 0);
     CHECK(fps::compositional_inverse(Poly{0, 0, 1}, 1) == Poly{0});
     CHECK(fps::compositional_inverse(Poly{}, 1) == Poly{0});
-    // Past the NTT's 2^25 words: thrown by the composition's own check, before any work, from
-    // n = 2^22 + 1 (test_limits runs n = 2^22).
-    constexpr std::size_t past = (std::size_t(1) << 22) + 1;
+    // Past the kernel's kMaxSize = 2^23: thrown by the frontend's own check, before any work, from
+    // n = 2^23 + 1 (test_limits runs n = 2^23). g[0] != 0 too: the check comes before the shift.
+    constexpr std::size_t past = fps::composition::kMaxSize + 1;
+    static_assert(past == (std::size_t(1) << 23) + 1);
     CHECK(throws_from<std::length_error>("fps::compose", [] { (void)fps::compose(Poly{1, 2}, Poly{0, 1, 1}, past); }));
+    CHECK(throws_from<std::length_error>("fps::compose", [] { (void)fps::compose(Poly{1, 2}, Poly{5, 1, 1}, past); }));
     CHECK(throws_from<std::length_error>("fps::compose", [] { (void)fps::compose(Poly{1, 2}, Poly{0, 1, 1}, std::size_t(1) << 24); }));
     CHECK(throws_from<std::length_error>("fps::compositional_inverse",
                                          [] { (void)fps::compositional_inverse(Poly{0, 1, 1}, past); }));
@@ -330,30 +344,41 @@ void test_errors() {
     Poly top((std::size_t(1) << 24) + 1);
     top[top.size() - 1] = 1;
     CHECK(throws_from<std::length_error>("Taylor shift", [&top] { (void)fps::compose(top, Poly{1, 1}); }));
-    // On the general path n <= 2^22 (the check above), so f needs more than 2^25 - 2^22 words.
-    Poly longer((std::size_t(1) << 25) - (std::size_t(1) << 22) + 2);
+    // On the general path n <= 2^23 (the check above), so f needs more than 2^25 - 2^23 words.
+    Poly longer((std::size_t(1) << 25) - (std::size_t(1) << 23) + 2);
     longer[longer.size() - 1] = 1;
     CHECK(throws_from<std::length_error>("Taylor shift",
-                                         [&longer] { (void)fps::compose(longer, Poly{1, 1, 1}, std::size_t(1) << 22); }));
+                                         [&longer] { (void)fps::compose(longer, Poly{1, 1, 1}, std::size_t(1) << 23); }));
 }
 
-// At the limits: the largest sizes the checks above pass run through every product. Vector
-// targets at -O2 only: 17 s on the Mac (arm), 192 s on lc-amd's scalar target, gigabytes under ASan.
+// At the limits: the largest sizes the checks above pass, n = 2^23, through every level of the
+// kernel. Vector targets at -O2 only (scalar: minutes; ASan: gigabytes more), and not sse: the
+// gate tests sse and avx2 at once on lc-amd (16 GB), and two copies peaking at 4.2 GB each beside
+// the builds could run it out of memory. The kernel keeps its work per thread (about 3.3 GiB for
+// compose at n = 2^23), so each part runs in a thread of its own, which frees it on exit.
+void in_thread(auto f) { std::thread(f).join(); }
+
+#if defined(__SSE4_1__) && !defined(__AVX2__)
+constexpr bool kSseTarget = true;
+#else
+constexpr bool kSseTarget = false;
+#endif
+
 void test_limits() {
-    if (kSanitized || std::is_same_v<fps::simd::Native, fps::simd::Scalar>) return;
-    const std::size_t n = std::size_t(1) << 22;
-    const fps::Factorials<P> fact(2 * n + 1);
-    // compose: f = 1 + y, g of n random words, g[0] = 0, gives 1 + g.
-    {
-        Poly g = poly(random_vec(n));
-        g[0] = 0;
-        Poly want = g;
-        want[0] = 1;
-        CHECK(fps::compose(Poly{1, 1}, g) == want);
-    }
+    if (kSanitized || kSseTarget || std::is_same_v<fps::simd::Native, fps::simd::Scalar>) return;
+    constexpr std::size_t n = fps::composition::kMaxSize;
+    // compose: f = 1 + y + y^2, g of n random words with g[0] != 0 (the Taylor shift, then the
+    // kernel): 1 + g + g^2.
+    Poly g = poly(random_vec(n));
+    g[0] = nonzero();
+    in_thread([&g] {
+        const Poly want = 1 + g + fps::mul(g, g, n);
+        CHECK(fps::compose(Poly{1, 1, 1}, g) == want);
+    });
     // compositional_inverse of x + x^2: sum over k >= 1 of (-1)^(k-1) C(k-1) x^k, C the Catalan
     // numbers.
-    {
+    in_thread([] {
+        const fps::Factorials<P> fact(2 * n + 1);
         const Poly g = fps::compositional_inverse(Poly{0, 1, 1}, n);
         CHECK(g.size() == n && g[0] == 0);
         for (const std::size_t k : {std::size_t(1), std::size_t(2), std::size_t(3), std::size_t(1000), n / 2 + 1, n - 1}) {
@@ -361,7 +386,7 @@ void test_limits() {
             const u32 c = mul(fact[2 * j], mul(fact.inverse(j), fact.inverse(j + 1)));
             CHECK(g[k] == (j % 2 ? (c ? P - c : 0) : c), k);
         }
-    }
+    });
     // The Taylor shift at exactly 2^25 words: f = x^(2^24), n = 2^24, so f(x + 1) = (x + 1)^(2^24),
     // coefficient k C(2^24, k).
     {
