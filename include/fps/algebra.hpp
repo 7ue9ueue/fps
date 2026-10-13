@@ -2,7 +2,7 @@
 //
 //   fps::gcd(f, g)           // monic gcd: deg + 1 coefficients; gcd(0, 0) = 0 (no coefficients)
 //   fps::inverse_mod(f, m)   // std::optional: h with f h = 1 mod m, deg m coefficients; m != 0
-//   fps::roots(f)            // the distinct roots in [0, P), increasing; f != 0
+//   fps::roots(f)            // the distinct roots in [0, P), increasing; f != 0, deg f < 2^24
 //   fps::factor(f)           // monic irreducible factors with multiplicities; f != 0, deg f < P
 //
 // f and g may end in zeros (size() counts them; nothing here reads past the degree). A broken
@@ -14,24 +14,27 @@
 // coefficients from the constant term up (lexicographic); results do not depend on the random
 // choices below.
 //
-// Paths (roots and factor are plain; backend issues #122 and #123 move lc-opt's root finding and
-// factorization):
+// Paths (factor is plain; backend issue #123 moves lc-opt's factorization):
 // - gcd, inverse_mod: one call each into the backend's half-gcd, fps::half_gcd (backend/gcd/gcd.hpp:
 //   lc-opt's, #103), O(n log^2 n), on f and g trimmed to their degrees (m too: the kernel needs its
 //   top word nonzero). An input of degree 2^25 or more (the transforms' limit; trailing zeros do
 //   not count) is first reduced modulo the other, by division, if the other is within the limit:
 //   gcd(f, x + 1) works for any f. Both past it, or m past it in inverse_mod: std::length_error.
-// - roots: f = x^z u (0 is a root for z > 0); the product r of (x - a) over the nonzero roots a is
-//   gcd(u, x^(P-1) - 1); r splits by Cantor and Zassenhaus: gcd(r, b^((P-1)/2) - 1) for random b.
+// - roots: one call into the backend's tangent Graeffe root finder, fps::root_finding::roots
+//   (backend/roots/roots.hpp: lc-opt's, #122), O(d log d) for d = deg f, more with many repeated
+//   or colliding roots (up to about d^2 / 300). Its transforms of 2 bit_ceil(d + 1) words need
+//   deg f <= 2^24 - 1 (trailing zeros do not count; a factor x^z counts): std::length_error past
+//   it, before any work. Its workspace, kept per thread, is 32 to 45 d words.
 // - factor: Yun's square-free decomposition (it needs deg f < P, so that f' = 0 only for a
 //   constant f), then per square-free part s the distinct-degree split gcd(s, x^(P^d) - x) for
 //   d = 1, 2, ... up to deg s / 2, then Cantor and Zassenhaus for each degree d: b^((P^d - 1)/2) - 1.
 // Powers modulo m are square and multiply on f * g and f % m: 30 squarings for an exponent near P.
 // A xorshift generator with a fixed seed draws b, so the run time is the same on every call.
-// Costs on the four timed targets (frontend/notes/168.md), ns per degree: gcd and inverse_mod of
-// two random polynomials of degree 2^12 82-235, 2^16 137-385 (within 1% of the kernel's from 2^8
-// on); ms: roots of 2^10 distinct linear factors 12-21, factor of a random polynomial of degree 256
-// 16-29.
+// Costs on the four timed targets (frontend/notes/168.md, 192.md), ns per degree: gcd and
+// inverse_mod of two random polynomials of degree 2^12 82-235, 2^16 137-385 (within 1% of the
+// kernel's from 2^8 on); roots (within 1% of the kernel's from 2^8 on) of a random f of degree
+// 2^12 54-166, 2^20 48-146; of 2^12 distinct linear factors 102-337, of 2^20 1077-4903 (the
+// kernel's climbs, #185); ms: factor of a random polynomial of degree 256 16-29.
 #pragma once
 
 #include <algorithm>
@@ -44,6 +47,7 @@
 #include <vector>
 
 #include "backend/gcd/gcd.hpp"
+#include "backend/roots/roots.hpp"
 #include "fps/division.hpp"
 #include "fps/modular.hpp"
 #include "fps/polynomial.hpp"
@@ -166,27 +170,18 @@ std::optional<Polynomial<P>> inverse_mod(const Polynomial<P>& f, const Polynomia
     return h;
 }
 
+// out of deg f words, as the kernel asks, trimmed to the roots found (the capacity too: a random
+// f has about one root). f = 0 is checked here, so the kernel's std::invalid_argument never
+// escapes, and the degree before out is allocated.
 template <std::uint32_t P>
 std::vector<std::uint32_t> roots(const Polynomial<P>& f) {
-    using namespace detail::algebra;
-    if (f.degree() < 0) throw std::domain_error("fps::roots: f = 0");
-    Polynomial<P> u = monic(f);
-    std::vector<std::uint32_t> found;
-    const std::size_t z = std::size_t(std::ranges::find_if(u.span(), [](std::uint32_t c) { return c != 0; }) -
-                                      u.span().begin());
-    if (z > 0) {
-        found.push_back(0);
-        u = u / Polynomial<P>::x(z);
-    }
-    if (u.degree() > 0) {
-        const Polynomial<P> r = gcd(u, pow_mod(Polynomial<P>::x(), P - 1, u) - 1);
-        Factors<P> linear;
-        Random random;
-        if (r.degree() > 0) split(r, 1, 1, linear, random);
-        for (const auto& [l, e] : linear) found.push_back(l[0] == 0 ? 0 : P - l[0]);
-    }
-    std::ranges::sort(found);
-    return found;
+    const int d = f.degree();
+    if (d < 0) throw std::domain_error("fps::roots: f = 0");
+    if (std::size_t(d) > root_finding::kMaxDegree) throw std::length_error("fps::roots: deg f >= 2^24");
+    std::vector<std::uint32_t> out(std::size_t(d), 0);
+    out.resize(root_finding::roots(f.span().first(std::size_t(d) + 1), out));
+    out.shrink_to_fit();
+    return out;
 }
 
 template <std::uint32_t P>

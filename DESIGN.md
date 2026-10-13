@@ -194,6 +194,16 @@ An input of degree 2^25 or more (its transforms' limit; trailing zeros do not co
 reduced modulo the other by division if the other is within the limit, so `gcd(f, x + 1)` works
 for any f; both inputs past it, or m past it in `inverse_mod`, throw `std::length_error` (#168).
 
+`roots(f)` runs the backend's tangent Graeffe root finder (lc-opt's, #122): O(d log d) for
+d = deg f, up to about d^2 / 300 more with many repeated or colliding roots (#185): at d = 2^20,
+0.10 s for a random f and 3.2 s for 2^20 distinct roots on Zen 3 (#192). It needs
+deg f < 2^24 (its transforms have 2 bit_ceil(d + 1) words; trailing zeros do not count, a factor
+x^z does) and throws `std::length_error` past it, before any work; its workspace is kept per
+thread, 32 to 45 d words (up to 3 GiB near 2^24). The frontend's own path (gcd with x^(P-1) - 1,
+Cantor and Zassenhaus) stopped near the same degree (its squares mod u, f = x^z u, pass 2^25
+words for deg u > 2^24) and ran 6 to 114 times slower (8 to 16 times at 2^20), so it was not kept for the inputs in
+between (deg u = 2^24, or a factor x^z that takes deg f to 2^24 or more) (#192).
+
 `compose(f, g, n)`: a constant g mod x^n gives f(g[0]) (Horner), a linear one a Taylor shift by
 g[0] and a scaling by g[1]^k; any other g a Taylor shift by g[0], then the backend's Kinoshita and
 Li (#169), as does `compositional_inverse`. Both run for n up to 2^23, the kernel's limit, and

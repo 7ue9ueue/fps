@@ -1,7 +1,8 @@
 // Tests of fps/algebra.hpp: gcd against Euclid's algorithm on long division, inverse_mod by f h = 1
-// mod m and against that gcd, roots against gcd(f, x^P - x) by naive powers and on polynomials
-// built from known roots, factor on products of known irreducibles (exact lists) and on random
-// polynomials (product, irreducibility by Rabin's test, order); threads and every error.
+// mod m and against that gcd, roots against gcd(f, x^P - x) by naive powers (to degree 2^11 + 1
+// by fps's products) and on polynomials built from known roots, factor on products of known
+// irreducibles (exact lists) and on random polynomials (product, irreducibility by Rabin's test,
+// order); threads and every error.
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -357,6 +358,79 @@ void test_roots() {
     CHECK(fps::roots(fps::product(linear) * poly(irreducible_quadratic(3, z))) == want);
 }
 
+// The kernel (#192) past kSizes: degrees 2^k - 1, 2^k, 2^k + 1 (its transform lengths and wrapped
+// coefficients), trailing zeros, a factor x^z, and per-thread workspaces of different sizes.
+Poly from_roots_poly(const Vec& roots) {
+    std::vector<Poly> linear;
+    for (const u32 r : roots) linear.push_back(Poly{sub(0, r), 1});
+    return fps::product(linear);
+}
+
+// x^P mod f by fps's products and division (square and multiply), for gcd(f, x^P - x).
+Poly x_to_p_mod(const Poly& f) {
+    Poly r = Poly{1} % f, a = Poly::x() % f;
+    for (u64 e = P; e; e >>= 1) {
+        if (e & 1) r = (r * a) % f;
+        if (e > 1) a = fps::square(a) % f;
+    }
+    return r;
+}
+
+void test_roots_long() {
+    const u32 z = non_square();
+    for (const int k : {7, 9, 11}) {
+        for (const std::size_t n : {(std::size_t(1) << k) - 1, std::size_t(1) << k, (std::size_t(1) << k) + 1}) {
+            // Planted: n factors over about 3n/4 values (0 among them for odd n), times c; then
+            // the same with an irreducible quadratic, so the degree is n + 2, and with trailing zeros.
+            Vec want;
+            for (std::size_t i = 0; i < n; ++i)
+                want.push_back(i == 0 && n % 2 ? 0 : i % 4 == 3 ? want[rng() % want.size()] : random_value());
+            Poly f = from_roots_poly(want) * nonzero();
+            std::ranges::sort(want);
+            want.erase(std::unique(want.begin(), want.end()), want.end());
+            CHECK(fps::roots(f) == want, n);
+            Poly g = f * poly(irreducible_quadratic(random_value(), z));
+            CHECK(fps::roots(g) == want, n);
+            g.resize(g.size() + 1 + n % 5);
+            CHECK(fps::roots(g) == want, n);
+            // Random of degree n: every root found is one, and they are all of gcd(f, x^P - x).
+            const Poly r = poly(random_degree(n));
+            const Vec found = fps::roots(r);
+            CHECK(std::ranges::is_sorted(found) && std::ranges::adjacent_find(found) == found.end(), n);
+            CHECK(std::ranges::all_of(found, [&](u32 a) { return r(a) == 0; }), n);
+            CHECK(fps::gcd(r, x_to_p_mod(r) - Poly::x()).degree() == int(found.size()), n, found.size());
+        }
+    }
+    // f = x^z u: 0 and u's roots; the degree counts z.
+    for (const std::size_t zeros : {1, 2, 1000, 4097}) {
+        const Vec u_roots = {5, 7, P - 1};
+        const Vec found = fps::roots(from_roots_poly(u_roots) * Poly::x(zeros));
+        CHECK(found == (Vec{0, 5, 7, P - 1}), zeros);
+        CHECK(fps::roots(Poly::x(zeros)) == Vec{0}, zeros);
+        CHECK(fps::roots(Poly::x(zeros) * 3 + Poly::x(zeros + 1)) == (Vec{0, P - 3}), zeros);
+    }
+    // Threads with sizes of their own: each grows its own workspace, results unchanged.
+    std::vector<Vec> sets;
+    std::vector<Poly> fs;
+    for (int t = 0; t < 4; ++t) {
+        Vec s;
+        for (int i = 0; i < 100 << (2 * t); ++i) s.push_back(random_value());
+        fs.push_back(from_roots_poly(s));
+        std::ranges::sort(s);
+        s.erase(std::unique(s.begin(), s.end()), s.end());
+        sets.push_back(std::move(s));
+    }
+    std::vector<int> ok(4, 1);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t)
+        threads.emplace_back([&, t] {
+            for (int rep = 0; rep < 3; ++rep)
+                for (int j = 0; j < 4; ++j) ok[std::size_t(t)] &= fps::roots(fs[std::size_t((t + j) % 4)]) == sets[std::size_t((t + j) % 4)];
+        });
+    for (std::thread& t : threads) t.join();
+    CHECK(std::ranges::all_of(ok, [](int v) { return v == 1; }));
+}
+
 // factor of the product of the given factors (to their multiplicities), times c.
 void check_factor(Factors parts, u32 c, std::size_t tag) {
     Vec f{c};
@@ -448,6 +522,23 @@ void test_errors() {
     CHECK(throws<domain_error>([] { (void)fps::inverse_mod(Poly{1, 2}, Poly(3)); }));
     CHECK(throws<domain_error>([] { (void)fps::roots(Poly{}); }));
     CHECK(throws<domain_error>([] { (void)fps::roots(Poly(4)); }));
+    // roots: deg f >= 2^24 (the kernel's transforms) throws std::length_error, before any work;
+    // trailing zeros do not count, a factor x^z does.
+    {
+        using std::length_error;
+        const std::size_t D = std::size_t(1) << 24;
+        Poly big = fps::detail::unwritten_polynomial<P>(D + 1);
+        big[D] = 1;
+        CHECK(throws<length_error>([&] { (void)fps::roots(big); }));
+        CHECK(throws<length_error>([] { (void)fps::roots(Poly::x(std::size_t(1) << 24)); }));
+        // The accepting side: deg f = 2^24 - 1, x^z included (the kernel splits x^z off first).
+        CHECK(fps::roots(Poly::x(D - 1)) == Vec{0});
+        CHECK(fps::roots(Poly::x(D - 2) * Poly{3, 1}) == (Vec{0, P - 3}));
+        CHECK(throws<length_error>([] { (void)fps::roots(Poly::x((std::size_t(1) << 24) - 1) * Poly{3, 1}); }));
+        Poly padded(D + 5);
+        padded[0] = P - 1, padded[2] = 1;
+        CHECK(fps::roots(padded) == (Vec{1, P - 1}));
+    }
     CHECK(throws<domain_error>([] { (void)fps::factor(Poly{}); }));
     CHECK(throws<domain_error>([] { (void)fps::factor(Poly(4)); }));
     // deg f >= P: 4 GB of unwritten memory, only the top word written.
@@ -487,6 +578,7 @@ int main() {
     test_inverse_mod();
     test_long();
     test_roots();
+    test_roots_long();
     test_factor();
     test_threads();
     test_errors();
