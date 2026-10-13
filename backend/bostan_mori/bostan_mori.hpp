@@ -68,7 +68,13 @@ constexpr u32 power(u32 a, u64 e) {
 }
 constexpr u32 inverse(u32 a) { return power(a, kP - 2); }
 inline constexpr u32 kR = u32((u64(1) << 32) % kP);  // 2^32 mod P
-inline constexpr u32 kHalf = (kP + 1) / 2;
+// 2^-h mod P for h <= 64: the scale of the values path after h steps.
+inline constexpr auto kHalves = [] {
+    std::array<u32, 65> t{};
+    t[0] = 1;
+    for (int h = 1; h <= 64; ++h) t[h] = mul(t[h - 1], (kP + 1) / 2);
+    return t;
+}();
 
 // p and q cut to k + 1 words, p without its zero top words.
 struct Input {
@@ -122,25 +128,53 @@ inline constexpr std::size_t kGap = 80;
 inline const u32* inverse_points(std::size_t words) {
     thread_local std::vector<u32> table;
     if (table.size() >= words) return table.data();
+    // x c mod P by Shoup's product with c's quotient, x < 2^32
+    const auto times = [](u32 x, u32 c, u32 cq) {
+        const u32 r = u32(x * c - u32((u64(x) * cq) >> 32) * kP);
+        return r >= kP ? r - kP : r;
+    };
+    const auto quotient = [](u32 c) { return u32((u64(c) << 32) / kP); };
     const std::size_t leaves = words / 4;  // L / 8
-    // inverse roots of order 2^(j + 2), j < 22; r(4 v)^-1 = product over the bits j of v of root j + 2
-    u32 root[24];
-    for (int j = 0; j < 24; ++j) root[j] = j + 2 <= 23 ? inverse(power(3, (kP - 1) >> (j + 2))) : 1;
+    // r(4 v)^-1 2^32: the product over the bits j of v of the inverse root of order 2^(j + 4)
     std::vector<u32> rho(leaves);
-    rho[0] = kR;  // times 2^32
+    rho[0] = kR;
     for (std::size_t h = 1; h < leaves; h *= 2) {
-        const u32 c = root[std::countr_zero(h) + 2];
-        for (std::size_t i = 0; i < h; ++i) rho[h + i] = mul(rho[i], c);
+        const u32 c = inverse(power(3, (kP - 1) >> (std::countr_zero(h) + 4))), cq = quotient(c);
+        for (std::size_t i = 0; i < h; ++i) rho[h + i] = times(rho[i], c, cq);
     }
-    const u32 zinv = root[1];  // z^-1, z = r(2) of order 8
+    const u32 zinv = inverse(power(3, (kP - 1) >> 3));  // z^-1, z = r(2) of order 8
     const u32 z2 = mul(zinv, zinv);
     const u32 rows[4] = {1, z2, zinv, mul(z2, zinv)};  // z^-bitrev2(m): z^0, z^-2, z^-1, z^-3
     std::vector<u32> t(words);
-    for (std::size_t g = 0; g < words / 32; ++g)
-        for (int m = 0; m < 4; ++m)
-            for (int x = 0; x < 8; ++x) t[32 * g + 8 * std::size_t(m) + std::size_t(x)] = mul(rho[8 * g + std::size_t(x)], rows[m]);
+    for (int m = 0; m < 4; ++m) {
+        const u32 c = rows[m], cq = quotient(c);
+        for (std::size_t g = 0; g < words / 32; ++g)
+            for (std::size_t x = 0; x < 8; ++x) t[32 * g + 8 * std::size_t(m) + x] = times(rho[8 * g + x], c, cq);
+    }
     table = std::move(t);
     return table.data();
+}
+
+// (even, odd): the even and the odd lanes of the 2W lanes a then b (W = 1, 4 or 8).
+template <class S>
+[[gnu::always_inline]] inline std::pair<typename S::V, typename S::V> unzip(typename S::V a, typename S::V b) {
+    if constexpr (S::lanes == 1) {
+        return {a, b};
+    } else if constexpr (S::lanes == 8) {
+#if defined(__AVX2__)
+        const __m256 x = _mm256_castsi256_ps(a), y = _mm256_castsi256_ps(b);
+        const __m256i e = _mm256_castps_si256(_mm256_shuffle_ps(x, y, 0x88));  // a0 a2 b0 b2 | a4 a6 b4 b6
+        const __m256i o = _mm256_castps_si256(_mm256_shuffle_ps(x, y, 0xdd));
+        return {_mm256_permute4x64_epi64(e, 0xd8), _mm256_permute4x64_epi64(o, 0xd8)};
+#endif
+    } else {
+#if defined(__ARM_NEON) && defined(__aarch64__)
+        return {vuzp1q_u32(a, b), vuzp2q_u32(a, b)};
+#elif defined(__SSE4_1__)
+        const __m128 x = _mm_castsi128_ps(a), y = _mm_castsi128_ps(b);
+        return {_mm_castps_si128(_mm_shuffle_ps(x, y, 0x88)), _mm_castps_si128(_mm_shuffle_ps(x, y, 0xdd))};
+#endif
+    }
 }
 
 // ---- The halving pass (values path) -------------------------------------------------------------
@@ -195,27 +229,6 @@ struct Pass {
         }
     }
 
-    // (even, odd): the even and the odd lanes of the 2W lanes a then b.
-    [[gnu::always_inline]] static std::pair<V, V> unzip(V a, V b) {
-        if constexpr (W == 1) {
-            return {a, b};
-        } else if constexpr (W == 8) {
-#if defined(__AVX2__)
-            const __m256 x = _mm256_castsi256_ps(a), y = _mm256_castsi256_ps(b);
-            const __m256i e = _mm256_castps_si256(_mm256_shuffle_ps(x, y, 0x88));  // a0 a2 b0 b2 | a4 a6 b4 b6
-            const __m256i o = _mm256_castps_si256(_mm256_shuffle_ps(x, y, 0xdd));
-            return {_mm256_permute4x64_epi64(e, 0xd8), _mm256_permute4x64_epi64(o, 0xd8)};
-#endif
-        } else {
-#if defined(__ARM_NEON) && defined(__aarch64__)
-            return {vuzp1q_u32(a, b), vuzp2q_u32(a, b)};
-#elif defined(__SSE4_1__)
-            const __m128 x = _mm_castsi128_ps(a), y = _mm_castsi128_ps(b);
-            return {_mm_castps_si128(_mm_shuffle_ps(x, y, 0x88)), _mm_castps_si128(_mm_shuffle_ps(x, y, 0xdd))};
-#endif
-        }
-    }
-
     // Output block h of U and V (64 words each) from blocks 2h and 2h + 1 of p and q (length L).
     // Output row m gets the even lanes (leaves 2u) of pair m, row m + 4 the odd ones (leaves 2u + 1):
     // leaf u = 4 g + t / 2 of length N holds the squares of leaves 2u and 2u + 1 of length L.
@@ -242,8 +255,8 @@ struct Pass {
             }
 #pragma GCC unroll 8
             for (int i = 0; i < C; ++i) {
-                const auto [ue, uo] = unzip(us[2 * i], us[2 * i + 1]);
-                const auto [ve, vo] = unzip(vs[2 * i], vs[2 * i + 1]);
+                const auto [ue, uo] = unzip<S>(us[2 * i], us[2 * i + 1]);
+                const auto [ve, vo] = unzip<S>(vs[2 * i], vs[2 * i + 1]);
                 S::store(u + 8 * m + W * i, ue), S::store(u + 8 * (m + 4) + W * i, uo);
                 S::store(v + 8 * m + W * i, ve), S::store(v + 8 * (m + 4) + W * i, vo);
             }
@@ -276,47 +289,58 @@ struct Schoolbook {
     using V = typename S::V;
     using L = small::detail::Lanes<S, kP>;
     using Acc = typename L::Acc;
+    using M = modarith::Ops<S, kP>;
     using Sums = small::Sums<kP>;
-    static constexpr std::size_t W = S::lanes;
+    static constexpr std::ptrdiff_t W = S::lanes;
     static constexpr std::size_t kMax = kSchoolbookCapacity;  // words of p and q at most
-    // Halves (pe, po, qe, qo, -qo) with zeros before (windows start at -(kMax / 2 + 1)) and after
-    // (windows reach kMax + 2W).
-    static constexpr std::size_t kFront = (kMax / 2 + 1 + 15) / 16 * 16;
+    // Halves (pe, po, qe, qo, -qo) with kFront zeros before (windows start at -W) and zeros after
+    // (windows reach kMax + W).
+    static constexpr std::size_t kFront = 16;
     static constexpr std::size_t kSpan = kFront + kMax + 2 * W + 16;
+    static_assert(W <= 8);
 
-    // out[j] = sum over a of A1[a] B1[j - a - s1] + A2[a] B2[j - a - s2] for j in [j0, j0 + W),
-    // times 2^-32, canonical; A1 of n1 words with B1 of m1 (zeros around), likewise A2, B2.
-    struct Term {
-        const u32 *a, *b;
-        std::size_t n, m, s;
-    };
-    [[gnu::always_inline]] static V sums(const Term (&terms)[2], std::size_t j0) {
-        Acc x;
-        bool started = false;
+    // Sums of a block of U and of V: words [j0, j0 + W).
+    struct Block {
+        Acc u, v;
         std::size_t count = 0, folds = 0;
-        for (const Term& t : terms) {
-            // a with 0 <= j - a - s < m for some j in the block, and a < n
-            const std::ptrdiff_t lo = std::max<std::ptrdiff_t>(0, std::ptrdiff_t(j0) - std::ptrdiff_t(t.s) - std::ptrdiff_t(t.m) + 1);
-            const std::ptrdiff_t hi = std::min<std::ptrdiff_t>(std::ptrdiff_t(t.n), std::ptrdiff_t(j0 + W) - std::ptrdiff_t(t.s));
-            if (lo >= hi) continue;
-            const u32* w = t.b + std::ptrdiff_t(j0) - std::ptrdiff_t(t.s) - lo;
-            if (!started) L::start(x, w), started = true;
-            else if constexpr (requires { x.next; }) x.next = S::load(w + 1);
-            for (std::ptrdiff_t a = lo; a < hi; ++a, --w) {
-                if (count == Sums::kFold) L::fold(x), count = 0, ++folds;
-                L::step(x, w, S::broadcast(t.a[a]));
-                ++count;
-            }
+        bool started = false;
+    };
+
+    // x += c[a] (window of bu at j0 - su - a, of bv at j0 - sv - a) for a in [lo, hi); wu, wv: the
+    // windows at a = lo. One broadcast of c[a] for both.
+    [[gnu::always_inline]] static void terms(Block& x, const u32* c, std::ptrdiff_t lo, std::ptrdiff_t hi,
+                                             const u32* wu, const u32* wv) {
+        if (lo >= hi) return;
+        if (!x.started) {
+            L::start(x.u, wu), L::start(x.v, wv), x.started = true;
+        } else if constexpr (requires { x.u.next; }) {  // a new run of windows (EvenOdd)
+            x.u.next = S::load(wu + 1), x.v.next = S::load(wv + 1);
         }
-        if (!started) return V{};
-        if (count > (folds ? Sums::kLastFromFold : Sums::kLastFromZero)) L::fold(x);
-        return L::finish(x);
+        for (std::ptrdiff_t a = lo;;) {
+            const std::ptrdiff_t stop = std::min(hi, a + std::ptrdiff_t(Sums::kFold - x.count));
+            x.count += std::size_t(stop - a);
+            for (; a < stop; ++a, --wu, --wv) {
+                const V b = S::broadcast(c[a]);
+                L::step(x.u, wu, b), L::step(x.v, wv, b);
+            }
+            if (a == hi) return;
+            L::fold(x.u), L::fold(x.v), x.count = 0, ++x.folds;
+        }
+    }
+
+    [[gnu::always_inline]] static void finish(Block& x, u32* u, u32* v) {
+        if (!x.started) {
+            S::store(u, V{}), S::store(v, V{});
+            return;
+        }
+        if (x.count > (x.folds ? Sums::kLastFromFold : Sums::kLastFromZero)) L::fold(x.u), L::fold(x.v);
+        S::store(u, L::finish(x.u)), S::store(v, L::finish(x.v));
     }
 
     // [x^k] p / q times kept scale: p, q of at most kMax words (np, nq >= 1), k >= 1.
     static u32 run(std::span<const u32> p0, std::span<const u32> q0, u64 k) {
         alignas(64) u32 pe[kSpan], po[kSpan], qe[kSpan], qo[kSpan], nqo[kSpan];
-        alignas(64) u32 out[2][kMax + 2 * W];
+        alignas(64) u32 out[2][kMax + 4 * W + 16];
         u32 *const e = pe + kFront, *const o = po + kFront, *const f = qe + kFront, *const g = qo + kFront,
                    *const ng = nqo + kFront;
         std::fill_n(pe, kSpan, 0u), std::fill_n(po, kSpan, 0u), std::fill_n(qe, kSpan, 0u);
@@ -326,28 +350,86 @@ struct Schoolbook {
         for (std::size_t i = 0; i < nq; ++i) (i % 2 ? g : f)[i / 2] = q0[i];
         for (std::size_t i = 0; i < nq / 2; ++i) ng[i] = g[i] ? kP - g[i] : 0;
         const std::size_t width = std::max(np, nq);  // sizes stay at most this
+        const auto halves = [](std::size_t n) { return ((n + 1) / 2 + W - 1) / W * W; };  // words of a half, rounded
+        std::size_t written = halves(width);  // the halves may be nonzero below this
+        const V zero = S::broadcast(0);
         for (; k > 0; k /= 2) {
             const std::size_t r = k % 2, top = std::size_t(std::min<u64>(k / 2 + 1, width));
-            const std::size_t ne = (np + 1) / 2, no = np / 2, me = (nq + 1) / 2, mo = nq / 2;
+            const std::ptrdiff_t ne = std::ptrdiff_t(np + 1) / 2, no = std::ptrdiff_t(np / 2);
+            const std::ptrdiff_t me = std::ptrdiff_t(nq + 1) / 2, mo = std::ptrdiff_t(nq / 2);
             const std::size_t nu = std::min(np + nq >= 2 + r ? (np + nq - 2 - r) / 2 + 1 : 0, top);
             const std::size_t nv = std::min(nq, top);
             if (nu == 0) return 0;
-            const Term tv[2] = {{f, f, me, me, 0}, {ng, g, mo, mo, 1}};
-            const Term tu0[2] = {{f, e, me, ne, 0}, {ng, o, mo, no, 1}};
-            const Term tu1[2] = {{f, o, me, no, 0}, {ng, e, mo, ne, 0}};
-            for (std::size_t j = 0; j < nv; j += W) S::store(out[1] + j, sums(tv, j));
-            for (std::size_t j = 0; j < nu; j += W) S::store(out[0] + j, sums(r ? tu1 : tu0, j));
-            std::fill(out[0] + nu, out[0] + width + 1, 0u), std::fill(out[1] + nv, out[1] + width + 1, 0u);
-            for (std::size_t i = 0; i < (width + 1) / 2; ++i) {
-                e[i] = out[0][2 * i], o[i] = out[0][2 * i + 1];
-                f[i] = out[1][2 * i], g[i] = out[1][2 * i + 1];
-                ng[i] = g[i] ? kP - g[i] : 0;
+            // U_0 = qe pe + (-qo) x po, U_1 = qe po + (-qo) pe, V = qe qe + (-qo) x qo
+            const u32 *const u1 = r ? o : e, *const u2 = r ? e : o;
+            const std::ptrdiff_t nu1 = r ? no : ne, nu2 = r ? ne : no, su2 = r ? 0 : 1;
+            for (std::ptrdiff_t j = 0; j < std::ptrdiff_t(std::max(nu, nv)); j += W) {
+                Block x;
+                // term 1: a < me, and some lane j' of the block with j' - a in [0, nu1) or [0, me)
+                const std::ptrdiff_t lo1 = std::max<std::ptrdiff_t>(0, j + 1 - std::max(nu1, me));
+                terms(x, f, lo1, std::min(me, j + W), u1 + j - lo1, f + j - lo1);
+                // term 2: a < mo, and j' - su2 - a in [0, nu2) or j' - 1 - a in [0, mo)
+                const std::ptrdiff_t lo2 = std::max<std::ptrdiff_t>(0, std::min(j - su2 + 1 - nu2, j - mo));
+                terms(x, ng, lo2, std::min(mo, j + W - su2), u2 + j - su2 - lo2, g + j - 1 - lo2);
+                finish(x, out[0] + j, out[1] + j);
             }
-            np = nu, nq = nv;
+            // the halves of U and V, zeros from nu and nv on (the blocks wrote garbage past them)
+            const std::size_t extent = halves(std::max(nu, nv));
+            for (std::size_t j = nu; j < 2 * extent; j += W) S::store(out[0] + j, zero);
+            for (std::size_t j = nv; j < 2 * extent; j += W) S::store(out[1] + j, zero);
+            for (std::size_t i = 0; i < extent; i += W) {
+                const auto [ue, uo] = unzip<S>(S::load(out[0] + 2 * i), S::load(out[0] + 2 * i + W));
+                const auto [ve, vo] = unzip<S>(S::load(out[1] + 2 * i), S::load(out[1] + 2 * i + W));
+                S::store(e + i, ue), S::store(o + i, uo), S::store(f + i, ve), S::store(g + i, vo);
+                S::store(ng + i, M::sub(zero, vo));
+            }
+            for (std::size_t i = extent; i < written; i += W)  // shorter than before: zeros
+                S::store(e + i, zero), S::store(o + i, zero), S::store(f + i, zero), S::store(g + i, zero),
+                    S::store(ng + i, zero);
+            written = extent, np = nu, nq = nv;
         }
         return mul(e[0], inverse(f[0]));
     }
 };
+
+// Steps for p and q of at most kTinyMax words, in scalar code by the definition: with s = q(-x),
+// U[j] = sum over i of s_i p_(2j + r - i), V[j] = sum over i of s_i q_(2j - i), each a 64-bit sum
+// of at most kTinyMax products (below 2^64) reduced once. Exact. Faster than Schoolbook's vectors
+// for 3 words (Fibonacci), slower from 5 (notes.md).
+inline constexpr std::size_t kTinyMax = 4;
+inline u32 tiny(std::span<const u32> p0, std::span<const u32> q0, u64 k) {
+    u32 buffers[4][kTinyMax], s[kTinyMax];
+    u32 *p = buffers[0], *q = buffers[1], *u = buffers[2], *v = buffers[3];
+    std::size_t np = p0.size(), nq = q0.size();
+    std::copy(p0.begin(), p0.end(), p), std::copy(q0.begin(), q0.end(), q);
+    const std::size_t width = std::max(np, nq);
+    for (; k > 0; k /= 2) {
+        const std::size_t r = k % 2, top = std::size_t(std::min<u64>(k / 2 + 1, width));
+        const std::size_t nu = std::min(np + nq >= 2 + r ? (np + nq - 2 - r) / 2 + 1 : 0, top);
+        const std::size_t nv = std::min(nq, top);
+        if (nu == 0) return 0;
+        for (std::size_t i = 0; i < nq; ++i) s[i] = i % 2 && q[i] ? kP - q[i] : q[i];
+        for (std::size_t j = 0; j < nu; ++j) {
+            const std::size_t t = 2 * j + r;
+            u64 sum = 0;
+            for (std::size_t i = t + 1 > np ? t + 1 - np : 0; i < nq && i <= t; ++i) sum += u64(s[i]) * p[t - i];
+            u[j] = u32(sum % kP);
+        }
+        for (std::size_t j = 0; j < nv; ++j) {
+            u64 sum = 0;
+            for (std::size_t i = 2 * j + 1 > nq ? 2 * j + 1 - nq : 0; i < nq && i <= 2 * j; ++i) sum += u64(s[i]) * q[2 * j - i];
+            v[j] = u32(sum % kP);
+        }
+        std::swap(p, u), std::swap(q, v), np = nu, nq = nv;
+    }
+    return mul(p[0], inverse(q[0]));
+}
+
+// [x^k] p / q times kept scale for p, q of at most kSchoolbookCapacity words, k >= 1.
+inline u32 small_steps(std::span<const u32> p, std::span<const u32> q, u64 k) {
+    if (std::max(p.size(), q.size()) <= kTinyMax) return tiny(p, q, k);
+    return Schoolbook<SchoolbookIsa>::run(p, q, k);
+}
 
 }  // namespace detail
 
@@ -360,7 +442,7 @@ inline u32 schoolbook(std::span<const u32> p, std::span<const u32> q, u64 k) {
     if (k == 0) return detail::mul(a[0], detail::inverse(b[0]));
     if (std::max(a.size(), b.size()) > kSchoolbookCapacity)
         throw std::length_error("fps::bostan_mori::variant::schoolbook: more than kSchoolbookCapacity words");
-    return detail::Schoolbook<SchoolbookIsa>::run(a, b, k);
+    return detail::small_steps(a, b, k);
 }
 
 // [x^k] p / q by two ntt::multiply per step, into vectors (the frontend's loop; any size).
@@ -394,7 +476,7 @@ inline u32 values(std::span<const u32> p, std::span<const u32> q, u64 k, std::si
     if (k == 0) return mul(a[0], inverse(b[0]));
     small = std::min(small, kSchoolbookCapacity);
     std::size_t dp = a.size() - 1, dq = b.size() - 1;  // degree bounds
-    if (std::max(dp, dq) < small) return Schoolbook<SchoolbookIsa>::run(a, b, k);
+    if (std::max(dp, dq) < small) return small_steps(a, b, k);
     // N > dq, 2N > dp + dq, N >= 2^ntt::kMinLog
     const auto half_length = [](std::size_t dp, std::size_t dq) {
         return std::max<std::size_t>({std::bit_ceil(dq + 1), std::bit_ceil(dp + dq + 1) / 2, std::size_t(1) << ntt::kMinLog});
@@ -410,20 +492,20 @@ inline u32 values(std::span<const u32> p, std::span<const u32> q, u64 k, std::si
     int lg = std::countr_zero(n);  // of n; the forms have length 2n
     transform(lg + 1).forward(pv, ntt::Form::values);
     transform(lg + 1).forward(qv, ntt::Form::values);
-    u64 halvings = 0;
+    std::size_t halvings = 0;
     for (;;) {
         const bool odd = k % 2;
         if (odd) Pass<PassIsa>::run<true>(pv, qv, 2 * n, winv);
         else Pass<PassIsa>::run<false>(pv, qv, 2 * n, winv);
         ++halvings, k /= 2;
-        const u32 scale = power(kHalf, halvings);
+        const u32 scale = kHalves[halvings];
         if (k == 0) return mul(scale, mul(sum(pv, n), inverse(sum(qv, n))));
         if (dp + dq < (odd ? 1u : 0u)) return 0;
         dp = std::size_t(std::min<u64>((dp + dq - (odd ? 1 : 0)) / 2, k)), dq = std::size_t(std::min<u64>(dq, k));
         const ntt::Transform& t = transform(lg);
         if (std::max(dp, dq) < small) {
             t.inverse(pv, ntt::Form::values), t.inverse(qv, ntt::Form::values);
-            return mul(scale, Schoolbook<SchoolbookIsa>::run({pv, dp + 1}, {qv, dq + 1}, k));
+            return mul(scale, small_steps({pv, dp + 1}, {qv, dq + 1}, k));
         }
         const std::size_t next = half_length(dp, dq);
         if (next < n) {  // the cut shortens the transforms: from the coefficients, cut

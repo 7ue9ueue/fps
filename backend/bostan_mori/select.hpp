@@ -32,7 +32,11 @@ inline constexpr std::size_t kSchoolbookMax = FPS_BOSTAN_MORI_SCHOOLBOOK_MAX;
 #else
 inline constexpr std::size_t kSchoolbookMax = [] {
     switch (tune::kTarget) {
-        default: return std::size_t(48);
+        case tune::Target::avx2: return std::size_t(96);    // Zen 3
+        case tune::Target::avx512: return std::size_t(96);  // Emerald Rapids
+        case tune::Target::zen5: return std::size_t(88);
+        case tune::Target::arm: return std::size_t(76);     // Neoverse V2
+        default: return std::size_t(64);                    // sse, scalar: not timed
     }
 }();
 #endif

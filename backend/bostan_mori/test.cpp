@@ -289,6 +289,20 @@ void schoolbook_struct() {
     }
 }
 
+// The scalar steps for tiny sizes against the model.
+void tiny() {
+    for (std::size_t np = 1; np <= bm::detail::kTinyMax; ++np)
+        for (std::size_t nq = 1; nq <= bm::detail::kTinyMax; ++nq)
+            for (int kind = 0; kind < 3; ++kind) {
+                const Vec p = random_vec(np, kind), q = random_vec(nq, kind, true);
+                for (u64 k : {u64(1), u64(2), u64(3), u64(7), kHuge[3], ~u64(0)}) {
+                    const auto [a, b] = bm::detail::trim(p, q, k);
+                    if (a.empty()) continue;
+                    CHECK(bm::detail::tiny(a, b, k) == model(p, q, k), np, nq, k);
+                }
+            }
+}
+
 void structs() {
     fps::simd::for_each(fps::simd::All{}, []<class S> {
         pass_struct<S>();
@@ -335,6 +349,7 @@ void errors() {
 int main() {
     errors();
     closed_forms();
+    tiny();
     structs();
     small_sizes();
     transform_edges();
