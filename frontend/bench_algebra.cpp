@@ -1,10 +1,10 @@
 // Times fps/algebra.hpp modulo P = 998244353; tools/kernel.py runs it, a binary of its own. Items
 // are the degree of the input.
 //   "<op>/<lg>"          through the API (gated)
-//   "<op>@kernel/<lg>"   gcd, inverse_mod: fps::half_gcd (backend/gcd) on the same inputs, into
-//                        kept memory
-// roots and factor have no kernel yet (backend issues #122, #123 move lc-opt's): they run on gcd,
-// f % g and f * g.
+//   "<op>@kernel/<lg>"   gcd, inverse_mod: fps::half_gcd (backend/gcd); roots, roots_split,
+//                        roots_repeated: fps::root_finding::roots (backend/roots); on the same
+//                        inputs, into kept memory
+// factor has no kernel yet (backend issue #123 moves lc-opt's): it runs on gcd, f % g and f * g.
 #include <cstddef>
 #include <cstdint>
 #include <random>
@@ -37,6 +37,16 @@ Poly split_poly(std::size_t n, unsigned seed) {
     return fps::product(linear);
 }
 
+// n linear factors over n / 4 random values, times a random polynomial of degree n / 2.
+Poly repeated_poly(std::size_t n, unsigned seed) {
+    std::mt19937 rng(seed);
+    std::vector<std::uint32_t> pool(n / 4);
+    for (std::uint32_t& r : pool) r = rng() % P;
+    std::vector<Poly> linear;
+    for (std::size_t i = 0; i < n; ++i) linear.push_back(Poly{(P - pool[rng() % pool.size()]) % P, 1});
+    return fps::product(linear) * random_poly(n / 2, seed + 1);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -65,17 +75,24 @@ int main(int argc, char** argv) {
             };
         }, n);
     }
-    // roots: of a random polynomial (about one root: the cost of x^(P-1) mod f and one gcd), and
-    // of n distinct linear factors (every root split off).
-    for (int lg : {6, 8, 10}) {
+    // roots: of a random polynomial (about one root), of n distinct linear factors (every root
+    // found), and of n linear factors over n / 4 values times a random polynomial of degree n / 2
+    // (repeated roots: the kernel's climbs).
+    for (int lg : {6, 8, 10, 12}) {
         const std::size_t n = std::size_t(1) << lg;
         const std::string size = "/" + std::to_string(lg);
-        suite.add("roots" + size, [n, lg] {
-            return [f = random_poly(n, unsigned(5 * lg))] { bench::keep(fps::roots(f)); };
-        }, n);
-        suite.add("roots_split" + size, [n, lg] {
-            return [f = split_poly(n, unsigned(7 * lg))] { bench::keep(fps::roots(f)); };
-        }, n);
+        const auto add = [&](const std::string& name, auto make) {
+            suite.add(name + size, [make] { return [f = make()] { bench::keep(fps::roots(f)); }; }, n);
+            suite.add(name + "@kernel" + size, [make] {
+                return [f = make(), out = std::vector<std::uint32_t>(make().size())]() mutable {
+                    bench::keep(fps::root_finding::roots(f.span(), out));
+                    bench::keep(out);
+                };
+            }, n);
+        };
+        add("roots", [n, lg] { return random_poly(n, unsigned(5 * lg)); });
+        add("roots_split", [n, lg] { return split_poly(n, unsigned(7 * lg)); });
+        add("roots_repeated", [n, lg] { return repeated_poly(n, unsigned(13 * lg)); });
     }
     // factor of a random polynomial: distinct degrees up to n / 2.
     for (int lg : {4, 6, 8}) {
