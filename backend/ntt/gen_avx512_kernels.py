@@ -18,7 +18,9 @@ p0).
 Kernels (the headers have their contracts):
   forward, inverse, forward_identity, inverse_identity (and forms for inputs < 2P, < P, and with
     prefetch): radix-4 butterflies of one group on columns of 16 words, 2 to 8 columns per
-    iteration (intrinsics.hpp's forward_group and inverse_group).
+    iteration (intrinsics.hpp's forward_group and inverse_group); forward_*from*: the same from
+    other memory into the array; inverse_scaled*: inverse groups with every output times s
+    (inverse_group_scaled).
   forward_groups4: groups of two columns (quarters of 32 words), four per statement.
   bottom_forward, bottom_inverse (1, 2 or 4 pairs of groups per statement), bottom_multiply,
     bottom_square: the bottom level of two groups (64 words) per pair (intrinsics.hpp's
@@ -660,6 +662,23 @@ def inverse_identity4(g, f, tw):
     return [g.low(g.add(ab, cd)), g.low(g.add(amb, cmd)), g.low_diff(ab, cd), g.low_diff(amb, cmd)]
 
 
+def inverse_scaled4(g, f, tw):
+    """intrinsics.hpp's inverse_group_scaled, k > 0: inverse4 with every output times s; twiddles S
+    = s, SX = s x, Y = s y, Z = s z and X = x."""
+    ab, cd = g.low(g.add(f[0], f[1])), g.low(g.add(f[2], f[3]))
+    amb, cmd = g.shoup(g.diff(f[0], f[1]), tw['Y']), g.shoup(g.diff(f[2], f[3]), tw['Z'])
+    return [g.shoup(g.add(ab, cd), tw['S']), g.low(g.add(amb, cmd)), g.shoup(g.diff(ab, cd), tw['SX']),
+            g.shoup(g.diff(amb, cmd), tw['X'])]
+
+
+def inverse_scaled_identity4(g, f, tw):
+    """inverse_scaled4() for k = 0: s y = s, x = 1."""
+    ab, cd = g.low(g.add(f[0], f[1])), g.low(g.add(f[2], f[3]))
+    amb, cmd = g.shoup(g.diff(f[0], f[1]), tw['S']), g.shoup(g.diff(f[2], f[3]), tw['Z'])
+    return [g.shoup(g.add(ab, cd), tw['S']), g.low(g.add(amb, cmd)), g.shoup(g.diff(ab, cd), tw['S']),
+            g.low_diff(amb, cmd)]
+
+
 # --------------------------------------------------------------------------------- column loops
 # One group's quarters q words apart at a: a column is vector t of each quarter, at a + disp +
 # t q (h = 4q bytes, h3 = 12q). Twiddles broadcast once per call into fixed registers.
@@ -683,6 +702,22 @@ class Loop:
     prefetch: bool = False
     knobs: Knobs = field(default_factory=Knobs)
     join: str = 'perm'
+    sources: Optional[tuple] = None  # (name, argument, byte offset) per twiddle, else by `twiddles`
+    src: bool = False         # reads the columns at src, writes them at a
+
+
+def loop_twiddles(loop):
+    """(name, (value register, quotient register), (argument, byte offset)) per twiddle."""
+    if loop.sources is None:
+        return [(n, TWIDDLE_REGS[n], TWIDDLE_SOURCES[n]) for n in loop.twiddles]
+    return [(n, (28 - 2 * i, 27 - 2 * i), (arg, disp)) for i, (n, arg, disp) in enumerate(loop.sources)]
+
+
+def loop_args(loop):
+    """The twiddle pointers' names, in order."""
+    if loop.sources is None:
+        return ['x', 'y'] if loop.twiddles == 'XYZ' else ['y']
+    return list(dict.fromkeys(arg for _, arg, _ in loop.sources))
 
 
 def loop_consts():
@@ -690,11 +725,13 @@ def loop_consts():
 
 
 def loop_body(loop):
-    tw = {n: (Value('fixed', reg=TWIDDLE_REGS[n][0]), Value('fixed', reg=TWIDDLE_REGS[n][1])) for n in loop.twiddles}
-    reserved = {REG_P, REG_2P, REG_J} | {r for n in loop.twiddles for r in TWIDDLE_REGS[n]}
+    twiddles = loop_twiddles(loop)
+    tw = {n: (Value('fixed', reg=regs[0]), Value('fixed', reg=regs[1])) for n, regs, _ in twiddles}
+    reserved = {REG_P, REG_2P, REG_J} | {r for _, regs, _ in twiddles for r in regs}
     g = Graph(loop_consts(), loop.join)
+    base = 'src' if loop.src else 'a'
     for k in range(loop.columns):
-        quarter = lambda t, extra=0, k=k: g.at('a', 64 * k + extra, *QUARTER[t])
+        quarter = lambda t, extra=0, k=k: g.at(base, 64 * k + extra, *QUARTER[t])
         f = [quarter(t) for t in range(4)]
         if loop.butterfly is forward4:
             out = forward4(g, f, tw, loop.kin, (lambda t: quarter(t, 4)) if loop.odd_loads else (lambda t: None))
@@ -706,14 +743,13 @@ def loop_body(loop):
             g.store(v, mem('a', 64 * k, *QUARTER[t]))
     body = compile_graph(g, reserved, loop.knobs)
     head = ['vpbroadcastd %[P], %%zmm31', 'vpbroadcastd %[P2], %%zmm30', 'vmovdqu64 %[J], %%zmm29']
-    for n in loop.twiddles:
-        base, disp = TWIDDLE_SOURCES[n]
-        head += [f'vpbroadcastd {disp}(%[{base}]), %%zmm{TWIDDLE_REGS[n][0]}',
-                 f'vpbroadcastd {disp + 32}(%[{base}]), %%zmm{TWIDDLE_REGS[n][1]}']
+    for _, regs, (arg, disp) in twiddles:
+        head += [f'vpbroadcastd {disp}(%[{arg}]), %%zmm{regs[0]}', f'vpbroadcastd {disp + 32}(%[{arg}]), %%zmm{regs[1]}']
     if loop.prefetch:  # the line PREFETCH bytes ahead in each quarter, per column
         pf = [f'prefetcht0 {address(mem("a", PREFETCH + 64 * k, *QUARTER[t]))}' for k in range(loop.columns) for t in range(4)]
         body = pf[:4] + body[:len(body) // 2] + pf[4:] + body[len(body) // 2:]
-    tail = [f'add ${64 * loop.columns}, %[a]', 'cmp %[end], %[a]', 'jne 1b']
+    tail = [f'add ${64 * loop.columns}, %[a]'] + ([f'add ${64 * loop.columns}, %[src]'] if loop.src else [])
+    tail += ['cmp %[end], %[a]', 'jne 1b']
     return head + ['.p2align 5', '1:'] + body + tail
 
 
@@ -721,15 +757,21 @@ LOOP_CLOBBERS = ', '.join(f'"xmm{i}"' for i in range(32)) + ', "memory", "cc"'
 
 
 def loop_function(loop):
-    twiddle_args = 'const u32* x, const u32* y' if loop.twiddles == 'XYZ' else 'const u32* y'
+    args = loop_args(loop)
+    twiddle_args = ', '.join(f'const u32* {a}' for a in args)
     lines = [f'// {line}' for line in loop.doc.split('\n')]
-    lines += [f'[[gnu::always_inline]] inline void {loop.name}(u32* a, std::size_t q, std::size_t columns, {twiddle_args}) {{',
+    src = 'const u32* src, ' if loop.src else ''
+    lines += [f'[[gnu::always_inline]] inline void {loop.name}({src}u32* a, std::size_t q, std::size_t columns, {twiddle_args}) {{',
               '    const u32* const end = a + 16 * columns;', '    asm volatile(']
     lines += asm_lines(loop_body(loop))
-    inputs = '[end] "r"(end), [h] "r"(4 * q), [h3] "r"(12 * q), [y] "r"(y)' + (', [x] "r"(x)' if loop.twiddles == 'XYZ' else '')
+    if loop.sources is None:
+        inputs = '[end] "r"(end), [h] "r"(4 * q), [h3] "r"(12 * q), [y] "r"(y)' + (', [x] "r"(x)' if loop.twiddles == 'XYZ' else '')
+    else:
+        inputs = '[end] "r"(end), [h] "r"(4 * q), [h3] "r"(12 * q), ' + ', '.join(f'[{a}] "r"({a})' for a in args)
     if loop.join != 'perm':
         inputs += ', [odd] "Yk"(__mmask16(0xaaaa))'
-    lines += ['        : [a] "+r"(a)', f'        : {inputs},', '          [P] "m"(kP), [P2] "m"(k2P), [J] "m"(kJoin)',
+    outputs = '[a] "+r"(a)' + (', [src] "+r"(src)' if loop.src else '')
+    lines += [f'        : {outputs}', f'        : {inputs},', '          [P] "m"(kP), [P2] "m"(k2P), [J] "m"(kJoin)',
               f'        : {LOOP_CLOBBERS});', '}']
     return lines
 
@@ -1058,11 +1100,38 @@ EMITTED_BOTTOMS = tuple(f'{name}_{part}' for name, *_ in STAGED for part in ('fi
 # 0.87, inverse 0.89, forward identity 0.86, inverse identity 0.91, two-column forward groups 0.77;
 # bottom forward 0.80 (4 pairs), inverse 0.85; product bottom 0.91, square 0.82. The product
 # bottom keeps a schedule on the Emerald Rapids model (model='avx512'): 0.91 against 0.93 at best
-# on the Zen 5 model (28 knob settings).
+# on the Zen 5 model (28 knob settings). Round 2 (notes/152-r2.md) added the scaled inverse top
+# groups (0.88-0.95) and first levels from other memory (0.87-0.98). Zen 5's op cache holds about
+# 5.9K instructions and the hot code of a product is near that (past it, about 3 instructions per
+# cycle), so a kernel's size counts as well as its speed: inverse groups of two columns (0.86-0.94
+# on L1 data) made products at 2^10-2^11 3-4% slower and are not emitted.
 ZEN5_LOOP_DOC = dict(LOOP_DOC, inverse=LOOP_DOC['inverse'] + ' columns a multiple of 4.',
                      forward_identity=LOOP_DOC['forward_identity'] + ' columns a multiple of 4.',
                      inverse_identity=LOOP_DOC['inverse_identity'] + ' columns a multiple of 8.')
 ZEN5_LOOPS = [replace(l, columns=8 if l.name == 'inverse_identity' else 4, doc=ZEN5_LOOP_DOC[l.name]) for l in LOOPS]
+# The inverse top groups with the scale (intrinsics.hpp's inverse_group_scaled, k < 4): s = the
+# scaled block (s at s, quotient 32 bytes on), sx = s + k, sy = s + 2k (s y, then s z), x = ir +
+# slot(k); for k = 0 s alone (s y = s, s z at s + 4).
+ZEN5_LOOPS += [
+    Loop('inverse_scaled', inverse_scaled4, '', (
+        'inverse() of group k > 0 (k < 4) with every output times s: s = the scaled block, sx = s + k,\n'
+        'sy = s + 2k, x = ir + slot(k). In and out < 2P. columns a multiple of 4.'), columns=4,
+        sources=(('S', 's', 0), ('SX', 'sx', 0), ('Y', 'sy', 0), ('Z', 'sy', 4), ('X', 'x', 0))),
+    Loop('inverse_scaled_identity', inverse_scaled_identity4, '', (
+        'inverse_scaled() for group 0: s = the scaled block. columns a multiple of 4.'), columns=4,
+        sources=(('S', 's', 0), ('Z', 's', 4))),
+]
+# The first level of a transform from other memory (a factor in the caller's memory): the columns
+# at src (quarters q words apart, any alignment) into a; no reads past a column (odd words by
+# shifts). Inputs < 2P (the subtrees' first levels under a radix-2 top). For canonical inputs (the
+# radix-4 top at odd lg) the asm (0.94 on L1 data) made middle products at 2^9 3-8% slower: the
+# intrinsics run there (notes/152-r2.md).
+ZEN5_LOOPS += [
+    Loop('forward_from_in2', forward4, 'XYZ', 'forward_in2() from src into a; reads nothing past the columns.',
+         kin=2, columns=4, odd_loads=False, src=True),
+    Loop('forward_identity_from_in2', forward_identity4, 'Z', 'forward_identity_in2() from src into a.', kin=2,
+         columns=4, src=True),
+]
 
 
 def zen5_bottoms():
