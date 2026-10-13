@@ -58,6 +58,25 @@ constexpr int kLatencyOps = 64, kThroughputOps = 96;
         name, nullptr,                                                                                          \
             [](long n) { for (long i = 0; i < n; ++i) asm volatile(REPT8(IRP6A(tp_a) IRP6B(tp_b)) ::: CLOBBERS); } \
     }
+// MIX with %0 the address of a 64-byte aligned buffer (loads and stores; throughput only).
+alignas(64) unsigned char buffer[1024];
+#define MEM(name, tp_a, tp_b)                                                                                    \
+    Probe {                                                                                                      \
+        name, nullptr, [](long n) {                                                                              \
+            for (long i = 0; i < n; ++i) asm volatile(REPT8(IRP6A(tp_a) IRP6B(tp_b)) ::"r"(buffer) : CLOBBERS); \
+        }                                                                                                        \
+    }
+
+#if defined(__x86_64__)
+// MIX with %0 the address of a 64-byte aligned buffer (x86 loads and stores; throughput only).
+alignas(64) unsigned char x86_buffer[2048];
+#define X86MEM(name, tp_a, tp_b)                                                                                     \
+    Probe {                                                                                                          \
+        name, nullptr, [](long n) {                                                                                  \
+            for (long i = 0; i < n; ++i) asm volatile(REPT8(IRP6A(tp_a) IRP6B(tp_b)) ::"r"(x86_buffer) : CLOBBERS, "k2"); \
+        }                                                                                                            \
+    }
+#endif
 
 std::vector<Probe> probes() {
     return {
@@ -81,6 +100,56 @@ std::vector<Probe> probes() {
         MIX("vpmuludq + vpmulld zmm", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r", "vpmulld %%zmm15, %%zmm14, %%zmm\\r"),
         MIX("vpmuludq + vpaddd zmm", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
         MIX("vpmuludq + vpsrlq zmm", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r", "vpsrlq $32, %%zmm15, %%zmm\\r"),
+        // Pipe classes of permutes and blends, and memory forms (ntt issue #152: the zmm asm on Zen 5).
+        X3("vpermi2d", "zmm"), X3("vpsubd", "zmm"),
+        MIX("vpermd + vpsrlq zmm", "vpermd %%zmm15, %%zmm14, %%zmm\\r", "vpsrlq $32, %%zmm15, %%zmm\\r"),
+        MIX("vpermd + vpmuludq zmm", "vpermd %%zmm15, %%zmm14, %%zmm\\r", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r"),
+        MIX("vpermd + vpaddd zmm", "vpermd %%zmm15, %%zmm14, %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        MIX("vpermt2d + vpmuludq zmm", "vpermt2d %%zmm15, %%zmm14, %%zmm\\r", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r"),
+        MIX("vpsrlq + vpaddd zmm", "vpsrlq $32, %%zmm15, %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        MIX("vpminud + vpmuludq zmm", "vpminud %%zmm15, %%zmm14, %%zmm\\r", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r"),
+        MIX("vpblendmd + vpmuludq zmm", "vpblendmd %%zmm15, %%zmm14, %%zmm\\r%{%%k1%}", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r"),
+        MIX("vpblendmd + vpsrlq zmm", "vpblendmd %%zmm15, %%zmm14, %%zmm\\r%{%%k1%}", "vpsrlq $32, %%zmm15, %%zmm\\r"),
+        MIX("vpmulld + vpaddd zmm", "vpmulld %%zmm15, %%zmm14, %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("vmovdqu64 load zmm", "vmovdqu64 64*\\r(%0), %%zmm\\r", "vmovdqu64 64*\\r(%0), %%zmm\\r"),
+        X86MEM("vmovdqu64 load zmm, 4 bytes past", "vmovdqu64 4+64*\\r(%0), %%zmm\\r", "vmovdqu64 4+64*\\r(%0), %%zmm\\r"),
+        X86MEM("vpbroadcastd zmm, m32", "vpbroadcastd 4*\\r(%0), %%zmm\\r", "vpbroadcastd 4*\\r(%0), %%zmm\\r"),
+        X86MEM("vpbroadcastd zmm{k}, m32", "vpbroadcastd 4*\\r(%0), %%zmm\\r%{%%k1%}", "vpbroadcastd 4*\\r(%0), %%zmm\\r%{%%k1%}"),
+        X86MEM("vmovdqu64 store zmm", "vmovdqu64 %%zmm\\r, 64*\\r(%0)", "vmovdqu64 %%zmm\\r, 64*\\r(%0)"),
+        X86MEM("vmovdqu32 store zmm{k}", "vmovdqu32 %%zmm\\r, 64*\\r(%0)%{%%k1%}", "vmovdqu32 %%zmm\\r, 64*\\r(%0)%{%%k1%}"),
+        X86MEM("vpaddd zmm, m512", "vpaddd 64*\\r(%0), %%zmm14, %%zmm\\r", "vpaddd 64*\\r(%0), %%zmm14, %%zmm\\r"),
+        X86MEM("vpmuludq zmm, m512 + vpaddd", "vpmuludq 64*\\r(%0), %%zmm14, %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("vpaddd zmm, m32{1to16}", "vpaddd 4*\\r(%0)%{1to16%}, %%zmm14, %%zmm\\r", "vpaddd 4*\\r(%0)%{1to16%}, %%zmm14, %%zmm\\r"),
+        X86MEM("load + vpaddd", "vmovdqu64 64*\\r(%0), %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("vpbroadcastd m32 + vpaddd", "vpbroadcastd 4*\\r(%0), %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("vpbroadcastd{k} m32 + vpaddd", "vpbroadcastd 4*\\r(%0), %%zmm\\r%{%%k1%}", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("vpbroadcastd{k} m32 + vpmuludq", "vpbroadcastd 4*\\r(%0), %%zmm\\r%{%%k1%}", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("store + vpaddd", "vmovdqu64 %%zmm\\r, 64*\\r(%0)", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("store + vpmuludq", "vmovdqu64 %%zmm\\r, 64*\\r(%0)", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("store + vpsrlq", "vmovdqu64 %%zmm\\r, 64*\\r(%0)", "vpsrlq $32, %%zmm15, %%zmm\\r"),
+        X86MEM("store + load", "vmovdqu64 %%zmm\\r, 64*\\r(%0)", "vmovdqu64 1024+64*\\r(%0), %%zmm\\r"),
+        X86MEM("vpaddd m512 + vpaddd", "vpaddd 64*\\r(%0), %%zmm14, %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("vpsrlq m512 + vpaddd", "vpsrlq $32, 64*\\r(%0), %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("vpermt2d m512 + vpaddd", "vpermt2d 64*\\r(%0), %%zmm14, %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("vinserti64x4 m256 + vpaddd", "vinserti64x4 $1, 32*\\r(%0), %%zmm14, %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("kmovw m16 + vpaddd", "kmovw 2*\\r(%0), %%k2", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("vpbroadcastd{k} m32 + vpsrlq", "vpbroadcastd 4*\\r(%0), %%zmm\\r%{%%k1%}", "vpsrlq $32, %%zmm15, %%zmm\\r"),
+        X86MEM("vpbroadcastd{k} m32 + vpermd", "vpbroadcastd 4*\\r(%0), %%zmm\\r%{%%k1%}", "vpermd %%zmm15, %%zmm14, %%zmm\\r"),
+        MIX("vpermd + vpblendmd zmm", "vpermd %%zmm15, %%zmm14, %%zmm\\r", "vpblendmd %%zmm15, %%zmm14, %%zmm\\r%{%%k1%}"),
+        // 4 instructions per entry (the time per instruction is the printed value / 4): 6 stores
+        // and 42 vpaddd, against 48 vpaddd: whether a store's data takes a vector pipe.
+        X86MEM("[/4] store + 3 vpaddd | 4 vpaddd",
+               "vmovdqu64 %%zmm\\r, 64*\\r(%0)\n vpaddd %%zmm15, %%zmm14, %%zmm12\n vpaddd %%zmm15, %%zmm14, %%zmm13\n vpaddd %%zmm15, %%zmm14, %%zmm\\r",
+               "vpaddd %%zmm15, %%zmm14, %%zmm12\n vpaddd %%zmm15, %%zmm14, %%zmm13\n vpaddd %%zmm15, %%zmm14, %%zmm\\r\n vpaddd %%zmm14, %%zmm15, %%zmm\\r"),
+        X86MEM("[/4] 4 vpaddd | 4 vpaddd",
+               "vpaddd %%zmm15, %%zmm14, %%zmm12\n vpaddd %%zmm15, %%zmm14, %%zmm13\n vpaddd %%zmm15, %%zmm14, %%zmm\\r\n vpaddd %%zmm14, %%zmm15, %%zmm\\r",
+               "vpaddd %%zmm15, %%zmm14, %%zmm12\n vpaddd %%zmm15, %%zmm14, %%zmm13\n vpaddd %%zmm15, %%zmm14, %%zmm\\r\n vpaddd %%zmm14, %%zmm15, %%zmm\\r"),
+        X86MEM("[/4] store + 3 vpmuludq | 4 vpaddd",
+               "vmovdqu64 %%zmm\\r, 64*\\r(%0)\n vpmuludq %%zmm15, %%zmm14, %%zmm12\n vpmuludq %%zmm15, %%zmm14, %%zmm13\n vpmuludq %%zmm15, %%zmm14, %%zmm\\r",
+               "vpaddd %%zmm15, %%zmm14, %%zmm12\n vpaddd %%zmm15, %%zmm14, %%zmm13\n vpaddd %%zmm15, %%zmm14, %%zmm\\r\n vpaddd %%zmm14, %%zmm15, %%zmm\\r"),
+        X86MEM("[/4] 4 vpmuludq | 4 vpaddd",
+               "vpmuludq %%zmm15, %%zmm14, %%zmm12\n vpmuludq %%zmm15, %%zmm14, %%zmm13\n vpmuludq %%zmm15, %%zmm14, %%zmm\\r\n vpmuludq %%zmm14, %%zmm15, %%zmm\\r",
+               "vpaddd %%zmm15, %%zmm14, %%zmm12\n vpaddd %%zmm15, %%zmm14, %%zmm13\n vpaddd %%zmm15, %%zmm14, %%zmm\\r\n vpaddd %%zmm14, %%zmm15, %%zmm\\r"),
 #endif
 #if defined(__AVX512IFMA__) && defined(__AVX512VL__)
         X3("vpmadd52luq", "ymm"), X3("vpmadd52huq", "ymm"), X3("vpmadd52luq", "zmm"), X3("vpmadd52huq", "zmm"),
@@ -103,6 +172,28 @@ std::vector<Probe> probes() {
         MIX("mul + sqdmulh", "mul v\\r\\().4s, v14.4s, v15.4s", "sqdmulh v\\r\\().4s, v14.4s, v15.4s"),
         MIX("mul + add", "mul v\\r\\().4s, v14.4s, v15.4s", "add v\\r\\().4s, v14.4s, v15.4s"),
         MIX("umull + uzp2", "umull v\\r\\().2d, v14.2s, v15.2s", "uzp2 v\\r\\().4s, v14.4s, v15.4s"),
+        // By-element forms, dup and ext, loads and stores (ntt issue #151: the Neon asm kernels).
+        PROBE("mul 4s by element", "mul v0.4s, v0.4s, v1.s[1]", "mul v\\r\\().4s, v14.4s, v15.s[1]"),
+        PROBE("mls 4s by element", "mls v0.4s, v1.4s, v2.s[1]", "mls v\\r\\().4s, v14.4s, v15.s[1]"),
+        PROBE("umlal 2d by element", "umlal v0.2d, v1.2s, v2.s[1]", "umlal v\\r\\().2d, v14.2s, v15.s[1]"),
+        PROBE("umlal2 2d by element", "umlal2 v0.2d, v1.4s, v2.s[1]", "umlal2 v\\r\\().2d, v14.4s, v15.s[1]"),
+        PROBE("umull 2d by element", "umull v0.2d, v0.2s, v1.s[1]", "umull v\\r\\().2d, v14.2s, v15.s[1]"),
+        PROBE("dup 4s element", "dup v0.4s, v0.s[1]", "dup v\\r\\().4s, v15.s[1]"),
+        PROBE("ext 16b", "ext v0.16b, v0.16b, v1.16b, #4", "ext v\\r\\().16b, v14.16b, v15.16b, #4"),
+        MIX("umlal by element + add", "umlal v\\r\\().2d, v14.2s, v15.s[1]", "add v\\r\\().4s, v14.4s, v15.4s"),
+        MIX("dup + mul", "dup v\\r\\().4s, v15.s[1]", "mul v\\r\\().4s, v14.4s, v15.4s"),
+        MIX("ext + add", "ext v\\r\\().16b, v14.16b, v15.16b, #4", "add v\\r\\().4s, v14.4s, v15.4s"),
+        MEM("ldr q", "ldr q\\r, [%0, #16*\\r]", "ldr q\\r, [%0, #16*\\r]"),
+        MEM("ldur q (4 bytes past)", "ldur q\\r, [%0, #4+16*\\r]", "ldur q\\r, [%0, #4+16*\\r]"),
+        MEM("ld1r 4s", "ld1r {v\\r\\().4s}, [%0]", "ld1r {v\\r\\().4s}, [%0]"),
+        MEM("str q", "str q\\r, [%0, #16*\\r]", "str q\\r, [%0, #16*\\r]"),
+        MEM("stur q (4 bytes past)", "stur q\\r, [%0, #4+16*\\r]", "stur q\\r, [%0, #4+16*\\r]"),
+        MEM("ldr q + mul", "ldr q\\r, [%0, #16*\\r]", "mul v\\r\\().4s, v14.4s, v15.4s"),
+        MEM("ld1r + mul", "ld1r {v\\r\\().4s}, [%0]", "mul v\\r\\().4s, v14.4s, v15.4s"),
+        MEM("ld1r + add", "ld1r {v\\r\\().4s}, [%0]", "add v\\r\\().4s, v14.4s, v15.4s"),
+        MEM("str q + mul", "str q\\r, [%0, #16*\\r]", "mul v\\r\\().4s, v14.4s, v15.4s"),
+        MEM("str q + add", "str q\\r, [%0, #16*\\r]", "add v\\r\\().4s, v14.4s, v15.4s"),
+        MEM("str q + ldr q", "str q\\r, [%0, #16*\\r]", "ldr q\\r, [%0, #512+16*\\r]"),
 #if defined(__ARM_FEATURE_SVE2)
         PROBE("umulh z.s (sve2)", "umulh z0.s, z0.s, z1.s", "umulh z\\r\\().s, z14.s, z15.s"),
         MIX("mul + umulh", "mul v\\r\\().4s, v14.4s, v15.4s", "umulh z\\r\\().s, z14.s, z15.s"),

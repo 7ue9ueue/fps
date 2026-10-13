@@ -67,21 +67,27 @@ inline void forward_upper(u32* f, int lg, const u32* r) {
     forward_levels(f, len / 8, 2, 2, r);
 }
 
+// forward_group undone, times 4.
+inline void inverse_group(u32* g, std::size_t q, std::size_t k, const u32* ir) {
+    const u32 x = ir[slot(k)], y = ir[slot(2 * k)], z = ir[slot(2 * k + 1)];
+    for (std::size_t j = 0; j < q; ++j) {
+        const u32 ab = add(g[j], g[j + q]), cd = add(g[j + 2 * q], g[j + 3 * q]);
+        const u32 amb = mul(y, sub(g[j], g[j + q])), cmd = mul(z, sub(g[j + 2 * q], g[j + 3 * q]));
+        g[j] = add(ab, cd), g[j + q] = add(amb, cmd);
+        g[j + 2 * q] = mul(x, sub(ab, cd)), g[j + 3 * q] = mul(x, sub(amb, cmd));
+    }
+}
+
+// forward_levels undone, times the leaves per group at quarters of `top` words.
+inline void inverse_levels(u32* f, std::size_t top, std::size_t first, std::size_t count, const u32* ir) {
+    for (std::size_t q = 8; q <= top; q *= 4)
+        for (std::size_t k = 0; k < count * (top / q); ++k) inverse_group(f + 4 * q * k, q, first * (top / q) + k, ir);
+}
+
 // forward() undone, times nv = len / 8 (the scale is left to the caller).
 inline void inverse_unscaled(u32* f, int lg, const u32* ir) {
     const std::size_t len = std::size_t(1) << lg;
-    for (std::size_t q = 8; q <= top_quarter(lg); q *= 4) {
-        for (std::size_t k = 0; k < len / (4 * q); ++k) {
-            const u32 x = ir[slot(k)], y = ir[slot(2 * k)], z = ir[slot(2 * k + 1)];
-            u32* g = f + 4 * q * k;
-            for (std::size_t j = 0; j < q; ++j) {
-                const u32 ab = add(g[j], g[j + q]), cd = add(g[j + 2 * q], g[j + 3 * q]);
-                const u32 amb = mul(y, sub(g[j], g[j + q])), cmd = mul(z, sub(g[j + 2 * q], g[j + 3 * q]));
-                g[j] = add(ab, cd), g[j + q] = add(amb, cmd);
-                g[j + 2 * q] = mul(x, sub(ab, cd)), g[j + 3 * q] = mul(x, sub(amb, cmd));
-            }
-        }
-    }
+    inverse_levels(f, top_quarter(lg), 0, len / (4 * top_quarter(lg)), ir);
     if (has_radix2(lg)) {
         for (std::size_t i = 0; i < len / 2; ++i) {
             const u32 x = f[i], y = f[i + len / 2];
@@ -92,6 +98,23 @@ inline void inverse_unscaled(u32* f, int lg, const u32* ir) {
 
 inline void scale(u32* f, std::size_t count, u32 s) {
     for (std::size_t i = 0; i < count; ++i) f[i] = mul(f[i], s);
+}
+
+// forward_upper undone: the upper half of the leaf form of length 2L, L = 2^lg, to p mod (x^L + 1);
+// ir: the table of length 2L.
+inline void inverse_upper(u32* f, int lg, const u32* ir) {
+    const std::size_t len = std::size_t(1) << lg;
+    if (has_radix2(lg + 1)) {
+        inverse_levels(f, len / 4, 1, 1, ir);
+    } else {
+        inverse_levels(f, len / 8, 2, 2, ir);
+        const u32 i1 = ir[slot(1)];
+        for (std::size_t j = 0; j < len / 2; ++j) {
+            const u32 x = f[j], y = f[j + len / 2];
+            f[j] = add(x, y), f[j + len / 2] = mul(i1, sub(x, y));
+        }
+    }
+    scale(f, len, leaf_scale(lg));
 }
 
 // out = a b mod x^8 - w_v in every leaf v, w_v = (-1)^v r(v / 2); out += a b if accumulate. out
@@ -111,6 +134,19 @@ inline void multiply_leaves(const u32* a, const u32* b, u32* out, int lg, const 
     }
 }
 inline void multiply_leaves(u32* a, const u32* b, int lg, const u32* r) { multiply_leaves(a, b, a, lg, r); }
+
+// f = the sum of the terms' leaf products (a alone where b is null; common.hpp, LeafTerm). The
+// first term's a or b may be f.
+inline void leaf_terms(const LeafTerm* terms, int n, u32* f, int lg, const u32* r) {
+    const std::size_t len = std::size_t(1) << lg;
+    for (int i = 0; i < n; ++i) {
+        const LeafTerm& t = terms[i];
+        if (t.b) multiply_leaves(t.a, t.b, f, lg, r, i > 0);
+        else if (i > 0)
+            for (std::size_t j = 0; j < len; ++j) f[j] = add(f[j], t.a[j]);
+        else if (t.a != f) std::copy_n(t.a, len, f);
+    }
+}
 
 // The values form (common.hpp) of the leaf form at `from`, into `to` (may be from); rows:
 // build_value_rows(lg).
@@ -174,6 +210,10 @@ struct scalar {
         detail::scalar::forward_upper(f, lg, roots);
     }
 
+    static void inverse_upper(std::uint32_t* f, int lg, const std::uint32_t* inverse_roots) {
+        detail::scalar::inverse_upper(f, lg, inverse_roots);
+    }
+
     static void inverse(std::uint32_t* f, int lg, const std::uint32_t* inverse_roots) {
         detail::scalar::inverse_unscaled(f, lg, inverse_roots);
         detail::scalar::scale(f, std::size_t(1) << lg, detail::leaf_scale(lg));
@@ -231,6 +271,60 @@ struct scalar {
         else if (from != f) std::copy_n(from, std::size_t(1) << lg, f);
         inverse(f, lg, inverse_roots);
         if (out != f) std::copy_n(f, count, out);
+    }
+
+    // Fused leaf-form ops (ntt.hpp, Transform), step by step: in copied into f, zero past n.
+    static void forward_from(const std::uint32_t* in, std::size_t n, std::uint32_t* f, int lg, const std::uint32_t* roots) {
+        std::fill(std::copy_n(in, n, f), f + (std::size_t(1) << lg), 0u);
+        forward(f, lg, roots);
+    }
+
+    static void forward_product(const std::uint32_t* in, std::size_t n, const std::uint32_t* b, std::uint32_t* f, int lg,
+                                const std::uint32_t* roots) {
+        forward_from(in, n, f, lg, roots);
+        detail::scalar::multiply_leaves(f, b, f, lg, roots);
+    }
+
+    static void forward_upper_from(const std::uint32_t* in, std::size_t n, std::uint32_t* f, int lg,
+                                   const std::uint32_t* roots) {
+        std::fill(std::copy_n(in, n, f), f + (std::size_t(1) << lg), 0u);
+        forward_upper(f, lg, roots);
+    }
+
+    static void cyclic_product(const std::uint32_t* in, std::size_t n, const std::uint32_t* b, std::uint32_t* f,
+                               std::uint32_t* out, std::size_t count, int lg, const std::uint32_t* roots,
+                               const std::uint32_t* inverse_roots, unsigned output) {
+        forward_from(in, n, f, lg, roots);
+        const detail::LeafTerm term{f, b};
+        inverse_product(&term, 1, f, out, count, lg, roots, inverse_roots, output);
+    }
+
+    static void inverse_product(const detail::LeafTerm* terms, int n, std::uint32_t* f, std::uint32_t* out,
+                                std::size_t count, int lg, const std::uint32_t* roots, const std::uint32_t* inverse_roots,
+                                unsigned output) {
+        detail::scalar::leaf_terms(terms, n, f, lg, roots);
+        inverse(f, lg, inverse_roots);
+        const std::uint32_t* from = f + (output & detail::kUpperHalf ? (std::size_t(1) << lg) / 2 : 0);
+        for (std::size_t i = 0; i < count; ++i) out[i] = output & detail::kNegated ? detail::scalar::sub(0, from[i]) : from[i];
+    }
+
+    // Hooked ops (Transform::forward(in, F, hook, ...)): one run of all the leaves; no pruning.
+    template <class Hook>
+    static void forward_hooked(const std::uint32_t* in, std::size_t n, std::uint32_t* f, int lg, const std::uint32_t* roots,
+                               std::size_t, Hook hook) {
+        forward_from(in, n, f, lg, roots);
+        hook(f, std::size_t(0), (std::size_t(1) << lg) / 8);
+    }
+
+    template <class Hook>
+    static void inverse_hooked(Hook hook, std::uint32_t* f, std::uint32_t* out, std::size_t count, int lg,
+                               const std::uint32_t*, const std::uint32_t* inverse_roots, unsigned output, std::size_t) {
+        const std::size_t len = std::size_t(1) << lg;
+        hook(f, std::size_t(0), len / 8);
+        detail::scalar::inverse_unscaled(f, lg, inverse_roots);
+        detail::scalar::scale(f, len, detail::product_scale(lg));  // the leaves carry 2^-32
+        const std::uint32_t* from = f + (output & detail::kUpperHalf ? len / 2 : 0);
+        for (std::size_t i = 0; i < count; ++i) out[i] = output & detail::kNegated ? detail::scalar::sub(0, from[i]) : from[i];
     }
 };
 

@@ -11,8 +11,10 @@ machine by `tools/tune.py`, and run-time tuning (explicit, FFTW-style wisdom) ca
 ## Starting point
 
 lc-opt's kernels (`lib/ntt`, `lib/poly`, `lib/multimod`) are AVX2 only, tuned for Zen 3, with no
-fallback and no other ISA. Their notes hold the measurements and lessons (register
-pressure, spills, aliasing, Zen 3 instruction costs). Read them before exploring a kernel they cover.
+fallback and no other ISA. They are the fastest implementations we have: start from their code
+(it may move here) and their notes, which hold the measurements and lessons (register pressure,
+spills, aliasing, Zen 3 instruction costs, and the attempts that lost). Read both before exploring
+a kernel they cover. For other ISAs, port the algorithm and the generators, and measure.
 
 v1 serves one modulus, P = 998244353 (DESIGN.md). Kernels for other moduli (`multimod`, `crt`)
 come after v1.
@@ -74,6 +76,11 @@ Kernels to start with: `simd` (per-ISA vector wrappers), `modarith`, `ntt`, `mul
   variant (reported). Sizes 2^6..2^25, to see L1, L2, L3 and memory.
 - Before optimizing, estimate the floor: multiply uops over multiply pipes, or bytes over
   bandwidth. Report the time next to it.
+- Where lc-opt has the operation (`../cpp_hpc/lc-opt`, `~/lc-opt` on the VMs; read-only), lc-opt
+  is the bar: time it against ours in the same run on `lc-bench` (Zen 3, the machine it was tuned
+  for), same compiler and flags, outputs checked equal, at several sizes, and report fps / lc-opt.
+  The `Speed` section compares against `main` only, so this is the only check that a move kept
+  lc-opt's speed. Keep the harness in the exploration folder (`<kernel>/issue<n>/`) for the next round.
 - Measure instruction costs you rely on (`perf` on `lc-intel` and `lc-arm`; probes elsewhere).
   Model rankings (`llvm-mca`) did not predict the hardware in lc-opt.
 - Test every variant the machine can run, not only the selected one: ragged sizes (0, 1, powers of
@@ -95,7 +102,7 @@ Kernels to start with: `simd` (per-ISA vector wrappers), `modarith`, `ntt`, `mul
   test machine, not the timing machine.
 - A change merges only if every target's tests pass (`tools/gate.py`, which does not time) and the
   pull request's `Speed` section shows no target slower beyond noise (geomean of new/base at most
-  1.005, measured by the author with `kernel.py bench --base`, next to lc-opt's time; `tools/prompt.md`). The agent opens
+  1.005, measured by the author with `kernel.py bench --base`, with the fps / lc-opt figure beside it; `tools/prompt.md`). The agent opens
   the pull request and returns; the coordinator checks the section, runs the gate and sends
   failures back (AGENTS.md, How work flows).
 - A round ends with a comment on its issue: what was tried, the numbers, and a last line that is

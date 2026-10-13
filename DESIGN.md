@@ -123,8 +123,8 @@ Polynomial exp(f, n);                     // f[0] == 0; n <= P
 Polynomial pow(f, std::uint64_t e, n);    // any f, leading zeros included; 0^0 = 1; n <= P
 std::optional<Polynomial> sqrt(f, n);     // g with g^2 = f mod x^n (below), or nullopt
 Polynomial compose(f, g, n);              // f(g) mod x^n; n defaults to max(f.size(), g.size());
-                                          // linear g: Taylor shift
-Polynomial compositional_inverse(f, n);   // f[0] == 0, f[1] != 0
+                                          // any f, g; constant g: f(g[0]); linear g: Taylor shift
+Polynomial compositional_inverse(f, n);   // f[0] == 0 (n >= 1), f[1] != 0 (n >= 2); n <= P
 
 // Evaluation and interpolation
 std::vector<std::uint32_t> evaluate(f, points);          // points: a span, or geometric(...)
@@ -135,10 +135,13 @@ std::vector<std::uint32_t> extrapolate(values, std::uint32_t c, std::size_t m);
 Polynomial to_newton_basis(f, points);
 
 // Algebra
-Polynomial gcd(f, g);                     // monic
-std::optional<Polynomial> inverse_mod(f, m);   // f^-1 mod m
-std::vector<std::uint32_t> roots(f);      // distinct roots in [0, P)
-std::vector<std::pair<Polynomial, int>> factor(f);   // monic irreducible factors, multiplicities
+Polynomial gcd(f, g);                     // monic, deg + 1 coefficients; gcd(0, 0) = 0 (none)
+std::optional<Polynomial> inverse_mod(f, m);   // f^-1 mod m: deg m coefficients, nullopt if
+                                          // gcd(f, m) != 1; m != 0; a constant m gives 0
+std::vector<std::uint32_t> roots(f);      // distinct roots in [0, P), increasing; f != 0
+std::vector<std::pair<Polynomial, int>> factor(f);   // monic irreducible factors, multiplicities;
+                                          // f != 0, deg f < P; by degree, then coefficients
+                                          // from the constant term; a constant f gives none
 ```
 
 `middle_product(f, g)`, for n = `f.size()` >= m = `g.size()` >= 1 (else `std::domain_error`):
@@ -151,7 +154,12 @@ time in lanes, one transform of each length per node); it also takes a `std::vec
 `divmod(f, g)`, `f / g`, `f % g`: f = q g + r with deg r < d = deg g. q has max(`f.size()` - d, 0)
 coefficients and r has d (f's, then zeros, if `f.size()` <= d), so `f / x^k` drops the lowest k
 coefficients and `f % x^k` is `f.truncate(k)`; neither is trimmed. g = 0, of any size, throws
-`std::domain_error`. `f / g` computes no remainder.
+`std::domain_error`. `f / g` computes no remainder. Divisors of few terms are detected (#147),
+each O(n t) for t terms below the leading one: g = c x^d is a shift; t <= 16 terms, the highest at
+least 8 (t + 1) below the leading one (`x^L - 1`, `x^d - x - 1` for d >= 25), run long division in
+vector passes; else t <= 2 (`x^3 + 2x + 5`) runs a recurrence. Every other g runs the backend's
+blocked division, whose transforms stay within 2^25 words (f of 2^25 + 2^10 by a dense g of
+2^25 + 1 runs, checked by hand: about 1 GB); the sparse paths have no length limit.
 
 `evaluate(f, points)` returns `points.size()` values, for any points (repeats too).
 `interpolate<P>(points, values)` returns m = `points.size()` coefficients; it needs as many values
@@ -159,14 +167,52 @@ and distinct points (a repeat throws `std::domain_error`: it makes M'(x_i) = 0 f
 prod (x - x_i), which the algorithm divides by, so the check is free). `to_newton_basis(f, points)`
 returns c of `f.size()` = n coefficients with f = sum_k c_k prod_(i < k) (x - x_i); it reads the
 first n - 1 points, any of them (fewer throws `std::domain_error`). Points and values >= P throw
-`std::domain_error`; 2^25 or more points (n >= 2^25) throw `std::length_error`.
+`std::domain_error`; 2^25 or more points to `interpolate` (n >= 2^25 to `to_newton_basis`) throw
+`std::length_error`. `evaluate` has no size limit: the backend splits f and the points into chunks
+of 2^24 (#139; the limit was the frontend's own tree's, whose root passed the NTT's 2^25).
+
+On geometric points (fps/geometric.hpp, the backend's chirp kernels): `evaluate(f,
+geometric(a, r, m))` returns m values for any a, r (repeats too); `interpolate<P>(geometric(a, r,
+m), values)` returns m coefficients and needs m values and distinct points (a != 0 for m >= 2,
+r != 0 for m >= 3, r^k != 1 for 0 < k < m; else `std::domain_error`). `extrapolate<P>(values, c,
+m)` reads f of degree < n = `values.size()` <= P from f(0 .. n - 1) and returns f(c + i) for i < m,
+c + i taken mod P. a, r, c and values >= P throw `std::domain_error`. `Geometric`'s constructor is
+explicit, so a braced list such as `{1, 2, 3}` stays a list of points. The NTT behind them throws
+`std::length_error` past 2^25 words (interpolate: m > 2^25, checked first).
 
 `sqrt(f, n)` is the root of the polynomial f mod x^n = x^(2k) u, u[0] != 0: x^k s with s^2 = u
 mod x^(n - k) and s[0] the smaller of the two square roots of u[0] in [0, P) (`sqrt(1 - 4x)` starts
 with 1). Its top k coefficients are free in g^2 = f mod x^n; this fixes them as if f had no terms
 past x^(n - 1). The zero polynomial for f mod x^n = 0; nullopt if the lowest nonzero term has an
-odd index or a coefficient that is not a square. `pow` needs n <= P, as `log` and `exp`: it runs
-(u / u[0])^e as exp(e log(u / u[0])), where only e mod P counts below x^P.
+odd index or a coefficient that is not a square. `pow` needs n <= P, as `log` and `exp`: for
+f = x^z u it runs u[0]^e (u / u[0])^e on the backend's power (#167), where only e mod P counts
+below x^P. Past 2^25 coefficients of u's part, both run only for u of at most 16 terms past
+u[0] (a recurrence; n <= P); any other u throws `std::length_error` before writing.
+
+`gcd(f, g)` and `inverse_mod(f, m)` run the backend's half-gcd (lc-opt's, #103), O(n log^2 n).
+An input of degree 2^25 or more (its transforms' limit; trailing zeros do not count) is first
+reduced modulo the other by division if the other is within the limit, so `gcd(f, x + 1)` works
+for any f; both inputs past it, or m past it in `inverse_mod`, throw `std::length_error` (#168).
+
+`roots(f)` runs the backend's tangent Graeffe root finder (lc-opt's, #122): O(d log d) for
+d = deg f, up to about d^2 / 300 more with many repeated or colliding roots (#185): at d = 2^20,
+0.10 s for a random f and 3.2 s for 2^20 distinct roots on Zen 3 (#192). It needs
+deg f < 2^24 (its transforms have 2 bit_ceil(d + 1) words; trailing zeros do not count, a factor
+x^z does) and throws `std::length_error` past it, before any work; its workspace is kept per
+thread, 32 to 45 d words (up to 3 GiB near 2^24). The frontend's own path (gcd with x^(P-1) - 1,
+Cantor and Zassenhaus) stopped near the same degree (its squares mod u, f = x^z u, pass 2^25
+words for deg u > 2^24) and ran 6 to 114 times slower (8 to 16 times at 2^20), so it was not kept for the inputs in
+between (deg u = 2^24, or a factor x^z that takes deg f to 2^24 or more) (#192).
+
+`compose(f, g, n)`: a constant g mod x^n gives f(g[0]) (Horner), a linear one a Taylor shift by
+g[0] and a scaling by g[1]^k; any other g a Taylor shift by g[0], then the backend's Kinoshita and
+Li (#169), as does `compositional_inverse`. Both run for n up to 2^23, the kernel's limit, and
+throw `std::length_error` past it before any work; the kernel keeps its work per thread, about
+16 m (log2 m + 3) bytes for compose, m = bit_ceil(n) (3.3 GiB at 2^23). The Taylor shift is the
+backend's (#182: lc-opt's, one cyclic product of 2^lg >= 2 (deg f + 1) words); it needs deg f
+< 2^24 (trailing zeros do not count; else `std::length_error`, before any work) for g[0] != 0, any
+n. It was a middle product of f.size() + min(n, f.size()) - 1 <= 2^25 words, which let a short n
+take f of up to 2^25 - n + 1 words; the kernel's layout needs 2 deg f < 2^25 instead.
 
 `Factorials<P> fact(n)`, n <= P: `fact[i]` = i!, `fact.inverse(i)` = 1/i!, `fact.binomial(n, k)`
 = C(n, k) (0 for k > n), for i, n < `fact.size()`. n > P throws: P! = 0 has no inverse. Indices
@@ -200,9 +246,9 @@ Operations, all exact and all returning a `Fraction` (a, b fractions; f a polyno
 
 | Code | Meaning |
 |---|---|
-| `a + b`, `a - b`, `-a`, `c * a` | Termwise sum, difference, scaling |
-| `a * b`, `f * a` | Product of series (convolution of the sequences) |
-| `a / f`, `a / b` | Division of series; needs f[0] != 0, b's numerator [0] != 0 |
+| `a + b`, `a - b`, `-a`, `c * a`, `a * c` | Termwise sum, difference, scaling |
+| `a * b`, `f * a`, `a * f` | Product of series (convolution of the sequences) |
+| `a / f`, `a / b` | Division of series; needs f[0] != 0, b's numerator [0] != 0 (else `std::domain_error`) |
 | `a / (1 - x)` | Prefix sums: coefficient k is a_0 + ... + a_k |
 | `a * Poly::x(k)` | The sequence moved k places later |
 | `derivative(a)` | Coefficient k is (k + 1) a_(k+1); `x * derivative(a)` gives k a_k |
@@ -211,9 +257,9 @@ Costs, with d the larger of deg p and deg q:
 
 | Operation | Cost |
 |---|---|
-| `f[k]` | O(d log d log k). Small d: microseconds. d = 10^5, k = 10^18: about 60 products of length 2d, roughly 100 ms (guess, not measured) |
-| `take(n)` | O(n d) by recurrence for small d, else `mul(p, inverse(q, n), n)` |
-| `a + b`, `a * b`, `a / b` | One or two polynomial products; the degrees add |
+| `f[k]` | O(d log d log k). k = 10^18: 3-6 us for Fibonacci, 6-16 us at d = 16; d = 10^5: 120 products of factors of about d, 44 ms (Zen 5), 86-92 ms (Emerald Rapids), 94 ms (Zen 3), 167 ms (Neoverse V2), measured (#23); a Bostan-Mori kernel is #114 |
+| `take(n)` | `mul(p, inverse(q, n), n)`; `inverse` runs a recurrence, O(n t), for q with t <= 16 nonzero terms past q[0] |
+| `a + b`, `a * b`, `a / b` | Three (`a + b`, `a - b`), two (`a * b`, `a / b`) or one (`a / f`, `f * a`) polynomial products; the degrees add |
 
 - Degrees grow and are never reduced: `fib + fib` has denominator q^2, not q. Long chains make
   `[k]` slower. See Later (`reduced()`).
@@ -259,6 +305,15 @@ Polynomial<P> to_coefficients(const Values<P>& A);   // L coefficients: the prod
 - The contents are opaque: no `operator[]`. The layout depends on the CPU (lc-opt's transform
   ends at blocks of 8 coefficients, not single values), so it is not a DFT. `fps::dft` and
   `fps::idft` give the true values at the roots, in a documented order, for users who need them.
+- `fps::dft(f, L)` returns f(w^i) for i < L, natural order, with w = 3^((P - 1) / L) (3
+  generates the units mod P): the DFT of f mod (x^L - 1), any `f.size()`. `fps::idft<P>(values)`
+  returns the f of L = `values.size()` coefficients with f(w^i) = values[i]. L is 0 or any divisor
+  of P - 1, not only a power of two (else `std::domain_error`): both run a chirp z-transform
+  (fps/geometric.hpp), one middle product of transforms of length about 2L, slower than
+  `to_values` for powers of two. Among powers of two they stop at 2^23 (P - 1 = 119 2^23 has no
+  roots of higher order), while `Values` goes on to 2^25: its leaves x^8 - w need roots of order
+  L/8 only. The middle product limits dft to f.size() + L - 1 <= 2^25 and idft to L <= 2^24
+  (`std::length_error`, before allocating).
 
 ## Raw functions
 

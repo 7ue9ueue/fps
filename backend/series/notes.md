@@ -1,75 +1,122 @@
 # backend/series
 
-Power series modulo P = 998244353: inverse, log and exp into caller memory. API: `series.hpp`
-(`inverse`, `log`, `exp`, each `(f, out)` in this thread's memory or `(f, out, scratch)` with
-`*_scratch(n)` words). Tests: `test.cpp`; bench: `bench.cpp`. Attempts: `notes/` (one file per issue round). From lc-opt's
-`lib/poly/{inverse,log,exp,calculus}.hpp` (its `lib/poly/notes.md`: Inverse, Log, Exp), rewritten
+Power series modulo P = 998244353: inverse, log, exp, pow and sqrt into caller memory. API:
+`series.hpp` (`inverse`, `log`, `exp` as `(f, out)`, `pow(f, e, c, out)`, `sqrt(f, c, out)`, in
+this thread's memory or with a last `scratch` argument of `*_scratch(n)` words). Tests: `test.cpp`,
+`test_pow_sqrt.cpp`; bench: `bench.cpp`, `bench_pow_sqrt.cpp`. Attempts: `notes/` (one file per
+issue round). From lc-opt's `lib/poly/{inverse,log,exp,pow,sqrt,calculus}.hpp` (its
+`lib/poly/notes.md`: Inverse, Log, Exp, Power, Sqrt), rewritten
 on `ntt::Transform`'s leaf form and `backend/simd`, so every target runs it (lc-opt's transform
 layer is AVX2 asm on Zen 3). One variant per op: no `select.hpp` yet.
 
 ## Design
 
-- Transforms: `ntt::Transform` per length, one per thread, kept (as `backend/product_tree`): its
-  `forward`, `inverse` in place, `multiply` and `multiply_add` (leaf products), the variants the
-  NTT's tuned table picks. Leaf v of a transform of 2L words sits at w_v = (-1)^v r(v / 2), which
-  does not depend on the length, so the transform of L words is the lower half of that of 2L.
-- Upper halves (lc-opt's `forward_upper`): for a of L words the upper half of T_2L(a) is T_L(a')
-  with a'[8j + t] = a[8j + t] rho^j, rho = r(L / 16) (`detail::twist`; product_tree's notes give
-  the argument). One Montgomery product per word against a second transform of L. Tested against
-  the upper half of T_2L for L = 2^6 .. 2^20.
+- Transforms: `ntt::Transform` per length, one per thread, kept (as `backend/product_tree`), and
+  its fused ops (issue #112): `forward(in, F)` from a span (a half-zero source skips its zero
+  half), `forward_product`, `forward_upper(in, H)`, `cyclic_product(in, B, work, out, {offset,
+  negate})` (forward, leaf products with a kept transform and inverse in one depth-first pass, the
+  lower or upper half out, negated by the top level's scale) and `inverse_product(terms, work,
+  out, ...)` (an inverse of a sum of up to 4 leaf products). So the steps copy, zero and negate
+  nothing (before: 4-6% of each op), and each product is one pass over memory, not three. Leaf v
+  of a transform of 2L words sits at w_v = (-1)^v r(v / 2), which does not depend on the length,
+  so the transform of L words is the lower half of that of 2L.
+- Shifted sources are not needed: (x^(L/2) a) b mod (x^L - 1) is a b rotated by L/2, so a step's
+  x^k e g mod (x^2k - 1) upper half is e g mod x^k (no wrap: degree < 2k - 1), from e in place.
+- Upper halves (lc-opt's `forward_upper`): `Transform::forward_upper(in, H)` from a span (was a
+  twisted copy and a transform of L, `detail::twist`).
 - Memory: arrays carved from one span (`detail::Arena`): this thread's NTT region
   (`ntt::detail::take_region`, huge pages, kept across calls) or the caller's scratch. Each array
   is 64-byte aligned with 80 words after it (the transforms read 16 words of padding; the rest
-  keeps arrays of a power-of-two length 320 bytes apart modulo 4 KiB). `Transform::inverse(F,
-  out)` is not used: it takes the thread's region, which a series call already holds, so it would
-  map a fresh one per call.
-- Reciprocals 1 / i (log's integral, exp's s): Montgomery form 2^32 / i from the factorial
-  tables, (i - 1)! / i! 2^64 by two Montgomery products per word (`detail::reciprocals`).
+  keeps arrays of a power-of-two length 320 bytes apart modulo 4 KiB). The fused ops take their
+  work array from the arena.
+- Divisions by indices (log's integral, exp's s): `detail::divide_by_index`, lc-opt's batch
+  inversion (4 chains of lanes, 3 Montgomery products a word and one by the dividend), divisors
+  below 2^13 from a table built once (the batch's lane totals cost about 0.8 us a call: exp and
+  log of 2^10 words were 10-14% slower on Zen 5 without it). Before: a table of 1 / i per call
+  from the factorial tables (0.9 ns per word on Zen 3) and a product pass.
 - Recurrences for few coefficients: `dot` sums 16 products < P^2 in 64 bits, then reduces. Below
   32 (inverse) and 64 (log, exp) coefficients. inverse with the recurrence to 64 was slower on the
   Mac (1.07 against 0.69 us at n = 64).
 
 ### inverse
 
-Newton k -> 2k with transforms of 2k (lc-opt's step): G = T(g mod x^k), E = T(-f mod x^2k),
-E G inverse gives -(f g)[k, 2k) in its upper half; that half alone, transformed, times G,
-inverse: g[k, 2k) in the upper half. 5 transforms and 2 leaf products of 2k a step, the sign in
-the copy of f. 10 T(n) + 4 LP(n) for n = 2^j.
+Newton k -> 2k with transforms of 2k (lc-opt's step): G = T(g mod x^k) (half-zero source), e =
+(f g)[k, k + c) by a cyclic product of f with G (upper half out) into g[k, k + c), then
+g[k, k + c) = -(e g mod x^c) by a cyclic product of e with G in place (negated). 5 transforms and
+2 leaf products of 2k a step. 10 T(n) + 4 LP(n) for n = 2^j.
 
 Last step from k to k + c with c <= k/2 (`inverse_half_step`), at length k: since g f = 1 mod
 x^k, the cyclic product (g f_lo) mod (x^k - 1) is 1 + (g f_lo)[k, 2k); with f_hi = f[k, k + c),
-g_c = g mod x^c, e = (g f_lo)[k, k + c) + (g_c f_hi) mod x^c from one inverse of E G + F G_c,
-then g[k, k + c) = -(g_c e mod x^c). 7 transforms and 3 leaf products of k against 5 and 2 of 2k.
-The two extra arrays share G's and E's (G_c at G + k: a transform reads its padding but never
-writes it).
+g_c = g mod x^c, e = (g f_lo)[k, k + c) + (g_c f_hi) mod x^c from one inverse_product of
+T(f_lo) T(g) (a forward_product) + T(f_hi) T(g_c), then g[k, k + c) = -(g_c e mod x^c). 6
+transforms and 3 leaf products of k against 5 and 2 of 2k. G_c at G + k, T(f_hi) at W + k + 64.
 
 ### log
 
 lc-opt's blocked division: q = f' / f mod x^(n-1) in B blocks of k coefficients, k the least
 power of two >= (n - 1) / 4 (at least 32; B = 2 .. 4), with h = 1 / f mod x^k and transforms of
-2k. q_j = h (d - f Q)[jk, (j+1)k) mod x^k (d = f', Q = q mod x^(jk)), the residual from one
-inverse of sum over i < j of T(W_(j-i)) T(q_i), W_t = f[(t-1)k, (t+1)k) (upper half exact).
-(3 + 5B) transforms and 2 + B + B(B-1)/2 leaf products of 2k: 23 and 12 for B = 4, 11.5 T(n) +
-6 LP(n). f is read into d, the W_t and h first, so out may overlap f. Not done: lc-opt's
-Toeplitz sharing of blocks 2 and 3 (one leaf product of 2k fewer).
+2k. q_j = h (f' - f Q)[jk, (j+1)k) mod x^k (Q = q mod x^(jk)), the residual from one
+inverse_product of the sum over i < j of T(W_(j-i)) T(q_i), W_t = f[(t-1)k, (t+1)k) (upper half
+exact; on avx2 the sums of 2 and 3 products have asm bottoms of their own). (3 + 5B) transforms
+and 2 + B + B(B-1)/2 leaf products of 2k: 23 and 12 for B = 4, 11.5 T(n) + 6 LP(n). Block j
+reads f'[jk, (j+1)k) from f (a copy of f if out overlaps it). Not done: lc-opt's Toeplitz
+sharing of blocks 2 and 3 (one leaf product of 2k fewer, about 2% at 2^21).
 
 ### exp
 
 lc-opt's step from m to 2m with h = 1 / g mod x^(m/2), H = T_m(h), q = x f' (x g' = q g),
 Q = q mod x^m:
-1. G_lo = T_m(g); e = (g h)[m/2, m) from G_lo H; h[m/2, m) = -(x^(m/2) e h)[m/2, m), H again.
-2. T_m(r) = T_m(Q) G_lo, r = Q g mod (x^m - 1) = x g' + (Q g)[m, 2m).
-3. H = T_2m(h) (kept for the next step); T_2m(r) = [T_m(r), twisted upper half];
-   t = h r mod x^m = Q + h (Q g)[m, 2m).
+1. G_lo = T_m(g); e = (g h)[m/2, m) by an inverse_product of G_lo H (upper half) into h[m/2, m);
+   h[m/2, m) = -(e h mod x^(m/2)) by a cyclic product in place.
+2. T_m(r) = forward_product of Q with G_lo, r = Q g mod (x^m - 1) = x g' + (Q g)[m, 2m).
+3. H = T_2m(h) (kept for the next step); T_2m(r) = [T_m(r), forward_upper(r)];
+   t = h r mod x^m = Q + h (Q g)[m, 2m) (inverse_product, lower half).
 4. s = (f - log g)[m, 2m) = (q[m + i] + t_i - Q_i) / (m + i).
-5. T_2m(g) = [G_lo, twisted upper half]; g[m, 2m) = (x^m s g)[m, 2m).
-16 transforms and 7 leaf products of m a step (8 and 3.5 of 2m), with 2 twists.
+5. T_2m(g) = [G_lo, forward_upper(g)]; g[m, 2m) = s g mod x^m (cyclic product).
+16 transforms and 7 leaf products of m a step (8 and 3.5 of 2m).
 
-A last step to n <= 3m/2 (`exp_half_step`, lc-opt's block 2 alone): t = h r mod x^(m/2) needs
-h mod x^(m/2) only, and g[m, n) = (g mod x^(m/2)) s mod x^(n-m), whose transform T_m(g mod
-x^(m/2)) the previous full step left in Gt. 7 transforms and 3 leaf products of m. Not done:
-lc-opt's block 3 (n - m > m/2 at length m: 14 transforms and 7 leaf products of m against 16
-and 7; about 6% of a power-of-two exp).
+The last step, to n <= 2m (`exp_last_step`, lc-opt's exp_last_step), at length m in blocks of
+B = m/2: block 2 as before (t = h0 r mod x^B, g_2 = g0 s), and for n > 3m/2 block 3: (q G)[3B,
+4B) for G = g mod x^(3B) is r[B, 2B) - x G'[B, 2B) plus the upper half of T(Q) T(g_2) + T(q_2)
+T(g mod x^m) (one inverse_product), times h0, then g_3 = g0 s_3. 14 transforms and 7 leaf
+products of m against 16 and 7 for a full step (exp of 2^21 words: 1.08 -> 1.01 of lc-opt).
+`exp_steps(q, c, g, ...)` runs the steps from any q (q[0] = 0) and g[0] = c (they do not depend
+on the scale of g); `QTransforms` hands the last step T_m(q mod x^m) and T_m(q[m, 3m/2)) when the
+caller has them (pow), which saves its forwards of them.
+
+### pow
+
+g = c (f / f[0])^e for residues e, c and f[0] != 0 (f^M = pow(f, M mod P, f[0]^M) for n <= P;
+the frontend handles leading zeros). lc-opt's power: g solves x g' = q g with q = e x f' / f,
+from log's blocked division (`divide()`, which log and pow share), then exp's steps from q
+(`exp_steps`); no integral of f'/f, no derivative in exp, no passes for f / f[0], e and c.
+Different from lc-opt: the division runs on N = e x f' (`index_block` with the factor e) over n
+coefficients, not on f' over n - 1, so its blocks q_j are q's own, written in place in q (lc-opt
+scales each block of f'/f by e and shifts it by one into q, a pass), and its kept transforms give
+the last exp step's directly: the division's k is m/2 for m = bit_ceil(n) / 2 at every n >
+kExpBase, T_m(q mod x^m) = T(q_0) + s T(q_1) with s = x^k = 1 on the lower half of the leaves
+and -1 on the upper (one add/sub pass, `add_lower_sub_upper`), and T_m(q[m, 3m/2)) = T(q_2),
+which exists (4 blocks) exactly when exp's block 3 runs. lc-opt gets them from T(f'/f) by a
+product with x per leaf (`times_x`: a lane rotation and w_p a_7), and only when n - 1 is not a
+power of two. Arrays: q (n words) and the Q_j first, then the division's other arrays, which
+exp's reuse. Below kExpBase + 1 coefficients: i g_i = sum_j ((e + 1) j - i) a_j g_(i-j), a = f /
+f[0] (`pow_direct`).
+
+### sqrt
+
+lc-opt's: Newton m -> 2m with h = -1 / g mod x^(m/2) and H = T_m(h) (the sign makes both updates
+plain products): G = T_m(g); e = (g h)[m/2, m) (inverse_product, upper half) and h[m/2, m) = e h
+mod x^(m/2) (cyclic product, in place); s = g^2 mod (x^m - 1) = f mod x^m + (g^2)[m, 2m) by an
+inverse_product of G G, r = (s - f[0, m) - f[m, 2m)) / 2 (`half_residual`); H = T_2m(h) (also the
+next step's); g[m, 2m) = h r mod x^m (cyclic product of length 2m). 11 transforms and 5 leaf
+products of m a step. The last step, to n <= 2m, at length m: d = h r mod x^(n-m) for n - m <=
+m/2 (4 transforms, 2 leaf products), else Karp and Markstein's split: d0 = h r0 mod x^(m/2), d1 =
+h (r + g d0)[m/2, n - m) with (g d0)[m/2, m) the upper half of a cyclic product with G (8
+transforms, 4 leaf products). Below kSqrtBase + 1 coefficients: 2 c g_i = f_i - sum g_j g_(i-j).
+Arrays: G, H, R, h, then W (the fused ops' work array) last: an output 320 bytes past W (mod 4
+KiB) made the last step's inverse_product of G G at 2^18 cost 590-685 us against 465-500 behind
+it (Zen 3, notes/107-r1.md); `half_residual` halves by a shift and a product of the low bit by
+(P + 1) / 2, with a fast path when f covers the block.
 
 ## Measurements
 
@@ -95,3 +142,8 @@ ns per coefficient at lg 22 (n = 2^21), inverse / log / exp: `lc-bench` 16.7 / 2
 - Ragged sizes (`_ragged`, n = 1.25 2^(lg-1)): inverse and exp run their half-length last steps;
   ns per coefficient against the power of two at lg 18 on Zen 3: inverse 19.0 / 13.5, log 21.9 /
   18.1, exp 27.1 / 23.4. Before the inverse's half step: inverse_ragged/18 3.72 ms, after 3.12.
+- pow and sqrt (`bench_pow_sqrt.cpp`, commit 934233f, 3 rounds), ratios to `multiply@ntt/<lg>`
+  at lg 14 / 18 / 22: pow 4.59 / 4.33 / 4.46 (Zen 3), 4.57 / 4.28 / 4.44 (Emerald Rapids), 5.14 /
+  4.82 / 4.34 (Zen 5), 4.24 / 4.25 / 4.24 (Neoverse V2); sqrt 1.62 / 1.48 / 1.57, 1.60 / 1.47 /
+  1.54, 1.83 / 1.67 / 1.50, 1.53 / 1.50 / 1.51 (lc-opt's counts: about 4.6 and 1.6). Against
+  lc-opt on Zen 3: pow 0.87-1.02, sqrt 0.92-0.99 (notes/107-r1.md).

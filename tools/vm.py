@@ -33,17 +33,24 @@ def zone(vm: str) -> str:
 
 def ssh(vm: str, command: str, stdin: bytes | None = None, capture: bool = False,
         timeout: float | None = None) -> subprocess.CompletedProcess:
-    """Run command on vm. A connection failure (exit 255), including a connection that went silent
-    for two minutes, is retried twice: every command the tools send (copy, test, bench) can safely
-    run again. `timeout` (seconds, per attempt) raises subprocess.TimeoutExpired."""
+    """Run command on vm. A connection failure (exit 255, a connection that went silent for two
+    minutes, or gcloud itself crashing on a timeout to the Compute API, seen in PR 134's gate) is
+    retried twice: every command the tools send (copy, test, bench) can safely run again.
+    `timeout` (seconds, per attempt) raises subprocess.TimeoutExpired."""
     cmd = ['gcloud', 'compute', 'ssh', vm, f'--zone={zone(vm)}', '--quiet', f'--command={command}',
            '--', '-o', 'LogLevel=ERROR', '-o', 'ConnectTimeout=20',
            '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=4']
     for attempt in range(3):
-        result = subprocess.run(cmd, input=stdin, capture_output=capture, timeout=timeout)
-        if result.returncode != 255:
+        # stderr always read, so a gcloud crash is seen on uncaptured calls too (ship: PR 156's gate)
+        result = subprocess.run(cmd, input=stdin, stdout=subprocess.PIPE if capture else None,
+                                stderr=subprocess.PIPE, timeout=timeout)
+        if not capture and result.stderr:
+            sys.stderr.buffer.write(result.stderr)
+            sys.stderr.flush()
+        crashed = b'gcloud crashed' in (result.stderr or b'')
+        if result.returncode != 255 and not crashed:
             return result
-        print(f'ssh to {vm} failed (exit 255), attempt {attempt + 1} of 3', file=sys.stderr)
+        print(f'ssh to {vm} failed (exit {result.returncode}), attempt {attempt + 1} of 3', file=sys.stderr)
         time.sleep(15)
     return result
 

@@ -9,9 +9,9 @@
 //   variant::tuned                     the selected variant: one table read per call (SelectedForward ...)
 //
 // Variants: scalar (every target), intrinsics<S> (every simd struct S the target has), avx2
-// (__AVX2__). backend/ntt/tune.hpp measures the table on this machine. -DFPS_NTT_FORWARD=<variant>
-// (and _INVERSE, _MULTIPLY, the last for both products) forces one, e.g.
-// -DFPS_NTT_FORWARD='intrinsics<fps::simd::Avx512>'. Measurements: notes.md.
+// (__AVX2__), neon (arm: neon.hpp). backend/ntt/tune.hpp measures the table on this machine.
+// -DFPS_NTT_FORWARD=<variant> (and _INVERSE, _MULTIPLY, the last for both products) forces one,
+// e.g. -DFPS_NTT_FORWARD='intrinsics<fps::simd::Avx512>'. Measurements: notes.md.
 #pragma once
 
 #include <algorithm>
@@ -22,6 +22,7 @@
 #include <string_view>
 
 #include "backend/ntt/intrinsics.hpp"
+#include "backend/ntt/neon.hpp"
 #include "backend/ntt/scalar.hpp"
 #include "backend/ntt/tuned.hpp"
 #include "backend/simd/select.hpp"
@@ -29,12 +30,19 @@
 #ifdef __AVX2__
 #include "backend/ntt/avx2.hpp"
 #endif
+#include "backend/ntt/avx512.hpp"
 
 namespace fps::ntt {
 
-// Native: the variant that builds the tables of ntt::Transform (every variant builds the same).
+// Native: the variant that builds the tables of ntt::Transform (every variant builds the same) and
+// runs its leaf-form ops (values form, leaf products, inverse into other memory); bench_leaves.cpp
+// times them on it. On zen5 avx512, whose asm runs Zen 5's schedules (issue #152).
 #if defined(__AVX2__) && !(defined(__AVX512F__) && defined(__AVX512BW__))
 using Native = variant::avx2;
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+using Native = variant::neon;
+#elif (defined(__znver4__) || defined(__znver5__)) && defined(__AVX512VL__)
+using Native = variant::avx512;
 #else
 using Native = variant::intrinsics<fps::simd::Native>;
 #endif
@@ -43,14 +51,21 @@ template <class... V>
 struct Candidates {};
 
 // Per target, the variants that are fastest at some op and length on our machines (notes.md). With
-// AVX-512: the asm, intrinsics on ymm (32 registers) and on zmm. With AVX2 alone the asm: on Zen 3
-// intrinsics<Avx2> won only forward at 2^8 (2.7%), and its code in the binary, even unused, made
-// f * g at 2^6 22-31% slower there (code placement). Elsewhere intrinsics on the widest struct.
-// A target with one candidate reads no table.
-#if defined(__AVX512F__) && defined(__AVX512BW__)  // avx512, zen5
-using Selected = Candidates<variant::avx2, variant::intrinsics<simd::Avx512Vl>, variant::intrinsics<simd::Avx512>>;
+// AVX-512: the asm, intrinsics on ymm (32 registers) and on zmm, and the zmm intrinsics with
+// generated asm kernels scheduled for the target's machine (avx512.hpp: Emerald Rapids, issue #150;
+// Zen 5, issue #152). With AVX2
+// alone the asm: on Zen 3 intrinsics<Avx2> won only forward at 2^8 (2.7%), and its code in the
+// binary, even unused, made f * g at 2^6 22-31% slower there (code placement). Elsewhere
+// intrinsics on the widest struct. On arm, neon (intrinsics<Neon> with generated asm kernels;
+// issue #151): 0.80-0.98 of the time of intrinsics<Neon> on every op from 2^8 (2^6-2^7 run nearly
+// the same code). A target with one candidate reads no table.
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)  // avx512, zen5
+using Selected = Candidates<variant::avx2, variant::intrinsics<simd::Avx512Vl>, variant::intrinsics<simd::Avx512>,
+                            variant::avx512>;
 #elif defined(__AVX2__)
 using Selected = Candidates<variant::avx2>;
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+using Selected = Candidates<variant::neon>;
 #else
 using Selected = Candidates<variant::intrinsics<simd::Native>>;
 #endif
@@ -71,6 +86,18 @@ struct Name;
 template <>
 struct Name<variant::avx2> {
     static constexpr std::string_view prefix = "avx2", isa = "";
+};
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+template <>
+struct Name<variant::avx512> {
+    static constexpr std::string_view prefix = "avx512", isa = "";
+};
+#endif
+#if defined(__ARM_NEON) && defined(__aarch64__)
+template <>
+struct Name<variant::neon> {
+    static constexpr std::string_view prefix = "neon", isa = "";
 };
 #endif
 template <class S>
@@ -137,6 +164,11 @@ template <class... V>
     (void)((i++ == v && (V::inverse(f, lg, ir), true)) || ...);
 }
 template <class... V>
+[[gnu::always_inline]] inline void run_inverse_upper(Candidates<V...>, int v, std::uint32_t* f, int lg, const std::uint32_t* ir) {
+    int i = 0;
+    (void)((i++ == v && (V::inverse_upper(f, lg, ir), true)) || ...);
+}
+template <class... V>
 [[gnu::always_inline]] inline void run_multiply(Candidates<V...>, int v, std::uint32_t* a, std::uint32_t* b,
                                                 std::size_t n, std::size_t m, int lg, const std::uint32_t* r,
                                                 const std::uint32_t* ir) {
@@ -172,6 +204,59 @@ template <class... V>
     (void)((i++ == v && (V::inverse(from, f, out, count, lg, ir, rows), true)) || ...);
 }
 
+// Transform's fused ops (ntt.hpp): forwards from caller memory by the forward's choice, cyclic
+// products by the product's, inverses of leaf products by the inverse's.
+template <class... V>
+[[gnu::always_inline]] inline void run_forward_from(Candidates<V...>, int v, const std::uint32_t* in, std::size_t n,
+                                                    std::uint32_t* f, int lg, const std::uint32_t* r) {
+    int i = 0;
+    (void)((i++ == v && (V::forward_from(in, n, f, lg, r), true)) || ...);
+}
+template <class... V>
+[[gnu::always_inline]] inline void run_forward_product(Candidates<V...>, int v, const std::uint32_t* in, std::size_t n,
+                                                       const std::uint32_t* b, std::uint32_t* f, int lg,
+                                                       const std::uint32_t* r) {
+    int i = 0;
+    (void)((i++ == v && (V::forward_product(in, n, b, f, lg, r), true)) || ...);
+}
+template <class... V>
+[[gnu::always_inline]] inline void run_forward_upper_from(Candidates<V...>, int v, const std::uint32_t* in, std::size_t n,
+                                                          std::uint32_t* f, int lg, const std::uint32_t* r) {
+    int i = 0;
+    (void)((i++ == v && (V::forward_upper_from(in, n, f, lg, r), true)) || ...);
+}
+template <class... V>
+[[gnu::always_inline]] inline void run_cyclic_product(Candidates<V...>, int v, const std::uint32_t* in, std::size_t n,
+                                                      const std::uint32_t* b, std::uint32_t* f, std::uint32_t* out,
+                                                      std::size_t count, int lg, const std::uint32_t* r,
+                                                      const std::uint32_t* ir, unsigned output) {
+    int i = 0;
+    (void)((i++ == v && (V::cyclic_product(in, n, b, f, out, count, lg, r, ir, output), true)) || ...);
+}
+template <class... V>
+[[gnu::always_inline]] inline void run_inverse_product(Candidates<V...>, int v, const LeafTerm* terms, int n,
+                                                       std::uint32_t* f, std::uint32_t* out, std::size_t count, int lg,
+                                                       const std::uint32_t* r, const std::uint32_t* ir, unsigned output) {
+    int i = 0;
+    (void)((i++ == v && (V::inverse_product(terms, n, f, out, count, lg, r, ir, output), true)) || ...);
+}
+
+// Transform's hooked ops: by the forward's and the inverse's choice.
+template <class Hook, class... V>
+[[gnu::always_inline]] inline void run_forward_hooked(Candidates<V...>, int v, const std::uint32_t* in, std::size_t n,
+                                                      std::uint32_t* f, int lg, const std::uint32_t* r, std::size_t width,
+                                                      Hook& hook) {
+    int i = 0;
+    (void)((i++ == v && (V::forward_hooked(in, n, f, lg, r, width, hook), true)) || ...);
+}
+template <class Hook, class... V>
+[[gnu::always_inline]] inline void run_inverse_hooked(Candidates<V...>, int v, Hook& hook, std::uint32_t* f,
+                                                      std::uint32_t* out, std::size_t count, int lg, const std::uint32_t* r,
+                                                      const std::uint32_t* ir, unsigned output, std::size_t width) {
+    int i = 0;
+    (void)((i++ == v && (V::inverse_hooked(hook, f, out, count, lg, r, ir, output, width), true)) || ...);
+}
+
 }  // namespace detail
 
 namespace variant {
@@ -191,6 +276,11 @@ struct tuned {
 
     static void inverse(std::uint32_t* f, int lg, const std::uint32_t* inverse_roots) {
         detail::run_inverse(Selected{}, choice(kInverse, lg), f, lg, inverse_roots);
+    }
+
+    // The inverse's candidate at the length it runs, 2^lg (its table is the one of 2^(lg + 1)).
+    static void inverse_upper(std::uint32_t* f, int lg, const std::uint32_t* inverse_roots) {
+        detail::run_inverse_upper(Selected{}, choice(kInverse, lg), f, lg, inverse_roots);
     }
 
     static void multiply(std::uint32_t* a, std::uint32_t* b, std::size_t n, std::size_t m, int lg,
@@ -220,6 +310,51 @@ struct tuned {
     static void inverse(const std::uint32_t* from, std::uint32_t* f, std::uint32_t* out, std::size_t count, int lg,
                         const std::uint32_t* inverse_roots, const std::uint32_t* rows) {
         detail::run_inverse_from(Selected{}, choice(kInverse, lg), from, f, out, count, lg, inverse_roots, rows);
+    }
+
+    // Transform's fused ops.
+    static void forward_from(const std::uint32_t* in, std::size_t n, std::uint32_t* f, int lg, const std::uint32_t* roots) {
+        detail::run_forward_from(Selected{}, choice(kForward, lg), in, n, f, lg, roots);
+    }
+
+    static void forward_product(const std::uint32_t* in, std::size_t n, const std::uint32_t* b, std::uint32_t* f, int lg,
+                                const std::uint32_t* roots) {
+        detail::run_forward_product(Selected{}, choice(kForward, lg), in, n, b, f, lg, roots);
+    }
+
+    // The forward's candidate at the length it runs, 2^lg (as forward_upper).
+    static void forward_upper_from(const std::uint32_t* in, std::size_t n, std::uint32_t* f, int lg,
+                                   const std::uint32_t* roots) {
+        detail::run_forward_upper_from(Selected{}, choice(kForward, lg), in, n, f, lg, roots);
+    }
+
+    static void cyclic_product(const std::uint32_t* in, std::size_t n, const std::uint32_t* b, std::uint32_t* f,
+                               std::uint32_t* out, std::size_t count, int lg, const std::uint32_t* roots,
+                               const std::uint32_t* inverse_roots, unsigned output) {
+        detail::run_cyclic_product(Selected{}, choice(kProduct, lg), in, n, b, f, out, count, lg, roots, inverse_roots,
+                                   output);
+    }
+
+    static void inverse_product(const detail::LeafTerm* terms, int n, std::uint32_t* f, std::uint32_t* out,
+                                std::size_t count, int lg, const std::uint32_t* roots, const std::uint32_t* inverse_roots,
+                                unsigned output) {
+        detail::run_inverse_product(Selected{}, choice(kInverse, lg), terms, n, f, out, count, lg, roots, inverse_roots,
+                                    output);
+    }
+
+    // Transform's hooked ops.
+    template <class Hook>
+    static void forward_hooked(const std::uint32_t* in, std::size_t n, std::uint32_t* f, int lg, const std::uint32_t* roots,
+                               std::size_t width, Hook hook) {
+        detail::run_forward_hooked(Selected{}, choice(kForward, lg), in, n, f, lg, roots, width, hook);
+    }
+
+    template <class Hook>
+    static void inverse_hooked(Hook hook, std::uint32_t* f, std::uint32_t* out, std::size_t count, int lg,
+                               const std::uint32_t* roots, const std::uint32_t* inverse_roots, unsigned output,
+                               std::size_t width) {
+        detail::run_inverse_hooked(Selected{}, choice(kInverse, lg), hook, f, out, count, lg, roots, inverse_roots, output,
+                                   width);
     }
 };
 

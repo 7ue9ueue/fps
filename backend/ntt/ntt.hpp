@@ -1,6 +1,7 @@
 // Number-theoretic transforms and polynomial products modulo P = 998244353 (backend kernel).
-// Variants: scalar (every target), intrinsics<S> (every target, on a backend/simd struct) and avx2
-// (lc-opt's, asm scheduled for Zen 3). select.hpp picks one per op and length from a tuned table
+// Variants: scalar (every target), intrinsics<S> (every target, on a backend/simd struct), avx2
+// (lc-opt's, asm scheduled for Zen 3) and neon (arm: intrinsics<Neon> with asm generated for
+// Neoverse V2). select.hpp picks one per op and length from a tuned table
 // (one table read per call; backend/ntt/tune.hpp measures it, tune::run() and wisdom keep it); the
 // ops' Variant template argument calls one directly. Linux or macOS. Design and measurements: notes.md.
 //
@@ -25,12 +26,28 @@
 //   t.inverse(f);                              // leaf form -> L coefficients
 //   t.forward_upper(h);                        // h: L / 2 words, p mod (x^(L/2) + 1) -> the upper
 //                                              // half of p's leaf form (transform doubling)
+//   t.inverse_upper(h);                        // forward_upper undone: the upper half of a leaf
+//                                              // form -> p mod (x^(L/2) + 1)
 //   t.multiply(a, b, out);                     // out = a b leaf by leaf; out may be a or b
 //   t.multiply_add(acc, a, b);                 // acc += a b leaf by leaf; acc may be a or b
 //   t.inverse(F, out);                         // out = the first out.size() coefficients; F kept
 //   t.inverse(F, out, Form::leaves, {.offset = k, .add = true});   // out[i] += coefficient k + i
 //   t.forward(f, Form::values);                // f -> values form (L <= 2^23); inverse(F, Form::values),
 //                                              // inverse(F, out, Form::values) undo it
+//   t.forward_upper(h, Form::values);          // the upper half of p's values form (doubling)
+//
+//   // Fused ops for Newton steps: sources and outputs in caller memory, one pass each.
+//   t.forward(std::span(g), G);                // G = leaf form of g (g.size() <= L, zero past it)
+//   t.forward_product(q, G, X);                // X = leaf form of q, times G leaf by leaf
+//   t.forward_upper(r, X + L / 2);             // the upper half of r's leaf form (r.size() <= L / 2)
+//   t.cyclic_product(f, G, work, e, {.offset = L / 2});  // e[i] = (f g mod (x^L - 1))[L/2 + i]
+//   t.cyclic_product(e, G, work, e, {.negate = true});   // e = -(e g mod (x^L - 1))[0, e.size())
+//   const fps::ntt::Term terms[] = {{A, B}, {C, D}};
+//   t.inverse_product(terms, work, out);       // out = coefficients of A B + C D
+//
+//   // Hooked ops: the caller's pass on each run of leaves in cache; pruned levels (issue #149).
+//   t.forward_hooked(in, F, hook, zero);       // F = leaf form of in; hook(F + 8 i, i, count) on runs
+//   t.inverse_hooked(hook, work, out, o, unused);  // hook writes the leaves (times 2^-32), then inverse
 //
 // multiply(f, g, out): the product from and into the caller's memory, with nothing copied: the
 // first transform level reads f and g, the last writes out, the levels between run in this
@@ -90,6 +107,11 @@
 // one transform of L / 2 words and no twist pass (backend/product_tree). The variant is the
 // forward's at L / 2.
 //
+// inverse_upper(h): forward_upper undone, with the inverse's scale: the subtrees' inverse levels,
+// then (radix-4 top) the radix-2 level with r(1)^-1 and the scale, or (radix-2 top) a pass for the
+// scale. With the lower half's inverse it gives p mod (x^(L/2) -+ 1) from p's leaf form at half
+// the cost of an inverse of length L each (backend/evaluation's descent halves a node's transform).
+//
 // inverse(F, out, ...): into other memory, F kept. Its subtrees copy (or join) their leaves from F
 // into this thread's region before their bottom level, and the top level writes out: no copy of
 // the whole of F in, nor of the coefficients out (with an offset or add: one pass out). Against
@@ -101,6 +123,16 @@
 // values form's length. Lengths: 2^kMinLog .. 2^kMaxLog. The ops with a Form or a span run the
 // variant the tuned table picks for forward or inverse at that length (select.hpp); multiply and
 // multiply_add run Native.
+//
+// Fused ops (issue #112, lc-opt's transform layer): the leaf forms they read or write (F, B, the
+// terms, work) are arrays as above; sources and outputs are spans of any alignment. forward(in, F)
+// reads in from its first level, skipping the zero half of a source of at most L/2 words. A cyclic
+// product runs the forward transform of in, the leaf products with B in each subtree's bottom stage
+// (registers, not a pass of their own) and the inverse transform depth first, so each subtree is
+// in cache once; inverse_product does the same for an inverse of leaf products. Their top level
+// writes only the half asked for, negated through its scale. Zen 3, bench_fused.cpp: a cyclic
+// product took 0.83-0.89 of the time of the steps it replaces (copy in, forward, multiply, inverse
+// in place, copy out) from 2^12 on, 0.98 at 2^8 (notes/112-r1.md).
 #pragma once
 
 #include <algorithm>
@@ -298,6 +330,15 @@ struct Coefficients {
     bool add = false;        // out[i] += it, mod P (out canonical); else out[i] = it
 };
 
+// The coefficients a fused op writes (Transform::cyclic_product, inverse_product).
+struct Output {
+    std::size_t offset = 0;  // out[i] is coefficient offset + i: 0 or length() / 2
+    bool negate = false;     // out[i] = -it
+};
+
+// A term of Transform::inverse_product: the leaf products of the leaf forms a and b, or a alone.
+using Term = detail::LeafTerm;
+
 // Forward and inverse transforms of length 2^lg, kMinLog <= lg <= kMaxLog, with their tables.
 class Transform {
 public:
@@ -331,6 +372,27 @@ public:
     void forward_upper(std::uint32_t* h) const {
         if (lg_ == kMinLog) throw std::length_error("fps::ntt::Transform::forward_upper: needs lg > kMinLog");
         Variant::forward_upper(h, lg_ - 1, roots());
+    }
+
+    // forward_upper(h), then (Form::values) those leaves on to their values: the upper half of p's
+    // values form, so a values form doubles too (backend/gcd). The split is intrinsics'
+    // (Values<Native>; its words are every variant's). Throws std::length_error past 2^kValuesMaxLog.
+    template <class Variant = SelectedForward>
+    void forward_upper(std::uint32_t* h, Form form) const {
+        if (form == Form::leaves) return forward_upper<Variant>(h);
+        const std::uint32_t* rows = checked_rows();
+        forward_upper<Variant>(h);
+        const std::size_t blocks = length() / 128;  // of 64 words in each half
+        detail::intrinsics::Values<detail::intrinsics::Ntt<simd::Native>::N>::split(h, h, blocks, blocks, rows);
+    }
+
+    // forward_upper undone: h (length() / 2 words, 32-byte aligned, kPadding after), leaves L / 16
+    // .. L / 8 - 1 of p's leaf form -> the coefficients of p mod (x^(L/2) + 1), canonical. lg >
+    // kMinLog. The variant is the inverse's at L / 2.
+    template <class Variant = SelectedInverse>
+    void inverse_upper(std::uint32_t* h) const {
+        if (lg_ == kMinLog) throw std::length_error("fps::ntt::Transform::inverse_upper: needs lg > kMinLog");
+        Variant::inverse_upper(h, lg_ - 1, inverse_roots());
     }
 
     // F in that form -> its coefficients, in place.
@@ -394,7 +456,103 @@ public:
         Variant::leaf_products(a, b, acc, lg_, roots(), true);
     }
 
+    // Fused ops (Newton steps): sources in caller memory, products and inverses in one pass.
+
+    // F = the leaf form of in (in.size() <= length() words, zero past them): the top level reads in,
+    // and skips the zero half of an in of at most length() / 2 words. F apart from in.
+    template <class Variant = SelectedForward>
+    void forward(std::span<const std::uint32_t> in, std::uint32_t* F) const {
+        Variant::forward_from(in.data(), checked_source(in, length()), F, lg_, roots());
+    }
+
+    // F = the leaf form of in times B, leaf by leaf: forward(in, F) then multiply(F, B, F) in one
+    // pass. F apart from in and B.
+    template <class Variant = SelectedForward>
+    void forward_product(std::span<const std::uint32_t> in, const std::uint32_t* B, std::uint32_t* F) const {
+        Variant::forward_product(in.data(), checked_source(in, length()), B, F, lg_, roots());
+    }
+
+    // H (length() / 2 words) = forward_upper of h = in, zero past it (in.size() <= length() / 2):
+    // the upper half of the leaf form of in. lg > kMinLog. H apart from in.
+    template <class Variant = SelectedForward>
+    void forward_upper(std::span<const std::uint32_t> in, std::uint32_t* H) const {
+        if (lg_ == kMinLog) throw std::length_error("fps::ntt::Transform::forward_upper: needs lg > kMinLog");
+        Variant::forward_upper_from(in.data(), checked_source(in, length() / 2), H, lg_ - 1, roots());
+    }
+
+    // out[i] = coefficient o.offset + i of in b mod (x^L - 1), negated if o.negate, for B the leaf
+    // form of b: the forward transform of in, the leaf products and the inverse transform in one
+    // depth-first pass, each subtree in cache. work: length() + kPadding words, apart from in, B and
+    // out; out may overlap in (in is read before out is written). o.offset: 0 or length() / 2,
+    // o.offset + out.size() <= length(), else std::out_of_range.
+    template <class Variant = SelectedMultiply>
+    void cyclic_product(std::span<const std::uint32_t> in, const std::uint32_t* B, std::uint32_t* work,
+                        std::span<std::uint32_t> out, Output o = {}) const {
+        const std::size_t n = checked_source(in, length());
+        const unsigned output = checked_output(out, o);
+        if (out.empty()) return;
+        Variant::cyclic_product(in.data(), n, B, work, out.data(), out.size(), lg_, roots(), inverse_roots(), output);
+    }
+
+    // out[i] = coefficient o.offset + i of the polynomial whose leaf form is the sum over the terms
+    // of a b leaf by leaf (of a, if b is null), negated if o.negate: the leaf products in each
+    // subtree of the inverse transform, in cache. 1 to 4 terms (else std::invalid_argument); work,
+    // o: as cyclic_product; out apart from the terms.
+    template <class Variant = SelectedInverse>
+    void inverse_product(std::span<const Term> terms, std::uint32_t* work, std::span<std::uint32_t> out, Output o = {}) const {
+        if (terms.empty() || terms.size() > std::size_t(detail::kMaxTerms))
+            throw std::invalid_argument("fps::ntt::Transform::inverse_product: 1 to 4 terms");
+        const unsigned output = checked_output(out, o);
+        if (out.empty()) return;
+        Variant::inverse_product(terms.data(), int(terms.size()), work, out.data(), out.size(), lg_, roots(),
+                                 inverse_roots(), output);
+    }
+
+    // Hooked ops (issue #149): the caller's pass over each run of leaves while it is in cache, and
+    // pruned levels for Kronecker layouts. hook(leaves, first, count) gets the leaves [first, first +
+    // count) of the leaf form at `leaves` (u32*, 8 count words, 32-byte aligned); count >= 4 a power of
+    // two, first a multiple of count. A column bit (a power of two of words; 0: none) skips the half
+    // of the columns above it: the levels above that bit of the index run on the words i with (i &
+    // bit) == 0 only. Not a power of two: std::invalid_argument.
+
+    // F = the leaf form of in (as forward(in, F)); hook(F + 8 first, first, count) after the bottom
+    // level of each run, which may read and change those leaves (canonical). in[i] must be 0 where
+    // i & zero is not 0.
+    template <class Variant = SelectedForward, class Hook>
+    void forward_hooked(std::span<const std::uint32_t> in, std::uint32_t* F, Hook hook, std::size_t zero = 0) const {
+        Variant::forward_hooked(in.data(), checked_source(in, length()), F, lg_, roots(), checked_bit(zero), hook);
+    }
+
+    // out[i] = coefficient o.offset + i of the polynomial whose leaf form times 2^-32 (as Montgomery
+    // products leave it) the hook writes: hook(work + 8 first, first, count) writes those leaves,
+    // canonical, then the inverse levels of the run. out[i] is unspecified where (o.offset + i) &
+    // unused is not 0. work, o: as cyclic_product.
+    template <class Variant = SelectedInverse, class Hook>
+    void inverse_hooked(Hook hook, std::uint32_t* work, std::span<std::uint32_t> out, Output o = {},
+                        std::size_t unused = 0) const {
+        const unsigned output = checked_output(out, o);
+        const std::size_t width = checked_bit(unused);
+        if (out.empty()) return;
+        Variant::inverse_hooked(hook, work, out.data(), out.size(), lg_, roots(), inverse_roots(), output, width);
+    }
+
 private:
+    static std::size_t checked_bit(std::size_t bit) {
+        if (bit & (bit - 1)) throw std::invalid_argument("fps::ntt::Transform: column bit not a power of two");
+        return bit;
+    }
+    static std::size_t checked_source(std::span<const std::uint32_t> in, std::size_t most) {
+        if (in.size() > most) throw std::out_of_range("fps::ntt::Transform: source longer than the transform");
+        return in.size();
+    }
+    // The variants' output flags (common.hpp): kUpperHalf for o.offset = length() / 2, kNegated.
+    unsigned checked_output(std::span<std::uint32_t> out, Output o) const {
+        const std::size_t len = length();
+        if ((o.offset != 0 && o.offset != len / 2) || out.size() > len - o.offset)
+            throw std::out_of_range("fps::ntt::Transform: output offset not 0 or length() / 2, or past the length");
+        return (o.offset ? detail::kUpperHalf : 0u) | (o.negate ? detail::kNegated : 0u);
+    }
+
     struct alignas(64) Line {
         std::uint32_t words[16];
     };

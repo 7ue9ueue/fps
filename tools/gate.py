@@ -91,13 +91,10 @@ def unit_paths(unit: str) -> list[str]:
 
 
 def units_in(tree: str) -> list[str]:
-    names = git('ls-tree', '--name-only', tree, 'backend/', check=False).stdout.split()
-    units = [n.split('/')[1] for n in names
-             if git('cat-file', '-e', f'{tree}:{n}/test.cpp', check=False).returncode == 0]
-    frontend = git('ls-tree', '--name-only', tree, 'frontend/', check=False).stdout.split()
-    if any(re.fullmatch(r'frontend/test[^/]*\.cpp', n) for n in frontend):
-        units.append('frontend')
-    return sorted(units)
+    """Units with a test*.cpp, as kernel.py test builds them."""
+    files = git('ls-tree', '-r', '--name-only', tree, 'backend/', 'frontend/', check=False).stdout.split()
+    found = (re.fullmatch(r'(?:backend/([^/]+)|(frontend))/test[^/]*\.cpp', f) for f in files)
+    return sorted({m.group(1) or m.group(2) for m in found if m})
 
 
 def changed_files(base: str, tree: str) -> list[str]:

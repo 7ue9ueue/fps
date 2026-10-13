@@ -18,7 +18,9 @@ DESIGN.md, BACKEND.md      the plans (frontend, backend); change them when you f
 include/fps/               the frontend headers, API at the top of each
 frontend/                  its tests (test_<area>.cpp), bench*.cpp, notes.md, notes/
 backend/<kernel>/          one kernel: headers (API at the top), select.hpp (variant per target),
-                           test.cpp, bench.cpp, notes.md, notes/, gen_*.py and their generated output
+                           test*.cpp (a new feature adds its own test_<area>.cpp; shared helpers in
+                           test_util.hpp where there is one), bench.cpp, notes.md, notes/, gen_*.py and
+                           their generated output
 backend/bench.hpp          the timing harness every bench.cpp uses
 backend/tune/              run-time tuning of kernels' choices; compiled defaults in tuned.hpp
 backend/simd/              per-ISA vector wrappers; probe.cpp and machines.py: measured
@@ -126,7 +128,9 @@ docs. You decide what is worth doing.
   gate whose units it touches test again.
 - The VMs are shared: keep them running, never delete one you did not create, and leave `~/lc-opt`
   alone. Time only under `flock /tmp/bench.lock` (`kernel.py bench` takes it), and never time x86
-  code on the Mac (Rosetta).
+  code on the Mac (Rosetta). Other agents run there at the same time: stop only processes you
+  started, by PID (`pkill -f` patterns match theirs too), and check on a running job with
+  `vm.py --no-sync` (a sync wipes the folder it runs in).
 - If the request is unclear, or you need access you lack (a VM, a login, a credential), ask the
   user rather than guess or work around it. Unattended: comment on your issue with the question and
   the options, add `blocked`, and return.
@@ -139,7 +143,9 @@ What has worked here; deviate when you have a reason and say it.
   against `<op>@kernel`); speed work belongs in the backend. If an ergonomic call costs speed, keep
   a fast path (raw spans, plans, `Values`) and say so in the header.
 - Back speed claims with passing tests and a same-run measurement: median and spread, with CPU,
-  compiler, flags and commit.
+  compiler, flags and commit. Include a large size, n = 2^20, wherever the operation takes one:
+  times near 2^10 move by several percent with code layout alone (#93, #152), so a claim resting
+  only on small sizes is weak.
 - Test against a simple reference (O(n^2) or brute force) on sizes 0, 1, powers of two and their
   neighbours, and random inputs; `kernel.py test` adds ASan and UBSan.
 - Start simple; add generality when a real caller needs it. Readable C++23, short rare comments
@@ -148,3 +154,5 @@ What has worked here; deviate when you have a reason and say it.
   place in the same pull request as the code, and say why there and in your notes entry.
 - Plain English, numbers over adjectives, guesses marked. Notes are logs. Commit subjects:
   imperative, at most 72 characters.
+- In GitHub text (pull requests, issues, comments), put code in backticks: a bare `intrinsics<S>`
+  opens an HTML `<s>` tag and strikes through the rest of the page (PR #142).

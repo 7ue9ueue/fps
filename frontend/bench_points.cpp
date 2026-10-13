@@ -1,9 +1,7 @@
 // Times fps/points.hpp modulo P = 998244353; tools/kernel.py runs it, a binary of its own. Items
 // are points.
-//   "<op>/<lg>"   through the API (gated): f of n = 2^lg coefficients, 2^lg random points
-// The backend has no evaluation kernel yet (backend issue #104 moves lc-opt's onto
-// backend/product_tree), so there are no "<op>@kernel" pairs: the tree's nodes are f * g and the
-// descent runs fps/division.hpp, whose products have their own pairs in bench.cpp.
+//   "<op>/<lg>"          through the API (gated): f of n = 2^lg coefficients, 2^lg random points
+//   "<op>@kernel/<lg>"   backend/evaluation on the same inputs into a kept output
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -62,6 +60,24 @@ int main(int argc, char** argv) {
         suite.add("newton" + size, [n, seed] {
             return [f = Poly(std::span<const std::uint32_t>(random_vec(n, seed + 5))), x = random_vec(n, seed + 6)] {
                 bench::keep(fps::to_newton_basis(f, x));
+            };
+        }, n);
+        suite.add("evaluate@kernel" + size, [n, seed] {
+            return [f = random_vec(n, seed), x = random_vec(n, seed + 1), out = Vec(n)]() mutable {
+                fps::evaluation::evaluate(f, x, out);
+                bench::keep(out);
+            };
+        }, n);
+        suite.add("interpolate@kernel" + size, [n, seed] {
+            return [x = distinct_points(n, seed + 2), y = random_vec(n, seed + 3), out = Vec(n)]() mutable {
+                fps::evaluation::interpolate(x, y, out);
+                bench::keep(out);
+            };
+        }, n);
+        suite.add("newton@kernel" + size, [n, seed] {
+            return [f = random_vec(n, seed + 5), x = random_vec(n, seed + 6), out = Vec(n)]() mutable {
+                fps::evaluation::to_newton_basis(f, std::span<const std::uint32_t>(x).first(x.size() - 1), out);
+                bench::keep(out);
             };
         }, n);
     }

@@ -10,6 +10,7 @@ After: none (or issues whose task must be merged first: #n, #m)
 Rounds: 3 (speed work; 1 for a feature, a move or a fix)
 
 Task: {what to do; for speed work, the cases that matter}
+lc-opt: {the lc-opt source to measure against in the same run, e.g. `lib/poly/exp.hpp`, or none}
 
 Agents work on this in rounds (see `tools/prompt.md`). Each round ends with a comment whose last
 line is `Result: gain` or `Result: no gain`. Labels: `ready` waits for a round, `running` has an
