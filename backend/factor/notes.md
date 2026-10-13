@@ -68,7 +68,7 @@ no `select.hpp`; `-DFPS_FACTOR_SMALL=0` turns off the ymm register path for modu
   (Kaltofen and Shoup) with modular composition on NTT products, then equal-degree splits, on
   backend/division and backend/gcd (half-gcd). A guess of its cost at 2^20: about sqrt(n) = 1024
   modular compositions of degree 2^20, each about 1024 NTT products of length 2^21 (Brent-Kung),
-  so about 10^6 products of ~10 ms each: hours. Not done; no caller needs it yet.
+  so about 10^6 products of ~10 ms each: hours. Not done; no caller needs it yet (#201, backlog).
 
 ## Measurements
 
