@@ -656,7 +656,7 @@ class TwLoop:
     doc: str
     source: bool = False  # quarters read from `from` (s0..s3), written to f
     store: int = 4        # outputs t < store written, to quarters t of f
-    upper: bool = False   # outputs 2 + t to quarters t
+    upper: bool = False   # the upper half of the outputs instead (2 + t, or 1 + t for radix 2)
     columns: int = 4
     knobs: Knobs = field(default_factory=lambda: Knobs(window=None, pattern='MA', pattern_window=32,
                                                        pattern_stores='A'))
