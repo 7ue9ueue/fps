@@ -16,42 +16,35 @@
 //
 // n defaults to f.size(). Each function reads only f mod x^n, so the precondition on f[0] holds
 // for n > 0 only (an empty f has f[0] = 0). A broken precondition, or out overlapping f where it
-// may not, throws std::domain_error. log and exp divide by 1 .. n - 1, which needs n <= P; so does
-// pow, which runs (f / f[0])^e as exp(e log(f / f[0])), where only e mod P counts below x^P.
+// may not, throws std::domain_error. log, exp and pow divide by 1 .. n - 1, which needs n <= P
+// (pow: only e mod P counts below x^P).
 //
 // pow: f mod x^n = x^z u with u[0] != 0 gives f^e = x^(z e) u[0]^e (u / u[0])^e; 0 if z e >= n.
 // sqrt: the root of the polynomial f mod x^n = x^(2k) u, u[0] != 0: x^k s with s^2 = u mod
 // x^(n - k), s[0] the smaller of the two square roots of u[0] in [0, P); 0 if f mod x^n = 0;
 // nullopt if the lowest nonzero term has an odd index or a non-square coefficient (no root).
-// On the Newton path, n past 2^25 throws std::length_error: inverse, log and exp before out is
-// written; pow after it wrote u / u[0] to out, sqrt from ntt::multiply in the first step whose
-// precision passes 2^25, after the earlier steps ran (out is then partly written). The recurrence has no such limit. sqrt runs
-// its recurrence only for s of at most P coefficients (it divides by 1 .. n - k - 1), and Newton
-// past that, which throws std::length_error.
+// On the backend's path, n past 2^25 (pow: n - z e, sqrt: n - k) throws std::length_error before
+// out is written. The recurrence has no such limit (n <= P).
 //
-// Paths. f mod x^n with at most kSparseTerms = 16 nonzero coefficients past f[0] runs a linear
-// recurrence with one tap per such term, O(n t) for t terms: inverse(1 - x, n) is O(n). Others run
-// Newton iteration:
-// - inverse, log, exp: the backend's (backend/series: lc-opt's steps on the NTT's leaf form,
-//   every transform of length 2k for precision k -> 2k, halves reused across steps);
-// - pow: u[0]^e exp(e log(u / u[0])) for u = f / x^z, cut to n - z e;
-// - sqrt: on the products of fps/products.hpp (raw::mul), g[k, 2k) = h (u - g^2)[k, 2k) / 2 mod
-//   x^k, with h = 1 / g mod x^k carried across the steps (one inverse step on h, a square and a
-//   product a step).
-// The recurrences for pow and sqrt solve u g' = e u' g (e = 1/2 for sqrt), one tap per term.
+// Paths. f mod x^n with at most kSparseTerms = 16 nonzero coefficients past f[0] (past u[0] for
+// pow and sqrt) runs a linear recurrence with one tap per such term, O(n t) for t terms:
+// inverse(1 - x, n) is O(n); pow and sqrt only where it beats the backend (see kPowTerms below).
+// Others run the backend (backend/series: lc-opt's Newton steps on the NTT's leaf form):
+// inverse, log, exp of f; pow as c (u / u[0])^e with c = u[0]^e, e mod P (lc-opt's power: x g' =
+// q g, q = e x u' / u); sqrt of u with g[0] = c, the smaller root. The frontend keeps the
+// leading zeros, u[0]^e, e mod P, the choice of root, and the errors.
 // From 2^13 coefficients on, in units of one ntt::multiply of two factors of n into n words, on
-// the four timed targets: inverse 1.6-2.1, log 2.0-2.9, exp 2.7-3.7 (frontend/notes/87.md; 2.6-2.9,
-// 4.1-4.8 and 7.6-9.8 on the frontend's Newton before), sqrt 3.0-3.6 (frontend/notes.md); pow
-// was 11.9-15.3 and is now about log + exp (not measured). lc-opt's need about 4.6 for pow and
-// 1.6 for sqrt (a guess from its transform counts): backend issue #107.
-// The recurrences are plain scalar loops: 3.7 to 12.5 ns per coefficient for 2 or 3 terms (#87).
-// Divisions by 1 .. n - 1 take their reciprocals from the backend's factorials::tables:
+// the four timed targets: inverse 1.6-2.1, log 2.0-2.9, exp 2.7-3.7 (frontend/notes/87.md), pow
+// 4.3-5.1 and sqrt 1.5-1.8 (backend/series/notes/107-r1.md; 0.95-1.02 and 0.94-0.99 of lc-opt's
+// time on Zen 3); the API adds nothing measurable (frontend/notes/167.md).
+// The recurrences are plain scalar loops: 7.5-21 ns per coefficient for 1 or 2 terms, 15-32 for 16
+// (pow, sqrt; frontend/notes/167.md). The ones for pow and sqrt solve u g' = e u' g (e = 1/2 for
+// sqrt). Divisions by 1 .. n - 1 take their reciprocals from the backend's factorials::tables:
 // 1 / i = (i - 1)! / i!.
 //
-// Memory: the results are new polynomials; the raw functions write only out. The recurrences and
-// sqrt work in a per-thread scratch kept across calls, of n words for inverse, 2 n for log and
-// sqrt, 3 n for exp and pow, f.size() + 1 for integral; the backend's Newton path and the
-// products use the backend's own per-thread memory.
+// Memory: the results are new polynomials; the raw functions write only out. The recurrences
+// work in a per-thread scratch kept across calls, of n words for inverse, 2 n for log, pow and
+// sqrt, 3 n for exp, f.size() + 1 for integral; the backend uses its own per-thread memory.
 #pragma once
 
 #include <algorithm>
@@ -66,7 +59,6 @@
 #include "fps/factorials.hpp"
 #include "fps/modular.hpp"
 #include "fps/polynomial.hpp"
-#include "fps/products.hpp"
 #include "fps/words.hpp"
 
 namespace fps {
@@ -80,8 +72,9 @@ using Out = std::span<u32>;
 
 inline constexpr std::size_t kSparseTerms = 16;
 
-// This thread's scratch of at least n words, kept and reused. The raw:: functions and integral
-// take it; the detail functions below get their part of it as an argument and never call it.
+// This thread's scratch of at least n words, kept and reused. The raw:: functions, integral, power
+// and sqrt take it (power and sqrt on their recurrence path only); the other detail functions get
+// their part of it as an argument and never call it.
 inline Out scratch(std::size_t n) {
     thread_local Words words;
     if (words.size() < n) words = Words(n, Words::Unwritten{});
@@ -91,9 +84,6 @@ inline Out scratch(std::size_t n) {
 inline bool overlaps(Span a, Span b) {
     return !a.empty() && !b.empty() && a.data() < b.data() + b.size() && b.data() < a.data() + a.size();
 }
-
-// f[i], 0 past the end.
-inline u32 at(Span f, std::size_t i) { return i < f.size() ? f[i] : 0; }
 
 // r[i] = 1 / i for 0 < i < n = r.size() <= P (r[0] = 1), with tmp of n words:
 // (i - 1)! / i! from the backend's tables.
@@ -226,52 +216,38 @@ void sparse_power(u32 u0, Sparse a, u32 e, u32 c, Out g, Out tmp) {
     }
 }
 
-// out = c (u / u[0])^e mod x^n, n = out.size() <= P, for u[0] != 0 and u of at most n words (e a
-// residue: only e mod P counts below x^P). scratch: 3 n words.
+// Where the recurrence beats the backend for t <= kSparseTerms terms past u[0] (frontend/notes/
+// 167.md): pow for t <= kPowTerms at any n, and any t from kPowLong coefficients on (all four
+// timed targets); sqrt for t <= kRootTerms up to kRootShort coefficients (all four) and from
+// kRootLong on (0.54-0.88 of the backend's time, but 1.26-1.40 on Zen 5, whose backend sqrt is
+// fastest; backend issue #171). Past the backend's kBackendMax both run it (n <= P), where the
+// backend has no plan. Speed choices only: the paths give the same results.
+inline constexpr std::size_t kPowTerms = 8, kRootTerms = 4;
+inline constexpr std::size_t kPowLong = std::size_t(1) << 17;
+inline constexpr std::size_t kRootShort = std::size_t(1) << 8, kRootLong = std::size_t(1) << 18;
+inline constexpr std::size_t kBackendMax = std::size_t(1) << ntt::kMaxLog;
+
+// out = c (u / u[0])^e mod x^n, n = out.size() <= P, for u[0] != 0, u of at most n words and
+// e < P (only e mod P counts below x^P); out apart from u. The recurrence works in this thread's
+// scratch (2 n words); the backend in its own memory, and throws std::length_error for n past
+// 2^25 before out is written.
 template <u32 P>
-void power(Span u, u32 e, u32 c, Out out, Out scratch) {
-    if (const auto s = sparse(u)) return sparse_power<P>(u[0], *s, e, c, out, scratch);
-    const u32 inverse0 = mod_inverse<P>(u[0]);
-    for (std::size_t i = 0; i < u.size(); ++i) out[i] = mod_mul<P>(u[i], inverse0);
-    std::fill(out.begin() + u.size(), out.end(), 0u);
-    log<P>(out, out, scratch);
-    for (u32& x : out) x = mod_mul<P>(x, e);
-    exp<P>(out, out, scratch);
-    if (c != 1)
-        for (u32& x : out) x = mod_mul<P>(x, c);
+void power(Span u, u32 e, u32 c, Out out) {
+    const std::size_t n = out.size();
+    if (const auto s = sparse(u); s && (s->count <= kPowTerms || n >= kPowLong))
+        return sparse_power<P>(u[0], *s, e, c, out, scratch(2 * n));
+    fps::series::pow(u, e, c, out);
 }
 
-// out = the root g of u mod x^n with g[0] = c, c^2 = u[0] != 0, for u of at most n words.
-// scratch: 2 n words.
+// out = the root g of u mod x^n with g[0] = c, c^2 = u[0] != 0, for u of at most n words; out
+// apart from u. As power; the recurrence divides by 1 .. n - 1, so it runs for n <= P only.
 template <u32 P>
-void sqrt(Span u, u32 c, Out out, Out scratch) {
-    constexpr u32 half = (P + 1) / 2;
+void sqrt(Span u, u32 c, Out out) {
     const std::size_t n = out.size();
-    if (n <= P)
-        if (const auto s = sparse(u)) return sparse_power<P>(u[0], *s, half, c, out, scratch);
-    // h = 1 / g mod x^kh, with m - k <= 2 kh at each step; w holds e, then g^2.
-    const Out h = scratch.first(n), w = scratch.subspan(n, n);
-    out[0] = c;
-    h[0] = mod_inverse<P>(c);
-    std::size_t kh = 1;
-    for (std::size_t k = 1; k < n;) {
-        const std::size_t m = std::min(2 * k, n), t = m - k;
-        if (t > kh) {
-            // g h = 1 + x^kh e mod x^t (t <= 2 kh <= k); then h[kh, t) = -(h e[kh, t)) mod x^(t - kh).
-            raw::mul<P>(out.first(t), h.first(kh), w.first(t));
-            raw::mul<P>(h.first(kh), w.subspan(kh, t - kh), h.subspan(kh, t - kh));
-            for (u32& x : h.subspan(kh, t - kh)) x = x ? P - x : 0;
-            kh = t;
-        }
-        // (g + x^k d)^2 = u mod x^m for 2 g d = (u - g^2)[k, m) mod x^t.
-        raw::mul<P>(out.first(k), out.first(k), w.first(m));
-        for (std::size_t i = k; i < m; ++i) {
-            const u32 a = at(u, i);
-            w[i] = mod_mul<P>(a >= w[i] ? a - w[i] : a + P - w[i], half);
-        }
-        raw::mul<P>(h.first(t), w.subspan(k, t), out.subspan(k, t));
-        k = m;
-    }
+    const auto s = sparse(u);
+    if (s && n <= P && ((s->count <= kRootTerms && (n <= kRootShort || n >= kRootLong)) || n > kBackendMax))
+        return sparse_power<P>(u[0], *s, (P + 1) / 2, c, out, scratch(2 * n));
+    fps::series::sqrt(u, c, out);
 }
 
 }  // namespace detail::series
@@ -329,9 +305,8 @@ void pow(std::span<const std::uint32_t> f, std::uint64_t e, std::span<std::uint3
     }
     const std::size_t shift = z * std::size_t(e), m = n - shift;
     const std::span<const std::uint32_t> u = f.subspan(z, std::min(f.size() - z, m));
+    detail::series::power<P>(u, std::uint32_t(e % P), mod_pow<P>(u[0], e), out.subspan(shift));
     std::fill_n(out.begin(), shift, 0u);
-    detail::series::power<P>(u, std::uint32_t(e % P), mod_pow<P>(u[0], e), out.subspan(shift),
-                             detail::series::scratch(3 * m));
 }
 
 template <std::uint32_t P>
@@ -345,9 +320,8 @@ bool sqrt(std::span<const std::uint32_t> f, std::span<std::uint32_t> out) {
     if (z == f.size()) return std::ranges::fill(out, 0u), true;
     const std::optional<std::uint32_t> c = detail::mod_sqrt<P>(f[z]);
     if (z % 2 || !c) return false;
-    const std::size_t m = n - z / 2;
+    detail::series::sqrt<P>(f.subspan(z), *c, out.subspan(z / 2));
     std::fill_n(out.begin(), z / 2, 0u);
-    detail::series::sqrt<P>(f.subspan(z), *c, out.subspan(z / 2), detail::series::scratch(2 * m));
     return true;
 }
 

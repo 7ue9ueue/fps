@@ -1,8 +1,9 @@
 // Tests of fps/series.hpp: pow, sqrt and their raw forms, against O(n^2) references (repeated
 // truncated products for any e < 2^64, the ODE recurrence, the root's own recurrence) on edge sizes
-// and random inputs with leading zeros, on both paths (Newton, and the recurrence for at most 16
-// terms past the lowest), against closed forms and identities at large sizes, with threads and
-// every precondition. Also detail::mod_sqrt.
+// and random inputs with leading zeros, on both paths (the backend's backend/series, and the
+// recurrence for at most 16 terms past the lowest), against closed forms and identities at large
+// sizes, with threads and every precondition; each path's limit past 2^25 coefficients. Also
+// detail::mod_sqrt.
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -24,6 +25,18 @@ using u64 = std::uint64_t;
 using Vec = std::vector<u32>;
 constexpr u32 P = 998244353;
 using Poly = fps::Polynomial<P>;
+
+#if defined(__SANITIZE_ADDRESS__)
+constexpr bool kSanitized = true;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+constexpr bool kSanitized = true;
+#else
+constexpr bool kSanitized = false;
+#endif
+#else
+constexpr bool kSanitized = false;
+#endif
 
 int failures = 0;
 
@@ -345,10 +358,13 @@ void test_sqrt_small() {
     CHECK(vec(*fps::sqrt(Poly{0, 0, 4, 4, 1}, 5)) == (Vec{0, 2, 1, 0, 0}));  // x^2 (2 + x)^2
 }
 
-// Exactly t terms past u[0] around kSparseTerms = 16, near index 0 and spread, both paths.
+// Exactly t terms past u[0] around the paths' bounds (kSparseTerms = 16, pow's kPowTerms = 8,
+// sqrt's kRootTerms = 4 up to kRootShort = 256 coefficients of s), near index 0 and spread.
 void test_term_counts() {
-    for (const std::size_t n : {std::size_t(17), std::size_t(18), std::size_t(40), std::size_t(300), std::size_t(1000)})
-        for (const std::size_t t : {0, 1, 2, 15, 16, 17, 18})
+    namespace d = fps::detail::series;
+    static_assert(d::kSparseTerms == 16 && d::kPowTerms == 8 && d::kRootTerms == 4 && d::kRootShort == 256);
+    for (const std::size_t n : {17, 40, 256, 257, 258, 1000})
+        for (const std::size_t t : {0, 1, 2, 4, 5, 8, 9, 16, 17})
             for (const bool spread : {false, true})
                 for (const std::size_t z : {std::size_t(0), std::size_t(2)}) {
                     if (t + z >= n) continue;
@@ -363,6 +379,34 @@ void test_term_counts() {
                     const auto r = fps::sqrt(poly(fs), n);
                     CHECK(r && vec(*r) == naive_sqrt(fs, n, 7), n, t, z);
                 }
+}
+
+// The bounds kPowLong and kRootLong: below, the backend runs; from them on, the recurrence. So
+// a result at the bound, cut by one coefficient, is the other path's; also f^2 = f f, g^2 = f.
+void test_long_bounds() {
+    namespace d = fps::detail::series;
+    for (const std::size_t t : {9, 12, 16})
+        for (const std::size_t z : {std::size_t(0), std::size_t(3)}) {
+            const u64 e = z ? 1 + rng() % 3 : random_exponent();
+            const std::size_t n = d::kPowLong + z * e;  // u's part: kPowLong coefficients
+            Vec u(n);
+            for (std::size_t i = 1; i <= t; ++i) u[i * (n / 32)] = u32(1 + rng() % (P - 1));
+            const Poly f = poly(with_zeros(z, u, u32(1 + rng() % (P - 1))));
+            const Poly g = fps::pow(f, e, n);
+            CHECK(vec(g.truncate(n - 1)) == vec(fps::pow(f, e, n - 1)), t, z, e);
+            CHECK(vec(fps::pow(f, 2, n)) == vec(fps::mul(f, f, n)), t, z);
+        }
+    // sqrt's bound kRootLong for t <= kRootTerms = 4 (5 terms run the backend on both sides).
+    for (const std::size_t t : {1, 4, 5})
+        for (const std::size_t z : {std::size_t(0), std::size_t(4)}) {
+            const std::size_t n = d::kRootLong + z / 2;
+            Vec u(n);
+            for (std::size_t i = 1; i <= t; ++i) u[i * (n / 8)] = u32(1 + rng() % (P - 1));
+            const Poly f = poly(with_zeros(z, u, 9));
+            const auto g = fps::sqrt(f, n), h = fps::sqrt(f, n - 1);
+            CHECK(g && h && vec(g->truncate(n - 1)) == vec(*h), t, z);
+            CHECK(g && (*g)[z / 2] == 3 && vec(fps::mul(*g, *g, n)) == vec(f.truncate(n)), t, z);
+        }
 }
 
 // Closed forms at large n: (1 + x)^e = sum C(e, i) x^i (e < P, and e mod P for e >= P with n <= P),
@@ -487,6 +531,30 @@ void test_errors() {
     }
 }
 
+// Past the backend's 2^25 coefficients: a dense f throws std::length_error before out is written
+// (the zeros of x^(z e) and x^k too); the recurrence has no such limit (not under ASan: 2^25 steps).
+void test_limits() {
+    const std::size_t big = (std::size_t(1) << 25) + 1;
+    Vec f(big + 2, P - 1), out(big + 2, 5);
+    f[0] = 4;
+    const std::span<const u32> dense(f);
+    CHECK(throws<std::length_error>([&] { fps::raw::pow<P>(dense, 3, std::span<u32>(out).first(big)); }));
+    CHECK(throws<std::length_error>([&] { (void)fps::raw::sqrt<P>(dense, std::span<u32>(out).first(big)); }));
+    f[0] = 0, f[1] = 0, f[2] = 4;  // x^2 u: the result's u part starts at 2 (pow, e = 1) or 1 (sqrt)
+    CHECK(throws<std::length_error>([&] { fps::raw::pow<P>(dense, 1, std::span<u32>(out)); }));
+    CHECK(throws<std::length_error>([&] { (void)fps::raw::sqrt<P>(dense, std::span<u32>(out)); }));
+    CHECK(std::ranges::all_of(out, [](u32 c) { return c == 5; }));
+    if (kSanitized) return;
+    // (1 - x)^(P - 1) = (1 - x^P) / (1 - x): all ones below x^P. sqrt((1 - x)^2) = 1 - x.
+    const Poly x = Poly::x();
+    const Poly g = fps::pow(1 - x, P - 1, big);
+    CHECK(g.size() == big && std::ranges::all_of(g.span(), [](u32 c) { return c == 1; }));
+    const auto s = fps::sqrt(1 - 2 * x + x * x, big);
+    Vec root(big, 0);
+    root[0] = 1, root[1] = P - 1;
+    CHECK(s && vec(*s) == root);
+}
+
 }  // namespace
 
 int main() {
@@ -495,10 +563,12 @@ int main() {
     test_pow_shifts();
     test_sqrt_small();
     test_term_counts();
+    test_long_bounds();
     test_closed_forms();
     test_large();
     test_threads();
     test_errors();
+    test_limits();
     if (failures) {
         std::printf("pow_sqrt: %d failures\n", failures);
         return 1;

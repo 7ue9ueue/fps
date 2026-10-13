@@ -1,8 +1,10 @@
 // Times fps/series.hpp modulo P = 998244353; tools/kernel.py runs it, a binary of its own. Items
 // are coefficients of the result.
 //   "<op>/<lg>"          through the API (gated)
-//   "<op>@kernel/<lg>"   inverse, log, exp: backend/series on the same input into a kept out
-// The recurrences and calculus are frontend loops. frontend/notes.md gives the Newton cases in
+//   "<op>@kernel/<lg>"   inverse, log, exp, pow, sqrt: backend/series on the same input into a
+//                        kept out (pow: e mod P and f[0]^e, as the API passes them)
+// The recurrences and calculus are frontend loops; "<op>_sparse@kernel/<lg>" times the backend on
+// the recurrences' inputs (pow, sqrt), the other side of the frontend's choice of path. frontend/notes.md gives the Newton cases in
 // units of mul@kernel/<lg> (ntt::multiply of two factors of n into n words) from the same run.
 #include <cstddef>
 #include <cstdint>
@@ -76,6 +78,10 @@ void newton(bench::Suite& suite) {
         kernel("inverse", 5, [](std::span<const std::uint32_t> f, std::span<std::uint32_t> o) { fps::series::inverse(f, o); });
         kernel("log", 1, [](std::span<const std::uint32_t> f, std::span<std::uint32_t> o) { fps::series::log(f, o); });
         kernel("exp", 0, [](std::span<const std::uint32_t> f, std::span<std::uint32_t> o) { fps::series::exp(f, o); });
+        kernel("pow", 5, [](std::span<const std::uint32_t> f, std::span<std::uint32_t> o) {
+            fps::series::pow(f, std::uint32_t(kExponent % P), fps::mod_pow<P>(5, kExponent), o);
+        });
+        kernel("sqrt", 4, [](std::span<const std::uint32_t> f, std::span<std::uint32_t> o) { fps::series::sqrt(f, 2, o); });
         if (lg == 14 || lg == 18)
             suite.add("raw_exp" + size, [n, seed] {
                 return [f = random_poly(n, 0, seed), out = Poly(n)]() mutable {
@@ -99,6 +105,18 @@ void sparse(bench::Suite& suite) {
         suite.add("exp_sparse" + size, [n, e] { return [n, e] { bench::keep(fps::exp(e, n)); }; }, n);
         suite.add("pow_sparse" + size, [n, q] { return [n, q] { bench::keep(fps::pow(q, kExponent, n)); }; }, n);
         suite.add("sqrt_sparse" + size, [n, q] { return [n, q] { bench::keep(fps::sqrt(q, n)); }; }, n);
+        suite.add("pow_sparse@kernel" + size, [n, q] {
+            return [q, out = Poly(n)]() mutable {
+                fps::series::pow(q.span(), std::uint32_t(kExponent % P), 1, out.span());
+                bench::keep(out);
+            };
+        }, n);
+        suite.add("sqrt_sparse@kernel" + size, [n, q] {
+            return [q, out = Poly(n)]() mutable {
+                fps::series::sqrt(q.span(), 1, out.span());
+                bench::keep(out);
+            };
+        }, n);
     }
 }
 
