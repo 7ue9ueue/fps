@@ -45,8 +45,8 @@ struct Generated {
 //   forward_groups(f, q, k, count, r) -> bool             forward_groups (avx512.hpp, issue #152)
 //   kJoinBottoms                                           Ntt::kJoin (2^6, 2^7: one bottom call)
 //   inverse_scaled(f, q, k, ir, scaled) -> bool            inverse_group_scaled
-//   inverse_top(from, f, q, words, ir, s) -> bool          inverse_radix4, inverse_radix4_part (4 quarters)
-//   inverse_radix2(from, f, half, words, s) -> bool        inverse_radix2, inverse_radix2_part<2>
+//   inverse_top<kStore, kUpper>(from, f, q, words, ir, s)  inverse_radix4, inverse_radix4_part; -> bool
+//   inverse_radix2<kStore, kUpper>(from, f, half, words, s) inverse_radix2, inverse_radix2_part; -> bool
 
 // Lazy arithmetic mod P on S: values < 4P in forward transforms, < 2P in inverse ones.
 template <class S>
@@ -1524,8 +1524,8 @@ struct Ntt : Butterflies<S> {
 
     // The inverse radix-2 level, times s if s != 0: in < 2P, canonical out.
     static void inverse_radix2(u32* f, std::size_t half, u32 s) {
-        if constexpr (requires { Generated<S>::inverse_radix2(f, f, half, half, s); })
-            if (Generated<S>::inverse_radix2(f, f, half, half, s)) return;
+        if constexpr (requires { Generated<S>::template inverse_radix2<2, false>(f, f, half, half, s); })
+            if (Generated<S>::template inverse_radix2<2, false>(f, f, half, half, s)) return;
         B::prefetching(half, kPrefetchHalfMin, [&]<bool kPf> [[gnu::always_inline]] (std::bool_constant<kPf>) {
             if (s == 0) {
                 for (std::size_t i = 0; i < half; i += S::lanes) {
@@ -1548,8 +1548,8 @@ struct Ntt : Butterflies<S> {
     // Inverse group 0 on quarters of q words, times s if s != 0: in < 2P, canonical out. With s, 4
     // products per column, not 5: s z (c - d) and s (a - b) serve two outputs each.
     static void inverse_radix4(u32* f, std::size_t q, const u32* ir, u32 s) {
-        if constexpr (requires { Generated<S>::inverse_top(f, f, q, q, ir, s); })
-            if (Generated<S>::inverse_top(f, f, q, q, ir, s)) return;
+        if constexpr (requires { Generated<S>::template inverse_top<4, false>(f, f, q, q, ir, s); })
+            if (Generated<S>::template inverse_top<4, false>(f, f, q, q, ir, s)) return;
         if (s == 0) {
             const F z = B::entry(ir, 1);
             return B::template each2<kPipelined.inverse_identity>(
@@ -1638,8 +1638,8 @@ struct Ntt : Butterflies<S> {
     template <int kStore, bool kUpper = false>
     [[gnu::noinline]] static void inverse_radix2_part(const u32* from, u32* f, std::size_t half, std::size_t words,
                                                       u32 s) {
-        if constexpr (kStore == 2 && !kUpper && requires { Generated<S>::inverse_radix2(from, f, half, words, s); })
-            if (Generated<S>::inverse_radix2(from, f, half, words, s)) return;
+        if constexpr (requires { Generated<S>::template inverse_radix2<kStore, kUpper>(from, f, half, words, s); })
+            if (Generated<S>::template inverse_radix2<kStore, kUpper>(from, f, half, words, s)) return;
         B::prefetching(half, kPrefetchHalfMin, [&]<bool kPf> [[gnu::always_inline]] (std::bool_constant<kPf>) {
             if (s == 0) {
                 for (std::size_t i = 0; i < words; i += S::lanes) {
@@ -1688,8 +1688,8 @@ struct Ntt : Butterflies<S> {
     template <int kStore, bool kUpper = false>
     [[gnu::noinline]] static void inverse_radix4_part(const u32* from, u32* f, std::size_t q, std::size_t words,
                                                       const u32* ir, u32 s) {
-        if constexpr (kStore == 4 && requires { Generated<S>::inverse_top(from, f, q, words, ir, s); })
-            if (Generated<S>::inverse_top(from, f, q, words, ir, s)) return;
+        if constexpr (requires { Generated<S>::template inverse_top<kStore, kUpper>(from, f, q, words, ir, s); })
+            if (Generated<S>::template inverse_top<kStore, kUpper>(from, f, q, words, ir, s)) return;
         if (s == 0) {
             const F z = B::entry(ir, 1);
             return B::template each2<kPipelined.inverse_identity, 4, kStore>(

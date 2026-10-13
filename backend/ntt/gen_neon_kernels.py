@@ -383,7 +383,8 @@ BUTTERFLY = {'forward': forward4, 'forward_identity': forward_identity4, 'invers
 
 BUTTERFLY.update({'forward_identity1': forward_identity1, 'inverse_scaled': inverse_scaled4,
                   'inverse_scaled_identity': inverse_scaled_identity4, 'inverse_top': inverse_top4,
-                  'inverse_top_identity': inverse_top_identity4, 'inverse_radix2': inverse_radix2, 'inverse_radix2_scaled': inverse_radix2})
+                  'inverse_top_identity': inverse_top_identity4, 'inverse_radix2': inverse_radix2,
+                  'inverse_radix2_scaled': inverse_radix2})
 # Twiddles of the loops with a twiddle block (TwLoop): values in v28 (and v27 past 4), quotients
 # broadcast in the registers below; the body has the rest.
 TW_NAMES = {'forward_identity1': ['z'], 'inverse_scaled': ['s', 'sx', 'sy', 'sz', 'x'],
@@ -393,7 +394,7 @@ WAYS = {'inverse_radix2': 2, 'inverse_radix2_scaled': 2}  # else 4 quarters
 
 
 def tw_layout(names):
-    """(twiddle map, first register not used by the body)."""
+    """(twiddle map, the number of registers v0.. left for the body)."""
     vectors = -(-len(names) // 4)
     tw = {n: ((Value(28 - i // 4), i % 4), Value(28 - vectors - i)) for i, n in enumerate(names)}
     return tw, 28 - vectors - len(names) + 1
@@ -411,11 +412,11 @@ def prune(ops):
 
 def group_loop(g, kind, columns, source=False, tw=None, store=4, upper=False):
     """One iteration: columns c < columns at bytes 16 c of the quarters (read from s0..s3 if source,
-    else from f0..f3). Outputs t < store to f0.. (upper: outputs 2 + t)."""
+    else from f0..f3). Outputs t < store to f0.. (upper: the upper half of the outputs)."""
     for c in range(columns):
         f = [g.load(f's{t}' if source else f'f{t}', 16 * c) for t in range(WAYS.get(kind, 4))]
         out = BUTTERFLY[kind](g, f, LOOP_TWIDDLES if tw is None else tw)
-        for t, v in enumerate(out[2:] if upper else out):
+        for t, v in enumerate(out[len(out) // 2:] if upper else out):
             if t < store:
                 g.store(v, f'f{t}', 16 * c)
     g.ops[:] = prune(g.ops)
@@ -743,6 +744,17 @@ TW_LOOPS = [
     TwLoop('inverse_radix2_level_to', 'inverse_radix2', 'inverse_radix2_level() from the halves of `from` into f.', True),
     TwLoop('inverse_radix2_level_scaled_to', 'inverse_radix2_scaled', 'inverse_radix2_level_scaled() from `from` into f.', True),
 ]
+# Into part of a product's output (a cut product, an upper half): the outputs t < store, or 2 + t
+# (radix-4) and 1 + t (radix-2) if upper, to quarters (halves) t of f; the rest is not computed.
+for scaled in (True, False):
+    for upper in (False, True):
+        top = 'inverse_top_group' if scaled else 'inverse_top_identity_group'
+        r2 = 'inverse_radix2_level_scaled' if scaled else 'inverse_radix2_level'
+        TW_LOOPS.append(TwLoop(f'{top}_{"upper" if upper else "lower"}_to', 'inverse_top' if scaled else 'inverse_top_identity',
+                               f'{top}_to(), outputs {"2 and 3" if upper else "0 and 1"} only (to quarters 0 and 1 of f).',
+                               True, 2, upper))
+        TW_LOOPS.append(TwLoop(f'{r2}_{"differences" if upper else "sums"}_to', 'inverse_radix2_scaled' if scaled else 'inverse_radix2',
+                               f'{r2}_to(), the {"differences" if upper else "sums"} only (to f).', True, 1, upper))
 
 
 def function(k):
@@ -797,11 +809,11 @@ def twloop_function(lp):
     seq, cycles = order_ops(group_loop(g, lp.kind, lp.columns, lp.source, tw, lp.store, lp.upper), regs, lp.knobs)
     reg = allocate(seq, regs)
     vectors = -(-len(names) // 4)
+    # Twiddles from general registers (tw[i], tw[8 + i] read by the compiler): a block just built on
+    # the stack and read by vector loads waited for its scalar stores (2^6 inverse 1.12x slower).
     head = ['dup v29.4s, %w[p]', 'dup v30.4s, %w[p2]']
-    if names:
-        head += ['ldr q28, [%[tw]]'] + (['ldr q27, [%[tw], #16]'] if vectors > 1 else [])
-        head += ['ldr q0, [%[tw], #32]'] + (['ldr q1, [%[tw], #48]'] if len(names) > 4 else [])
-        head += [f'dup v{28 - vectors - i}.4s, v{i // 4}.s[{i % 4}]' for i in range(len(names))]
+    head += [f'mov v{28 - i // 4}.s[{i % 4}], %w[w{i}]' for i in range(len(names))]
+    head += [f'dup v{28 - vectors - i}.4s, %w[q{i}]' for i in range(len(names))]
     head += ['.p2align 5', '1:']
     ways = WAYS.get(lp.kind, 4)
     dests = [f'f{t}' for t in range(min(lp.store, ways) if lp.source else ways)]
@@ -819,7 +831,8 @@ def twloop_function(lp):
     lines += ['    const std::uint32_t* const end = f + words;', '    asm volatile(']
     lines += asm_lines(head + [emit(o, reg) for o in seq] + tail)
     lines += ['        : ' + ', '.join(f'[{x}] "+&r"({x})' for x in pointers),
-              '        : [end] "r"(end), ' + ('[tw] "r"(tw), ' if names else '') + '[p] "r"(kP), [p2] "r"(2 * kP)',
+              '        : [end] "r"(end), ' + ''.join(f'[w{i}] "r"(tw[{i}]), [q{i}] "r"(tw[{8 + i}]), ' for i in range(len(names)))
+              + '[p] "r"(kP), [p2] "r"(2 * kP)',
               '        : ' + CLOBBERS + ', "cc");', '}']
     return lines
 

@@ -34,10 +34,10 @@ struct Generated<neon::Vec> {
     // At 2^6 and 2^7 (subtrees of one group) the bottoms of all subtrees run in one call, as pairs.
     static constexpr bool kJoinBottoms = true;
 
-    // Group k on quarters of q words, columns [0, words / 4), words a multiple of 16: in place with
-    // inputs < kIn P (forward), or from other memory with inputs < kIn P <= 2P (forward_from).
-    // Canonical inputs (kIn = 1): group 0 is a transform's top group (no reductions at all), other
-    // groups run as for kIn = 2. False if not run.
+    // Group k on quarters of q words, columns [0, words / 4): in place with inputs < kIn P (forward;
+    // words a multiple of 16), or from other memory with inputs < kIn P <= 2P (forward_from; any
+    // multiple of 8 from 16 on, by16). Canonical inputs (kIn = 1): group 0 is a transform's top
+    // group (no reductions at all), other groups run as for kIn = 2. False if not run.
     template <int kIn>
     [[gnu::always_inline]] static bool forward(u32* f, std::size_t q, std::size_t words, std::size_t k, const u32* r) {
         if constexpr (kIn <= 2) return forward_from<kIn>(f, f, q, words, k, r);
@@ -49,16 +49,17 @@ struct Generated<neon::Vec> {
     template <int kIn>
     [[gnu::always_inline]] static bool forward_from(const u32* from, u32* f, std::size_t q, std::size_t words, std::size_t k,
                                                     const u32* r) {
-        if (kIn > 2 || words % 16 != 0) return false;
-        if (kIn == 1 && k == 0) {
-            if (from == f) neon_kernels::forward_top_group(f, q, words, r + slot(1));
-            else neon_kernels::forward_top_group_from(from, f, q, words, r + slot(1));
-        } else if (k == 0) {
-            neon_kernels::forward_identity_group2(from, f, q, words, r);
-        } else {
-            neon_kernels::forward_group2(from, f, q, words, r + slot(k), r + slot(2 * k));
-        }
-        return true;
+        if constexpr (kIn > 2) return false;
+        return by16(from, f, words, [&](const u32* a, u32* b, std::size_t n) {
+            if (kIn == 1 && k == 0) {
+                if (a == b) neon_kernels::forward_top_group(b, q, n, r + slot(1));
+                else neon_kernels::forward_top_group_from(a, b, q, n, r + slot(1));
+            } else if (k == 0) {
+                neon_kernels::forward_identity_group2(a, b, q, n, r);
+            } else {
+                neon_kernels::forward_group2(a, b, q, n, r + slot(k), r + slot(2 * k));
+            }
+        });
     }
     // Inverse group k in place, in and out < 2P.
     [[gnu::always_inline]] static bool inverse(u32* f, std::size_t q, std::size_t k, const u32* ir) {
@@ -67,8 +68,9 @@ struct Generated<neon::Vec> {
         else neon_kernels::inverse_group(f, q, q, ir + slot(k), ir + slot(2 * k));
         return true;
     }
-    // inverse_group_scaled: group k < 4 times s, scaled = scaled_block(s). The asm reads twiddle
-    // blocks (values, then quotients 8 words on); for k = 0 that is the scaled block itself.
+    // inverse_group_scaled: group k < 4 times s, scaled = scaled_block(s). The asm takes its
+    // twiddles as a block (values, then quotients 8 words on), read into general registers; for
+    // k = 0 that is the scaled block itself.
     [[gnu::always_inline]] static bool inverse_scaled(u32* f, std::size_t q, std::size_t k, const u32* ir, const u32* scaled) {
         if (q % 16 != 0) return false;
         if (k == 0) return neon_kernels::inverse_scaled_identity_group(f, q, q, scaled), true;
@@ -89,11 +91,15 @@ struct Generated<neon::Vec> {
         if (main < words) run(from + words - 16, f + words - 16, std::size_t(16));
         return true;
     }
-    // The inverse top group (inverse_radix4, inverse_radix4_part with 4 quarters out), times s if
-    // s != 0: in < 2P, canonical out.
+    // The inverse top group (inverse_radix4, inverse_radix4_part), times s if s != 0: in < 2P,
+    // canonical out; all 4 outputs (in place or not), or outputs 0, 1 (2, 3 if kUpper) to quarters
+    // 0, 1 of f (other memory). Other kStore: false.
+    template <int kStore, bool kUpper>
     [[gnu::always_inline]] static bool inverse_top(const u32* from, u32* f, std::size_t q, std::size_t words, const u32* ir,
                                                    u32 s) {
-        alignas(16) u32 block[16]{};
+        if constexpr (kStore != 4 && kStore != 2) return false;
+        if (kStore == 2 && from == f) return false;
+        u32 block[16]{};
         const u32* tw = ir + slot(1);  // s = 0: z
         if (s != 0) {
             const u32 sz = multiply_mod(s, ir[slot(1)]);
@@ -101,19 +107,35 @@ struct Generated<neon::Vec> {
             tw = block;
         }
         return by16(from, f, words, [&](const u32* a, u32* b, std::size_t n) {
-            if (a == b) s ? neon_kernels::inverse_top_group(b, q, n, tw) : neon_kernels::inverse_top_identity_group(b, q, n, tw);
-            else if (s) neon_kernels::inverse_top_group_to(a, b, q, n, tw);
-            else neon_kernels::inverse_top_identity_group_to(a, b, q, n, tw);
+            namespace k = neon_kernels;
+            if constexpr (kStore == 2) {
+                if (s) kUpper ? k::inverse_top_group_upper_to(a, b, q, n, tw) : k::inverse_top_group_lower_to(a, b, q, n, tw);
+                else kUpper ? k::inverse_top_identity_group_upper_to(a, b, q, n, tw) : k::inverse_top_identity_group_lower_to(a, b, q, n, tw);
+            } else if (a == b) {
+                s ? k::inverse_top_group(b, q, n, tw) : k::inverse_top_identity_group(b, q, n, tw);
+            } else {
+                s ? k::inverse_top_group_to(a, b, q, n, tw) : k::inverse_top_identity_group_to(a, b, q, n, tw);
+            }
         });
     }
-    // The inverse radix-2 level on halves of `half` words (inverse_radix2, inverse_radix2_part<2>):
-    // in < 2P, canonical out, times s if s != 0.
+    // The inverse radix-2 level on halves of `half` words (inverse_radix2, inverse_radix2_part): in
+    // < 2P, canonical out, times s if s != 0; both halves (in place or not), or the sums (the
+    // differences if kUpper) to f (other memory).
+    template <int kStore, bool kUpper>
     [[gnu::always_inline]] static bool inverse_radix2(const u32* from, u32* f, std::size_t half, std::size_t words, u32 s) {
-        alignas(16) const u32 tw[16] = {s, 0, 0, 0, 0, 0, 0, 0, s ? quotient(s) : 0};
+        if (kStore == 1 && from == f) return false;
+        const u32 tw[16] = {s, 0, 0, 0, 0, 0, 0, 0, s ? quotient(s) : 0};
         return by16(from, f, words, [&](const u32* a, u32* b, std::size_t n) {
-            if (a == b) s ? neon_kernels::inverse_radix2_level_scaled(b, half, n, tw) : neon_kernels::inverse_radix2_level(b, half, n);
-            else if (s) neon_kernels::inverse_radix2_level_scaled_to(a, b, half, n, tw);
-            else neon_kernels::inverse_radix2_level_to(a, b, half, n);
+            namespace k = neon_kernels;
+            if constexpr (kStore == 1) {
+                if (s) kUpper ? k::inverse_radix2_level_scaled_differences_to(a, b, half, n, tw)
+                              : k::inverse_radix2_level_scaled_sums_to(a, b, half, n, tw);
+                else kUpper ? k::inverse_radix2_level_differences_to(a, b, half, n) : k::inverse_radix2_level_sums_to(a, b, half, n);
+            } else if (a == b) {
+                s ? k::inverse_radix2_level_scaled(b, half, n, tw) : k::inverse_radix2_level(b, half, n);
+            } else {
+                s ? k::inverse_radix2_level_scaled_to(a, b, half, n, tw) : k::inverse_radix2_level_to(a, b, half, n);
+            }
         });
     }
 

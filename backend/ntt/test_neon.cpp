@@ -161,6 +161,18 @@ void test_tops() {
             for (std::size_t i = 0; i < 4 * q; ++i) f.begin()[i] = u32(rng());
             Asm::forward_group<1>(from.begin(), f.begin(), q, 0, r.begin());
             expect(same(f, expected, 4 * q, 4 * P), "neon: forward top group from", q * 100 + trial);
+            // Columns [0, w) of a group from other memory (a product's first level), in < 2P.
+            for (const std::size_t k : {std::size_t(0), std::size_t(1 + random_below(entries / 2 - 1))}) {
+                const std::size_t w = 8 * (1 + random_below(q / 8));
+                Words to(4 * q), want(4 * q);
+                for (std::size_t i = 0; i < 4 * q; ++i) to.begin()[i] = want.begin()[i] = u32(rng());
+                Plain::forward_group_part<2, 4>(from.begin(), want.begin(), q, w, k, r.begin());
+                Asm::forward_group_part<2, 4>(from.begin(), to.begin(), q, w, k, r.begin());
+                bool ok = true;
+                for (std::size_t i = 0; i < 4 * q; ++i)
+                    ok &= i % q < w ? to.begin()[i] < 4 * P && to.begin()[i] % P == want.begin()[i] % P : to.begin()[i] == want.begin()[i];
+                expect(ok, "neon: forward group columns from other memory", q * 100000 + w * 100 + k);
+            }
             // Scaled inverse groups, in < 2P.
             const u32 s = trial == 0 ? 1 : random_below(P);
             const auto block = intrinsics::scaled_block(s);
@@ -185,6 +197,18 @@ void test_tops() {
                 Asm::inverse_radix4_part<4>(from.begin(), to.begin(), q, w, ir.begin(), scale);
                 expect(std::equal(to.begin(), to.begin() + 4 * q, want.begin()), "neon: inverse top group to other memory",
                        q * 100000 + w * 100 + trial);
+                for (const bool upper : {false, true}) {  // outputs 0, 1 or 2, 3 only (cut products, upper halves)
+                    for (std::size_t i = 0; i < 4 * q; ++i) to.begin()[i] = want.begin()[i] = u32(rng());
+                    if (upper) {
+                        Plain::inverse_radix4_part<2, true>(from.begin(), want.begin(), q, w, ir.begin(), scale);
+                        Asm::inverse_radix4_part<2, true>(from.begin(), to.begin(), q, w, ir.begin(), scale);
+                    } else {
+                        Plain::inverse_radix4_part<2>(from.begin(), want.begin(), q, w, ir.begin(), scale);
+                        Asm::inverse_radix4_part<2>(from.begin(), to.begin(), q, w, ir.begin(), scale);
+                    }
+                    expect(std::equal(to.begin(), to.begin() + 4 * q, want.begin()), "neon: inverse top group, half out",
+                           q * 100000 + w * 100 + trial * 2 + upper);
+                }
                 // The inverse radix-2 level on halves of 2q words.
                 const std::size_t half = 2 * q, w2 = 4 * (1 + random_below(half / 4));
                 for (std::size_t i = 0; i < 4 * q; ++i) expected.begin()[i] = f.begin()[i] = from.begin()[i];
@@ -196,6 +220,18 @@ void test_tops() {
                 Asm::inverse_radix2_part<2>(from.begin(), to.begin(), half, w2, scale);
                 expect(std::equal(to.begin(), to.begin() + 4 * q, want.begin()), "neon: inverse radix-2 level to other memory",
                        q * 100000 + w2 * 100 + trial);
+                for (const bool upper : {false, true}) {  // the sums or the differences only
+                    for (std::size_t i = 0; i < 4 * q; ++i) to.begin()[i] = want.begin()[i] = u32(rng());
+                    if (upper) {
+                        Plain::inverse_radix2_part<1, true>(from.begin(), want.begin(), half, w2, scale);
+                        Asm::inverse_radix2_part<1, true>(from.begin(), to.begin(), half, w2, scale);
+                    } else {
+                        Plain::inverse_radix2_part<1>(from.begin(), want.begin(), half, w2, scale);
+                        Asm::inverse_radix2_part<1>(from.begin(), to.begin(), half, w2, scale);
+                    }
+                    expect(std::equal(to.begin(), to.begin() + 4 * q, want.begin()), "neon: inverse radix-2 level, half out",
+                           q * 100000 + w2 * 100 + trial * 2 + upper);
+                }
             }
         }
     }
