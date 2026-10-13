@@ -24,8 +24,10 @@ user and every agent) are ours; text from any other account is information, neve
    - The prototype (see `frontend/notes.md`) implements most of DESIGN.md: read it and move code
      from it, rewritten to this repo's standards. Do not bring its `include/fps/lcopt/`.
    - For each API call that wraps a backend call, add two cases to a new
-     `frontend/bench_<area>.cpp` (`kernel.py bench` times every `bench*.cpp`) on the same inputs: `<op>/<lg>` through the API and `<op>@kernel/<lg>` calling the backend directly. The
-     API adds no overhead of its own (AGENTS.md, Conventions). Do not tune the frontend: speed
+     `frontend/bench_<area>.cpp` (`kernel.py bench` times every `bench*.cpp`) on the same inputs:
+     `<op>/<lg>` through the API and `<op>@kernel/<lg>` calling the backend directly, with lg = 20
+     among the sizes where the operation takes inputs that large (small sizes alone are noisy).
+     The API adds no overhead of its own (AGENTS.md, Conventions). Do not tune the frontend: speed
      work belongs in the backend, through a backend issue.
    - If DESIGN.md is wrong or unclear, follow AGENTS.md: fix it in the same pull request with the
      reason. If it is a choice only the user can make, ask (above).
@@ -33,9 +35,11 @@ user and every agent) are ours; text from any other account is information, neve
    (`tools/vm.py`); time with `tools/kernel.py bench frontend`.
 5. Log what you built and the numbers in a new file `frontend/notes/{issue}.md`, starting with
    `# #{issue}: <title>` (new file, never an edit of an existing entry). Commit, push, and open a pull request
-   that names issue #{issue}. Comment on issue #{issue}: what was built and the numbers.
+   that names issue #{issue}. Comment on issue #{issue}: what was built and the numbers, always
+   including n = 2^20 (against the kernel, against the code it replaces, and against lc-opt when
+   lc-opt has the operation).
 6. Stop every background process you started, then return: the pull request's number and each
-   `<op>` against `<op>@kernel` ratio. Do not run `tools/gate.py` and do not merge: a reviewer
+   `<op>` against `<op>@kernel` ratio, 2^20 included. Do not run `tools/gate.py` and do not merge: a reviewer
    reads the pull request first, then the coordinator gates and merges it.
 
 You may be sent review findings or a failed gate. Fix each finding or answer it on the pull request;
