@@ -194,12 +194,15 @@ An input of degree 2^25 or more (its transforms' limit; trailing zeros do not co
 reduced modulo the other by division if the other is within the limit, so `gcd(f, x + 1)` works
 for any f; both inputs past it, or m past it in `inverse_mod`, throw `std::length_error` (#168).
 
-`compose(f, g, n)`: a constant g mod x^n gives f(g[0]) (Horner), a linear one a Taylor shift (a
-middle product of f.size() + min(n, f.size()) - 1 words, at most 2^25) and a scaling; any other g
-a Taylor shift by g[0], then the backend's Kinoshita and Li (#169), as does
-`compositional_inverse`. Both run for n up to 2^23, the kernel's limit, and throw
-`std::length_error` past it before any work; the kernel keeps its work per thread, about
-16 m (log2 m + 3) bytes for compose, m = bit_ceil(n) (3.3 GiB at 2^23).
+`compose(f, g, n)`: a constant g mod x^n gives f(g[0]) (Horner), a linear one a Taylor shift by
+g[0] and a scaling by g[1]^k; any other g a Taylor shift by g[0], then the backend's Kinoshita and
+Li (#169), as does `compositional_inverse`. Both run for n up to 2^23, the kernel's limit, and
+throw `std::length_error` past it before any work; the kernel keeps its work per thread, about
+16 m (log2 m + 3) bytes for compose, m = bit_ceil(n) (3.3 GiB at 2^23). The Taylor shift is the
+backend's (#182: lc-opt's, one cyclic product of 2^lg >= 2 (deg f + 1) words); it needs deg f
+< 2^24 (trailing zeros do not count; else `std::length_error`, before any work) for g[0] != 0, any
+n. It was a middle product of f.size() + min(n, f.size()) - 1 <= 2^25 words, which let a short n
+take f of up to 2^25 - n + 1 words; the kernel's layout needs 2 deg f < 2^25 instead.
 
 `Factorials<P> fact(n)`, n <= P: `fact[i]` = i!, `fact.inverse(i)` = 1/i!, `fact.binomial(n, k)`
 = C(n, k) (0 for k > n), for i, n < `fact.size()`. n > P throws: P! = 0 has no inverse. Indices
