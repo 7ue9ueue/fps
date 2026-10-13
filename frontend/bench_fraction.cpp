@@ -1,6 +1,8 @@
 // Times fps/fraction.hpp modulo P = 998244353; tools/kernel.py runs it, a binary of its own.
 //   "<op>/<size>"          through the API (gated)
 //   "<op>@kernel/<size>"   the backend calls the API makes, by hand, on the same inputs
+//   "<op>@api/<size>"      through the API, outside the gate's verdict: [k] at d = 2^20, 0.4-1.1 s
+//                          a call, timed for reports only (it would add minutes to every gate)
 // a * b and a + b are products of polynomials, so they have kernel pairs: ntt::multiply into new
 // memory, as the results hold them. [k] is one bostan_mori::coefficient call: its pair calls the
 // kernel on the same spans. take(n) runs inverse and mul, with no kernel of its own;
@@ -53,7 +55,7 @@ void coefficient(bench::Suite& suite) {
         const Frac a = d == 2 ? Frac(Poly{0, 1}, Poly{1, P - 1, P - 1})
                               : Frac(random_poly(d, 3, unsigned(d)), random_poly(d + 1, 1, unsigned(d) + 1));
         const std::string size = "/" + std::to_string(d);
-        suite.add("fraction_at" + size, [a] { return [a] { bench::keep(a[k]); }; }, d);
+        suite.add(std::string(d == 1 << 20 ? "fraction_at@api" : "fraction_at") + size, [a] { return [a] { bench::keep(a[k]); }; }, d);
         suite.add("fraction_at@kernel" + size, [a] {
             return [a] {
                 bench::keep(fps::bostan_mori::coefficient(a.numerator().span(), a.denominator().span(), k));
