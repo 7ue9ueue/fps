@@ -605,14 +605,14 @@
    "machine": "lc-arm",
    "cpu": "implementer 0x41 variant 0x0 part 0xd4f revision 1",
    "flags": "-mcpu=neoverse-v2",
-   "date": "2026-10-12",
-   "commit": "1e867c9",
+   "date": "2026-10-13",
+   "commit": "877a450+changes",
    "fields": [
     [
      "signature",
      "int",
      [
-      "1288679911"
+      "395475373"
      ]
     ],
     [

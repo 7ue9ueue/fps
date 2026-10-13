@@ -38,6 +38,10 @@ template <class S>
 struct Generated {
     static constexpr bool kOn = false;
 };
+// Optional members of Generated<S> beyond kOn's (neon.hpp, issue #151), each used where present:
+//   forward_from<kIn>(from, f, q, words, k, r) -> bool    forward_group_part with from != f
+//   inverse(f, q, k, ir) -> bool                           inverse_group
+//   bottom_forward(f, count, first, r), bottom_inverse     Bottom::forward, inverse; count even
 
 // Lazy arithmetic mod P on S: values < 4P in forward transforms, < 2P in inverse ones.
 template <class S>
@@ -348,6 +352,8 @@ struct Butterflies : Arith<S> {
                                                           std::size_t k, const u32* r) {
         if constexpr (Generated<S>::kOn && kLoad == 4)
             if (from == f && Generated<S>::template forward<kIn>(f, q, words, k, r)) return;
+        if constexpr (kLoad == 4 && requires { Generated<S>::template forward_from<kIn>(from, f, q, words, k, r); })
+            if (from != f && Generated<S>::template forward_from<kIn>(from, f, q, words, k, r)) return;
         if constexpr (kLoad <= 1) {
             prefetching(q, kPrefetchMin, [&]<bool kPf> [[gnu::always_inline]] (std::bool_constant<kPf>) {
                 const bool write = from != f;
@@ -372,6 +378,8 @@ struct Butterflies : Arith<S> {
 
     static void inverse_group(u32* f, std::size_t q, std::size_t k, const u32* ir) { inverse_group_inline(f, q, k, ir); }
     [[gnu::always_inline]] static void inverse_group_inline(u32* f, std::size_t q, std::size_t k, const u32* ir) {
+        if constexpr (requires { Generated<S>::inverse(f, q, k, ir); })
+            if (Generated<S>::inverse(f, q, k, ir)) return;
         if (k == 0) {
             const F z = A::entry(ir, 1);
             return each2<kPipelined.inverse_identity>(
@@ -1274,11 +1282,15 @@ struct Ntt : Butterflies<S> {
     // lanes and count is even, else on N.
     static constexpr bool kWideBottom = S::lanes == 16;
     static void bottom_forward(u32* f, std::size_t count, std::size_t first, const u32* r) {
+        if constexpr (requires { Generated<S>::bottom_forward(f, count, first, r); })
+            if (count % 2 == 0) return Generated<S>::bottom_forward(f, count, first, r);
         if constexpr (kWideBottom)
             if (count % 2 == 0) return WideBottom<S>::forward(f, count, first, r);
         Leaf::forward(f, count, first, r);
     }
     static void bottom_inverse(u32* f, std::size_t count, std::size_t first, const u32* ir) {
+        if constexpr (requires { Generated<S>::bottom_inverse(f, count, first, ir); })
+            if (count % 2 == 0) return Generated<S>::bottom_inverse(f, count, first, ir);
         if constexpr (kWideBottom)
             if (count % 2 == 0) return WideBottom<S>::inverse(f, count, first, ir);
         Leaf::inverse(f, count, first, ir);

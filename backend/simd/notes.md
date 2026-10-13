@@ -78,6 +78,12 @@ umull2, sqdmulh 4 / 0.5; mla, mls, umlal, umlal2 1.15 / 0.5 (through the accumul
 2 / 0.5. Mixed: mul + umull and mul + sqdmulh 0.5 (shared pipes), mul + add and umull + uzp2 0.33
 (not 0.25). SVE2 `umulh z.s` 4 / 0.5, on the multiply pipes (mul + umulh 0.5, umulh + add 0.33);
 `usra` 1.15 / 0.5 through the accumulator (2026-10-11, round 2).
+By element (ntt issue #151, 2026-10-13): `mul`, `umull` 4 / 0.5, `mls`, `umlal`, `umlal2` 1.15 / 0.5,
+as the vector forms; `dup` of a lane and `ext` 2 / 0.25 (`ext + add` 0.25: any pipe). Memory,
+reciprocal throughput: `ldr q` 0.336, `ldur q` 4 bytes past alignment 0.495 (loads across 32 bytes
+take two slots, a guess), `ld1r` 0.427, `str q` 0.526, `stur q` 0.747. Mixed: `ldr q + mul` 0.25
+(disjoint), `ld1r + mul` and `ld1r + add` 0.33 (`ld1r` takes a V uop), `str q + mul` 0.50 and `str q +
+add` 0.51 (a store's data takes a V0/V1 uop), `str q + ldr q` 0.60.
 
 Per CPU, for the kernels:
 - `vpmulld` costs as much as `vpmuludq` on Zen 3 and 5, twice (2 uops, latency 10-11.5) on Emerald
@@ -189,6 +195,11 @@ lanes, guard words around). A partial store through a stack buffer and piece cop
 kernel a store-forwarding stall at 8x8 (about 18 cycles on Emerald Rapids); the masked store does
 not (`backend/small/notes.md`, Log). The simd, modarith, ntt and factorials bench binaries are
 byte-identical to main's (avx2, avx512).
+
+2026-10-13, claude (ntt issue #151, round 1): `probe.cpp` times by-element multiplies, `dup`, `ext`,
+loads and stores on Neoverse V2 (a `MEM` probe with a buffer operand); results in Instruction costs
+and `machines.py`. For the ntt's Neon asm generator (`backend/ntt/gen_neon_kernels.py`), which models
+stores as a V0/V1 uop.
 
 ## Sources
 

@@ -9,9 +9,9 @@
 //   variant::tuned                     the selected variant: one table read per call (SelectedForward ...)
 //
 // Variants: scalar (every target), intrinsics<S> (every simd struct S the target has), avx2
-// (__AVX2__). backend/ntt/tune.hpp measures the table on this machine. -DFPS_NTT_FORWARD=<variant>
-// (and _INVERSE, _MULTIPLY, the last for both products) forces one, e.g.
-// -DFPS_NTT_FORWARD='intrinsics<fps::simd::Avx512>'. Measurements: notes.md.
+// (__AVX2__), neon (arm: neon.hpp). backend/ntt/tune.hpp measures the table on this machine.
+// -DFPS_NTT_FORWARD=<variant> (and _INVERSE, _MULTIPLY, the last for both products) forces one,
+// e.g. -DFPS_NTT_FORWARD='intrinsics<fps::simd::Avx512>'. Measurements: notes.md.
 #pragma once
 
 #include <algorithm>
@@ -22,6 +22,7 @@
 #include <string_view>
 
 #include "backend/ntt/intrinsics.hpp"
+#include "backend/ntt/neon.hpp"
 #include "backend/ntt/scalar.hpp"
 #include "backend/ntt/tuned.hpp"
 #include "backend/simd/select.hpp"
@@ -33,9 +34,12 @@
 
 namespace fps::ntt {
 
-// Native: the variant that builds the tables of ntt::Transform (every variant builds the same).
+// Native: the variant that builds the tables of ntt::Transform (every variant builds the same) and
+// runs its leaf products; bench_leaves.cpp times the leaf-form ops on it.
 #if defined(__AVX2__) && !(defined(__AVX512F__) && defined(__AVX512BW__))
 using Native = variant::avx2;
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+using Native = variant::neon;
 #else
 using Native = variant::intrinsics<fps::simd::Native>;
 #endif
@@ -48,7 +52,9 @@ struct Candidates {};
 // zmm intrinsics with generated asm kernels (avx512.hpp; Zen 5's tuning is issue #152). With AVX2
 // alone the asm: on Zen 3 intrinsics<Avx2> won only forward at 2^8 (2.7%), and its code in the
 // binary, even unused, made f * g at 2^6 22-31% slower there (code placement). Elsewhere
-// intrinsics on the widest struct. A target with one candidate reads no table.
+// intrinsics on the widest struct. On arm, neon (intrinsics<Neon> with generated asm kernels;
+// issue #151): 0.80-0.98 of the time of intrinsics<Neon> on every op from 2^8 (2^6-2^7 run nearly
+// the same code). A target with one candidate reads no table.
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && !defined(__znver4__) && \
     !defined(__znver5__)  // avx512
 using Selected = Candidates<variant::avx2, variant::intrinsics<simd::Avx512Vl>, variant::intrinsics<simd::Avx512>,
@@ -57,6 +63,8 @@ using Selected = Candidates<variant::avx2, variant::intrinsics<simd::Avx512Vl>, 
 using Selected = Candidates<variant::avx2, variant::intrinsics<simd::Avx512Vl>, variant::intrinsics<simd::Avx512>>;
 #elif defined(__AVX2__)
 using Selected = Candidates<variant::avx2>;
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+using Selected = Candidates<variant::neon>;
 #else
 using Selected = Candidates<variant::intrinsics<simd::Native>>;
 #endif
@@ -83,6 +91,12 @@ struct Name<variant::avx2> {
 template <>
 struct Name<variant::avx512> {
     static constexpr std::string_view prefix = "avx512", isa = "";
+};
+#endif
+#if defined(__ARM_NEON) && defined(__aarch64__)
+template <>
+struct Name<variant::neon> {
+    static constexpr std::string_view prefix = "neon", isa = "";
 };
 #endif
 template <class S>
