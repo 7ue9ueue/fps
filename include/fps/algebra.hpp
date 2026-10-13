@@ -26,9 +26,10 @@
 //   d = 1, 2, ... up to deg s / 2, then Cantor and Zassenhaus for each degree d: b^((P^d - 1)/2) - 1.
 // Powers modulo m are square and multiply on f * g and f % m: 30 squarings for an exponent near P.
 // A xorshift generator with a fixed seed draws b, so the run time is the same on every call.
-// Costs on the four timed targets (frontend/notes/25.md), ms: gcd and inverse_mod of two random
-// polynomials of degree 2^10 2.5-4.0, 2^12 38-60 (2.2-3.6 ns per n^2); roots of 2^10 distinct linear
-// factors 20-31; factor of a random polynomial of degree 64 1.1-1.5, 256 34-56.
+// Costs on the four timed targets (frontend/notes/168.md), ns per degree: gcd and inverse_mod of
+// two random polynomials of degree 2^12 82-235, 2^16 137-385 (within 1% of the kernel's from 2^8
+// on); ms: roots of 2^10 distinct linear factors 12-21, factor of a random polynomial of degree 256
+// 16-29.
 #pragma once
 
 #include <algorithm>
