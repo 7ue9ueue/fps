@@ -121,8 +121,33 @@ public:
         scan(fact, inverse, c, start, first, down);
     }
 
-private:
     using Lanes = std::array<u32, kWidth>;
+
+    // run()'s lanes (its passes 1 and 2) for kernels that run their own chains over them
+    // (backend/taylor_shift): n >= kMinSize positions and a head of h < kLanes words; start[s] =
+    // a_s = min(h + s c, n - c), first[s] = (a_s)!, down[s] = 1 / (a_s + c - 1)!, canonical; returns
+    // c = chunk(n). A copy of run()'s first lines, not shared with it: moving them out of run()
+    // made tables/8 1.12 and tables/10 1.05 of main on Zen 3 (code layout, notes/124-r1.md).
+    static std::size_t lanes(std::size_t n, std::size_t h, Lanes& start, Lanes& first, Lanes& down) {
+        const std::size_t c = chunk(n);
+        const std::size_t k = (n - h) / c;  // lanes s < k start at h + s c, lanes s >= k at n - c
+        Lanes up_base, product;
+        detail::unrolled<K>([&](auto v) {
+            const V iota = S::load(detail::kIota.data() + v * kLanes);
+            const V a = S::min(S::add(S::broadcast(u32(h)), S::mul_lo(iota, S::broadcast(u32(c)))),
+                               S::broadcast(u32(n - c)));
+            S::store(start.data() + v * kLanes, a);
+            S::store(up_base.data() + v * kLanes, to_montgomery(S::add(a, S::broadcast(1))));
+        });
+        const u32 partial = lane_products(start, up_base, c - 1, k < kWidth ? n - c - start[k - 1] : 0, k - 1, product);
+        starts(start, product, partial, c, h, k, first, down);
+        return c;
+    }
+
+    // 1 / x for x in [1, P) (inverse, below).
+    static u32 invert(u32 x) { return inverse(x); }
+
+private:
     static constexpr u32 kR = u32((u64(1) << 32) % P);  // 1 in Montgomery form
     static constexpr u32 kR2 = u32(u64(kR) * kR % P);
     static constexpr u32 kR3 = u32(u64(kR2) * kR % P);
