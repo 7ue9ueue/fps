@@ -3,25 +3,28 @@
 //   fps::compose(f, g, n)              // f(g) mod x^n; n defaults to max(f.size(), g.size())
 //   fps::compositional_inverse(f, n)   // g with f(g) = g(f) = x mod x^n; n defaults to f.size()
 //
-// compose takes any f and g; only g mod x^n counts. With a = g[0]:
+// compose takes any f and g; only g mod x^n counts. With a = g[0] and F(y) = f(y + a) mod y^t,
+// t = min(n, f.size()) (for a = 0, F = f; else one call into the backend's Taylor shift,
+// fps::taylor_shift::shift, on f without its trailing zeros):
 // - g mod x^n constant: f(a), then zeros. O(f.size()).
-// - g mod x^n = a + b x, b != 0: h[k] = F[k] b^k, F(y) = f(y + a) (for a = 0, F = f). The Taylor
-//   shift is one middle product: k! F[k] = sum_j (f[k + j] (k + j)!) (a^j / j!), for k < min(n,
-//   f.size()). O(n log n).
-// - else f(g) = F(g - a), F mod x^n by the Taylor shift above (a != 0), then one call into the
-//   backend's fps::composition::compose (Kinoshita and Li with lc-opt's layout), which reads g[0]
-//   as 0. O(n log^2 n).
+// - g mod x^n = a + b x, b != 0: h[k] = F[k] b^k (b = 1: F itself). O(n log n). The scaling is
+//   one vector pass, chirp::multiply_chirp(1, b, 1), from F into h (into the kernel: backend
+//   issue #186).
+// - else f(g) = F(g - a): one call into the backend's fps::composition::compose (Kinoshita and Li
+//   with lc-opt's layout), which reads g[0] as 0. O(n log^2 n).
 // compositional_inverse needs f[0] = 0 for n >= 1 and f[1] != 0 for n >= 2 (only f mod x^n is
 // read), and n <= P; else std::domain_error. Then it is one call into the backend's
 // fps::composition::compositional_inverse (power projection, then Lagrange's inversion).
 //
 // Limits: compose's general path and compositional_inverse run for n up to 2^23, the kernel's
 // kMaxSize (its transforms have 4 bit_ceil(n) words), and throw std::length_error past it before
-// any work. The Taylor shift is a cyclic product of f.size() + t - 1 words, t = min(n, f.size());
-// it throws past 2^25. The tuned Taylor shift is backend issue #124.
+// any work. The Taylor shift (a != 0, g not constant) takes f of degree below 2^24, the shift
+// kernel's kMaxSize (a cyclic product of 2^25 words), and throws std::length_error past it before
+// any work; trailing zeros do not count.
 //
-// Memory: the kernel keeps its work per thread, the largest so far, m = bit_ceil(n): compose about
-// 16 m (log2 m + 3) bytes (n = 2^17: 40 MiB; 2^23: 3.3 GiB), compositional_inverse about 150 m.
+// Memory: the kernels keep their work per thread, the largest so far, m = bit_ceil(n): compose about
+// 16 m (log2 m + 3) bytes (n = 2^17: 40 MiB; 2^23: 3.3 GiB), compositional_inverse about 150 m; the
+// Taylor shift 2 L + d words, d = deg f + 1 and L = bit_ceil(2 d) (d = 2^24: 320 MiB).
 #pragma once
 
 #include <algorithm>
@@ -30,40 +33,33 @@
 #include <span>
 #include <stdexcept>
 
+#include "backend/chirp/chirp.hpp"
 #include "backend/composition/composition.hpp"
-#include "fps/factorials.hpp"
+#include "backend/taylor_shift/taylor_shift.hpp"
 #include "fps/modular.hpp"
 #include "fps/polynomial.hpp"
-#include "fps/products.hpp"
 
 namespace fps {
 
 namespace detail::composition {
 
 using u32 = std::uint32_t;
-using Span = std::span<const u32>;
-using Out = std::span<u32>;
 
-// The NTT's longest transform, 2^25 words.
-inline constexpr std::size_t kMaxTransform = std::size_t(1) << ntt::kMaxLog;
+inline u32 at(std::span<const u32> f, std::size_t i) { return i < f.size() ? f[i] : 0; }
 
-inline u32 at(Span f, std::size_t i) { return i < f.size() ? f[i] : 0; }
+// f without its trailing zeros.
+inline std::span<const u32> trimmed(std::span<const u32> f) {
+    std::size_t d = f.size();
+    while (d > 0 && f[d - 1] == 0) --d;
+    return f.first(d);
+}
 
-// out[k] = [y^k] f(y + a) for k < out.size() <= f.size(): k! out[k] = sum_j A[k + j] E[j] with
-// A[i] = f[i] i!, E[j] = a^j / j!, a middle product of A (zeros past f) and E reversed.
-template <u32 P>
-void taylor_shift(Span f, u32 a, Out out) {
-    const std::size_t m = f.size(), t = out.size();
-    if (t == 0) return;
-    // ntt::middle_product: a cyclic product of length >= m - 1 + t.
-    if (m - 1 + t > kMaxTransform) throw std::length_error("fps::compose: Taylor shift past 2^25 words");
-    const Factorials<P> fact(m);
-    Polynomial<P> weighted(m + t - 1), e(m);
-    for (std::size_t i = 0; i < m; ++i) weighted[i] = mod_mul<P>(f[i], fact[i]);
-    u32 power = 1;
-    for (std::size_t j = 0; j < m; ++j, power = mod_mul<P>(power, a)) e[m - 1 - j] = mod_mul<P>(power, fact.inverse(j));
-    const Polynomial<P> h = middle_product(weighted, e);
-    for (std::size_t k = 0; k < t; ++k) out[k] = mod_mul<P>(h[k], fact.inverse(k));
+// out[k] = [y^k] f(y + a) for k < out.size(), any out.size(): the kernel's shift, zeros past f.
+// The caller checks f.size() <= the kernel's kMaxSize.
+inline void shift(std::span<const u32> f, u32 a, std::span<u32> out) {
+    const std::size_t m = std::min(f.size(), out.size());
+    fps::taylor_shift::shift(f, a, out.first(m));
+    std::fill(out.begin() + std::ptrdiff_t(m), out.end(), 0);
 }
 
 }  // namespace detail::composition
@@ -84,20 +80,27 @@ Polynomial<P> compose(const Polynomial<P>& f, const Polynomial<P>& g, std::size_
         h[0] = f(a);
         return h;
     }
-    // F = f(y + a) mod y^t.
+    // F = f(y + a) mod y^t, t = min(n, f.size()); the shift reads f without its trailing zeros.
     const std::size_t t = std::min(n, f.size());
-    Polynomial<P> shifted;
-    std::span<const std::uint32_t> F = f.span().first(t);
-    if (a != 0) {
-        shifted = Polynomial<P>(t);
-        c::taylor_shift<P>(f.span(), a, shifted.span());
-        F = shifted.span();
-    }
-    if (terms == 2) {
-        Polynomial<P> h(n);
-        std::uint32_t power = 1;
-        for (std::size_t k = 0; k < t; ++k, power = mod_mul<P>(power, gs[1])) h[k] = mod_mul<P>(F[k], power);
+    const std::span<const std::uint32_t> fs = a != 0 ? c::trimmed(f.span()) : f.span().first(t);
+    if (a != 0 && fs.size() > fps::taylor_shift::kMaxSize)
+        throw std::length_error("fps::compose: Taylor shift of f of degree 2^24 or more (the shift kernel's kMaxSize)");
+    if (terms == 2) {  // h = F(b y): F written into h, then scaled by b^k
+        Polynomial<P> h = detail::unwritten_polynomial<P>(n);
+        const std::span<std::uint32_t> head = h.span().first(t);
+        const std::uint32_t b = gs[1];
+        if (a != 0) c::shift(fs, a, head);
+        if (b != 1) chirp::multiply_chirp(1, b, 1, a != 0 ? std::span<const std::uint32_t>(head) : fs, head);
+        else if (a == 0) std::copy(fs.begin(), fs.end(), head.begin());
+        std::fill(h.span().begin() + std::ptrdiff_t(t), h.span().end(), 0);
         return h;
+    }
+    Polynomial<P> shifted;
+    std::span<const std::uint32_t> F = fs;
+    if (a != 0) {
+        shifted = detail::unwritten_polynomial<P>(t);
+        c::shift(fs, a, shifted.span());
+        F = shifted.span();
     }
     Polynomial<P> h = detail::unwritten_polynomial<P>(n);
     composition::compose(F, gs, h.span());

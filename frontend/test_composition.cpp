@@ -195,6 +195,27 @@ void test_compose_large() {
     }
 }
 
+// f with trailing zeros through the Taylor shift (g[0] != 0), which reads f without them: fewer
+// words than t = min(n, f.size()) (the rest of F zero), as many, more; Horner's rule on the
+// kernel's small path and on its lanes.
+void test_trailing_zeros() {
+    for (const std::size_t r : {std::size_t(1), std::size_t(7), std::size_t(90), std::size_t(200)})
+        for (const std::size_t z : {std::size_t(1), std::size_t(60), std::size_t(300)})
+            for (const std::size_t n : {std::size_t(1), std::size_t(5), std::size_t(150), std::size_t(320)}) {
+                Vec a = random_vec(r);
+                if (a.back() == 0) a.back() = 1;
+                Vec padded = a;
+                padded.resize(r + z);
+                Vec general = random_vec(n + 1);
+                general[0] = nonzero();
+                for (const Vec& g : {Vec{nonzero(), nonzero()}, Vec{nonzero(), 1}, Vec{nonzero(), 0, nonzero()}, general}) {
+                    const Poly h = fps::compose(poly(padded), poly(g), n);
+                    CHECK(h.size() == n, r, z, n);
+                    CHECK(h == horner(poly(a), poly(g), n), r, z, n);
+                }
+            }
+}
+
 void test_defaults() {
     for (const std::size_t m : {std::size_t(0), std::size_t(1), std::size_t(5), std::size_t(40)})
         for (const std::size_t k : {std::size_t(0), std::size_t(1), std::size_t(2), std::size_t(3), std::size_t(40), std::size_t(77)}) {
@@ -339,16 +360,26 @@ void test_errors() {
     // An empty f runs no product: n zeros, whatever n.
     const Poly zeros = fps::compose(Poly{}, Poly{0, 1, 1}, std::size_t(1) << 24);
     CHECK(zeros.size() == std::size_t(1) << 24 && zeros.degree() == -1);
-    // The Taylor shift: a cyclic product of f.size() + t - 1 words, t = min(n, f.size()); past 2^25
-    // it throws before its tables are built.
+    // The Taylor shift (g[0] != 0, g not constant) takes f of degree below 2^24, the shift kernel's
+    // kMaxSize, whatever n; past it the frontend throws before the kernel (whose own
+    // std::length_error names fps::taylor_shift) and before any work. test_limits runs degree
+    // 2^24 - 1.
+    static_assert(fps::taylor_shift::kMaxSize == std::size_t(1) << 24);
     Poly top((std::size_t(1) << 24) + 1);
     top[top.size() - 1] = 1;
-    CHECK(throws_from<std::length_error>("Taylor shift", [&top] { (void)fps::compose(top, Poly{1, 1}); }));
-    // On the general path n <= 2^23 (the check above), so f needs more than 2^25 - 2^23 words.
-    Poly longer((std::size_t(1) << 25) - (std::size_t(1) << 23) + 2);
-    longer[longer.size() - 1] = 1;
-    CHECK(throws_from<std::length_error>("Taylor shift",
-                                         [&longer] { (void)fps::compose(longer, Poly{1, 1, 1}, std::size_t(1) << 23); }));
+    for (const std::size_t n : {std::size_t(2), std::size_t(5), std::size_t(1) << 23, top.size()})
+        CHECK(throws_from<std::length_error>("fps::compose: Taylor shift", [&top, n] { (void)fps::compose(top, Poly{1, 1}, n); }), n);
+    CHECK(throws_from<std::length_error>("fps::compose: Taylor shift", [&top] { (void)fps::compose(top, Poly{3, 0, 1}, 9); }));
+    // Without the shift, no limit: g[0] = 0 (a scaling, or the kernel on f mod x^n), or g constant.
+    const Poly scaled = fps::compose(top, Poly{0, 3}, 9);
+    CHECK(scaled == Poly(9));
+    CHECK(fps::compose(top, Poly{0, 1, 1}, 9) == Poly(9));
+    CHECK(fps::compose(top, Poly{2}, 3) == poly(Vec{fps::mod_pow<P>(2, std::size_t(1) << 24), 0, 0}));
+    // Trailing zeros do not count: f of 2^24 + 1 words and degree 2.
+    Poly padded((std::size_t(1) << 24) + 1);
+    padded[0] = 1, padded[2] = 1;
+    CHECK((fps::compose(padded, Poly{1, 1}, 4) == Poly{2, 2, 1, 0}));
+    CHECK((fps::compose(padded, Poly{1, 0, 1}, 5) == Poly{2, 0, 2, 0, 1}));
 }
 
 // At the limits: the largest sizes the checks above pass, n = 2^23, through every level of the
@@ -387,18 +418,24 @@ void test_limits() {
             CHECK(g[k] == (j % 2 ? (c ? P - c : 0) : c), k);
         }
     });
-    // The Taylor shift at exactly 2^25 words: f = x^(2^24), n = 2^24, so f(x + 1) = (x + 1)^(2^24),
-    // coefficient k C(2^24, k).
-    {
-        const std::size_t m = (std::size_t(1) << 24) + 1, t = std::size_t(1) << 24;
+    // The Taylor shift at the kernel's kMaxSize: f = x^(2^24 - 1) with trailing zeros, so
+    // f(x + 1) = (x + 1)^(2^24 - 1), coefficient k C(2^24 - 1, k); then scaled by b^k, and with
+    // fewer outputs. In a thread too: the shift keeps 320 MiB per thread at this size.
+    in_thread([] {
+        constexpr std::size_t m = fps::taylor_shift::kMaxSize, d = m - 1;
         const fps::Factorials<P> big(m);
-        Poly f(m);
-        f[m - 1] = 1;
-        const Poly h = fps::compose(f, Poly{1, 1}, t);
-        CHECK(h.size() == t);
-        for (const std::size_t k : {std::size_t(0), std::size_t(1), std::size_t(12345), t / 2, t - 1})
-            CHECK(h[k] == mul(big[m - 1], mul(big.inverse(k), big.inverse(m - 1 - k))), k);
-    }
+        Poly f(m + 5);
+        f[d] = 1;
+        const auto binomial = [&big](std::size_t k) { return mul(big[d], mul(big.inverse(k), big.inverse(d - k))); };
+        const Poly h = fps::compose(f, Poly{1, 1});
+        CHECK(h.size() == m + 5 && h[m - 1] == 1 && h[m] == 0 && h[m + 4] == 0);
+        for (const std::size_t k : {std::size_t(0), std::size_t(1), std::size_t(12345), m / 2, m - 1}) CHECK(h[k] == binomial(k), k);
+        const u32 b = nonzero();
+        const Poly s = fps::compose(f, Poly{1, b}, m / 2 + 3);
+        CHECK(s.size() == m / 2 + 3);
+        for (const std::size_t k : {std::size_t(0), std::size_t(1), std::size_t(777), m / 2 + 2})
+            CHECK(s[k] == mul(binomial(k), fps::mod_pow<P>(b, k)), k);
+    });
 }
 
 }  // namespace
@@ -406,6 +443,7 @@ void test_limits() {
 int main() {
     test_compose_small();
     test_compose_large();
+    test_trailing_zeros();
     test_defaults();
     test_identities();
     test_inverse();
