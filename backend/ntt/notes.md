@@ -244,9 +244,10 @@ the other variants' word for word.
 ### avx512 (issue #150)
 
 `variant::avx512` (`avx512.hpp`): `intrinsics<S>` on a struct of its own (`avx512::Zmm`, simd's
-Avx512 renamed), for which `intrinsics.hpp`'s hook `Generated<S>` swaps in generated asm
-(`avx512_kernels.hpp`, `gen_avx512_kernels.py`) for two kernels; every other path is the zmm
-intrinsics'. A candidate on the avx512 target only (Zen 5's tuning is issue #152).
+Avx512 renamed), for which `intrinsics.hpp`'s hook `Generated<S>` swaps in generated asm for some
+kernels; every other path is the zmm intrinsics'. One generator, one header per target's machine:
+`avx512_kernels.hpp` (Emerald Rapids, avx512 target) and `zen5_kernels.hpp` (Zen 5, zen5 target,
+issue #152, below). A candidate on both targets; on zen5 also `Native` (the leaf-form ops).
 
 - Generator: gen_avx2_kernels.py's method on zmm. Dataflow graphs of EVEX instructions (memory
   operands and `{1to16}` broadcasts folded where used once, vpermt2d/vpermi2d writing a source,
@@ -267,6 +268,22 @@ intrinsics'. A candidate on the avx512 target only (Zen 5's tuning is issue #152
   row is stored in halves. Kernel time 0.93 of WideBottom::multiply's on L1 data.
 - Constants: each statement loads its own (pure loads); masks are "Yk" operands, as a kmovw from
   memory costs a p0/p5 uop (measured, notes/150-r1.md).
+- Zen 5 (`zen5_kernels.hpp`, issue #152; notes/152-r1.md): the model in `machines.py` (four 512-bit
+  pipes: multiplies and shifts on disjoint pairs, permutes and masked-broadcast merges on a pair
+  sharing one pipe with each; 2 zmm loads and 1 store per cycle, a load across a line takes two
+  slots), uops matched to pipes per cycle, and only ops that keep the source order feasible in
+  registers (no deadlock: `Liveness`, after gen_neon_kernels.py). Kernels: every group loop
+  (forward and inverse, k > 0 and identity, 4 columns per iteration, 8 for inverse identity),
+  forward groups of two columns (quarters of 32 words) four groups per statement, the bottom
+  level forward and inverse in statements of 4 and 2 pairs, and the product bottoms as on Emerald
+  Rapids (one pair per stage; `multiply_*` scheduled on the Emerald Rapids model, which ran faster
+  on Zen 5). Kernels on L1 data against the intrinsics: groups 0.86-0.91, two-column forward
+  groups 0.77, bottom forward 0.80, inverse 0.85, product bottom 0.91, square 0.82.
+- Zen 5 cares about code size and store forwarding more than the model says: the product bottom two
+  pairs per stage (0.88 on L1 data) and inverse two-column groups (0.86) made whole products slower
+  (more hot code than the op cache holds, a guess), and loads 4 bytes past a column (odd words)
+  in the two-column groups ran 1.36x slower (loads across two recent stores do not forward).
+
 ### neon (issue #151)
 
 The arm target's one candidate: the intrinsics on `neon::Vec` (`simd::Neon` under its own name)
@@ -293,8 +310,8 @@ memory with inputs < 2P; inverse).
 A tuned choice, "ntt.variant" (`backend/tune`): per target a list of candidates (`select.hpp`,
 `Selected`) and a table of one candidate per op and lg 6..25 (`Choices`, 80 bytes).
 
-- Candidates: zen5 {avx2, intrinsics<Avx512Vl>, intrinsics<Avx512>}, avx512 the same and avx512
-  (issue #150); avx2 {avx2,
+- Candidates: avx512 and zen5 {avx2, intrinsics<Avx512Vl>, intrinsics<Avx512>, avx512} (issues
+  #150, #152); avx2 {avx2,
   intrinsics<Avx2>}; arm, sse, scalar intrinsics<Native> alone (no table read: `choice()` is a
   constant 0). Each is fastest somewhere on our machines (Log, issue #78).
 - Candidates: avx512 and zen5 {avx2, intrinsics<Avx512Vl>, intrinsics<Avx512>}; avx2 {avx2,

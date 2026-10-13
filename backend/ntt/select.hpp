@@ -35,11 +35,14 @@
 namespace fps::ntt {
 
 // Native: the variant that builds the tables of ntt::Transform (every variant builds the same) and
-// runs its leaf products; bench_leaves.cpp times the leaf-form ops on it.
+// runs its leaf-form ops (values form, leaf products, inverse into other memory); bench_leaves.cpp
+// times them on it. On zen5 avx512, whose asm runs Zen 5's schedules (issue #152).
 #if defined(__AVX2__) && !(defined(__AVX512F__) && defined(__AVX512BW__))
 using Native = variant::avx2;
 #elif defined(__ARM_NEON) && defined(__aarch64__)
 using Native = variant::neon;
+#elif (defined(__znver4__) || defined(__znver5__)) && defined(__AVX512VL__)
+using Native = variant::avx512;
 #else
 using Native = variant::intrinsics<fps::simd::Native>;
 #endif
@@ -48,19 +51,17 @@ template <class... V>
 struct Candidates {};
 
 // Per target, the variants that are fastest at some op and length on our machines (notes.md). With
-// AVX-512: the asm, intrinsics on ymm (32 registers) and on zmm, and on avx512 (Emerald Rapids) the
-// zmm intrinsics with generated asm kernels (avx512.hpp; Zen 5's tuning is issue #152). With AVX2
+// AVX-512: the asm, intrinsics on ymm (32 registers) and on zmm, and the zmm intrinsics with
+// generated asm kernels scheduled for the target's machine (avx512.hpp: Emerald Rapids, issue #150;
+// Zen 5, issue #152). With AVX2
 // alone the asm: on Zen 3 intrinsics<Avx2> won only forward at 2^8 (2.7%), and its code in the
 // binary, even unused, made f * g at 2^6 22-31% slower there (code placement). Elsewhere
 // intrinsics on the widest struct. On arm, neon (intrinsics<Neon> with generated asm kernels;
 // issue #151): 0.80-0.98 of the time of intrinsics<Neon> on every op from 2^8 (2^6-2^7 run nearly
 // the same code). A target with one candidate reads no table.
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && !defined(__znver4__) && \
-    !defined(__znver5__)  // avx512
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)  // avx512, zen5
 using Selected = Candidates<variant::avx2, variant::intrinsics<simd::Avx512Vl>, variant::intrinsics<simd::Avx512>,
                             variant::avx512>;
-#elif defined(__AVX512F__) && defined(__AVX512BW__)  // zen5
-using Selected = Candidates<variant::avx2, variant::intrinsics<simd::Avx512Vl>, variant::intrinsics<simd::Avx512>>;
 #elif defined(__AVX2__)
 using Selected = Candidates<variant::avx2>;
 #elif defined(__ARM_NEON) && defined(__aarch64__)

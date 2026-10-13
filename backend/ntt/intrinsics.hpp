@@ -42,6 +42,7 @@ struct Generated {
 //   forward_from<kIn>(from, f, q, words, k, r) -> bool    forward_group_part with from != f
 //   inverse(f, q, k, ir) -> bool                           inverse_group
 //   bottom_forward(f, count, first, r), bottom_inverse     Bottom::forward, inverse; count even
+//   forward_groups(f, q, k, count, r) -> bool             forward_groups (avx512.hpp, issue #152)
 
 // Lazy arithmetic mod P on S: values < 4P in forward transforms, < 2P in inverse ones.
 template <class S>
@@ -395,6 +396,8 @@ struct Butterflies : Arith<S> {
     // per group cost the level of quarters of 32 words 18% on Emerald Rapids (notes.md). In < 4P
     // (forward), < 2P (inverse).
     static void forward_groups(u32* f, std::size_t q, std::size_t k, std::size_t count, const u32* r) {
+        if constexpr (requires { Generated<S>::forward_groups(f, q, k, count, r); })
+            if (Generated<S>::forward_groups(f, q, k, count, r)) return;
         const std::size_t end = k + count;
         if (q == 2 * S::lanes) {  // two columns per group
             for (; k < end; ++k, f += 4 * q) {

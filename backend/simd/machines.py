@@ -108,14 +108,20 @@ EMERALD_RAPIDS = Machine(
            'one register; unexplained (vpaddq ymm: 1.67 in one run, 1 in the next). vpmulld is 2 uops.'),
 )
 
-# AMD Zen 5 (Turin): four 512-bit pipes; simple integer ops have latency 2.
+# AMD Zen 5 (Turin): four 512-bit pipes; simple integer ops have latency 2. Classes of the zmm
+# forms from mixed pairs (ntt issue #152): multiplies and shifts on disjoint pairs of pipes;
+# permutes and the merge of a masked broadcast on a third pair that shares one pipe with each
+# (vpermd + vpsrlq and vpermd + vpmuludq 0.34 per instruction, not 0.25 or 0.5); which pipes is a
+# guess. Memory forms on the pseudo-pipes "load" and "store": 2 zmm loads and 1 zmm store per cycle;
+# a zmm load 4 bytes past a 64-byte boundary (across a line) takes two load slots; a folded memory
+# operand costs no vector uop; a store's data takes no vector pipe (6 stores among 42 vpaddd: 10.5
+# cycles, 48 vpaddd: 12). Load latencies are not measured (7, a guess).
 ZEN5 = Machine(
     target='zen5', vm='lc-zen5', cpu='AMD EPYC 9B45 (Zen 5)', clock_ghz=4.12, vector_bits=512,
     vector_pipes=('FP0', 'FP1', 'FP2', 'FP3'),
     loads_per_cycle={256: 4, 512: 2}, stores_per_cycle={256: 2, 512: 1},
     ops=_ops({
-        **{(m, w): (2, 0.25, 'FP0 FP1 FP2 FP3') for m in ('vpaddd', 'vpaddq', 'vpminud') for w in (256, 512)},
-        ('vpsubd', 256): (2, 0.25, 'FP0 FP1 FP2 FP3'),
+        **{(m, w): (2, 0.25, 'FP0 FP1 FP2 FP3') for m in ('vpaddd', 'vpaddq', 'vpminud', 'vpsubd') for w in (256, 512)},
         ('vpblendd', 256): (2, 0.25, 'FP0 FP1 FP2 FP3'),
         ('vpblendmd', 512): (2, 0.25, 'FP0 FP1 FP2 FP3'),
         **{(m, w): (3, 0.5, 'FP0 FP3') for m in ('vpmuludq', 'vpmulld') for w in (256, 512)},
@@ -123,11 +129,17 @@ ZEN5 = Machine(
         **{(m, w): (2, 0.5, 'FP1 FP2') for m in ('vpsrlq', 'vpsllq') for w in (256, 512)},
         ('vpshufb', 256): (2, 0.5, 'FP1 FP2'),
         ('vpermd', 256): (4, 0.5, 'FP1 FP2'),
-        ('vpermd', 512): (5, 0.5, 'FP1 FP2'),
         ('vpermt2d', 256): (4, 0.5, 'FP1 FP2'),
-        ('vpermt2d', 512): (5, 0.5, 'FP1 FP2'),
+        **{(m, 512): (5, 0.5, 'FP0 FP1') for m in ('vpermd', 'vpermt2d', 'vpermi2d')},
+        ('vpbroadcastd{k}', 512): (5, 0.5, 'FP0 FP1'),  # merge-masked from m32: the merge uop
+        ('vinserti64x4', 512): (2, 0.25, 'FP0 FP1 FP2 FP3'),  # from m256: mixes with vpaddd at 0.25
+        ('vmovdqu64 load', 512): (7, 0.5, 'load'),
+        ('vmovdqu64 load split', 512): (7, 1.0, 'load'),  # across a cache line
+        ('vpbroadcastd m32', 512): (7, 0.5, 'load'),
+        ('vmovdqu64 store', 512): (1, 1.0, 'store'),
+        ('vmovdqu32 store{k}', 512): (1, 1.0, 'store'),
     }),
-    guess=(('vpshufb', 256), ('vpermd', 256), ('vpermd', 512), ('vpermt2d', 256), ('vpermt2d', 512)),
+    guess=(('vpshufb', 256), ('vpermd', 256), ('vpermt2d', 256), ('vinserti64x4', 512), ('vpbroadcastd{k}', 512)),
     notes='vpmulld costs the same as vpmuludq here (unlike Intel). IFMA shares the multiply pipes.',
 )
 
