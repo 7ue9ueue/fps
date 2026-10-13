@@ -3,9 +3,9 @@
 //   scalar: lc-bench (AMD EPYC 7B13), 2026-10-12, commit f5b5706
 //   sse: lc-bench (AMD EPYC 7B13), 2026-10-12, commit f5b5706
 //   avx2: lc-bench (AMD EPYC 7B13), 2026-10-12, commit f5b5706
-//   avx512: lc-intel (INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz), 2026-10-12, commit 828f8ee
+//   avx512: lc-intel (INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz), 2026-10-13, commit 4f1a759
 //   zen5: lc-zen5 (AMD EPYC 9B45), 2026-10-12, commit 828f8ee
-//   arm: lc-arm (implementer 0x41 variant 0x0 part 0xd4f revision 1), 2026-10-12, commit f5b5706
+//   arm: lc-arm (implementer 0x41 variant 0x0 part 0xd4f revision 1), 2026-10-13, commit 4f1a759
 #pragma once
 
 namespace fps::small::tuned {
@@ -26,7 +26,7 @@ inline constexpr int variant[][44] = {
         1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1,
     },
     {  // avx512
-        6, 6, 6, 9, 6, 6, 1, 9, 6, 1, 1, 9, 1, 1, 9, 9, 1, 7, 9, 4, 9, 3, 4, 4, 4, 4, 4, 0, 4, 4, 3,
+        6, 6, 6, 4, 6, 6, 1, 9, 6, 1, 2, 9, 1, 1, 9, 9, 9, 7, 9, 4, 9, 3, 4, 4, 4, 4, 4, 0, 4, 4, 3,
         0, 4, 3, 0, 0, 4, 3, 3, 0, 4, 3, 3, 0,
     },
     {  // zen5
@@ -39,13 +39,13 @@ inline constexpr int variant[][44] = {
     },
 };
 
-inline constexpr double term[] = {0.3158, 0.1032, 0.04927, 0.03749, 0.01854, 0.09376};
+inline constexpr double term[] = {0.3158, 0.1032, 0.04927, 0.04075, 0.01854, 0.09457};
 
-inline constexpr double word[] = {1.787, 0.5259, 0.2648, 0.1896, 0.1031, 0.4382};
+inline constexpr double word[] = {1.787, 0.5259, 0.2648, 0.1972, 0.1031, 0.3882};
 
-inline constexpr double call[] = {165.3, 59.14, 37.4, 30.4, 26.83, 39.21};
+inline constexpr double call[] = {165.3, 59.14, 37.4, 31.77, 26.83, 34.52};
 
-inline constexpr double square[] = {0.09961, 0.03673, 0.02136, 0.01282, 0.004179, 0.02483};
+inline constexpr double square[] = {0.09961, 0.03673, 0.02136, 0.01286, 0.004179, 0.03083};
 
 inline constexpr double ntt[][20] = {
     {  // scalar
@@ -64,9 +64,9 @@ inline constexpr double ntt[][20] = {
         9.693e+07, 2.106e+08,
     },
     {  // avx512
-        161.3, 238.4, 417.5, 893.4, 2045, 4443, 9770, 2.167e+04, 4.69e+04, 1.014e+05, 2.187e+05,
-        4.494e+05, 1.013e+06, 2.153e+06, 4.641e+06, 9.263e+06, 1.933e+07, 3.9e+07, 8.701e+07,
-        1.906e+08,
+        145.1, 236.8, 449.5, 987.3, 2209, 4531, 1.03e+04, 2.237e+04, 4.892e+04, 1.051e+05,
+        2.251e+05, 4.664e+05, 1.043e+06, 2.212e+06, 4.932e+06, 9.649e+06, 1.987e+07, 4.019e+07,
+        9.02e+07, 1.981e+08,
     },
     {  // zen5
         116.9, 178.1, 235.2, 498.3, 1095, 2297, 4897, 1.06e+04, 2.309e+04, 4.71e+04, 1.004e+05,
@@ -74,9 +74,9 @@ inline constexpr double ntt[][20] = {
         9.892e+07,
     },
     {  // arm
-        204, 404.8, 842.5, 1953, 4269, 9310, 1.971e+04, 4.219e+04, 9.318e+04, 1.921e+05, 4.187e+05,
-        8.862e+05, 1.909e+06, 3.939e+06, 8.527e+06, 1.755e+07, 3.758e+07, 7.806e+07, 1.616e+08,
-        3.392e+08,
+        157.5, 302.7, 689.8, 1562, 3461, 7250, 1.6e+04, 3.46e+04, 7.59e+04, 1.56e+05, 3.418e+05,
+        7.264e+05, 1.573e+06, 3.246e+06, 6.989e+06, 1.487e+07, 3.094e+07, 6.49e+07, 1.37e+08,
+        2.867e+08,
     },
 };
 
