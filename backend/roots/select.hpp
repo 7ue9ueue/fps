@@ -20,4 +20,16 @@ using Folds = simd::Avx512;
 using Folds = product_tree::Lanes;
 #endif
 
+// The Graeffe step on x86 through a buffer of columns, a pass per lane parity
+// (kernels.hpp, even_parts_columns), or with all operands in registers (even_parts): the columns
+// took 0.65 of the time of the step on Zen 5, the same on Zen 3, where whole runs were 2-5%
+// slower at 2^6-2^8 with them (notes/122-r1.md). -DFPS_ROOTS_PAIR_COLUMNS=0 or 1 forces it.
+#if defined(FPS_ROOTS_PAIR_COLUMNS)
+inline constexpr bool kPairColumns = FPS_ROOTS_PAIR_COLUMNS;
+#elif defined(__AVX512F__) && defined(__AVX512BW__)
+inline constexpr bool kPairColumns = true;
+#else
+inline constexpr bool kPairColumns = false;
+#endif
+
 }  // namespace fps::root_finding
