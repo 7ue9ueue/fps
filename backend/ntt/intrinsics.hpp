@@ -2019,22 +2019,27 @@ struct Ntt : Butterflies<S> {
     // The forward top level from in into f, then sub(kIn, from, g, nv, k) on each subtree of group k
     // (nv leaves at g, read from `from`), as multiply(p): a source of at most half the length is read
     // by both subtrees' first levels, with no radix-2 level (from 2^7 on).
-    // With kJoin, joined(count) runs the subtrees of one group each at f instead (count 2 or 4).
-    template <class Sub, class Joined>
+    // With kJoin and a joined callable, joined(count) runs the subtrees of one group each at f
+    // instead (count 2 or 4).
+    struct NoJoin {};
+    template <class Sub, class Joined = NoJoin>
     [[gnu::always_inline]] static void from_top(const u32* in, std::size_t n, u32* f, int lg, const u32* r, Sub sub,
-                                                Joined joined) {
+                                                Joined joined = {}) {
         const std::size_t len = std::size_t(1) << lg, nv = len / 8;
+        constexpr bool kJoined = kJoin && !std::is_same_v<Joined, NoJoin>;
         if (!has_radix2(lg)) {
             const std::size_t q = len / 4;
             forward_radix4_from(in, n, f, q, r);
-            if (kJoin && nv == 16) return joined(4);
+            if constexpr (kJoined)
+                if (nv == 16) return joined(4);
             for (std::size_t t = 0; t < 4; ++t) sub(std::integral_constant<int, 4>{}, f + t * q, f + t * q, nv / 4, t);
             return;
         }
         const std::size_t half = len / 2;
         if (n > half || nv / 2 < 16) {
             forward_radix2_from(in, n, f, half);
-            if (kJoin && nv == 8) return joined(2);
+            if constexpr (kJoined)
+                if (nv == 8) return joined(2);
             sub(std::integral_constant<int, 2>{}, f + half, f + half, nv / 2, 1);
             sub(std::integral_constant<int, 2>{}, f, f, nv / 2, 0);
             return;
@@ -2288,7 +2293,9 @@ struct Ntt : Butterflies<S> {
             if (!whole) hook(t, at / 8, leaves);
             bottom_inverse(t, leaves / 4, at / 32, ir);
         };
-        if (!has_radix2(lg)) {
+        if (kJoin && whole) {  // 2^6, 2^7: subtrees of one group (Ntt::kJoin)
+            stage(f, nv);
+        } else if (!has_radix2(lg)) {
             for (std::size_t t = 0; t < 4; ++t) inverse_pruned_tree(f + t * len / 4, nv / 4, t, ir, width, stage);
         } else {
             inverse_pruned_tree(f, nv / 2, 0, ir, width, stage);
