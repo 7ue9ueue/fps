@@ -1,16 +1,23 @@
 // Variant avx512: the intrinsics variant on zmm (intrinsics.hpp, Ntt<S>) with generated asm in
-// place of two kernels (avx512_kernels.hpp, gen_avx512_kernels.py, scheduled for Emerald Rapids):
-// the forward radix-4 groups k > 0 of 4 columns and more, in place, and the bottom stage of
-// products (forward butterflies, leaf products, inverse butterflies; also squares and Transform's
-// cyclic products). Same splitting, tables, lazy ranges and outputs as every variant. The other
-// kernels ran as fast in asm as in intrinsics on Emerald Rapids and stay intrinsics. Design and
-// measurements: notes.md (avx512), notes/150-r1.md.
+// place of some kernels, scheduled for the target's machine by gen_avx512_kernels.py:
+// avx512_kernels.hpp for Emerald Rapids (avx512 target), zen5_kernels.hpp for Zen 5 (zen5 target,
+// -march=znver5). On both: the forward radix-4 groups k > 0 of 4 columns and more, in place, and
+// the bottom stage of products (forward butterflies, leaf products, inverse butterflies; also
+// squares and Transform's cyclic products). On Zen 5 also the identity and inverse groups, forward
+// groups of two columns and the transforms' bottom level. Same splitting, tables, lazy ranges and
+// outputs as every variant. The other kernels ran as fast in asm as in intrinsics (or, on Zen 5,
+// slowed products) and stay intrinsics. Design and measurements: notes.md (avx512),
+// notes/150-r1.md, notes/152-r1.md.
 #pragma once
 
 #include "backend/ntt/intrinsics.hpp"
 
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+#if defined(__znver4__) || defined(__znver5__)
+#include "backend/ntt/zen5_kernels.hpp"
+#else
 #include "backend/ntt/avx512_kernels.hpp"
+#endif
 
 namespace fps::ntt::detail::avx512 {
 
@@ -18,6 +25,12 @@ namespace fps::ntt::detail::avx512 {
 struct Zmm : simd::Avx512 {
     static constexpr const char* name = "avx512";
 };
+
+#if defined(__znver4__) || defined(__znver5__)
+namespace kernels = zen5_kernels;
+#else
+namespace kernels = avx512_kernels;
+#endif
 
 }  // namespace fps::ntt::detail::avx512
 
@@ -37,7 +50,8 @@ struct Generated<avx512::Zmm> {
     // intrinsics ran as fast there). Prefetching where intrinsics.hpp's groups prefetch.
     template <int kIn>
     [[gnu::always_inline]] static bool forward(u32* f, std::size_t q, std::size_t words, std::size_t k, const u32* r) {
-        namespace K = avx512_kernels;
+        namespace K = avx512::kernels;
+#if !defined(__znver4__) && !defined(__znver5__)
         if (k == 0 || words % 64 != 0) return false;
         const std::size_t columns = words / 16;
         const u32 *x = r + slot(k), *y = r + slot(2 * k);
@@ -49,15 +63,80 @@ struct Generated<avx512::Zmm> {
             if (pf) K::forward_prefetch(f, q, columns, x, y);
             else K::forward(f, q, columns, x, y);
         }
+#else  // Zen 5: group 0 too (identity groups); no prefetch (kPrefetch)
+        if (words % 64 != 0) return false;
+        const std::size_t columns = words / 16;
+        if (k == 0) {
+            if constexpr (kIn == 1) K::forward_identity_in1(f, q, columns, r);
+            else if constexpr (kIn == 2) K::forward_identity_in2(f, q, columns, r);
+            else K::forward_identity(f, q, columns, r);
+            return true;
+        }
+        const u32 *x = r + slot(k), *y = r + slot(2 * k);
+        if constexpr (kIn <= 2) K::forward_in2(f, q, columns, x, y);
+        else K::forward(f, q, columns, x, y);
+#endif
         return true;
     }
+
+#if defined(__znver4__) || defined(__znver5__)
+    // Zen 5 (notes/152-r1.md): inverse groups of 4 columns and more (identity groups of 8 and
+    // more), in place, in and out < 2P; false if not run (groups of 2 columns).
+    [[gnu::always_inline]] static bool inverse(u32* f, std::size_t q, std::size_t k, const u32* ir) {
+        namespace K = avx512::kernels;
+        if (k == 0) {
+            if (q % 128 != 0) return false;
+            K::inverse_identity(f, q, q / 16, ir);
+            return true;
+        }
+        if (q % 64 != 0) return false;
+        K::inverse(f, q, q / 16, ir + slot(k), ir + slot(2 * k));
+        return true;
+    }
+
+    // Forward groups [k, k + count) of quarters of 32 words (two columns each), 4 per statement,
+    // if k and count are multiples of 4; false if not run. In < 4P, out < 4P. (The same for inverse
+    // groups made the inverse transform 1-3% faster at 2^10-2^12 but products 6-8% slower at 2^10:
+    // notes/152-r1.md.)
+    static bool forward_groups(u32* f, std::size_t q, std::size_t k, std::size_t count, const u32* r) {
+        namespace K = avx512::kernels;
+        if (q != 32 || k % 4 != 0 || count % 4 != 0) return false;
+        for (const std::size_t end = k + count; k < end; k += 4, f += 512) {
+            if (k == 0) K::forward_groups4_first(f, r, r);
+            else K::forward_groups4(f, r + slot(k), r + slot(2 * k));
+        }
+        return true;
+    }
+
+    // The bottom level of groups [first, first + count) (both even): 4 pairs of groups per
+    // statement from a multiple of 8, then 2 from a multiple of 4; other pairs by the intrinsics
+    // (one pair per statement ran as fast). Forward: in < 4P, canonical leaves out; inverse: < 2P.
+    static void bottom_forward(u32* f, std::size_t count, std::size_t first, const u32* r) {
+        namespace K = avx512::kernels;
+        const std::size_t end = first + count;
+        for (std::size_t k = first; k < end;) {
+            if (k % 8 == 0 && k + 8 <= end) K::bottom_forward4(f, r + slot(k), r + slot(2 * k)), k += 8, f += 256;
+            else if (k % 4 == 0 && k + 4 <= end) K::bottom_forward2(f, r + slot(k), r + slot(2 * k)), k += 4, f += 128;
+            else WideBottom<avx512::Zmm>::forward(f, 2, k, r), k += 2, f += 64;
+        }
+    }
+    static void bottom_inverse(u32* f, std::size_t count, std::size_t first, const u32* ir) {
+        namespace K = avx512::kernels;
+        const std::size_t end = first + count;
+        for (std::size_t k = first; k < end;) {
+            if (k % 8 == 0 && k + 8 <= end) K::bottom_inverse4(f, ir + slot(k), ir + slot(2 * k)), k += 8, f += 256;
+            else if (k % 4 == 0 && k + 4 <= end) K::bottom_inverse2(f, ir + slot(k), ir + slot(2 * k)), k += 4, f += 128;
+            else WideBottom<avx512::Zmm>::inverse(f, 2, k, ir), k += 2, f += 64;
+        }
+    }
+#endif
 
     // The bottom stage of a product, groups [first, first + count) (both even), as WideBottom's
     // multiply: pair j's leaf products and inverse butterflies interleaved with pair j + 1's
     // forward butterflies (the *_both kernels), through two leaf buffers.
     template <bool kSquare>
     static void multiply(u32* a, const u32* b, std::size_t count, std::size_t first, const u32* r, const u32* ir) {
-        namespace K = avx512_kernels;
+        namespace K = avx512::kernels;
         alignas(64) u32 buf[2][K::kLeafBuffer];
         const std::size_t end = first + count;
         if constexpr (kSquare) K::square_first(a, buf[0], r + slot(first), r + slot(2 * first));
@@ -78,7 +157,7 @@ struct Generated<avx512::Zmm> {
     // WideBottom::multiply_stored: b the leaf form of the groups (canonical), at b + 32 (k - first).
     static void multiply_stored(u32* a, const u32* b, std::size_t count, std::size_t first, const u32* r,
                                 const u32* ir) {
-        namespace K = avx512_kernels;
+        namespace K = avx512::kernels;
         alignas(64) u32 buf[2][K::kLeafBuffer];
         const std::size_t end = first + count;
         K::square_first(a, buf[0], r + slot(first), r + slot(2 * first));

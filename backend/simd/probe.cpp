@@ -67,6 +67,17 @@ alignas(64) unsigned char buffer[1024];
         }                                                                                                        \
     }
 
+#if defined(__x86_64__)
+// MIX with %0 the address of a 64-byte aligned buffer (x86 loads and stores; throughput only).
+alignas(64) unsigned char x86_buffer[2048];
+#define X86MEM(name, tp_a, tp_b)                                                                                     \
+    Probe {                                                                                                          \
+        name, nullptr, [](long n) {                                                                                  \
+            for (long i = 0; i < n; ++i) asm volatile(REPT8(IRP6A(tp_a) IRP6B(tp_b)) ::"r"(x86_buffer) : CLOBBERS, "k2"); \
+        }                                                                                                            \
+    }
+#endif
+
 std::vector<Probe> probes() {
     return {
 #if defined(__x86_64__)
@@ -89,6 +100,56 @@ std::vector<Probe> probes() {
         MIX("vpmuludq + vpmulld zmm", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r", "vpmulld %%zmm15, %%zmm14, %%zmm\\r"),
         MIX("vpmuludq + vpaddd zmm", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
         MIX("vpmuludq + vpsrlq zmm", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r", "vpsrlq $32, %%zmm15, %%zmm\\r"),
+        // Pipe classes of permutes and blends, and memory forms (ntt issue #152: the zmm asm on Zen 5).
+        X3("vpermi2d", "zmm"), X3("vpsubd", "zmm"),
+        MIX("vpermd + vpsrlq zmm", "vpermd %%zmm15, %%zmm14, %%zmm\\r", "vpsrlq $32, %%zmm15, %%zmm\\r"),
+        MIX("vpermd + vpmuludq zmm", "vpermd %%zmm15, %%zmm14, %%zmm\\r", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r"),
+        MIX("vpermd + vpaddd zmm", "vpermd %%zmm15, %%zmm14, %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        MIX("vpermt2d + vpmuludq zmm", "vpermt2d %%zmm15, %%zmm14, %%zmm\\r", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r"),
+        MIX("vpsrlq + vpaddd zmm", "vpsrlq $32, %%zmm15, %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        MIX("vpminud + vpmuludq zmm", "vpminud %%zmm15, %%zmm14, %%zmm\\r", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r"),
+        MIX("vpblendmd + vpmuludq zmm", "vpblendmd %%zmm15, %%zmm14, %%zmm\\r%{%%k1%}", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r"),
+        MIX("vpblendmd + vpsrlq zmm", "vpblendmd %%zmm15, %%zmm14, %%zmm\\r%{%%k1%}", "vpsrlq $32, %%zmm15, %%zmm\\r"),
+        MIX("vpmulld + vpaddd zmm", "vpmulld %%zmm15, %%zmm14, %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("vmovdqu64 load zmm", "vmovdqu64 64*\\r(%0), %%zmm\\r", "vmovdqu64 64*\\r(%0), %%zmm\\r"),
+        X86MEM("vmovdqu64 load zmm, 4 bytes past", "vmovdqu64 4+64*\\r(%0), %%zmm\\r", "vmovdqu64 4+64*\\r(%0), %%zmm\\r"),
+        X86MEM("vpbroadcastd zmm, m32", "vpbroadcastd 4*\\r(%0), %%zmm\\r", "vpbroadcastd 4*\\r(%0), %%zmm\\r"),
+        X86MEM("vpbroadcastd zmm{k}, m32", "vpbroadcastd 4*\\r(%0), %%zmm\\r%{%%k1%}", "vpbroadcastd 4*\\r(%0), %%zmm\\r%{%%k1%}"),
+        X86MEM("vmovdqu64 store zmm", "vmovdqu64 %%zmm\\r, 64*\\r(%0)", "vmovdqu64 %%zmm\\r, 64*\\r(%0)"),
+        X86MEM("vmovdqu32 store zmm{k}", "vmovdqu32 %%zmm\\r, 64*\\r(%0)%{%%k1%}", "vmovdqu32 %%zmm\\r, 64*\\r(%0)%{%%k1%}"),
+        X86MEM("vpaddd zmm, m512", "vpaddd 64*\\r(%0), %%zmm14, %%zmm\\r", "vpaddd 64*\\r(%0), %%zmm14, %%zmm\\r"),
+        X86MEM("vpmuludq zmm, m512 + vpaddd", "vpmuludq 64*\\r(%0), %%zmm14, %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("vpaddd zmm, m32{1to16}", "vpaddd 4*\\r(%0)%{1to16%}, %%zmm14, %%zmm\\r", "vpaddd 4*\\r(%0)%{1to16%}, %%zmm14, %%zmm\\r"),
+        X86MEM("load + vpaddd", "vmovdqu64 64*\\r(%0), %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("vpbroadcastd m32 + vpaddd", "vpbroadcastd 4*\\r(%0), %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("vpbroadcastd{k} m32 + vpaddd", "vpbroadcastd 4*\\r(%0), %%zmm\\r%{%%k1%}", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("vpbroadcastd{k} m32 + vpmuludq", "vpbroadcastd 4*\\r(%0), %%zmm\\r%{%%k1%}", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("store + vpaddd", "vmovdqu64 %%zmm\\r, 64*\\r(%0)", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("store + vpmuludq", "vmovdqu64 %%zmm\\r, 64*\\r(%0)", "vpmuludq %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("store + vpsrlq", "vmovdqu64 %%zmm\\r, 64*\\r(%0)", "vpsrlq $32, %%zmm15, %%zmm\\r"),
+        X86MEM("store + load", "vmovdqu64 %%zmm\\r, 64*\\r(%0)", "vmovdqu64 1024+64*\\r(%0), %%zmm\\r"),
+        X86MEM("vpaddd m512 + vpaddd", "vpaddd 64*\\r(%0), %%zmm14, %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("vpsrlq m512 + vpaddd", "vpsrlq $32, 64*\\r(%0), %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("vpermt2d m512 + vpaddd", "vpermt2d 64*\\r(%0), %%zmm14, %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("vinserti64x4 m256 + vpaddd", "vinserti64x4 $1, 32*\\r(%0), %%zmm14, %%zmm\\r", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("kmovw m16 + vpaddd", "kmovw 2*\\r(%0), %%k2", "vpaddd %%zmm15, %%zmm14, %%zmm\\r"),
+        X86MEM("vpbroadcastd{k} m32 + vpsrlq", "vpbroadcastd 4*\\r(%0), %%zmm\\r%{%%k1%}", "vpsrlq $32, %%zmm15, %%zmm\\r"),
+        X86MEM("vpbroadcastd{k} m32 + vpermd", "vpbroadcastd 4*\\r(%0), %%zmm\\r%{%%k1%}", "vpermd %%zmm15, %%zmm14, %%zmm\\r"),
+        MIX("vpermd + vpblendmd zmm", "vpermd %%zmm15, %%zmm14, %%zmm\\r", "vpblendmd %%zmm15, %%zmm14, %%zmm\\r%{%%k1%}"),
+        // 4 instructions per entry (the time per instruction is the printed value / 4): 6 stores
+        // and 42 vpaddd, against 48 vpaddd: whether a store's data takes a vector pipe.
+        X86MEM("[/4] store + 3 vpaddd | 4 vpaddd",
+               "vmovdqu64 %%zmm\\r, 64*\\r(%0)\n vpaddd %%zmm15, %%zmm14, %%zmm12\n vpaddd %%zmm15, %%zmm14, %%zmm13\n vpaddd %%zmm15, %%zmm14, %%zmm\\r",
+               "vpaddd %%zmm15, %%zmm14, %%zmm12\n vpaddd %%zmm15, %%zmm14, %%zmm13\n vpaddd %%zmm15, %%zmm14, %%zmm\\r\n vpaddd %%zmm14, %%zmm15, %%zmm\\r"),
+        X86MEM("[/4] 4 vpaddd | 4 vpaddd",
+               "vpaddd %%zmm15, %%zmm14, %%zmm12\n vpaddd %%zmm15, %%zmm14, %%zmm13\n vpaddd %%zmm15, %%zmm14, %%zmm\\r\n vpaddd %%zmm14, %%zmm15, %%zmm\\r",
+               "vpaddd %%zmm15, %%zmm14, %%zmm12\n vpaddd %%zmm15, %%zmm14, %%zmm13\n vpaddd %%zmm15, %%zmm14, %%zmm\\r\n vpaddd %%zmm14, %%zmm15, %%zmm\\r"),
+        X86MEM("[/4] store + 3 vpmuludq | 4 vpaddd",
+               "vmovdqu64 %%zmm\\r, 64*\\r(%0)\n vpmuludq %%zmm15, %%zmm14, %%zmm12\n vpmuludq %%zmm15, %%zmm14, %%zmm13\n vpmuludq %%zmm15, %%zmm14, %%zmm\\r",
+               "vpaddd %%zmm15, %%zmm14, %%zmm12\n vpaddd %%zmm15, %%zmm14, %%zmm13\n vpaddd %%zmm15, %%zmm14, %%zmm\\r\n vpaddd %%zmm14, %%zmm15, %%zmm\\r"),
+        X86MEM("[/4] 4 vpmuludq | 4 vpaddd",
+               "vpmuludq %%zmm15, %%zmm14, %%zmm12\n vpmuludq %%zmm15, %%zmm14, %%zmm13\n vpmuludq %%zmm15, %%zmm14, %%zmm\\r\n vpmuludq %%zmm14, %%zmm15, %%zmm\\r",
+               "vpaddd %%zmm15, %%zmm14, %%zmm12\n vpaddd %%zmm15, %%zmm14, %%zmm13\n vpaddd %%zmm15, %%zmm14, %%zmm\\r\n vpaddd %%zmm14, %%zmm15, %%zmm\\r"),
 #endif
 #if defined(__AVX512IFMA__) && defined(__AVX512VL__)
         X3("vpmadd52luq", "ymm"), X3("vpmadd52huq", "ymm"), X3("vpmadd52luq", "zmm"), X3("vpmadd52huq", "zmm"),

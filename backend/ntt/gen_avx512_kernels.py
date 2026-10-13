@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Generate avx512_kernels.hpp: the NTT's butterfly kernels on zmm as GCC inline assembly.
+"""Generate avx512_kernels.hpp and zen5_kernels.hpp: the NTT's butterfly kernels on zmm as GCC
+inline assembly, scheduled for Emerald Rapids (avx512 target) and Zen 5 (zen5 target; OUTPUTS).
 
 The AVX-512 counterpart of gen_avx2_kernels.py: each kernel is a dataflow graph of AVX-512
 instructions, list-scheduled on a machine model (backend/simd/machines.py: pipes, latencies and
@@ -14,22 +15,24 @@ takes the odd words' product from a load 4 bytes on where x is loaded from memor
 joins the halves of the quotient with vpermt2d (p5 on Emerald Rapids, where shifts and vpminud take
 p0).
 
-Kernels (avx512_kernels.hpp has their contracts):
+Kernels (the headers have their contracts):
   forward, inverse, forward_identity, inverse_identity (and forms for inputs < 2P, < P, and with
-    prefetch): radix-4 butterflies of one group on columns of 16 words, two columns per iteration
-    (intrinsics.hpp's forward_group and inverse_group).
-  bottom_forward, bottom_inverse, bottom_multiply, bottom_square: the bottom level of two groups
-    (64 words) per statement (intrinsics.hpp's WideBottom), multiply and square with the leaf
-    products and the inverse butterflies, the windows of the leaf products built in registers.
+    prefetch): radix-4 butterflies of one group on columns of 16 words, 2 to 8 columns per
+    iteration (intrinsics.hpp's forward_group and inverse_group).
+  forward_groups4: groups of two columns (quarters of 32 words), four per statement.
+  bottom_forward, bottom_inverse (1, 2 or 4 pairs of groups per statement), bottom_multiply,
+    bottom_square: the bottom level of two groups (64 words) per pair (intrinsics.hpp's
+    WideBottom), multiply and square with the leaf products and the inverse butterflies; the
+    product bottoms in two stages (*_first, *_last, *_both).
 
-Usage: gen_avx512_kernels.py [--check]   (--check: exit 1 if avx512_kernels.hpp differs from the output)
+Usage: gen_avx512_kernels.py [--check]   (--check: exit 1 if a header differs from the output)
 """
 from __future__ import annotations
 
 import argparse
 import random
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
@@ -51,14 +54,14 @@ class Cost:
 
 def model(machine: machines.Machine) -> dict[str, Cost]:
     """Per mnemonic: latency (cycles, rounded up), uops and the pipes they issue to, from the
-    machine's measured 512-bit forms. vpsubd costs as vpaddd, vpermi2d as vpermt2d, a broadcast
-    merged under a mask as vpblendmd (guess)."""
+    machine's measured 512-bit forms. Where the machine has no entry: vpsubd costs as vpaddd,
+    vpermi2d as vpermt2d, a broadcast merged under a mask as vpblendmd (guess)."""
     ops = {m: machine.ops[(m, 512)] for m in
            ('vpaddd', 'vpaddq', 'vpminud', 'vpmuludq', 'vpmulld', 'vpsrlq', 'vpermt2d', 'vpblendmd')}
-    ops['vpsubd'] = ops['vpaddd']
-    ops['vpermi2d'] = ops['vpermt2d']
+    ops['vpsubd'] = machine.ops.get(('vpsubd', 512), ops['vpaddd'])
+    ops['vpermi2d'] = machine.ops.get(('vpermi2d', 512), ops['vpermt2d'])
     ops['vpsllq'] = ops['vpsrlq']
-    ops['vpbroadcastd_mask'] = ops['vpblendmd']
+    ops['vpbroadcastd_mask'] = machine.ops.get(('vpbroadcastd{k}', 512), ops['vpblendmd'])
     ops['vpermd'] = machine.ops[('vpermd', 512)]
     cost = {}
     for m, o in ops.items():
@@ -67,8 +70,30 @@ def model(machine: machines.Machine) -> dict[str, Cost]:
     return cost
 
 
+def split_load_slots(machine: machines.Machine) -> int:
+    """Load slots of a zmm load across a cache line (4 bytes past a 64-byte boundary): measured
+    on Zen 5 (2); 1 where not measured."""
+    split, whole = machine.ops.get(('vmovdqu64 load split', 512)), machine.ops.get(('vmovdqu64 load', 512))
+    return round(split.throughput / whole.throughput) if split and whole else 1
+
+
+# The machine the scheduler models (use()): its costs, the load slots of a load across a line,
+# whether an op's uops go to pipes by a matching over the cycle's ops (Zen 5: classes that share
+# pipes) or each to the first free pipe of its list, and whether it takes only ops that keep the
+# source order feasible (Liveness: no register deadlock). Emerald Rapids keeps the scheduler #150
+# tuned its kernels with: first free pipe, a load op counted as two load slots, no feasibility.
 MACHINE = machines.MACHINES['avx512']
 COST = model(MACHINE)
+SPLIT_LOADS, MATCHING, FEASIBLE, LOAD_OP_EXTRA = 1, False, False, 1
+
+
+def use(target):
+    global MACHINE, COST, SPLIT_LOADS, MATCHING, FEASIBLE, LOAD_OP_EXTRA
+    MACHINE = machines.MACHINES[target]
+    COST = model(MACHINE)
+    SPLIT_LOADS = split_load_slots(MACHINE)
+    emr = target == 'avx512'
+    MATCHING, FEASIBLE, LOAD_OP_EXTRA = not emr, not emr, int(emr)
 LOADS = {'vmovdqu64', 'vpbroadcastd'}
 COMMUTATIVE = {'vpaddd', 'vpaddq', 'vpminud', 'vpmuludq', 'vpmulld'}
 TIED = {'vpermt2d', 'vpermi2d', 'vpbroadcastd_mask'}  # the result overwrites srcs[0]
@@ -111,7 +136,12 @@ class Op:
         return [s for s in self.srcs if s.kind == 'reg']
 
     def loads(self):
-        return sum(1 for s in self.srcs if s.in_memory) + (self.unit() == 'load')
+        """Load slots: a vector 4 bytes past a 64-byte boundary (the odd words' loads) takes
+        SPLIT_LOADS (operands are 64-byte aligned plus their displacement). A load op counts
+        LOAD_OP_EXTRA more (Emerald Rapids: 1, as #150 tuned its kernels)."""
+        def slots(v):
+            return SPLIT_LOADS if v.kind == 'mem' and v.mem[3] % 64 else 1
+        return sum(slots(s) for s in self.srcs if s.in_memory) + (LOAD_OP_EXTRA if self.unit() == 'load' else 0)
 
 
 def mem(base, disp=0, index=None, scale=1):
@@ -247,6 +277,9 @@ class Knobs:
     load_latency: int = 7       # modeled cycles
     loads_per_cycle: int = 2
     window: Optional[int] = None  # issue only among the next `window` ops in source order
+    model: Optional[str] = None   # schedule on this target's model and scheduler (default: the output's)
+    latency_scale: float = 1.0    # vector ops' modeled latencies times this
+    width: Optional[int] = None   # at most this many vector uops per modeled cycle
 
 
 def latency(o, knobs):
@@ -254,7 +287,10 @@ def latency(o, knobs):
         return knobs.load_latency
     if o.unit() == 'store':
         return 1
-    return COST[o.mnemonic].latency + (knobs.load_latency if any(s.in_memory for s in o.srcs) else 0)
+    lat = COST[o.mnemonic].latency
+    if knobs.latency_scale != 1.0:
+        lat = max(1, round(lat * knobs.latency_scale))
+    return lat + (knobs.load_latency if any(s.in_memory for s in o.srcs) else 0)
 
 
 def memory_accesses(o):
@@ -274,6 +310,108 @@ def overlap(xs, ys):
     group, at least 128 bytes apart: a load 4 bytes on reads one word of the next quarter, whose
     lane (odd) no op uses."""
     return any(x[:3] == y[:3] and x[3] < y[4] and y[3] < x[4] for x in xs for y in ys)
+
+
+class Liveness:
+    """Values live while ops (in source order) are taken out of order. feasible(o): after taking
+    o, the ops not yet taken can still follow in source order with at most `budget` values live, so
+    a scheduler that takes only feasible ops cannot deadlock (gen_neon_kernels.py's rule, #151)."""
+
+    def __init__(self, ops, budget):
+        self.ops, self.budget, self.index = ops, budget, {o: i for i, o in enumerate(ops)}
+        self.uses = {}
+        for o in ops:
+            for s in o.reg_srcs():
+                self.uses[s] = self.uses.get(s, 0) + 1
+        self.taken, self.live, self.head = [False] * len(ops), 0, 0
+
+    def growth(self, o, uses):
+        srcs = o.reg_srcs()
+        return int(o.dst is not None) - sum(1 for s in set(srcs) if uses[s] == srcs.count(s))
+
+    def feasible(self, o):
+        grow = self.growth(o, self.uses)
+        if grow <= 0:
+            return True
+        live, uses, i = self.live + grow, dict(self.uses), self.index[o]
+        if live > self.budget:
+            return False
+        for s in o.reg_srcs():
+            uses[s] -= 1
+        for j in range(self.head, len(self.ops)):
+            if self.taken[j] or j == i:
+                continue
+            live += self.growth(self.ops[j], uses)
+            if live > self.budget:
+                return False
+            for s in self.ops[j].reg_srcs():
+                uses[s] -= 1
+        return True
+
+    def take(self, o):
+        self.live += self.growth(o, self.uses)
+        for s in o.reg_srcs():
+            self.uses[s] -= 1
+        self.taken[self.index[o]] = True
+        while self.head < len(self.ops) and self.taken[self.head]:
+            self.head += 1
+
+
+def peak_live(ops):
+    """The most values live at once when ops run in this order."""
+    uses = {}
+    for o in ops:
+        for s in o.reg_srcs():
+            uses[s] = uses.get(s, 0) + 1
+    live = top = 0
+    for o in ops:
+        srcs = o.reg_srcs()
+        live += int(o.dst is not None) - sum(1 for s in set(srcs) if uses[s] == srcs.count(s))
+        top = max(top, live)
+        for s in srcs:
+            uses[s] -= 1
+    return top
+
+
+def lean_order(ops, preds, after):
+    """A topological order (data and ordering edges) that takes, at each step, the ready op that
+    grows the live set least (then the earliest): for interleaved graphs (multiply_both) whose
+    source order needs more registers than there are."""
+    index = {o: i for i, o in enumerate(ops)}
+    uses = {}
+    for o in ops:
+        for s in o.reg_srcs():
+            uses[s] = uses.get(s, 0) + 1
+    done, out, rest = set(), [], list(ops)
+    while rest:
+        ready = [o for o in rest if all(p in done for p in preds[o]) and all(u in done for u in after[o])]
+
+        def growth(o):
+            srcs = o.reg_srcs()
+            return int(o.dst is not None) - sum(1 for s in set(srcs) if uses[s] == srcs.count(s))
+        o = min(ready, key=lambda o: (growth(o), index[o]))
+        for s in o.reg_srcs():
+            uses[s] -= 1
+        done.add(o)
+        out.append(o)
+        rest.remove(o)
+    return out
+
+
+def assignable(sets):
+    """Whether uops with these pipe sets can each take a pipe of its set, one uop per pipe
+    (augmenting paths)."""
+    owner = {}
+
+    def place(i, seen):
+        for p in sets[i]:
+            if p not in seen:
+                seen.add(p)
+                if p not in owner or place(owner[p], seen):
+                    owner[p] = i
+                    return True
+        return False
+    return all(place(i, set()) for i in range(len(sets)))
 
 
 def schedule(ops, budget, knobs):
@@ -314,10 +452,16 @@ def schedule(ops, budget, knobs):
     pipes = MACHINE.vector_pipes
     issued_at, order, remaining, live, cycle, stall = {}, [], list(ops), 0, 0, 0
     finish = {}
+    lv = None
+    if FEASIBLE:  # the reference order: the source order if it fits the budget
+        lv = Liveness(ops if peak_live(ops) <= budget else lean_order(ops, preds, after), budget)
     while remaining:
         free = {p: 1 for p in pipes}
         free['load'], free['store'] = knobs.loads_per_cycle, 1
+        uops = []  # MATCHING: the pipe sets of the uops issued this cycle
         candidates = remaining[:knobs.window] if knobs.window else remaining
+        if lv and knobs.window and lv.ops[lv.head] not in candidates:  # the reference order's next op
+            candidates = candidates + [lv.ops[lv.head]]
         ready = [o for o in candidates if all(p in finish and finish[p] <= cycle for p in preds[o])
                  and all(u in issued_at for u in after[o])]
 
@@ -334,7 +478,13 @@ def schedule(ops, budget, knobs):
             if free['load'] < loads:
                 continue
             taken = []
-            if o.unit() == 'vector':
+            if o.unit() == 'vector' and MATCHING:
+                cost = COST[o.mnemonic]
+                if knobs.width and len(uops) + cost.uops > knobs.width:
+                    continue
+                if not assignable(uops + [cost.pipes] * cost.uops):
+                    continue
+            elif o.unit() == 'vector':
                 cost = COST[o.mnemonic]
                 for _ in range(cost.uops):
                     p = next((p for p in cost.pipes if free.get(p, 0) > taken.count(p)), None)
@@ -346,10 +496,14 @@ def schedule(ops, budget, knobs):
             elif o.unit() == 'store' and free['store'] == 0:
                 continue
             dying, new = delta(o)
-            if live - dying + new > budget:
+            if live - dying + new > budget or (lv and not lv.feasible(o)):
                 continue
+            if lv:
+                lv.take(o)
             for p in taken:
                 free[p] -= 1
+            if o.unit() == 'vector' and MATCHING:
+                uops += [COST[o.mnemonic].pipes] * COST[o.mnemonic].uops
             if o.unit() == 'store':
                 free['store'] -= 1
             free['load'] -= loads
@@ -455,7 +609,13 @@ def asm_lines(lines, indent='        '):
 def compile_graph(g, reserved, knobs):
     g.finish()
     regs = [r for r in range(32) if r not in reserved]
-    seq = schedule(g.ops, len(regs), knobs)
+    target = MACHINE.target
+    if knobs.model:
+        use(knobs.model)
+    try:
+        seq = schedule(g.ops, len(regs), knobs)
+    finally:
+        use(target)
     reg = allocate(seq, regs)
     return [emit(o, reg) for o in seq]
 
@@ -630,51 +790,83 @@ def bottom_consts(twiddles):
     return {name: Value('fixed', reg=r) for name, r in fixed.items()}
 
 
-def pair_twiddles(g, x, y):
+def pair_twiddles(g, x, y, p=0):
+    """The twiddles of a pair at x, y; p > 0: pair p of groups k + 2p, k + 2p + 1 with k a multiple
+    of 2 * pairs (pairs <= 4), entries 2p and 4p on from x's and y's: in x's block, and in y's or
+    the next one ('bcst' only)."""
     if g.twiddles == 'perm':
         xs, ys = g.at(x, 0), g.at(y, 0)
         perm = lambda table, lanes: g.op('vpermd', table, g.c[lanes])
         return {'X': (perm(xs, 'XW'), perm(xs, 'XQ')), 'Y': (perm(ys, 'YW'), perm(ys, 'YQ')),
                 'Z': (perm(ys, 'ZW'), perm(ys, 'ZQ'))}
-    return {'X': (g.halves(x, 0, 4), g.halves(x, 32, 36)), 'Y': (g.halves(y, 0, 8), g.halves(y, 32, 40)),
-            'Z': (g.halves(y, 4, 12), g.halves(y, 36, 44))}
+    dx, dy = 8 * p, 4 * (4 * p // 8 * 16 + 4 * p % 8)  # slot() offsets in bytes
+    return {'X': (g.halves(x, dx, dx + 4), g.halves(x, dx + 32, dx + 36)),
+            'Y': (g.halves(y, dy, dy + 8), g.halves(y, dy + 32, dy + 40)),
+            'Z': (g.halves(y, dy + 4, dy + 12), g.halves(y, dy + 36, dy + 44))}
 
 
-def load_pair(g, base):
-    """The quarter vectors of the 64 words at base (two groups)."""
-    z = [g.at(base, 64 * i) for i in range(4)]
+def load_pair(g, base, disp=0):
+    """The quarter vectors of the 64 words disp bytes past base (two groups)."""
+    z = [g.at(base, disp + 64 * i) for i in range(4)]
     lo, hi = g.c['LO'], g.c['HI']
     return [g.op('vpermt2d', g.load(z[0]), lo, z[2]), g.op('vpermt2d', g.load(z[0]), hi, z[2]),
             g.op('vpermt2d', g.load(z[1]), lo, z[3]), g.op('vpermt2d', g.load(z[1]), hi, z[3])]
 
 
-def store_pair(g, base, q):
+def store_pair(g, base, q, disp=0):
     """load_pair undone: words [16i, 16i + 16) from quarters (q[0], q[1]) and (q[2], q[3]). By
     vpermi2d, or ('mask') by 8 stores of half vectors under masks (no shuffle uops)."""
     if g.ostore == 'mask':
         for t, v in enumerate(q):  # quarter t: words [8t, 8t + 8) of group k, [32 + 8t, ...) of k + 1
-            g.ops.append(Op('vmovdqu32', None, [v], store=mem(base, 32 * t), mask='lo'))
-            g.ops.append(Op('vmovdqu32', None, [v], store=mem(base, 96 + 32 * t), mask='hi'))
+            g.ops.append(Op('vmovdqu32', None, [v], store=mem(base, disp + 32 * t), mask='lo'))
+            g.ops.append(Op('vmovdqu32', None, [v], store=mem(base, disp + 96 + 32 * t), mask='hi'))
         return
     lo, hi = g.c['LO'], g.c['HI']
     for i, (u, v, idx) in enumerate([(q[0], q[1], lo), (q[2], q[3], lo), (q[0], q[1], hi), (q[2], q[3], hi)]):
-        g.store(g.op('vpermi2d', g.load(INDEX[idx is hi]), u, v), mem(base, 64 * i))
+        g.store(g.op('vpermi2d', g.load(INDEX[idx is hi]), u, v), mem(base, disp + 64 * i))
 
 
 INDEX = {False: Value('mem', mem=mem('ix', 0)), True: Value('mem', mem=mem('ix', 64))}  # LO, HI in memory
 
 
-def bottom_forward(g):
-    """Forward butterflies of groups k, k + 1 at a, in < 4P; canonical leaves out."""
-    tw = pair_twiddles(g, 'x', 'y')
-    out = forward4(g, load_pair(g, 'a'), tw)
-    store_pair(g, 'a', [g.canonical(g.low(v)) for v in out])
+def bottom_forward(g, pairs=1):
+    """Forward butterflies of groups k, k + 1 at a, in < 4P; canonical leaves out. More pairs (k a
+    multiple of 2 pairs): pair p (groups k + 2p, k + 2p + 1) at a + 64 p words."""
+    for p in range(pairs):
+        out = forward4(g, load_pair(g, 'a', 256 * p), pair_twiddles(g, 'x', 'y', p))
+        store_pair(g, 'a', [g.canonical(g.low(v)) for v in out], 256 * p)
 
 
-def bottom_inverse(g):
-    """Inverse butterflies of groups k, k + 1 at a, in and out < 2P (inverse table)."""
-    tw = pair_twiddles(g, 'x', 'y')
-    store_pair(g, 'a', inverse4(g, load_pair(g, 'a'), tw))
+def bottom_inverse(g, pairs=1):
+    """Inverse butterflies of groups k, k + 1 at a, in and out < 2P (inverse table). pairs: as
+    bottom_forward."""
+    for p in range(pairs):
+        store_pair(g, 'a', inverse4(g, load_pair(g, 'a', 256 * p), pair_twiddles(g, 'x', 'y', p)), 256 * p)
+
+
+def small_groups(g, inverse=False, identity_first=False, groups=4, odd_loads=False):
+    """Radix-4 groups k .. k + groups - 1 (k a multiple of groups, groups <= 4) on quarters of 32
+    words (two columns each), group i at a + 128 i words, in place: forward in < 4P, out < 4P;
+    inverse in and out < 2P. Twiddles of group i: x + 4 i bytes (r(k + i)), y + 8 i (r(2k + 2i)),
+    y + 8 i + 4 (r(2k + 2i + 1)), quotients 32 bytes on (x = t + slot(k), y = t + slot(2k)).
+    identity_first: group k is group 0 (x = y = 1, z at y + 4). odd_loads: the odd words of
+    quarters 2 and 3 from loads 4 bytes on (forward; 1.36x slower on Zen 5: loads across two
+    recent stores do not forward)."""
+    for i in range(groups):
+        identity = identity_first and i == 0
+        tw = {'X': (g.bcst('x', 4 * i), g.bcst('x', 4 * i + 32)), 'Y': (g.bcst('y', 8 * i), g.bcst('y', 8 * i + 32)),
+              'Z': (g.bcst('y', 8 * i + 4), g.bcst('y', 8 * i + 36))}
+        for c in range(2):
+            def quarter(t, extra=0):
+                return g.at('a', 512 * i + 64 * c + 128 * t + extra)
+            f = [quarter(t) for t in range(4)]
+            if inverse:
+                out = inverse_identity4(g, f, tw) if identity else inverse4(g, f, tw)
+            else:
+                odd = (lambda t: quarter(t, 4)) if odd_loads else (lambda t: None)
+                out = forward_identity4(g, f, tw, 4) if identity else forward4(g, f, tw, 4, odd)
+            for t, v in enumerate(out):
+                g.store(v, mem('a', 512 * i + 64 * c + 128 * t))
 
 
 # Leaf products of a pair: leaf t of each group is a polynomial mod x^8 - w_t, w_t = y, -y, z, -z
@@ -749,48 +941,54 @@ def bottom_multiply(g, square=False):
 LEAF_BUF = 768
 
 
-def multiply_first(g, square=False):
-    """square (or 'stored'): the rows of a alone."""
-    tw = pair_twiddles(g, 'x', 'y')
-    a = [g.canonical(g.low(v)) for v in forward4(g, load_pair(g, 'a'), tw)]
-    for t, (w, v) in enumerate(leaf_rows(g, a, tw)):
-        g.store(w, mem('buf', 128 * t))
-        g.store(v, mem('buf', 128 * t + 64))
-    if not square:
-        for t, v in enumerate(forward4(g, load_pair(g, 'b'), tw)):
-            g.store(g.canonical(g.low(v)), mem('buf', 512 + 64 * t))
+def multiply_first(g, square=False, pairs=1):
+    """square (or 'stored'): the rows of a alone. pairs = 2: groups k .. k + 3 (k a multiple of 4),
+    pair p at a + 64 p words (and b) into buf + LEAF_BUF p bytes."""
+    for p in range(pairs):
+        tw = pair_twiddles(g, 'x', 'y', p)
+        da, dbuf = 256 * p, LEAF_BUF * p
+        a = [g.canonical(g.low(v)) for v in forward4(g, load_pair(g, 'a', da), tw)]
+        for t, (w, v) in enumerate(leaf_rows(g, a, tw)):
+            g.store(w, mem('buf', dbuf + 128 * t))
+            g.store(v, mem('buf', dbuf + 128 * t + 64))
+        if not square:
+            for t, v in enumerate(forward4(g, load_pair(g, 'b', da), tw)):
+                g.store(g.canonical(g.low(v)), mem('buf', dbuf + 512 + 64 * t))
 
 
-def multiply_last(g, square=False):
-    """square: B_t is A_t; 'stored': B is a leaf form at bs (groups k, k + 1: 64 words)."""
-    c = []
-    for t in range(4):
-        w, a = g.at('cur', 128 * t), g.at('cur', 128 * t + 64)
-        win = {8: a}
-        for j in WINDOWS:
-            win[j] = g.op('vpermi2d', g.load(g.at('ix', 128 + 64 * WINDOWS.index(j))), w, a)
-        if square == 'stored':  # word i of B_t: bs + 32 t + 4 i (group k), 128 bytes on (group k + 1)
-            base, b0, b1 = 'bs', 32 * t, 128 + 32 * t
-        else:
-            bt = 128 * t + 64 if square else 512 + 64 * t
-            base, b0, b1 = 'cur', bt, bt + 32
-        e = o = None
-        for i in range(8):
-            b = g.halves(base, b0 + 4 * i, b1 + 4 * i)
-            pe, po = g.op('vpmuludq', win[8 - i], b), g.op('vpmuludq', win[9 - i], b)
-            e = pe if e is None else g.op('vpaddq', e, pe)
-            o = po if o is None else g.op('vpaddq', o, po)
-        ni, p = g.c['NI'], g.c['P']
-        e = g.op('vpaddq', e, g.op('vpmuludq', g.op('vpmuludq', e, ni), p))
-        o = g.op('vpaddq', o, g.op('vpmuludq', g.op('vpmuludq', o, ni), p))
-        c.append(g.low(g.join_high(e, o)))
-    store_pair(g, 'out', inverse4(g, c, pair_twiddles(g, 'ix_', 'iy_')))
+def multiply_last(g, square=False, pairs=1):
+    """square: B_t is A_t; 'stored': B is a leaf form at bs (groups k, k + 1: 64 words). pairs = 2:
+    pair p from cur + LEAF_BUF p bytes (and bs + 64 p words) to out + 64 p words."""
+    for p in range(pairs):
+        dcur, dout = LEAF_BUF * p, 256 * p
+        c = []
+        for t in range(4):
+            w, a = g.at('cur', dcur + 128 * t), g.at('cur', dcur + 128 * t + 64)
+            win = {8: a}
+            for j in WINDOWS:
+                win[j] = g.op('vpermi2d', g.load(g.at('ix', 128 + 64 * WINDOWS.index(j))), w, a)
+            if square == 'stored':  # word i of B_t: bs + 32 t + 4 i (group k), 128 bytes on (group k + 1)
+                base, b0, b1 = 'bs', dout + 32 * t, dout + 128 + 32 * t
+            else:
+                bt = dcur + (128 * t + 64 if square else 512 + 64 * t)
+                base, b0, b1 = 'cur', bt, bt + 32
+            e = o = None
+            for i in range(8):
+                b = g.halves(base, b0 + 4 * i, b1 + 4 * i)
+                pe, po = g.op('vpmuludq', win[8 - i], b), g.op('vpmuludq', win[9 - i], b)
+                e = pe if e is None else g.op('vpaddq', e, pe)
+                o = po if o is None else g.op('vpaddq', o, po)
+            ni, P = g.c['NI'], g.c['P']
+            e = g.op('vpaddq', e, g.op('vpmuludq', g.op('vpmuludq', e, ni), P))
+            o = g.op('vpaddq', o, g.op('vpmuludq', g.op('vpmuludq', o, ni), P))
+            c.append(g.low(g.join_high(e, o)))
+        store_pair(g, 'out', inverse4(g, c, pair_twiddles(g, 'ix_', 'iy_', p)), dout)
 
 
-def multiply_both(g, square=False, shift=0.0):
-    multiply_last(g, square)
+def multiply_both(g, square=False, shift=0.0, pairs=1):
+    multiply_last(g, square, pairs)
     split = len(g.ops)
-    multiply_first(g, square)
+    multiply_first(g, square, pairs)
     older, newer = g.ops[:split], g.ops[split:]
     keyed = [(i / len(older), 0, i, o) for i, o in enumerate(older)]
     keyed += [(j / len(newer) + shift, 1, j, o) for j, o in enumerate(newer)]
@@ -807,6 +1005,7 @@ class Bottom:
     join: str = 'perm'
     twiddles: str = 'bcst'  # pair twiddles by masked broadcasts ('bcst') or vpermd of a table block ('perm')
     ostore: str = 'perm'    # outputs transposed by vpermi2d ('perm') or stored in halves under masks ('mask')
+    in_place: bool = False  # writes a (a u32* parameter)
 
 
 ARG_TYPES = {'out': 'u32*', 'buf': 'u32*'}  # the others are read only
@@ -852,6 +1051,49 @@ for name, kind, first_args, last_args, what in STAGED:
 EMITTED_BOTTOMS = tuple(f'{name}_{part}' for name, *_ in STAGED for part in ('first', 'last', 'both')
                         if not (name == 'stored' and part == 'first'))  # stored_first is square_first
 
+# zen5_kernels.hpp (notes/152-r1.md): every loop, on the Zen 5 model, 4 columns per iteration (8
+# for inverse identity groups), no window; forward groups of two columns 4 per statement; the
+# bottom level in statements of 4 and 2 pairs; the product bottoms in stages, one pair each. Knobs
+# from timing families on lc-zen5, kernels on L1 data, against intrinsics<Avx512>: forward groups
+# 0.87, inverse 0.89, forward identity 0.86, inverse identity 0.91, two-column forward groups 0.77;
+# bottom forward 0.80 (4 pairs), inverse 0.85; product bottom 0.91, square 0.82. The product
+# bottom keeps a schedule on the Emerald Rapids model (model='avx512'): 0.91 against 0.93 at best
+# on the Zen 5 model (28 knob settings).
+ZEN5_LOOP_DOC = dict(LOOP_DOC, inverse=LOOP_DOC['inverse'] + ' columns a multiple of 4.',
+                     forward_identity=LOOP_DOC['forward_identity'] + ' columns a multiple of 4.',
+                     inverse_identity=LOOP_DOC['inverse_identity'] + ' columns a multiple of 8.')
+ZEN5_LOOPS = [replace(l, columns=8 if l.name == 'inverse_identity' else 4, doc=ZEN5_LOOP_DOC[l.name]) for l in LOOPS]
+
+
+def zen5_bottoms():
+    named = {b.name: b for b in BOTTOMS}
+    out = []
+    for name, build in (('bottom_forward', bottom_forward), ('bottom_inverse', bottom_inverse)):
+        base = named[name]
+        for pairs in (2, 4):
+            doc = (f'{base.doc}\n{name}{pairs}(): {pairs} such pairs, k a multiple of {2 * pairs}: pair p (groups k + 2p, k + 2p + 1)\n'
+                   f'at a + 64 p words.')
+            out.append(replace(base, name=f'{name}{pairs}', doc=doc, knobs=Knobs(), twiddles='bcst', ostore='perm',
+                               build=lambda g, build=build, pairs=pairs: build(g, pairs), in_place=True))
+    for name, inverse, window in (('forward_groups4', False, 128),):
+        doc = (f'{"Inverse" if inverse else "Forward"} radix-4 groups k .. k + 3 (k a multiple of 4) on quarters of 32 words, group\n'
+               f'k + i at a + 128 i words, in place; {"in and out < 2P" if inverse else "in < 4P, out < 4P"}. x = t + slot(k), y = t + slot(2k)\n'
+               f'({"ir" if inverse else "r"}). {name}_first(): k = 0 (group 0 the identity).')
+        for suffix, first in (('_first', True), ('', False)):
+            out.append(Bottom(name + suffix, lambda g, inverse=inverse, first=first: small_groups(g, inverse, first),
+                              ['a', 'x', 'y'], doc if not first else f'{name}() for k = 0.', Knobs(window=window), in_place=True))
+    # The product bottoms one pair per stage. Two pairs per stage (multiply_first(g, kind, 2) ...)
+    # ran 0.88 of the intrinsics' time on L1 data against 0.91, but whole products 2-10% slower
+    # (twice the code: notes/152-r1.md).
+    for b in BOTTOMS:
+        if b.name in EMITTED_BOTTOMS:
+            knobs = Knobs(window=64, model='avx512') if b.name.startswith('multiply') else Knobs(window=64)
+            out.append(replace(b, knobs=knobs))
+    return out
+
+
+ZEN5_BOTTOMS = zen5_bottoms()
+
 
 def index_table():
     """kIndex rows: LO, HI, the windows 1-7 and 9, NI (broadcast), J, the twiddle lanes, P, 2P, and
@@ -885,7 +1127,8 @@ def bottom_function(bottom):
     """The masks are operands (a kmovw costs a p5 uop, measured: notes/150-r1.md), so a caller's
     loop keeps them in mask registers."""
     body = bottom_body(bottom)
-    params = ', '.join(f'{ARG_TYPES.get(a, "const u32*")} {a}' for a in bottom.args)
+    params = ', '.join(f'{"u32*" if bottom.in_place and a == "a" else ARG_TYPES.get(a, "const u32*")} {a}'
+                       for a in bottom.args)
     lines = [f'// {line}' for line in bottom.doc.split('\n')]
     lines += [f'[[gnu::always_inline]] inline void {bottom.name}({params}, __mmask16 lo = 0x00ff, __mmask16 hi = 0xff00,',
               '                                            __mmask16 odd = 0xaaaa) {', '    asm volatile(']
@@ -914,7 +1157,7 @@ HEADER = '''\
 #include <cstddef>
 #include <cstdint>
 
-namespace fps::ntt::avx512_kernels {{
+namespace fps::ntt::{namespace} {{
 
 using u32 = std::uint32_t;
 
@@ -924,40 +1167,56 @@ inline constexpr std::size_t kLeafBuffer = {leaf_words};  // words of a leaf buf
 alignas(64) inline constexpr u32 kJoin[16] = {{1, 17, 3, 19, 5, 21, 7, 23, 9, 25, 11, 27, 13, 29, 15, 31}};
 '''
 
-def generate():
-    lines = HEADER.format(cpu=MACHINE.cpu, leaf_words=LEAF_BUF // 4).split('\n')
+@dataclass
+class Output:
+    """A header of kernels scheduled for one target's machine (use(target))."""
+    target: str
+    path: Path
+    namespace: str
+    loops: list           # Loop, emitted in this order
+    prefetched: tuple     # names of loops emitted with a prefetching form too
+    bottoms: list         # Bottom
+
+
+def generate(out):
+    use(out.target)
+    lines = HEADER.format(cpu=MACHINE.cpu, leaf_words=LEAF_BUF // 4, namespace=out.namespace).split('\n')
     rows = index_table()
     lines += ['// The bottoms\' constants (index_table() in the generator): the vpermt2d and vpermi2d indices of',
               '// the transposes (LO, HI) and windows (1-7 and 9), -1 / P mod 2^32, join_high\'s index, the',
               '// twiddle lanes, P, 2P, and the masks 0xff00 and 0xaaaa.',
               f'alignas(64) inline constexpr u32 kIndex[{len(rows)}][16] = {{']
     lines += ['    {' + ', '.join(str(x) for x in r) + '},' for r in rows] + ['};', '']
-    for loop in LOOPS:
-        if loop.name not in EMITTED_LOOPS:
-            continue
+    for loop in out.loops:
         lines += loop_function(loop) + ['']
-        if loop.name in PREFETCHED:
+        if loop.name in out.prefetched:
             lines += loop_function(with_prefetch(loop)) + ['']
-    for bottom in BOTTOMS:
-        if bottom.name not in EMITTED_BOTTOMS:
-            continue
+    for bottom in out.bottoms:
         lines += bottom_function(bottom) + ['']
-    lines += ['}  // namespace fps::ntt::avx512_kernels']
+    lines += [f'}}  // namespace fps::ntt::{out.namespace}']
     return '\n'.join(lines) + '\n'
+
+
+OUTPUTS = [
+    Output('avx512', OUT, 'avx512_kernels', [l for l in LOOPS if l.name in EMITTED_LOOPS], PREFETCHED,
+           [b for b in BOTTOMS if b.name in EMITTED_BOTTOMS]),
+    Output('zen5', HERE / 'zen5_kernels.hpp', 'zen5_kernels', ZEN5_LOOPS, (), ZEN5_BOTTOMS),
+]
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
-    text = generate()
-    if args.check:
-        if not OUT.exists() or OUT.read_text() != text:
-            print(f'{OUT.name} is stale: run {Path(__file__).name}')
-            return 1
-        return 0
-    OUT.write_text(text)
-    return 0
+    stale = 0
+    for out in OUTPUTS:
+        text = generate(out)
+        if not args.check:
+            out.path.write_text(text)
+        elif not out.path.exists() or out.path.read_text() != text:
+            print(f'{out.path.name} is stale: run {Path(__file__).name}')
+            stale = 1
+    return stale
 
 
 if __name__ == '__main__':
