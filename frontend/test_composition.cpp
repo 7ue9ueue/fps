@@ -352,13 +352,20 @@ void test_errors() {
 }
 
 // At the limits: the largest sizes the checks above pass, n = 2^23, through every level of the
-// kernel. Vector targets at -O2 only (scalar: minutes; ASan: gigabytes more). The kernel keeps its
-// work per thread (about 3.3 GiB for compose at n = 2^23), so each part runs in a thread of its
-// own, which frees it on exit.
+// kernel. Vector targets at -O2 only (scalar: minutes; ASan: gigabytes more), and not sse: the
+// gate tests sse and avx2 at once on lc-amd (16 GB), and two copies peaking at 4.2 GB each beside
+// the builds could run it out of memory. The kernel keeps its work per thread (about 3.3 GiB for
+// compose at n = 2^23), so each part runs in a thread of its own, which frees it on exit.
 void in_thread(auto f) { std::thread(f).join(); }
 
+#if defined(__SSE4_1__) && !defined(__AVX2__)
+constexpr bool kSseTarget = true;
+#else
+constexpr bool kSseTarget = false;
+#endif
+
 void test_limits() {
-    if (kSanitized || std::is_same_v<fps::simd::Native, fps::simd::Scalar>) return;
+    if (kSanitized || kSseTarget || std::is_same_v<fps::simd::Native, fps::simd::Scalar>) return;
     constexpr std::size_t n = fps::composition::kMaxSize;
     // compose: f = 1 + y + y^2, g of n random words with g[0] != 0 (the Taylor shift, then the
     // kernel): 1 + g + g^2.
