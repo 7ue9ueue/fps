@@ -29,8 +29,9 @@
 // steps while p and q are short (76 to 96 words by target), steps in the NTT's values form beyond:
 // O(d log d log k), d the larger of p.size() and q.size(). Nothing is cached: each [k] is a full
 // computation; for many small indices, call take(n) once. k = 10^18: 0.8 to 1.2 us for
-// Fibonacci; d = 10^5: 21 ms (Zen 5) to 59 ms (Neoverse V2) (frontend/notes/191.md). The kernel
-// keeps its arrays per thread and allocates only for a call longer than the thread's earlier ones.
+// Fibonacci; d = 10^5: 21 to 59 ms, d = 2^20: 0.36 to 1.06 s (Zen 5 to Neoverse V2;
+// frontend/notes/191.md). The kernel keeps its arrays per thread and allocates only for a call
+// longer than the thread's earlier ones.
 //
 // take(n) = mul(p, inverse(q, n), n) (fps/products.hpp, fps/series.hpp): inverse runs a linear
 // recurrence, O(n t), for a q with t <= 16 nonzero terms past q[0], Newton iteration otherwise.
