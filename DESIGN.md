@@ -247,7 +247,7 @@ Costs, with d the larger of deg p and deg q:
 
 | Operation | Cost |
 |---|---|
-| `f[k]` | O(d log d log k). k = 10^18: 3-6 us for Fibonacci, 6-16 us at d = 16; d = 10^5: 120 products of factors of about d, 44 ms (Zen 5), 86-92 ms (Emerald Rapids), 94 ms (Zen 3), 167 ms (Neoverse V2), measured (#23); a Bostan-Mori kernel is #114 |
+| `f[k]` | O(d log d log k), one call into the Bostan-Mori kernel (`backend/bostan_mori`). k = 10^18: 0.8-1.2 us for Fibonacci, 2.7-4.4 us at d = 16; d = 10^5: 20.6 ms (Zen 5), 37.9 ms (Zen 3), 39.7 ms (Emerald Rapids), 59.4 ms (Neoverse V2), 2.0-2.5x faster than the frontend's own loop of two products per step (#191) |
 | `take(n)` | `mul(p, inverse(q, n), n)`; `inverse` runs a recurrence, O(n t), for q with t <= 16 nonzero terms past q[0] |
 | `a + b`, `a * b`, `a / b` | Three (`a + b`, `a - b`), two (`a * b`, `a / b`) or one (`a / f`, `f * a`) polynomial products; the degrees add |
 
