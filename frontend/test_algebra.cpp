@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <numeric>
 #include <random>
 #include <span>
 #include <stdexcept>
@@ -251,6 +252,45 @@ void test_inverse_mod() {
     CHECK(!fps::inverse_mod(Poly{}, Poly{1, 1}).has_value() && !fps::inverse_mod(Poly{0, 1}, Poly{0, 1}).has_value());
 }
 
+// Past the half-gcd's Euclid (backend/gcd runs Euclid on jumps of at most 64 degrees, transforms
+// above): sizes 2^k - 1 .. 2^k + 1 against naive Euclid, with and without a common factor, and
+// inverse_mod by f h = 1 mod m; long quotients (x^a - 1, x^b - 1); a known common factor of
+// degree 1500 in polynomials of 2^12 + 1 coefficients.
+void test_long() {
+    for (const std::size_t k : {7, 9, 11}) {
+        for (const std::size_t n : {(std::size_t(1) << k) - 1, std::size_t(1) << k, (std::size_t(1) << k) + 1}) {
+            const std::size_t m = n - rng() % (n / 2);
+            Vec f = random_degree(n - 1), g = random_degree(m - 1);
+            const auto h = fps::inverse_mod(poly(f), poly(g));
+            CHECK(h && h->size() == m - 1 && naive_mod(naive_mul(f, vec(*h)), g) == Vec{1}, n, m);
+            CHECK(vec(fps::gcd(poly(f), poly(g))) == Vec{1}, n, m);
+            // A common factor c: gcd(f c, g c) = monic c (f, g coprime above), and no inverse.
+            const Vec c = random_degree(1 + rng() % (m / 2));
+            f = naive_mul(f, c), g = naive_mul(g, c);
+            const Vec want = naive_gcd(f, g);
+            CHECK(want == monic(c), n, m);
+            CHECK(vec(fps::gcd(poly(f), poly(g))) == want, n, m, c.size());
+            CHECK(vec(fps::gcd(poly(g), poly(f))) == want, n, m, c.size());
+            CHECK(!fps::inverse_mod(poly(f), poly(g)).has_value(), n, m);
+        }
+    }
+    // gcd(x^a - 1, x^b - 1) = x^gcd(a, b) - 1: quotients of a - b words, then of many.
+    for (const auto& [a, b] : {std::pair{4096, 1536}, {5000, 3001}, {65, 64}, {3000, 2999}}) {
+        const Poly fa = Poly::x(std::size_t(a)) - 1, fb = Poly::x(std::size_t(b)) - 1;
+        const Poly want = Poly::x(std::size_t(std::gcd(a, b))) - 1;
+        CHECK(vec(fps::gcd(fa, fb)) == vec(want), std::size_t(a), std::size_t(b));
+        CHECK(!fps::inverse_mod(fa, fb).has_value(), std::size_t(a));
+    }
+    const Vec c = random_degree(1500), a = random_degree(2596), b = random_degree(2595);
+    const Poly fa = poly(a) * poly(c), fb = poly(b) * poly(c);
+    CHECK(fa.size() == 4097 && vec(fps::gcd(fa, fb)) == monic(c));
+    // Trailing zeros past the transforms' 2^25 words: only the degree counts.
+    Poly z(std::size_t(1 << 25) + 3);
+    z[0] = 3, z[1] = 1;
+    CHECK(vec(fps::gcd(z, Poly{6, 2, 0})) == (Vec{3, 1}));
+    CHECK(vec(*fps::inverse_mod(z, Poly{0, 1})) == Vec{inv(3)});
+}
+
 u32 non_square() {
     u32 z = 2;
     while (power(z, (P - 1) / 2) == 1) ++z;
@@ -417,6 +457,27 @@ void test_errors() {
         CHECK(throws<domain_error>([&] { (void)fps::factor(big); }));
     }
     CHECK(!throws<domain_error>([] { (void)fps::gcd(Poly{}, Poly(3)); }));
+    // Degree 2^25, past the half-gcd's transforms: reduced first by division when the other input
+    // is within them. x^(2^25) - 1 has x^2 - 1 and x^2 + 1 as factors (4 divides 2^25).
+    {
+        using std::length_error;
+        const std::size_t D = std::size_t(1) << 25;
+        Poly big(D + 1);
+        big[0] = P - 1, big[D] = 1;
+        CHECK(vec(fps::gcd(big, Poly{P - 1, 0, 1})) == (Vec{P - 1, 0, 1}));
+        CHECK(vec(fps::gcd(Poly{1, 0, 1}, big)) == (Vec{1, 0, 1}));
+        CHECK(vec(fps::gcd(big, Poly{2, 1})) == Vec{1});  // (-2)^(2^25) != 1
+        CHECK(vec(fps::gcd(big, Poly{3})) == Vec{1});
+        const Poly whole = fps::gcd(3 * big, Poly{});  // monic(3 big) = big
+        CHECK(whole.size() == D + 1 && whole[0] == P - 1 && whole[D] == 1 && whole[1] == 0);
+        CHECK(!fps::inverse_mod(big, Poly{1, 0, 1}));  // x^2 + 1 divides big
+        big[0] = 2;  // x^(2^25) + 2 = 1 + 2 = 3 mod x^2 + 1
+        const auto h = fps::inverse_mod(big, Poly{1, 0, 1});
+        CHECK(h && vec(*h) == (Vec{fps::mod_inverse<P>(3), 0}));
+        // Both past the limit, or m past it: the kernel's std::length_error.
+        CHECK(throws<length_error>([&] { (void)fps::gcd(big, big); }));
+        CHECK(throws<length_error>([&] { (void)fps::inverse_mod(Poly{1, 1}, big); }));
+    }
 }
 
 }  // namespace
@@ -424,6 +485,7 @@ void test_errors() {
 int main() {
     test_gcd();
     test_inverse_mod();
+    test_long();
     test_roots();
     test_factor();
     test_threads();

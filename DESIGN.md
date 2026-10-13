@@ -189,6 +189,11 @@ f = x^z u it runs u[0]^e (u / u[0])^e on the backend's power (#167), where only 
 below x^P. Past 2^25 coefficients of u's part, both run only for u of at most 16 terms past
 u[0] (a recurrence; n <= P); any other u throws `std::length_error` before writing.
 
+`gcd(f, g)` and `inverse_mod(f, m)` run the backend's half-gcd (lc-opt's, #103), O(n log^2 n).
+An input of degree 2^25 or more (its transforms' limit; trailing zeros do not count) is first
+reduced modulo the other by division if the other is within the limit, so `gcd(f, x + 1)` works
+for any f; both inputs past it, or m past it in `inverse_mod`, throw `std::length_error` (#168).
+
 `Factorials<P> fact(n)`, n <= P: `fact[i]` = i!, `fact.inverse(i)` = 1/i!, `fact.binomial(n, k)`
 = C(n, k) (0 for k > n), for i, n < `fact.size()`. n > P throws: P! = 0 has no inverse. Indices
 are not checked, as in `operator[]`.
