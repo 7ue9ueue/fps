@@ -272,7 +272,7 @@ Polynomial<P> compositional_inverse(const Polynomial<P>& f, std::size_t n) {
     for (std::size_t j = 0; j < N; ++j) h[j] = mod_mul<P>(r[N - j], projection[N - j]);
     // g / x = (1 / f[1]) (h / h[0])^(-1 / N) mod x^N.
     const std::uint32_t e = c::negate<P>(r[N]);
-    detail::series::power<P>(h, e, inverse1, g.span().subspan(1), detail::series::scratch(3 * N));
+    detail::series::power<P>(h, e, inverse1, g.span().subspan(1));
     g[0] = 0;
     return g;
 }

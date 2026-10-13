@@ -184,8 +184,10 @@ explicit, so a braced list such as `{1, 2, 3}` stays a list of points. The NTT b
 mod x^(n - k) and s[0] the smaller of the two square roots of u[0] in [0, P) (`sqrt(1 - 4x)` starts
 with 1). Its top k coefficients are free in g^2 = f mod x^n; this fixes them as if f had no terms
 past x^(n - 1). The zero polynomial for f mod x^n = 0; nullopt if the lowest nonzero term has an
-odd index or a coefficient that is not a square. `pow` needs n <= P, as `log` and `exp`: it runs
-(u / u[0])^e as exp(e log(u / u[0])), where only e mod P counts below x^P.
+odd index or a coefficient that is not a square. `pow` needs n <= P, as `log` and `exp`: for
+f = x^z u it runs u[0]^e (u / u[0])^e on the backend's power (#167), where only e mod P counts
+below x^P. Past 2^25 coefficients of u's part, both run only for u of at most 16 terms past
+u[0] (a recurrence; n <= P); any other u throws `std::length_error` before writing.
 
 `Factorials<P> fact(n)`, n <= P: `fact[i]` = i!, `fact.inverse(i)` = 1/i!, `fact.binomial(n, k)`
 = C(n, k) (0 for k > n), for i, n < `fact.size()`. n > P throws: P! = 0 has no inverse. Indices
