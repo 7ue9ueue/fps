@@ -74,8 +74,9 @@ d = 1024 (lg 11) 2.87 -> 1.76, 2.80 -> 2.09, 2.90 -> 2.18, 2.76 -> 1.77; d = 10^
 1.53 -> 0.62, 1.53 -> 0.69, 1.61 -> 0.82, 1.54 -> 0.66 (the scheme's four transforms of N are
 about 2/3 of one product's six of N, plus the values conversions and the pass).
 
-Parts of a step at N = 2^11 and 2^17 (`parts.cpp` in the exploration folder, ns, median of 3): the values
-conversions (join before the inverse, split after forward_upper) against the leaf-form ops:
+Parts of a step at N = 2^11 and 2^17 (`parts.cpp` in the exploration folder, ns, median of 3):
+the values conversions (join before the inverse, split after forward_upper) against the leaf-form
+ops:
 
 | | Zen 3 | Emerald Rapids | Zen 5 | Neoverse V2 |
 |---|---:|---:|---:|---:|
