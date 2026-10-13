@@ -141,7 +141,9 @@ What has worked here; deviate when you have a reason and say it.
   against `<op>@kernel`); speed work belongs in the backend. If an ergonomic call costs speed, keep
   a fast path (raw spans, plans, `Values`) and say so in the header.
 - Back speed claims with passing tests and a same-run measurement: median and spread, with CPU,
-  compiler, flags and commit.
+  compiler, flags and commit. Include a large size, n = 2^20, wherever the operation takes one:
+  times near 2^10 move by several percent with code layout alone (#93, #152), so a claim resting
+  only on small sizes is weak.
 - Test against a simple reference (O(n^2) or brute force) on sizes 0, 1, powers of two and their
   neighbours, and random inputs; `kernel.py test` adds ASan and UBSan.
 - Start simple; add generality when a real caller needs it. Readable C++23, short rare comments
