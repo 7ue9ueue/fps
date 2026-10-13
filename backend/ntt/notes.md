@@ -306,10 +306,16 @@ memory with inputs < 2P; inverse).
 - Product bottoms: two groups per asm statement, the forward half of pair j + 1 interleaved with
   the products of pair j through a leaf buffer; twiddles and B by element (`umlal v, x, b.s[i]`),
   quotients broadcast once per group. Group levels: an asm loop, 4 columns per iteration.
+- Round 2 (`notes/151-r2.md`): the same loops for the scaled top groups of subtrees
+  (`inverse_group_scaled`), the forward top group on canonical inputs, the inverse top group and
+  radix-2 level (in place and into a product's output: a boundary of 8 words reruns the last 16,
+  which read only the source); twiddles from a block of values and quotients. At 2^6 and 2^7 the
+  subtrees are single groups: `Generated::kJoinBottoms` makes the top levels run all their bottoms
+  in one call, so the pair kernels take them (products 0.74-0.81 there).
 - Against `intrinsics<Neon>` on L1 data: product bottom 0.74, group loops 0.84-0.91, transform
   bottoms 0.83 (forward) and 0.95 (inverse). Whole ops, same binary, 2^8-2^22: multiply and
-  products 0.80-0.84, forward 0.84-0.89, inverse 0.90-0.98; 2^6-2^7 unchanged (single-group
-  subtrees). `Native` is neon on arm. Attempts and numbers: `notes/151-r1.md`.
+  products 0.80-0.84, forward 0.84-0.89, inverse 0.90-0.98 (round 1; 2^6-2^7 then unchanged).
+  `Native` is neon on arm. Attempts and numbers: `notes/151-r1.md`, `notes/151-r2.md`.
 
 ### Variant selection (issue #78)
 

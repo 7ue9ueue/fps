@@ -7,7 +7,7 @@ budget, reordered so that its multiplies and other vector ops alternate (repatte
 onto v0-v28 by linear scan and emitted as one asm statement. The arithmetic is intrinsics.hpp's
 (Bottom<Neon>, Butterflies<Neon>): outputs equal the intrinsics' mod P, in the same ranges.
 
-Kernels (neon.hpp calls them; design and measurements in notes.md and notes/151-r1.md):
+Kernels (neon.hpp calls them; design and measurements in notes.md, notes/151-r1.md, 151-r2.md):
   bottom_first, bottom_last, bottom_both: the bottom stage of a product, two groups k, k + 1 (k
     even) per statement. first: forward butterflies of a and b (h = 1), the leaf rows [w_t A_t,
     A_t] and B_t into a leaf buffer; last: the 8 x 8 leaf products from the buffer (umull/umlal
@@ -18,6 +18,10 @@ Kernels (neon.hpp calls them; design and measurements in notes.md and notes/151-
   bottom_forward_pair, bottom_inverse_pair: the bottom level of a transform, two groups.
   forward_group, inverse_group (and _identity_, group 0; forward_group2: inputs < 2P from other
     memory): one radix-4 group on quarters of q words, an asm loop of 4 columns per iteration.
+  forward_top_group, inverse_top_group (and _identity_, _from, _to), inverse_scaled_group (and
+    _identity_), inverse_radix2_level (and _scaled, _to): the top levels and the scaled top groups
+    of the subtrees, loops as the group loops with their twiddles in a block (values, then
+    quotients 8 words on).
 
 Usage: gen_neon_kernels.py [--check] [--out FILE] [--knobs JSON]
   --check: exit 1 if neon_kernels.hpp differs from the output. --out, --knobs (exploration): write
@@ -191,6 +195,55 @@ def inverse_identity4(g, f, tw):
     return [g.low(g.add(ab, cd)), g.low(g.add(amb, cmd)), g.low_diff(ab, cd), g.low_diff(amb, cmd)]
 
 
+# Top and scaled groups (intrinsics.hpp: forward_identity_first<1>, inverse_group_scaled,
+# inverse_radix4). Twiddle names: s (the scale), sx, sy, sz (s times x, y, z), x, z.
+def forward_identity1(g, f, tw):
+    """forward_identity4 on canonical inputs (a transform's top group): no reductions; out < 4P."""
+    a, b, c, d = f
+    ac, amc, bd = g.add(a, c), g.sub(g.add(a, g.c['P']), c), g.add(b, d)
+    z = g.shoup(g.diff(b, d), *tw['z'])
+    return [g.add(ac, bd), g.diff(ac, bd), g.add(amc, z), g.diff(amc, z)]
+
+
+def inverse_scaled4(g, f, tw):
+    """inverse4 with every output times s (group k > 0 under the top level); in and out < 2P."""
+    ab, cd = g.low(g.add(f[0], f[1])), g.low(g.add(f[2], f[3]))
+    amb, cmd = g.shoup(g.diff(f[0], f[1]), *tw['sy']), g.shoup(g.diff(f[2], f[3]), *tw['sz'])
+    return [g.shoup(g.add(ab, cd), *tw['s']), g.low(g.add(amb, cmd)), g.shoup(g.diff(ab, cd), *tw['sx']),
+            g.shoup(g.diff(amb, cmd), *tw['x'])]
+
+
+def inverse_scaled_identity4(g, f, tw):
+    """inverse_scaled4 for k = 0 (sx = sy = s)."""
+    ab, cd = g.low(g.add(f[0], f[1])), g.low(g.add(f[2], f[3]))
+    amb, cmd = g.shoup(g.diff(f[0], f[1]), *tw['s']), g.shoup(g.diff(f[2], f[3]), *tw['sz'])
+    return [g.shoup(g.add(ab, cd), *tw['s']), g.low(g.add(amb, cmd)), g.shoup(g.diff(ab, cd), *tw['s']),
+            g.low_diff(amb, cmd)]
+
+
+def inverse_top4(g, f, tw):
+    """The inverse top group times s (inverse_radix4, s != 0): in < 2P, canonical out."""
+    ab, cd = g.low(g.add(f[0], f[1])), g.low(g.add(f[2], f[3]))
+    amb, cmd = g.shoup(g.diff(f[0], f[1]), *tw['s']), g.shoup(g.diff(f[2], f[3]), *tw['sz'])
+    return [g.canonical(g.shoup(g.add(ab, cd), *tw['s'])), g.canonical(g.low(g.add(amb, cmd))),
+            g.canonical(g.shoup(g.diff(ab, cd), *tw['s'])), g.canonical(g.low(g.diff(amb, cmd)))]
+
+
+def inverse_top_identity4(g, f, tw):
+    """The inverse top group without a scale (s = 0: folded into the groups below): canonical out."""
+    return [g.canonical(v) for v in inverse_identity4(g, f, tw)]
+
+
+# The inverse radix-2 level on halves x, y (intrinsics.hpp, inverse_radix2). The forward one (an add
+# and a subtract per pair) ran as fast as the intrinsics on L1 data: not generated.
+def inverse_radix2(g, f, tw):
+    """In < 2P, canonical out; times s if tw has it."""
+    x, y = f
+    if 's' in tw:
+        return [g.canonical(g.shoup(g.add(x, y), *tw['s'])), g.canonical(g.shoup(g.diff(x, y), *tw['s']))]
+    return [g.canonical(g.low(g.add(x, y))), g.canonical(g.low(g.diff(x, y)))]
+
+
 class Twiddles:
     """Twiddles of groups k + m (k even): x_m at x[m] (quotients 8 words on), y_m, z_m at yz[2m],
     yz[2m + 1]. Values are used by element; quotients broadcast (dup), as SVE2 umulh has no
@@ -328,13 +381,44 @@ BUTTERFLY = {'forward': forward4, 'forward_identity': forward_identity4, 'invers
              'forward_identity2': lambda g, f, tw: forward_identity4(g, f, tw, 2)}
 
 
-def group_loop(g, kind, columns, source=False):
+BUTTERFLY.update({'forward_identity1': forward_identity1, 'inverse_scaled': inverse_scaled4,
+                  'inverse_scaled_identity': inverse_scaled_identity4, 'inverse_top': inverse_top4,
+                  'inverse_top_identity': inverse_top_identity4, 'inverse_radix2': inverse_radix2, 'inverse_radix2_scaled': inverse_radix2})
+# Twiddles of the loops with a twiddle block (TwLoop): values in v28 (and v27 past 4), quotients
+# broadcast in the registers below; the body has the rest.
+TW_NAMES = {'forward_identity1': ['z'], 'inverse_scaled': ['s', 'sx', 'sy', 'sz', 'x'],
+            'inverse_scaled_identity': ['s', 'sz'], 'inverse_top': ['s', 'sz'], 'inverse_top_identity': ['z'],
+            'inverse_radix2': [], 'inverse_radix2_scaled': ['s']}
+WAYS = {'inverse_radix2': 2, 'inverse_radix2_scaled': 2}  # else 4 quarters
+
+
+def tw_layout(names):
+    """(twiddle map, first register not used by the body)."""
+    vectors = -(-len(names) // 4)
+    tw = {n: ((Value(28 - i // 4), i % 4), Value(28 - vectors - i)) for i, n in enumerate(names)}
+    return tw, 28 - vectors - len(names) + 1
+
+
+def prune(ops):
+    """ops without the ones whose results nothing uses (stores are used)."""
+    while True:
+        used = {s for o in ops for s in o.srcs}
+        kept = [o for o in ops if o.dst is None or o.dst in used]
+        if len(kept) == len(ops):
+            return ops
+        ops = kept
+
+
+def group_loop(g, kind, columns, source=False, tw=None, store=4, upper=False):
     """One iteration: columns c < columns at bytes 16 c of the quarters (read from s0..s3 if source,
-    else from f0..f3)."""
+    else from f0..f3). Outputs t < store to f0.. (upper: outputs 2 + t)."""
     for c in range(columns):
-        f = [g.load(f's{t}' if source else f'f{t}', 16 * c) for t in range(4)]
-        for t, v in enumerate(BUTTERFLY[kind](g, f, LOOP_TWIDDLES)):
-            g.store(v, f'f{t}', 16 * c)
+        f = [g.load(f's{t}' if source else f'f{t}', 16 * c) for t in range(WAYS.get(kind, 4))]
+        out = BUTTERFLY[kind](g, f, LOOP_TWIDDLES if tw is None else tw)
+        for t, v in enumerate(out[2:] if upper else out):
+            if t < store:
+                g.store(v, f'f{t}', 16 * c)
+    g.ops[:] = prune(g.ops)
     return g.ops
 
 
@@ -562,6 +646,21 @@ class Loop:
     source: bool = False  # quarters read from `from` (s0..s3), written to f
 
 
+@dataclass
+class TwLoop:
+    """An asm loop over columns whose twiddles come in a block tw: values tw[0..8), their Shoup
+    quotients tw[8..16), in the order of TW_NAMES[kind] (top groups, scaled groups)."""
+    name: str
+    kind: str
+    doc: str
+    source: bool = False  # quarters read from `from` (s0..s3), written to f
+    store: int = 4        # outputs t < store written, to quarters t of f
+    upper: bool = False   # outputs 2 + t to quarters t
+    columns: int = 4
+    knobs: Knobs = field(default_factory=lambda: Knobs(window=None, pattern='MA', pattern_window=32,
+                                                       pattern_stores='A'))
+
+
 FIRST_DOC = ('Forward half of the bottom stage for groups k, k + 1 (k even) of a{b}, inputs < 4P: buf gets\n'
              'their leaf rows{rows}. x = r + slot(k), yz = r + slot(2k).')
 LAST_DOC = ('Leaf products from the leaf buffers at cur0, cur1 (groups k, k + 1){of} and the inverse\n'
@@ -627,6 +726,23 @@ LOOPS = [
     Loop('forward_identity_group2', 'forward_identity2', 4, 'forward_identity_group() on inputs < 2P, read from `from`.',
          Knobs(**LOOP_KNOBS), True),
 ]
+TW_LOOPS = [
+    TwLoop('forward_top_group', 'forward_identity1', 'The top group of a forward transform (group 0, x = y = 1) on canonical inputs, in place:\n'
+           'columns [0, words / 4) of the quarters f + tq, out < 4P. tw: z. words a positive multiple of 16.'),
+    TwLoop('forward_top_group_from', 'forward_identity1', 'forward_top_group() from the quarters of `from` into f.', True),
+    TwLoop('inverse_scaled_group', 'inverse_scaled', 'Inverse group k > 0 with every output times s, in place, in and out < 2P. tw: s, s x, s y,\n'
+           's z, x (inverse twiddles of group k).'),
+    TwLoop('inverse_scaled_identity_group', 'inverse_scaled_identity', 'inverse_scaled_group() for k = 0. tw: s, s z.'),
+    TwLoop('inverse_top_group', 'inverse_top', 'The top group of an inverse transform times s, in place: in < 2P, canonical out. tw: s, s z.'),
+    TwLoop('inverse_top_identity_group', 'inverse_top_identity', 'inverse_top_group() without the scale. tw: z.'),
+    TwLoop('inverse_top_group_to', 'inverse_top', 'inverse_top_group() from the quarters of `from` into f.', True),
+    TwLoop('inverse_top_identity_group_to', 'inverse_top_identity', 'inverse_top_identity_group() from `from` into f.', True),
+    TwLoop('inverse_radix2_level', 'inverse_radix2', 'The radix-2 level of an inverse transform on the halves f, f + q, in place: in < 2P,\n'
+           'canonical out; columns [0, words / 4). words a positive multiple of 16.'),
+    TwLoop('inverse_radix2_level_scaled', 'inverse_radix2_scaled', 'inverse_radix2_level() times s. tw: s.'),
+    TwLoop('inverse_radix2_level_to', 'inverse_radix2', 'inverse_radix2_level() from the halves of `from` into f.', True),
+    TwLoop('inverse_radix2_level_scaled_to', 'inverse_radix2_scaled', 'inverse_radix2_level_scaled() from `from` into f.', True),
+]
 
 
 def function(k):
@@ -674,6 +790,40 @@ def loop_function(lp):
     return lines
 
 
+def twloop_function(lp):
+    names = TW_NAMES[lp.kind]
+    tw, regs = tw_layout(names)
+    g = Graph()
+    seq, cycles = order_ops(group_loop(g, lp.kind, lp.columns, lp.source, tw, lp.store, lp.upper), regs, lp.knobs)
+    reg = allocate(seq, regs)
+    vectors = -(-len(names) // 4)
+    head = ['dup v29.4s, %w[p]', 'dup v30.4s, %w[p2]']
+    if names:
+        head += ['ldr q28, [%[tw]]'] + (['ldr q27, [%[tw], #16]'] if vectors > 1 else [])
+        head += ['ldr q0, [%[tw], #32]'] + (['ldr q1, [%[tw], #48]'] if len(names) > 4 else [])
+        head += [f'dup v{28 - vectors - i}.4s, v{i // 4}.s[{i % 4}]' for i in range(len(names))]
+    head += ['.p2align 5', '1:']
+    ways = WAYS.get(lp.kind, 4)
+    dests = [f'f{t}' for t in range(min(lp.store, ways) if lp.source else ways)]
+    pointers = dests + ([f's{t}' for t in range(ways)] if lp.source else [])
+    tail = [f'add %[{x}], %[{x}], #{16 * lp.columns}' for x in pointers] + ['cmp %[f0], %[end]', 'b.ne 1b']
+    args = ('const std::uint32_t* from, ' if lp.source else '') + 'std::uint32_t* f, std::size_t q, std::size_t words'
+    args += ', const std::uint32_t* tw' if names else ''
+    at = lambda base, t: base + (f' + {t} * q' if t > 1 else ' + q' if t else '')
+    lines = [f'// {line}' for line in lp.doc.split('\n')]
+    lines += [f'// Per iteration ({lp.columns} columns): {counts(g.ops)}; {cycles} cycles modeled.']
+    lines += [f'[[gnu::always_inline]] inline void {lp.name}({args}) {{',
+              '    std::uint32_t ' + ', '.join(f'*f{t} = {at("f", t)}' for t in range(len(dests))) + ';']
+    if lp.source:
+        lines += ['    const std::uint32_t ' + ', '.join(f'*s{t} = {at("from", t)}' for t in range(ways)) + ';']
+    lines += ['    const std::uint32_t* const end = f + words;', '    asm volatile(']
+    lines += asm_lines(head + [emit(o, reg) for o in seq] + tail)
+    lines += ['        : ' + ', '.join(f'[{x}] "+&r"({x})' for x in pointers),
+              '        : [end] "r"(end), ' + ('[tw] "r"(tw), ' if names else '') + '[p] "r"(kP), [p2] "r"(2 * kP)',
+              '        : ' + CLOBBERS + ', "cc");', '}']
+    return lines
+
+
 HEADER = '''\
 // Generated by backend/ntt/gen_neon_kernels.py. Do not edit.
 // NTT kernels for Neoverse V2 as inline assembly (Neon and SVE2 umulh on 128-bit vectors),
@@ -698,6 +848,8 @@ def generate():
         lines += function(k) + ['']
     for lp in LOOPS:
         lines += loop_function(lp) + ['']
+    for lp in TW_LOOPS:
+        lines += twloop_function(lp) + ['']
     lines += ['}  // namespace fps::ntt::neon_kernels', '', '#endif']
     return '\n'.join(lines) + '\n'
 
