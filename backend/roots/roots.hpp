@@ -380,6 +380,18 @@ private:
         evaluate<K, 1>(which, v);
     }
 
+    // A power as an operand of the sums: EvenOdd's odd words stored G words on, so the loads are
+    // aligned (S::load reads them one word on: with zmm a cache-line split on every load).
+    static constexpr bool kEvenOdd = std::is_same_v<S, product_tree::detail::EvenOdd<F>>;
+    [[gnu::always_inline]] static void store_power(u32* p, V x) {
+        F::store(p, x);
+        if constexpr (kEvenOdd) F::store(p + G, F::template shr64<32>(x));
+    }
+    [[gnu::always_inline]] static typename S::Op load_power(const u32* p) {
+        if constexpr (kEvenOdd) return {F::load(p), F::load(p + G)};
+        else return S::load(p);
+    }
+
     // Lanes [u W, u W + W) of the group: word `at` on of their rows.
     static void store_lanes(u32* const (&rows)[R], std::size_t at, int u, V x) {
         if constexpr (W <= 8) {
@@ -412,14 +424,14 @@ private:
             }
             for (int m = 0; m < log_n_; ++m) big[u] = montgomery_canonical<F>(big[u], big[u]);  // V
         }
-        alignas(64) u32 powers[G * 16 + 16];  // V^t 2^32 for the chunk's t; EvenOdd::load reads a word more
+        alignas(64) u32 powers[2 * G * 16];  // V^t 2^32 for the chunk's t, and (EvenOdd) its odd words
         for (std::size_t first = 0; first < terms; first += 16) {
             const std::size_t count = std::min<std::size_t>(16, terms - first);
             const bool initial = first == 0, final = first + count == terms;
             for (std::size_t t = 0; t < count; ++t)
 #pragma GCC unroll 8
                 for (int u = 0; u < kVectors; ++u) {
-                    F::store(powers + G * t + u * W, y[u]);
+                    store_power(powers + 2 * G * t + u * W, y[u]);
                     y[u] = montgomery_canonical<F>(y[u], big[u]);
                 }
             for (std::size_t j = 0; j < n; j += J) {
@@ -427,7 +439,7 @@ private:
                 {
                     typename S::Op power[kVectors];
 #pragma GCC unroll 8
-                    for (int u = 0; u < kVectors; ++u) power[u] = S::load(powers + u * W);
+                    for (int u = 0; u < kVectors; ++u) power[u] = load_power(powers + u * W);
 #pragma GCC unroll 3
                     for (int i = 0; i < K; ++i)
 #pragma GCC unroll 4
@@ -441,7 +453,7 @@ private:
                 for (std::size_t t = 1; t < count; ++t) {
                     typename S::Op power[kVectors];
 #pragma GCC unroll 8
-                    for (int u = 0; u < kVectors; ++u) power[u] = S::load(powers + G * t + u * W);
+                    for (int u = 0; u < kVectors; ++u) power[u] = load_power(powers + 2 * G * t + u * W);
 #pragma GCC unroll 3
                     for (int i = 0; i < K; ++i)
 #pragma GCC unroll 4
