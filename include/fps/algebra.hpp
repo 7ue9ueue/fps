@@ -6,7 +6,8 @@
 //   fps::factor(f)           // monic irreducible factors with multiplicities; f != 0, deg f < P
 //
 // f and g may end in zeros (size() counts them; nothing here reads past the degree). A broken
-// precondition throws std::domain_error, a degree past the kernels' limit std::length_error (below). inverse_mod returns std::nullopt when gcd(f, m) != 1; for
+// precondition throws std::domain_error, a degree past the kernels' limit std::length_error
+// (below). inverse_mod returns std::nullopt when gcd(f, m) != 1; for
 // a constant m every residue is 0, so it returns the zero polynomial (no coefficients). factor
 // returns the empty list for a constant f and drops the leading coefficient: f = lc(f) times the
 // product of the factors to their multiplicities. Factors are ordered by degree, then by their
@@ -17,8 +18,9 @@
 // factorization):
 // - gcd, inverse_mod: one call each into the backend's half-gcd, fps::half_gcd (backend/gcd/gcd.hpp:
 //   lc-opt's, #103), O(n log^2 n), on f and g trimmed to their degrees (m too: the kernel needs its
-//   top word nonzero). f or g (m) of degree 2^25 or more throws std::length_error (the transforms'
-//   limit; trailing zeros do not count).
+//   top word nonzero). An input of degree 2^25 or more (the transforms' limit; trailing zeros do
+//   not count) is first reduced modulo the other, by division, if the other is within the limit:
+//   gcd(f, x + 1) works for any f. Both past it, or m past it in inverse_mod: std::length_error.
 // - roots: f = x^z u (0 is a root for z > 0); the product r of (x - a) over the nonzero roots a is
 //   gcd(u, x^(P-1) - 1); r splits by Cantor and Zassenhaus: gcd(r, b^((P-1)/2) - 1) for random b.
 // - factor: Yun's square-free decomposition (it needs deg f < P, so that f' = 0 only for a
@@ -51,6 +53,9 @@
 namespace fps {
 
 namespace detail::algebra {
+
+// The half-gcd's transforms take inputs of at most 2^25 words past trailing zeros.
+inline constexpr std::size_t kHalfGcdMax = std::size_t(1) << ntt::kMaxLog;
 
 // f without its trailing zeros (resize to a smaller size keeps the memory, no copy).
 template <std::uint32_t P>
@@ -133,21 +138,28 @@ void factor_square_free(Polynomial<P> s, int e, Factors<P>& out, Random& random)
 }  // namespace detail::algebra
 
 // The kernel's out has as many words as the gcd can have: the shorter trimmed size if both are
-// nonzero, else the nonzero one's.
+// nonzero, else the nonzero one's. One input past the kernel's limit next to one within it is
+// first reduced: gcd(f, g) = gcd(f mod g, g), gcd(f, 0) = monic(f) (division has no such limit).
 template <std::uint32_t P>
 Polynomial<P> gcd(const Polynomial<P>& f, const Polynomial<P>& g) {
+    using detail::algebra::kHalfGcdMax;
     const std::size_t nf = std::size_t(f.degree() + 1), ng = std::size_t(g.degree() + 1);
+    if (nf > kHalfGcdMax && ng <= kHalfGcdMax) return ng ? gcd(f % g, g) : detail::algebra::monic(f);
+    if (ng > kHalfGcdMax && nf <= kHalfGcdMax) return nf ? gcd(f, g % f) : detail::algebra::monic(g);
     Polynomial<P> out = detail::unwritten_polynomial<P>(nf && ng ? std::min(nf, ng) : std::max(nf, ng));
     out.resize(half_gcd::gcd(f.span().first(nf), g.span().first(ng), out.span()));
     return out;
 }
 
 // m trimmed for the kernel (it needs m's top word nonzero); f trimmed, so that only its degree
-// counts toward the transforms' limit.
+// counts toward the transforms' limit, and reduced mod m first if only f is past it.
 template <std::uint32_t P>
 std::optional<Polynomial<P>> inverse_mod(const Polynomial<P>& f, const Polynomial<P>& m) {
     const int d = m.degree();
     if (d < 0) throw std::domain_error("fps::inverse_mod: m = 0");
+    using detail::algebra::kHalfGcdMax;
+    if (std::size_t(f.degree() + 1) > kHalfGcdMax && std::size_t(d) + 1 <= kHalfGcdMax)
+        return inverse_mod(f % m, m);
     Polynomial<P> h = detail::unwritten_polynomial<P>(std::size_t(d));
     const std::span<const std::uint32_t> a = f.span().first(std::size_t(f.degree() + 1));
     if (half_gcd::inverse_mod(a, m.span().first(std::size_t(d) + 1), h.span()) < 0) return std::nullopt;

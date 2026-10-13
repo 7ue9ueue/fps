@@ -457,14 +457,25 @@ void test_errors() {
         CHECK(throws<domain_error>([&] { (void)fps::factor(big); }));
     }
     CHECK(!throws<domain_error>([] { (void)fps::gcd(Poly{}, Poly(3)); }));
-    // Degree 2^25: past the half-gcd's transforms. Unwritten memory, only the top word written.
+    // Degree 2^25, past the half-gcd's transforms: reduced first by division when the other input
+    // is within them. x^(2^25) - 1 has x^2 - 1 and x^2 + 1 as factors (4 divides 2^25).
     {
         using std::length_error;
-        Poly big = fps::detail::unwritten_polynomial<P>((std::size_t(1) << 25) + 1);
-        big[1 << 25] = 1;
-        CHECK(throws<length_error>([&] { (void)fps::gcd(big, Poly{1, 1}); }));
-        CHECK(throws<length_error>([&] { (void)fps::gcd(Poly{1, 1}, big); }));
-        CHECK(throws<length_error>([&] { (void)fps::inverse_mod(big, Poly{1, 0, 1}); }));
+        const std::size_t D = std::size_t(1) << 25;
+        Poly big(D + 1);
+        big[0] = P - 1, big[D] = 1;
+        CHECK(vec(fps::gcd(big, Poly{P - 1, 0, 1})) == (Vec{P - 1, 0, 1}));
+        CHECK(vec(fps::gcd(Poly{1, 0, 1}, big)) == (Vec{1, 0, 1}));
+        CHECK(vec(fps::gcd(big, Poly{2, 1})) == Vec{1});  // (-2)^(2^25) != 1
+        CHECK(vec(fps::gcd(big, Poly{3})) == Vec{1});
+        const Poly whole = fps::gcd(3 * big, Poly{});  // monic(3 big) = big
+        CHECK(whole.size() == D + 1 && whole[0] == P - 1 && whole[D] == 1 && whole[1] == 0);
+        CHECK(!fps::inverse_mod(big, Poly{1, 0, 1}));  // x^2 + 1 divides big
+        big[0] = 2;  // x^(2^25) + 2 = 1 + 2 = 3 mod x^2 + 1
+        const auto h = fps::inverse_mod(big, Poly{1, 0, 1});
+        CHECK(h && vec(*h) == (Vec{fps::mod_inverse<P>(3), 0}));
+        // Both past the limit, or m past it: the kernel's std::length_error.
+        CHECK(throws<length_error>([&] { (void)fps::gcd(big, big); }));
         CHECK(throws<length_error>([&] { (void)fps::inverse_mod(Poly{1, 1}, big); }));
     }
 }

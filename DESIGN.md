@@ -188,8 +188,9 @@ odd index or a coefficient that is not a square. `pow` needs n <= P, as `log` an
 (u / u[0])^e as exp(e log(u / u[0])), where only e mod P counts below x^P.
 
 `gcd(f, g)` and `inverse_mod(f, m)` run the backend's half-gcd (lc-opt's, #103), O(n log^2 n).
-An input of degree 2^25 or more throws `std::length_error` (its transforms' limit; trailing zeros
-do not count), also where a first division would leave a short pair (#168).
+An input of degree 2^25 or more (its transforms' limit; trailing zeros do not count) is first
+reduced modulo the other by division if the other is within the limit, so `gcd(f, x + 1)` works
+for any f; both inputs past it, or m past it in `inverse_mod`, throw `std::length_error` (#168).
 
 `Factorials<P> fact(n)`, n <= P: `fact[i]` = i!, `fact.inverse(i)` = 1/i!, `fact.binomial(n, k)`
 = C(n, k) (0 for k > n), for i, n < `fact.size()`. n > P throws: P! = 0 has no inverse. Indices
