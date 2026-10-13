@@ -78,7 +78,9 @@ tests and times each are in `BACKEND.md` (Targets) and `TARGETS` in `tools/kerne
 
 GCP project `project-c73e6eb1-e167-4d7a-a31`, region `europe-west2`; `lc-intel` and
 `lc-intel-test` are in zone `europe-west2-c`, the rest in `europe-west2-b`. All run Ubuntu 24.04;
-`kernel.py` builds in the `gcc:15.2.0` Docker image. Repo copies live in `~/hpc_library/<branch>`;
+`kernel.py` builds in the `gcc:16.2.0` Docker image (`IMAGE`; `--image` tries another compiler, and
+`bench` builds each side with its own checkout's pin); the gate also tests `avx2` with GCC 15.2.0, which
+users may still have (`COMPAT`; its #183 miscompile is worked around). Repo copies live in `~/hpc_library/<branch>`;
 keep exploration files in `~/explore/hpc_library/` and copy them back to the Mac. More capacity:
 create `lc-<purpose>` in the same project and region, and add it to lc-opt's machine table.
 

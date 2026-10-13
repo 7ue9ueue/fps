@@ -7,7 +7,8 @@
       it is built, one run at a time, in order. With --base (another checkout that passed these
       tests, e.g. of main), skip a build whose preprocessed text is identical there: the same
       compiler, flags and text give the same binary, so the same result. A skipped one prints
-      `skip` instead of `pass`; nothing is skipped if DIR pins another compiler (its IMAGE). With
+      `skip` instead of `pass`; nothing is skipped if DIR was not tested with this compiler (its
+      IMAGE or COMPAT). With
       --sanitize, only the listed units are built with ASan/UBSan (none, if the list is empty);
       the gate uses it, and tools/sanitize.py runs them all.
   kernel.py [--image IMAGE] bench UNIT [--target T] [--base DIR [--base-image IMAGE]] [--rounds N]
@@ -39,11 +40,11 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import importlib.util
 import json
 import math
 import os
 import platform
-import re
 import shlex
 import socket
 import statistics
@@ -52,7 +53,13 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-IMAGE = 'mirror.gcr.io/library/gcc:15.2.0@sha256:3ae15afe768b06d0c0fe088d822ba5f8045c26630bdacc8d8e7713cf5d8e7289'
+IMAGE = 'mirror.gcr.io/library/gcc:16.2.0@sha256:17043c23ec2ad97fc3beca18da77275d26be5db5cd70ea0a5d73200e21a8e999'
+# Older compilers users may still build with, tested (never timed) beside IMAGE by the gate:
+# (target, machine, image). GCC 15.2.0 miscompiles a loop at -O2 with AVX2 (#183, worked around in
+# backend/roots); IMAGE was 15.2.0 until #190.
+COMPAT = [
+    ('avx2', 'lc-amd', 'mirror.gcr.io/library/gcc:15.2.0@sha256:3ae15afe768b06d0c0fe088d822ba5f8045c26630bdacc8d8e7713cf5d8e7289'),
+]
 MAC = sys.platform == 'darwin'
 CXX = ('clang++' if MAC else 'g++') + ' -std=c++23 -Wall -Wextra -I. -Iinclude'
 
@@ -137,11 +144,21 @@ def table(rows: list[dict]) -> str:
     return '\n'.join(lines)
 
 
-def image_of(tree: Path) -> str:
-    """The compiler image tree's tools/kernel.py pins (this one's if it has none)."""
-    found = re.search(r"^IMAGE = '([^']+)'", (tree / 'tools/kernel.py').read_text(), re.M) \
-        if (tree / 'tools/kernel.py').exists() else None
-    return found.group(1) if found else IMAGE
+def pins(tree: Path) -> tuple[str, list]:
+    """IMAGE and COMPAT of tree's tools/kernel.py (this one's if it has none)."""
+    path = tree / 'tools/kernel.py'
+    if not path.exists():
+        return IMAGE, COMPAT
+    spec = importlib.util.spec_from_file_location('kernel_of_tree', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.IMAGE, getattr(module, 'COMPAT', [])
+
+
+def tested_images(tree: Path, target: str) -> set[str]:
+    """The images tree's checks test target with: its pin and its compatibility images."""
+    image, compat = pins(tree)
+    return {image, *(i for t, _, i in compat if t == target)}
 
 
 def sh(trees: dict[str, Path], make_script, image: str | None = None) -> subprocess.CompletedProcess:
@@ -256,8 +273,8 @@ def test(args) -> int:
         modes = (False, True) if args.sanitize is None or unit in args.sanitize else (False,)
         jobs += [(unit, source, sanitize) for source in sources for sanitize in modes]
     same = set()
-    if args.base and not MAC and image_of(Path(args.base)) != IMAGE:
-        print(f'no skips: base pins {image_of(Path(args.base))}, this run uses {IMAGE}')
+    if args.base and not MAC and IMAGE not in tested_images(Path(args.base), args.target):
+        print(f'no skips: base was not tested with {IMAGE}')
     elif args.base:
         with ThreadPoolExecutor(2) as pool:
             new, base = [pool.submit(fingerprints, t, jobs, args.target) for t in (tree, Path(args.base))]
@@ -293,7 +310,7 @@ def bench(args) -> int:
         trees['base'] = Path(args.base)
     images = {'new': IMAGE}
     if args.base:
-        images['base'] = args.base_image or image_of(trees['base'])
+        images['base'] = args.base_image or pins(trees['base'])[0]
     sources = sorted(p.name for p in Path(unit_dir(args.kernel)).glob('bench*.cpp'))
     with ThreadPoolExecutor() as pool:  # base and new at once
         builds = {name: [pool.submit(build, tree, args.kernel, source, args.target, image=images[name])

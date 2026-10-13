@@ -6,7 +6,9 @@
 
 For every target in tools/kernel.py, all at once, on the target's machines:
   - test: kernel.py test of every affected unit on each test machine, at once ('mac' is this Mac,
-    with clang); kernel.py check once, on the first target's first test machine. A test whose
+    with clang), and with each older compiler in kernel.py's COMPAT on its machine (GCC 15.2 on
+    lc-amd for avx2: users may still build with it); kernel.py check once, on the first target's
+    first test machine. A test whose
     preprocessed text for the target is identical to the base's is skipped (kernel.py --base):
     the base passed it already, and the same text, compiler and flags give the same binary.
     ASan/UBSan builds only for the kernels whose own folder changed (all, if a shared file did):
@@ -68,7 +70,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from kernel import TARGETS, gated, summarize, table, unit_dir
+from kernel import COMPAT, TARGETS, gated, summarize, table, unit_dir
 from vm import rev_tar, ship, ssh
 
 ROUNDS = 9  # was 21: the same units were flagged slow in 232 saved runs (see PR), at 43% of the time
@@ -201,11 +203,12 @@ def geomean(values: list[float]) -> float | None:
 
 
 def run_tests(machine: str, name: str, new_tar: bytes, base_tar: bytes | None, target: str, units: list[str],
-              check: bool, sanitized: list[str] | None = None) -> subprocess.CompletedProcess:
+              check: bool, sanitized: list[str] | None = None, image: str | None = None) -> subprocess.CompletedProcess:
     """Tests that build to the same preprocessed text as in base_tar are skipped (kernel.py --base);
-    only the units in `sanitized` are built with ASan/UBSan (None: all)."""
+    only the units in `sanitized` are built with ASan/UBSan (None: all). image: a COMPAT compiler
+    instead of the pinned one."""
     command = ('python3 tools/kernel.py check && ' if check else '') + \
-        f'python3 tools/kernel.py test {" ".join(units)} --target {target}'
+        f'python3 tools/kernel.py{f" --image {image}" if image else ""} test {" ".join(units)} --target {target}'
     if sanitized is not None:
         command += f' --sanitize {" ".join(sanitized)}'
     if machine == 'mac':
@@ -215,7 +218,8 @@ def run_tests(machine: str, name: str, new_tar: bytes, base_tar: bytes | None, t
                 tarfile.open(fileobj=io.BytesIO(base_tar), mode='r:gz').extractall(base)
                 command += f' --base {base}'
             return subprocess.run(command, shell=True, cwd=tree, capture_output=True)
-    share = sum(machine in spec['test'] for spec in TARGETS.values())  # targets testing here share its cores
+    # the test runs on this machine (targets, compatibility images) share its cores
+    share = sum(machine in spec['test'] for spec in TARGETS.values()) + sum(m == machine for _, m, _ in COMPAT)
     command += f' -j $(( ($(nproc) + {share - 1}) / {share} ))'
     path = ship(machine, name, new_tar)
     base_path = ship(machine, f'{name}-base', base_tar) if base_tar else ''
@@ -256,18 +260,20 @@ def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, units: 
     name = f'gate-{label}-{target}'
     out = [f'### {target}: `{spec["flags"] or "no flags"}`', '']
 
-    def test_on(machine: str) -> tuple[subprocess.CompletedProcess, float]:
-        log(f'[{target}] testing on {machine}')
+    def test_on(machine: str, image: str | None = None) -> tuple[subprocess.CompletedProcess, float]:
+        log(f'[{target}] testing on {machine}' + (f' with {image}' if image else ''))
         start = time.monotonic()
-        result = run_tests(machine, f'{name}-test', new_tar, base_tar, target, units,
-                           check and machine == spec['test'][0], sanitized)
+        result = run_tests(machine, f'{name}-test' + ('-compat' if image else ''), new_tar, base_tar, target, units,
+                           check and machine == spec['test'][0] and not image, sanitized, image)
         if result.returncode:
             failed.set()
         return result, minutes(start)
 
     vm = spec['time']
     with ThreadPoolExecutor() as executor:
+        # keys: the machine, or (machine, image) for a compatibility compiler (tests only)
         tests = {m: executor.submit(test_on, m) for m in spec['test']}
+        tests |= {(m, i): executor.submit(test_on, m, i) for t, m, i in COMPAT if t == target}
         if vm in spec['test']:
             for future in tests.values():
                 future.result()
@@ -277,7 +283,8 @@ def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, units: 
         results = {m: future.result() for m, future in tests.items()}
 
     tests_ok = True
-    for machine, (result, took) in results.items():
+    for key, (result, took) in results.items():
+        machine = key if isinstance(key, str) else f'{key[0]} with `{key[1].split("@")[0].split("/")[-1]}`'
         lines = [line for line in result.stdout.decode().splitlines() if line.startswith(('pass', 'FAIL', 'skip'))]
         if result.returncode == 0:
             skipped = sum(line.startswith('skip') for line in lines)

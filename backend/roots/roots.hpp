@@ -304,7 +304,8 @@ void graeffe(u32* a, u32* b, std::size_t d, int k, std::span<const Save> saves, 
 
 // GCC 15.2 at -O2 with AVX2 vectorizes the folds' loop over the terms wrongly for the Scalar
 // struct's u64 sums (8 lanes' sums; -O3 and SSE are right; a reproducer in issue #183): that loop
-// stays scalar.
+// stays scalar. GCC 15.3 and 16.2 are right; kept for users on 15.2 (the timed binaries are the
+// same with and without it, issue #190).
 #if defined(__GNUC__) && !defined(__clang__)
 #define FPS_ROOTS_NOVECTOR _Pragma("GCC novector")
 #else

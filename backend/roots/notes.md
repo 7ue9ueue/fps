@@ -43,7 +43,8 @@ lc-opt's design (its notes.md, Design), with these changes:
   grown on demand; transforms: series::detail::transform. lc-opt mapped one huge page and built
   its tables per run (100-160 us at N = 4000).
 - The folds' loop over the terms carries `#pragma GCC novector` (GCC only): GCC 15.2 at -O2 with
-  AVX2 vectorizes it wrongly for the Scalar struct's u64 sums (issue #183).
+  AVX2 vectorizes it wrongly for the Scalar struct's u64 sums (issue #183). 15.3 and 16.2 are right
+  without it (`notes/190-r1.md`); it stays for users on 15.2, at no cost to the timed paths.
 
 Costs (Zen 3, `lc-bench`, d = 4096, random f): shift 29 us, Graeffe 296 us (14 steps of 21 us:
 the pair step 9 us, two inverses and two forward_upper of 4096 2.8-2.9 us each), H 108 us (A only).

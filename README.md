@@ -137,7 +137,7 @@ The library is header-only: add the checkout's root and `include/` to the includ
 `-mcpu=native` on Arm. With no flags the scalar code runs.
 
 The tools run from the checkout's root. On the Mac they build with the local `clang++` and run the `scalar` and
-`arm` targets; on Linux they build in the pinned `gcc:15.2.0` Docker image.
+`arm` targets; on Linux they build in the pinned `gcc:16.2.0` Docker image.
 
 ```bash
 python3 tools/kernel.py test frontend --target scalar
@@ -149,3 +149,16 @@ python3 tools/vm.py lc-bench --base <hash> 'python3 tools/kernel.py bench ntt --
 `test` builds every `test*.cpp` of the units and runs each. `bench` times two checkouts in the same run; a ratio
 below 1 means the new one is faster. `-DFPS_<KERNEL>_<OP>=<variant>` forces one variant, and `-DFPS_NO_TUNER`
 compiles the tuner out (for single-file contest bundles).
+
+### Compilers
+
+| Compiler | Status |
+|---|---|
+| GCC 16.2.0 (Linux) | pinned: tests, benches and the gate (the `gcc:16.2.0` Docker image, by digest in `tools/kernel.py`) |
+| GCC 15.2.0 (Linux) | supported: the gate also runs the `avx2` tests with it (not timed) |
+| Apple clang (Mac) | the `scalar` and `arm` tests |
+
+Other compilers and versions are untested; C++23 is required. Known bugs:
+
+- GCC 15.2.0 miscompiles a reduction loop at `-O2` with AVX2 ([#183](https://github.com/7ue9ueue/fps/issues/183));
+  fps works around it. 15.3.0 and 16.2.0 are right.
