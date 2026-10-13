@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <string_view>
+#include <vector>
 
 #if defined(__ARM_NEON) && defined(__aarch64__)
 namespace {
@@ -62,31 +64,41 @@ void test_bottom(Kind kind, const char* name) {
     }
 }
 
-// Bottom::inverse_terms of one term a b (canonical leaves of groups from `first`, into out) against
-// Bottom<Neon>: out < 2P and equal mod P; two terms run the intrinsics in both.
+// Bottom::inverse_terms: sums of 1 to 4 terms, product terms (p: a b) and plain ones (x: a times
+// 2^-32) in any order, against Bottom<Neon>: out < 2P, equal mod P. Canonical leaves: random, all
+// P - 1, or 0 and P - 1. The asm runs one term a b, or up to 4 products and one plain term in
+// passes; the other lists (no product, two plain terms) fall back to the intrinsics.
 void test_terms() {
     const std::size_t leaves = std::size_t(1) << 13;
     Words r(leaves), ir(leaves);
     Plain::build_table(r.begin(), leaves / 2, false);
     Plain::build_table(ir.begin(), leaves / 2, true);
-    for (const int n : {1, 2}) {
+    static constexpr const char* kLists[] = {"p", "px", "xp", "pp", "ppx", "xpp", "pxp", "ppp", "pppp", "xppp", "pppx", "x", "xx", "pxx"};
+    for (std::size_t list = 0; list < std::size(kLists); ++list) {
+        const std::string_view spec = kLists[list];
+        const int n = int(spec.size());
         for (std::size_t count : {2, 4, 16, 64}) {
-            for (int trial = 0; trial < 12; ++trial) {
+            for (int trial = 0; trial < 9; ++trial) {
                 const std::size_t first = trial < 2 ? trial * count : count * random_below(leaves / 4 / count);
                 const int pick = trial % 3;
                 const std::size_t words = 32 * (first + count);
-                Words a0(words), b0(words), a1(words), out(32 * count), expected(32 * count);
-                for (std::size_t i = 0; i < words; ++i) {
-                    const auto word = [&] { return pick == 0 ? random_below(P) : pick == 1 ? P - 1 : u32(random_below(2) * (P - 1)); };
-                    a0.begin()[i] = word(), b0.begin()[i] = word(), a1.begin()[i] = word();
+                std::vector<Words> a, b;
+                fps::ntt::detail::LeafTerm terms[fps::ntt::detail::kMaxTerms];
+                for (int i = 0; i < n; ++i) {
+                    a.emplace_back(words), b.emplace_back(words);
+                    for (std::size_t w = 0; w < words; ++w) {
+                        const auto word = [&] { return pick == 0 ? random_below(P) : pick == 1 ? P - 1 : u32(random_below(2) * (P - 1)); };
+                        a.back().begin()[w] = word(), b.back().begin()[w] = word();
+                    }
                 }
-                const fps::ntt::detail::LeafTerm terms[] = {{a0.begin(), b0.begin()}, {a1.begin(), nullptr}};
+                for (int i = 0; i < n; ++i) terms[i] = {a[i].begin(), spec[i] == 'p' ? b[i].begin() : nullptr};
+                Words out(32 * count), expected(32 * count);
                 Plain::bottom_inverse_terms(expected.begin(), terms, n, count, first, r.begin(), ir.begin());
                 Asm::bottom_inverse_terms(out.begin(), terms, n, count, first, r.begin(), ir.begin());
                 bool ok = true;
                 for (std::size_t i = 0; i < 32 * count; ++i)
                     ok &= out.begin()[i] < 2 * P && out.begin()[i] % P == expected.begin()[i] % P;
-                expect(ok, "neon: inverse_terms bottom against Bottom<Neon>", n * 10000000 + count * 10000 + first);
+                expect(ok, "neon: inverse_terms bottom against Bottom<Neon>", list * 10000000 + count * 10000 + first);
             }
         }
     }
