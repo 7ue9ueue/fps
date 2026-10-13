@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """Test and time backend kernels, per target (see TARGETS and BACKEND.md).
 
-  kernel.py test UNIT... [--target T] [-j N] [--base DIR] [--sanitize [UNIT...]]
+  kernel.py [--image IMAGE] test UNIT... [--target T] [-j N] [--base DIR] [--sanitize [UNIT...]]
       Build every test*.cpp of the units for target T at -O2 and with ASan/UBSan, at most N at a
       time (default: every core), fewer if the machine is busy (build_slots); run each as soon as
       it is built, one run at a time, in order. With --base (another checkout that passed these
       tests, e.g. of main), skip a build whose preprocessed text is identical there: the same
       compiler, flags and text give the same binary, so the same result. A skipped one prints
-      `skip` instead of `pass`. With --sanitize, only the listed units are built with ASan/UBSan
-      (none, if the list is empty); the gate uses it, and tools/sanitize.py runs them all.
-  kernel.py bench UNIT [--target T] [--base DIR] [--rounds N] [--filter RE] [--json FILE]
+      `skip` instead of `pass`; nothing is skipped if DIR pins another compiler (its IMAGE). With
+      --sanitize, only the listed units are built with ASan/UBSan (none, if the list is empty);
+      the gate uses it, and tools/sanitize.py runs them all.
+  kernel.py [--image IMAGE] bench UNIT [--target T] [--base DIR [--base-image IMAGE]] [--rounds N]
+                            [--filter RE] [--json FILE]
       Time the unit's bench*.cpp, each its own binary (e.g. frontend/bench_values.cpp, whose
       code changes how GCC compiles bench.cpp's). Case names must be unique across a unit's
       bench files: a duplicate within one round is an error. With --base (another checkout,
       e.g. of main), time both in the same run, alternating, and print each case's paired
-      ratio new/base: below 1 is faster.
+      ratio new/base: below 1 is faster. Each tree builds with its own compiler: base with the
+      IMAGE its tools/kernel.py pins (or --base-image), new with this one's (or --image); if they
+      differ, each side also runs in its own image (libstdc++), one container per side and round.
+      To compare compilers on the same code, pass the same commit as base and new and --image.
 
 A unit is a backend kernel (folder backend/<kernel>/) or `frontend` (folder frontend/, headers in
 include/fps/).
@@ -22,8 +27,9 @@ include/fps/).
       Run every backend/*/gen_*.py --check: generated files match their generators; and
       tools/tune.py --check: tuned tables (backend/*/tuned.hpp) match their measurements.
 
-On Linux (the VMs) it builds in the pinned GCC 15.2 image with Docker. On the Mac it builds with
-the local clang++ and runs the targets that list 'mac'. Run from the checkout's root.
+On Linux (the VMs) it builds in the pinned GCC image (IMAGE) with Docker; --image replaces it, e.g.
+to try another compiler (mirror.gcr.io/library/gcc:<version>; IMAGE pins a digest). On the Mac it
+builds with the local clang++ and runs the targets that list 'mac'. Run from the checkout's root.
 bench holds /tmp/bench.lock and pins one core; on a timing machine every command holds the lock,
 so builds never disturb another agent's timing.
 """
@@ -37,6 +43,7 @@ import json
 import math
 import os
 import platform
+import re
 import shlex
 import socket
 import statistics
@@ -130,9 +137,16 @@ def table(rows: list[dict]) -> str:
     return '\n'.join(lines)
 
 
-def sh(trees: dict[str, Path], make_script) -> subprocess.CompletedProcess:
-    """Run a shell script in the first tree. make_script gets each tree's path as the script
-    sees it: in Docker, tree <name> is mounted at /<name>."""
+def image_of(tree: Path) -> str:
+    """The compiler image tree's tools/kernel.py pins (this one's if it has none)."""
+    found = re.search(r"^IMAGE = '([^']+)'", (tree / 'tools/kernel.py').read_text(), re.M) \
+        if (tree / 'tools/kernel.py').exists() else None
+    return found.group(1) if found else IMAGE
+
+
+def sh(trees: dict[str, Path], make_script, image: str | None = None) -> subprocess.CompletedProcess:
+    """Run a shell script in the first tree, in `image` (default IMAGE). make_script gets each
+    tree's path as the script sees it: in Docker, tree <name> is mounted at /<name>."""
     if MAC:
         paths = {name: str(tree.resolve()) for name, tree in trees.items()}
         return subprocess.run(['sh', '-ec', make_script(paths)], cwd=next(iter(paths.values())),
@@ -141,7 +155,7 @@ def sh(trees: dict[str, Path], make_script) -> subprocess.CompletedProcess:
     cmd = ['docker', 'run', '--rm', '--network', 'none', '--user', f'{os.getuid()}:{os.getgid()}']
     for name, tree in trees.items():
         cmd += ['-v', f'{tree.resolve()}:/{name}']
-    cmd += ['-w', next(iter(paths.values())), IMAGE, 'sh', '-ec', make_script(paths)]
+    cmd += ['-w', next(iter(paths.values())), image or IMAGE, 'sh', '-ec', make_script(paths)]
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
@@ -182,12 +196,13 @@ def unit_dir(unit: str) -> str:
     return 'frontend' if unit == 'frontend' else f'backend/{unit}'
 
 
-def compile_(tree: Path, unit: str, source: str, target: str, sanitize: bool = False) -> tuple[Path, str | None]:
+def compile_(tree: Path, unit: str, source: str, target: str, sanitize: bool = False,
+             image: str | None = None) -> tuple[Path, str | None]:
     """Compile <unit folder>/<source> in tree, from relative paths, so the same sources give
     byte-identical binaries in any tree. Returns the binary and, on a failure, the output."""
     out = f'build/{target}/{unit}-{Path(source).stem}{"-san" if sanitize else ""}'
     result = sh({'w': tree}, lambda _: f'mkdir -p build/{target}\n'
-                f'{CXX} {options(sanitize)} {flags(target)} {unit_dir(unit)}/{source} -o {out}')
+                f'{CXX} {options(sanitize)} {flags(target)} {unit_dir(unit)}/{source} -o {out}', image)
     return tree / out, (result.stdout + result.stderr if result.returncode else None)
 
 
@@ -211,8 +226,8 @@ def fingerprints(tree: Path, jobs: list[tuple[str, str, bool]], target: str) -> 
     return {job: None if hashes[str(i)] == '-' else hashes[str(i)] for i, job in enumerate(jobs)}
 
 
-def build(tree: Path, unit: str, source: str, target: str, sanitize: bool = False) -> Path:
-    binary, error = compile_(tree, unit, source, target, sanitize)
+def build(tree: Path, unit: str, source: str, target: str, sanitize: bool = False, image: str | None = None) -> Path:
+    binary, error = compile_(tree, unit, source, target, sanitize, image)
     if error is not None:
         sys.exit(f'build failed in {tree}:\n{error}')
     return binary
@@ -241,7 +256,9 @@ def test(args) -> int:
         modes = (False, True) if args.sanitize is None or unit in args.sanitize else (False,)
         jobs += [(unit, source, sanitize) for source in sources for sanitize in modes]
     same = set()
-    if args.base:
+    if args.base and not MAC and image_of(Path(args.base)) != IMAGE:
+        print(f'no skips: base pins {image_of(Path(args.base))}, this run uses {IMAGE}')
+    elif args.base:
         with ThreadPoolExecutor(2) as pool:
             new, base = [pool.submit(fingerprints, t, jobs, args.target) for t in (tree, Path(args.base))]
         same = {job for job in jobs if new.result()[job] is not None and new.result()[job] == base.result()[job]}
@@ -274,14 +291,19 @@ def bench(args) -> int:
     trees = {'new': Path('.')}
     if args.base:
         trees['base'] = Path(args.base)
+    images = {'new': IMAGE}
+    if args.base:
+        images['base'] = args.base_image or image_of(trees['base'])
     sources = sorted(p.name for p in Path(unit_dir(args.kernel)).glob('bench*.cpp'))
     with ThreadPoolExecutor() as pool:  # base and new at once
-        builds = {name: [pool.submit(build, tree, args.kernel, source, args.target) for source in sources
+        builds = {name: [pool.submit(build, tree, args.kernel, source, args.target, image=images[name])
+                         for source in sources
                          if (tree / unit_dir(args.kernel) / source).exists()]
                   for name, tree in trees.items()}
     binaries = {name: [b.result() for b in bs] for name, bs in builds.items()}
     report = {'kernel': args.kernel, 'target': args.target, 'flags': flags(args.target),
               'cpu': cpu_name(), 'compiler': 'clang++' if MAC else IMAGE, 'rounds': args.rounds,
+              'base_compiler': 'clang++' if MAC else images.get('base'),
               'identical': False, 'cases': {}}
     digests = {tuple(hashlib.sha256(b.read_bytes()).hexdigest() for b in bs) for bs in binaries.values()}
     if args.base and len(digests) == 1:
@@ -291,21 +313,26 @@ def bench(args) -> int:
         pin = '' if MAC else f'taskset -c {os.cpu_count() - 1} '  # core 0 takes most interrupts
         names = list(trees)
 
-        def script(paths: dict[str, str]) -> str:
+        def script(paths: dict[str, str], rounds: range, sides: list[str]) -> str:
             lines = []
-            for r in range(args.rounds):
-                for name in (names if r % 2 == 0 else names[::-1]):
+            for r in rounds:
+                for name in (sides if r % 2 == 0 else sides[::-1]):
                     for b in binaries[name]:
                         binary = f'{paths[name]}/{b.relative_to(trees[name])}'
                         run = f'{pin}{binary} {shlex.quote(args.filter)}'
                         lines.append(f'echo "## {name} {r}"; {run}')
             return '\n'.join(lines)
 
-        result = sh(trees, script)
-        if result.returncode:
-            sys.exit(f'bench failed:\n{result.stdout}{result.stderr}')
+        if MAC or len(set(images.values())) == 1:  # one container for the whole run
+            runs = [sh(trees, lambda paths: script(paths, range(args.rounds), names))]
+        else:  # each side in its own image: one container per side and round, alternating
+            runs = [sh({name: trees[name]}, lambda paths: script(paths, range(r, r + 1), [name]), images[name])
+                    for r in range(args.rounds) for name in (names if r % 2 == 0 else names[::-1])]
+        for result in runs:
+            if result.returncode:
+                sys.exit(f'bench failed:\n{result.stdout}{result.stderr}')
         current, round_, seen = None, None, set()
-        for line in result.stdout.splitlines():
+        for line in ''.join(result.stdout for result in runs).splitlines():
             if line.startswith('## '):
                 current, round_ = line[3:].split()
             elif '\t' in line:
@@ -319,6 +346,8 @@ def bench(args) -> int:
                 if current == 'new' and rest:
                     entry['items'] = int(rest[0])
     print(f'{report["cpu"]}, target {args.target} ({report["flags"] or "no flags"}), {args.rounds} rounds')
+    if not MAC and len(set(images.values())) > 1:
+        print(f'new built with {images["new"]}\nbase built with {images["base"]}')
     if args.base:
         rows, geomean = summarize(report['cases'])
         print(table(rows))
@@ -345,6 +374,7 @@ def check(_) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--image', help='build (and run) in this Docker image instead of IMAGE')
     sub = parser.add_subparsers(dest='command', required=True)
     default = 'scalar' if MAC else 'avx2'
     p = sub.add_parser('test')
@@ -358,6 +388,7 @@ def main() -> int:
     p.add_argument('kernel')
     p.add_argument('--target', choices=TARGETS, default=default)
     p.add_argument('--base', help='root of another checkout to compare against')
+    p.add_argument('--base-image', help="build and run the base in this image (default: the one base's kernel.py pins)")
     p.add_argument('--rounds', type=int, default=11)
     p.add_argument('--filter', default='', help='regex the case names must contain')
     p.add_argument('--json', help='write the raw times here')
@@ -365,6 +396,9 @@ def main() -> int:
     p = sub.add_parser('check')
     p.set_defaults(run=check)
     args = parser.parse_args()
+    if args.image:
+        global IMAGE
+        IMAGE = args.image
     units = [] if args.command == 'check' else args.kernel if args.command == 'test' else [args.kernel]
     for unit in units:
         if not Path(unit_dir(unit)).is_dir():
