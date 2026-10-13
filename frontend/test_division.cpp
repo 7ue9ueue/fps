@@ -1,6 +1,7 @@
 // Tests of fps/division.hpp: divmod, f / g, f % g, /= and %=, against long division on edge sizes
-// and random inputs, on both paths (a monomial divisor in the frontend; every other divisor in
-// backend/division, here on divisors with trailing zeros, few terms, short and long quotients),
+// and random inputs, on every path (in the frontend: a monomial divisor, sparse long division,
+// the recurrence for 1-2 close terms; every other divisor in backend/division, here on divisors
+// with trailing zeros, short and long quotients),
 // against f = q g + r at large sizes, with aliasing, threads and every error.
 #include <algorithm>
 #include <cstdint>
@@ -330,9 +331,10 @@ void test_errors() {
         CHECK(throws<domain_error>([&] { h %= zero; }));
         CHECK(vec(h) == vec(f));
     }
-    // Past 2^25 coefficients: the kernel's blocks split the work into transforms of at most 2^25
-    // words, so f of 2^25 + 2^10 by x^(2^25) + x + 1 (which threw std::length_error before #147)
-    // gives q and r. Checked at random points: f(c) = q(c) g(c) + r(c).
+    // Past 2^25 coefficients: f of 2^25 + 2^10 by x^(2^25) + x + 1 (which threw std::length_error
+    // before #147) runs the sparse path, which has no length limit. Checked at random points:
+    // f(c) = q(c) g(c) + r(c). (A dense divisor of that length goes to the kernel; it ran by hand,
+    // about 1.5 s and 1 GB, too heavy for this test.)
     {
         const std::size_t d = std::size_t(1) << 25, k = std::size_t(1) << 10;
         const Poly big = poly(random_vec(d + k, 0));

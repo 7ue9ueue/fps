@@ -158,8 +158,8 @@ coefficients and `f % x^k` is `f.truncate(k)`; neither is trimmed. g = 0, of any
 each O(n t) for t terms below the leading one: g = c x^d is a shift; t <= 16 terms, the highest at
 least 8 (t + 1) below the leading one (`x^L - 1`, `x^d - x - 1` for d >= 25), run long division in
 vector passes; else t <= 2 (`x^3 + 2x + 5`) runs a recurrence. Every other g runs the backend's
-blocked division, whose transforms stay within 2^25 words (f of 2^25 + 2^10 by g of 2^25 + 1
-runs).
+blocked division, whose transforms stay within 2^25 words (f of 2^25 + 2^10 by a dense g of
+2^25 + 1 runs, checked by hand: about 1 GB); the sparse paths have no length limit.
 
 `evaluate(f, points)` returns `points.size()` values, for any points (repeats too).
 `interpolate<P>(points, values)` returns m = `points.size()` coefficients; it needs as many values

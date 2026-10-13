@@ -27,8 +27,9 @@
 // Newton division and few-term recurrence before #147).
 //
 // Long inputs: the kernel splits the quotient into blocks and the remainder into products of at
-// most 2^25 words (f of 2^25 + 2^10 by g of 2^25 + 1 runs); it throws std::length_error for the
-// shapes no such plan covers (longer divisors). The other paths have no limit.
+// most 2^25 words (f of 2^25 + 2^10 by a dense g of 2^25 + 1 runs, checked by hand); it throws
+// std::length_error for the shapes no such plan covers (longer divisors). The other paths have no
+// limit.
 #pragma once
 
 #include <algorithm>
