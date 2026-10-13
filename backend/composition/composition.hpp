@@ -860,8 +860,8 @@ struct Level1Hook {
     const PairTables& t;
     [[gnu::always_inline]] void operator()(u32* leaves, std::size_t first, std::size_t count) const {
         on_pairs(count / 2, [&]<class N>(std::type_identity<N>) {
-            u32* const o[5] = {out[0] + 4 * first, out[1] + 4 * first, out[2] + 4 * first, out[3] + 4 * first,
-                               out[4] + 4 * first};
+            u32* o[5];  // out[i] may be null (no p1): no offset on it
+            for (int i = 0; i < 5; ++i) o[i] = out[i] ? out[i] + 4 * first : nullptr;
             N::level1_run(F1 + 8 * first, leaves, FP ? FP + 8 * first : nullptr, o, first / 2, count / 2, t);
         });
     }
