@@ -77,14 +77,16 @@ int main(int argc, char** argv) {
     }
     // roots: of a random polynomial (about one root), of n distinct linear factors (every root
     // found), and of n linear factors over n / 4 values times a random polynomial of degree n / 2
-    // (repeated roots: the kernel's climbs).
-    for (int lg : {6, 8, 10, 12}) {
+    // (repeated roots: the kernel's climbs, up to about d^2 / 300 more: to 2^12 only).
+    for (int lg : {6, 8, 10, 12, 20}) {
         const std::size_t n = std::size_t(1) << lg;
         const std::string size = "/" + std::to_string(lg);
         const auto add = [&](const std::string& name, auto make) {
             suite.add(name + size, [make] { return [f = make()] { bench::keep(fps::roots(f)); }; }, n);
             suite.add(name + "@kernel" + size, [make] {
-                return [f = make(), out = std::vector<std::uint32_t>(make().size())]() mutable {
+                Poly f = make();
+                std::vector<std::uint32_t> out(f.size());
+                return [f = std::move(f), out = std::move(out)]() mutable {
                     bench::keep(fps::root_finding::roots(f.span(), out));
                     bench::keep(out);
                 };
@@ -92,7 +94,7 @@ int main(int argc, char** argv) {
         };
         add("roots", [n, lg] { return random_poly(n, unsigned(5 * lg)); });
         add("roots_split", [n, lg] { return split_poly(n, unsigned(7 * lg)); });
-        add("roots_repeated", [n, lg] { return repeated_poly(n, unsigned(13 * lg)); });
+        if (lg <= 12) add("roots_repeated", [n, lg] { return repeated_poly(n, unsigned(13 * lg)); });
     }
     // factor of a random polynomial: distinct degrees up to n / 2.
     for (int lg : {4, 6, 8}) {
