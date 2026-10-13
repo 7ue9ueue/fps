@@ -14,17 +14,24 @@
 // f = 0 throws std::invalid_argument, deg f > kMaxDegree std::length_error.
 //
 // Cost: O(m^3) per square-free part of degree m (the Krylov sequence and the elimination below),
-// two m x m matrices of words: about 0.2-0.3 ms at degree 100 on Zen 3, 2 ms at 256 (notes.md).
-// Larger degrees want a distinct-degree split by baby steps and giant steps (Kaltofen-Shoup) on
-// NTT products instead; not here yet.
+// two m x m matrices of words. Random f on Zen 3 (notes.md): degree 100 about 0.2 ms, 256 about
+// 2 ms, 1024 about 0.1 s, 4096 (the limit: 2 x 64 MiB of matrices) several seconds. Degree 2^20 is
+// out of reach here (4 TiB of matrices); it wants a distinct-degree split by baby steps and giant
+// steps (Kaltofen-Shoup) on NTT products. Up to kKeepDegree, each thread keeps its factorizer
+// (buffers, matrices) between calls.
 //
-// Algorithm (lc-opt's):
+// Algorithm (lc-opt's, but for the root finding):
 // - square-free decomposition by Yun's algorithm (deg f < P, so f' = 0 only for a constant);
-// - per square-free part g of degree m: s = x^((P-1)/2) mod g by squarings (a product, then the
-//   reduction by the table x^(m + j) mod g), x^P = x s^2; the linear factors L = gcd(g, x^P - x) by
-//   Cantor-Zassenhaus root finding (s mod L gives the first split);
-// - the rest by Berlekamp: rows q_j = x^(P j) mod g by mat-vecs with the matrix of the
-//   multiplication by x^P, 8 rows at a time transposed into A = (Q - I)^T; the kernel of A
+// - per square-free part g of degree m: x^((P-1)/2^j) mod g for j = K .. 1 by squarings (a
+//   product, then the reduction by the table x^(m + j) mod g), x^P = x (x^((P-1)/2))^2; the linear
+//   factors L = gcd(g, x^P - x);
+// - roots (of L, and of mu below) by 2-power characters: P - 1 = 119 2^23, so w = (x + a)^((P-1)
+//   / 2^k) takes 2^k-th roots of unity at the roots; gcds with w^(2^(k-j-1)) - (a root of unity)
+//   split them bit by bit of those values, k - j - 1 squarings at depth j (for L, a = 0 and w
+//   comes from the squarings above);
+// - the rest by Berlekamp: rows q_j = x^(P j) mod g, the first 8 by mat-vecs with the matrix of
+//   the multiplication by x^P, then each block of 8 the block before times the matrix of the
+//   multiplication by q_8 (combine_rows), transposed into A = (Q - I)^T; the kernel of A
 //   (dimension k = the number of factors) by fraction-free blocked elimination (linear.hpp);
 // - k > 1: two random kernel elements v, w. The factors are grouped by the value of v
 //   (v = c_i mod g_i): the c_i are the roots of the minimal polynomial mu of v, found from the
@@ -34,7 +41,7 @@
 //   group where w is not constant is factored again, and if the count still falls short of k
 //   every group left is.
 // - moduli of degree <= 8 on x86 with AVX2: polynomials in one ymm register (poly.hpp), as root
-//   finding runs chains of 30 dependent squarings at tiny degrees.
+//   finding runs chains of dependent squarings at tiny degrees.
 #pragma once
 
 #include <algorithm>

@@ -1,7 +1,8 @@
 // Times backend/factor; tools/kernel.py runs it. Items are the degree n = 2^lg of f.
-//   "factor/<lg>"               random f of degree n (a few factors of distinct degrees)
+//   "factor/<lg>"               random f of degree n (a few factors of distinct degrees), lg 4 to 8
+//                               and 10 (2^20 is out of reach: notes.md, Limits)
 //   "factor_split/<lg>"         n / 2 random irreducible quadratics (lc-opt's same_degree: Berlekamp
-//                               with k = n / 2, the split by the minimal polynomial)
+//                               with k = n / 2, the split by the minimal polynomial), lg 4 to 8
 //   "<case>@avx512vl/<lg>"      AVX-512 targets: on ymm (Avx512Vl) instead of zmm (not gated)
 //   "<case>@frontend/<lg>"      fps::factor (include/fps/algebra.hpp: distinct-degree split and
 //                               Cantor-Zassenhaus) on the same f, factor to 2^8, factor_split to
@@ -85,5 +86,6 @@ int main(int argc, char** argv) {
         add("factor", random_poly(n, unsigned(11 * lg)), true);
         add("factor_split", quadratics(n / 2, unsigned(13 * lg)), lg <= 6);
     }
+    suite.add("factor/10", [] { return [f = random_poly(1024, 110)] { bench::keep(fz::factor(f)); }; }, 1024);
     return suite.run();
 }

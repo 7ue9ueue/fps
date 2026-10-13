@@ -4,7 +4,15 @@
 //   combine<S>(out, len, init, coef, count, base, stride)
 //       out[t] = init[t] + sum_{s < count} coef[s] (base + s stride)[t]; init may be null (zero)
 //   combine_scaled<S>(out, len, init, scale, coef, count, base, stride)   the same with scale init[t]
+//   combine_rows<S>(out, ostride, rows, len, init, istride, scale, coef, cstride, sstride, count,
+//                   base, stride)
+//       combine_scaled for several rows at once (a matrix product): row r of out from row r of
+//       init and coefficients coef[r cstride + s sstride]; each column's words serve kRows rows
 //   lincomb<S>(out, x, a, y, b, len)          out[t] = a x[t] + b y[t]
+//   axpy<S>(out, x, c, y, len)                out[t] = x[t] + c y[t] (no product for x)
+//   times_x<S>(y, a, g, m)                    y = x a mod g, g monic of degree m
+//   times_x_chain<S>(first, count, stride, g, m)
+//       columns x^s a mod g, s < count, at first + s stride, from column 0 = a
 //   multiply<S>(a, na, b, nb, out, scratch)   out = a b, na + nb - 1 words
 //   transpose_rows<S>(dst, ld, rows, j0, src, stride)
 //       dst[i ld + j0 + q] = src[q stride + i], q < 8, i < rows

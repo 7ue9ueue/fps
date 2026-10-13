@@ -82,21 +82,20 @@ struct Echelon {
 
 // Pivot t ends at row t of A: a chosen row is swapped to the front of the trailing rows, so they
 // stay contiguous (rows r0 .. rows - 1) and a block's update of them is one combine_rows.
-template <class S>
+template <class S, int kBlockColumns = 16>
 Echelon eliminate(Matrix& A) {
-    constexpr int kBlockColumns = 16;
     const int rows = A.rows, cols = A.cols, ld = A.ld;
     Echelon E;
     E.cols = cols;
     std::vector<int>&pivots = E.pivots, &pivot_rows = E.pivot_rows;
     std::vector<u32>& pivot_values = E.scales;
     const int pstride = round_up(rows, 16);
-    std::vector<u32> panel(std::size_t(kBlockColumns + 1) * pstride);  // M_0 .. M_(nb-1), then the work column
-    std::vector<u32> block(std::size_t(kBlockColumns) * ld);              // P_0 .. P_(nb-1)
+    std::vector<u32> panel(static_cast<std::size_t>(kBlockColumns + 1) * pstride);  // M_0 .. M_(nb-1), then the work column
+    std::vector<u32> block(static_cast<std::size_t>(kBlockColumns) * ld);             // P_0 .. P_(nb-1)
     int r0 = 0;  // rows r0 on: trailing, zero at every column before c0
     for (int c0 = 0; c0 < cols; c0 += kBlockColumns) {
         const int c1 = std::min(cols, c0 + kBlockColumns), n = rows - r0;
-        const int from = c0, len = cols - from;  // c0 is a multiple of 16
+        const int from = c0 & ~15, len = cols - from;  // rows rounded to 16 words: whole vectors from here
         u32* P = block.data();
         u32* R0 = A.row(r0);
         int nb = 0;  // positions 0 .. nb - 1 of the trailing rows: this block's pivots
