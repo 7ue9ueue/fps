@@ -20,7 +20,7 @@
 // Words are Montgomery residues in [0, P) in and out. Kernels work on whole vectors of W = S::lanes
 // words: t runs to len rounded up to W, so arrays are readable (and out writable) that far, and
 // the extra words of the inputs must be zero where the extra outputs are to be zero. out may be
-// init or a column.
+// init, or a column of at most kColumnTile (256) columns (longer sums run in passes into out).
 //
 // Sums: products of two residues (< (P - 1)^2) add up in 64-bit lanes; fold(s) = s - (s >> 32) kQ
 // = (s >> 32) R1 + (s mod 2^32), R1 = 2^32 mod P, kQ = 2^32 - R1 (a multiple of P), keeps a sum
@@ -181,6 +181,12 @@ using Sums = std::conditional_t<HasMulEven<S>, EvenOdd<S>, std::conditional_t<Ha
 template <class S>
 inline constexpr bool kSingle = !HasMulEven<S> && !HasMulWide<S>;
 
+// Columns per pass of combine and combine_rows: for each output vector they read a word range of
+// every column, one 4 KiB page per column when columns are 16 KiB apart (m = 4096); past about
+// 2048 columns these pages miss Zen 3's L2 TLB (2048 entries): degree 4096 took 28 s against
+// 1.5 s at 2048. Passes of 256 columns keep the pages of a pass in the TLB.
+inline constexpr int kColumnTile = 256;
+
 // Vectors per block of combine: the sums of a block stay in registers (2 per vector).
 template <class S>
 inline constexpr int kBlock = S::registers >= 32 ? 8 : 4;
@@ -333,6 +339,13 @@ inline void combine_rows(u32* out, std::ptrdiff_t ostride, int rows, int len, co
                          const u32* base, std::ptrdiff_t stride) {
     using namespace detail;
     constexpr int R = kRows<S>;
+    if (count > kColumnTile) {  // passes of kColumnTile columns, each adding into out
+        combine_rows<S>(out, ostride, rows, len, init, istride, scale, coef, cstride, sstride, kColumnTile, base, stride);
+        for (int s0 = kColumnTile; s0 < count; s0 += kColumnTile)
+            combine_rows<S>(out, ostride, rows, len, out, ostride, kOne, coef + s0 * sstride, cstride, sstride,
+                            std::min(kColumnTile, count - s0), base + s0 * stride, stride);
+        return;
+    }
     if (!init) init = kZeros, istride = 0;
     int r = 0;
     for (; r + R <= rows; r += R)
@@ -344,11 +357,18 @@ inline void combine_rows(u32* out, std::ptrdiff_t ostride, int rows, int len, co
 }
 
 // out[t] = scale init[t] + sum_{s < count} coef[s] (base + s stride)[t] for t < len rounded up to
-// W; init may be null (zero). Columns and init are read over the same rounded range.
+// W; init may be null (zero). Columns and init are read over the same rounded range. out may be
+// init, or a column if count <= kColumnTile.
 template <class S>
 inline void combine_scaled(u32* out, int len, const u32* init, u32 scale, const u32* coef, int count, const u32* base,
                            std::ptrdiff_t stride) {
     using namespace detail;
+    if (count > kColumnTile) {  // passes of kColumnTile columns, each adding into out
+        combine_scaled<S>(out, len, init, scale, coef, kColumnTile, base, stride);
+        for (int s0 = kColumnTile; s0 < count; s0 += kColumnTile)
+            combine_scaled<S>(out, len, out, kOne, coef + s0, std::min(kColumnTile, count - s0), base + s0 * stride, stride);
+        return;
+    }
     constexpr int W = S::lanes, B = kBlock<S>;
     const int vectors = (len + W - 1) / W;
     int v = 0;

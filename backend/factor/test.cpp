@@ -169,7 +169,7 @@ void test_kernels() {
     constexpr int W = S::lanes;
     for (int trial = 0; trial < 300; ++trial) {
         const int len = trial < 80 ? 1 + trial : 1 + int(rng() % 140);
-        const int count = std::vector<int>{0, 1, 2, 16, 17, 18, 34, 35, 52, 100}[trial % 10];
+        const int count = std::vector<int>{0, 1, 2, 16, 17, 18, 34, 35, 52, 100, 257, 600}[trial % 12];
         const bool extreme = trial % 7 == 3, with_init = trial % 3 != 0;
         const int stride = fd::round_up(len, 16) + 16 * int(trial % 2);
         auto word = [&] { return extreme ? P - 1 : rand_word(); };
@@ -218,7 +218,7 @@ void test_kernels() {
     // combine_rows: 1 to 9 rows, in place or from other rows, init null or not.
     for (int trial = 0; trial < 200; ++trial) {
         const int rows = 1 + trial % 9, len = 1 + int(rng() % 140);
-        const int count = std::vector<int>{0, 1, 5, 16, 17, 18, 40, 100}[trial % 8];
+        const int count = std::vector<int>{0, 1, 5, 16, 17, 18, 40, 100, 256, 300, 530}[trial % 11];
         const bool extreme = trial % 7 == 3, in_place = trial % 3 == 1, with_init = trial % 3 != 0;
         const int stride = fd::round_up(len, 16) + 16 * int(trial % 2);
         // Coefficients by rows (cstride, step 1) or by columns (step sstride, rows 1 apart).
