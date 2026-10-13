@@ -5,6 +5,7 @@
 // is then intrinsics<Neon>) only what runs.
 #include "backend/ntt/test_util.hpp"
 
+#include <algorithm>
 #include <cstdio>
 
 #if defined(__ARM_NEON) && defined(__aarch64__)
@@ -57,6 +58,36 @@ void test_bottom(Kind kind, const char* name) {
             for (std::size_t i = 0; i < 32 * count; ++i)
                 ok &= a.begin()[i] < 2 * P && a.begin()[i] % P == expected.begin()[i] % P;
             expect(ok, name, count * 1000000 + first);
+        }
+    }
+}
+
+// Bottom::inverse_terms of one term a b (canonical leaves of groups from `first`, into out) against
+// Bottom<Neon>: out < 2P and equal mod P; two terms run the intrinsics in both.
+void test_terms() {
+    const std::size_t leaves = std::size_t(1) << 13;
+    Words r(leaves), ir(leaves);
+    Plain::build_table(r.begin(), leaves / 2, false);
+    Plain::build_table(ir.begin(), leaves / 2, true);
+    for (const int n : {1, 2}) {
+        for (std::size_t count : {2, 4, 16, 64}) {
+            for (int trial = 0; trial < 12; ++trial) {
+                const std::size_t first = trial < 2 ? trial * count : count * random_below(leaves / 4 / count);
+                const int pick = trial % 3;
+                const std::size_t words = 32 * (first + count);
+                Words a0(words), b0(words), a1(words), out(32 * count), expected(32 * count);
+                for (std::size_t i = 0; i < words; ++i) {
+                    const auto word = [&] { return pick == 0 ? random_below(P) : pick == 1 ? P - 1 : u32(random_below(2) * (P - 1)); };
+                    a0.begin()[i] = word(), b0.begin()[i] = word(), a1.begin()[i] = word();
+                }
+                const fps::ntt::detail::LeafTerm terms[] = {{a0.begin(), b0.begin()}, {a1.begin(), nullptr}};
+                Plain::bottom_inverse_terms(expected.begin(), terms, n, count, first, r.begin(), ir.begin());
+                Asm::bottom_inverse_terms(out.begin(), terms, n, count, first, r.begin(), ir.begin());
+                bool ok = true;
+                for (std::size_t i = 0; i < 32 * count; ++i)
+                    ok &= out.begin()[i] < 2 * P && out.begin()[i] % P == expected.begin()[i] % P;
+                expect(ok, "neon: inverse_terms bottom against Bottom<Neon>", n * 10000000 + count * 10000 + first);
+            }
         }
     }
 }
@@ -129,6 +160,113 @@ void test_groups() {
     }
 }
 
+// Round 2's kernels against the intrinsics, on quarters of q words: the forward top group on
+// canonical inputs (in place, from other memory), the scaled inverse groups k < 4 (scaled blocks of
+// random scales), the inverse top group and radix-2 level with and without a scale (in place, and
+// from other memory into words [0, w) of the quarters or halves, w a multiple of 8 or 4). Canonical
+// outputs equal, others mod P.
+void test_tops() {
+    const std::size_t entries = 512;
+    Words r(2 * entries), ir(2 * entries);
+    Plain::build_table(r.begin(), entries, false);
+    Plain::build_table(ir.begin(), entries, true);
+    const auto fill = [](Words& w, std::size_t n, u32 bound, int pick) {
+        for (std::size_t i = 0; i < n; ++i) w.begin()[i] = forward_word(pick == 3 ? int(random_below(4)) : pick) % bound;
+    };
+    const auto same = [](Words& a, Words& b, std::size_t n, u32 bound) {
+        bool ok = true;
+        for (std::size_t i = 0; i < n; ++i) ok &= a.begin()[i] < bound && a.begin()[i] % P == b.begin()[i] % P;
+        return ok;
+    };
+    for (const std::size_t q : {16, 32, 48, 64, 128, 512}) {
+        for (int trial = 0; trial < 16; ++trial) {
+            const int pick = trial % 4;
+            Words f(4 * q), expected(4 * q), from(4 * q);
+            // Forward top group, canonical in.
+            fill(f, 4 * q, P, pick);
+            for (std::size_t i = 0; i < 4 * q; ++i) expected.begin()[i] = from.begin()[i] = f.begin()[i];
+            Plain::forward_group<1>(expected.begin(), q, 0, r.begin());
+            Asm::forward_group<1>(f.begin(), q, 0, r.begin());
+            expect(same(f, expected, 4 * q, 4 * P), "neon: forward top group", q * 100 + trial);
+            for (std::size_t i = 0; i < 4 * q; ++i) f.begin()[i] = u32(rng());
+            Asm::forward_group<1>(from.begin(), f.begin(), q, 0, r.begin());
+            expect(same(f, expected, 4 * q, 4 * P), "neon: forward top group from", q * 100 + trial);
+            // Columns [0, w) of a group from other memory (a product's first level), in < 2P.
+            for (const std::size_t k : {std::size_t(0), std::size_t(1 + random_below(entries / 2 - 1))}) {
+                const std::size_t w = 8 * (1 + random_below(q / 8));
+                Words to(4 * q), want(4 * q);
+                for (std::size_t i = 0; i < 4 * q; ++i) to.begin()[i] = want.begin()[i] = u32(rng());
+                Plain::forward_group_part<2, 4>(from.begin(), want.begin(), q, w, k, r.begin());
+                Asm::forward_group_part<2, 4>(from.begin(), to.begin(), q, w, k, r.begin());
+                bool ok = true;
+                for (std::size_t i = 0; i < 4 * q; ++i)
+                    ok &= i % q < w ? to.begin()[i] < 4 * P && to.begin()[i] % P == want.begin()[i] % P : to.begin()[i] == want.begin()[i];
+                expect(ok, "neon: forward group columns from other memory", q * 100000 + w * 100 + k);
+            }
+            // Scaled inverse groups, in < 2P.
+            const u32 s = trial == 0 ? 1 : random_below(P);
+            const auto block = intrinsics::scaled_block(s);
+            for (std::size_t k = 0; k < 4; ++k) {
+                fill(f, 4 * q, 2 * P, pick);
+                for (std::size_t i = 0; i < 4 * q; ++i) expected.begin()[i] = f.begin()[i];
+                Plain::inverse_group_scaled(expected.begin(), q, k, ir.begin(), block.words);
+                Asm::inverse_group_scaled(f.begin(), q, k, ir.begin(), block.words);
+                expect(same(f, expected, 4 * q, 2 * P), "neon: scaled inverse group", q * 1000 + trial * 10 + k);
+            }
+            // Inverse top group, s and 0.
+            for (const u32 scale : {s, 0u}) {
+                fill(f, 4 * q, 2 * P, pick);
+                for (std::size_t i = 0; i < 4 * q; ++i) expected.begin()[i] = from.begin()[i] = f.begin()[i];
+                Plain::inverse_radix4(expected.begin(), q, ir.begin(), scale);
+                Asm::inverse_radix4(f.begin(), q, ir.begin(), scale);
+                expect(std::equal(f.begin(), f.begin() + 4 * q, expected.begin()), "neon: inverse top group", q * 100 + trial);
+                const std::size_t w = 8 * (1 + random_below(q / 8));
+                Words to(4 * q), want(4 * q);
+                for (std::size_t i = 0; i < 4 * q; ++i) to.begin()[i] = want.begin()[i] = u32(rng());
+                Plain::inverse_radix4_part<4>(from.begin(), want.begin(), q, w, ir.begin(), scale);
+                Asm::inverse_radix4_part<4>(from.begin(), to.begin(), q, w, ir.begin(), scale);
+                expect(std::equal(to.begin(), to.begin() + 4 * q, want.begin()), "neon: inverse top group to other memory",
+                       q * 100000 + w * 100 + trial);
+                for (const bool upper : {false, true}) {  // outputs 0, 1 or 2, 3 only (cut products, upper halves)
+                    for (std::size_t i = 0; i < 4 * q; ++i) to.begin()[i] = want.begin()[i] = u32(rng());
+                    if (upper) {
+                        Plain::inverse_radix4_part<2, true>(from.begin(), want.begin(), q, w, ir.begin(), scale);
+                        Asm::inverse_radix4_part<2, true>(from.begin(), to.begin(), q, w, ir.begin(), scale);
+                    } else {
+                        Plain::inverse_radix4_part<2>(from.begin(), want.begin(), q, w, ir.begin(), scale);
+                        Asm::inverse_radix4_part<2>(from.begin(), to.begin(), q, w, ir.begin(), scale);
+                    }
+                    expect(std::equal(to.begin(), to.begin() + 4 * q, want.begin()), "neon: inverse top group, half out",
+                           q * 100000 + w * 100 + trial * 2 + upper);
+                }
+                // The inverse radix-2 level on halves of 2q words.
+                const std::size_t half = 2 * q, w2 = 4 * (1 + random_below(half / 4));
+                for (std::size_t i = 0; i < 4 * q; ++i) expected.begin()[i] = f.begin()[i] = from.begin()[i];
+                Plain::inverse_radix2(expected.begin(), half, scale);
+                Asm::inverse_radix2(f.begin(), half, scale);
+                expect(std::equal(f.begin(), f.begin() + 4 * q, expected.begin()), "neon: inverse radix-2 level", q * 100 + trial);
+                for (std::size_t i = 0; i < 4 * q; ++i) to.begin()[i] = want.begin()[i] = u32(rng());
+                Plain::inverse_radix2_part<2>(from.begin(), want.begin(), half, w2, scale);
+                Asm::inverse_radix2_part<2>(from.begin(), to.begin(), half, w2, scale);
+                expect(std::equal(to.begin(), to.begin() + 4 * q, want.begin()), "neon: inverse radix-2 level to other memory",
+                       q * 100000 + w2 * 100 + trial);
+                for (const bool upper : {false, true}) {  // the sums or the differences only
+                    for (std::size_t i = 0; i < 4 * q; ++i) to.begin()[i] = want.begin()[i] = u32(rng());
+                    if (upper) {
+                        Plain::inverse_radix2_part<1, true>(from.begin(), want.begin(), half, w2, scale);
+                        Asm::inverse_radix2_part<1, true>(from.begin(), to.begin(), half, w2, scale);
+                    } else {
+                        Plain::inverse_radix2_part<1>(from.begin(), want.begin(), half, w2, scale);
+                        Asm::inverse_radix2_part<1>(from.begin(), to.begin(), half, w2, scale);
+                    }
+                    expect(std::equal(to.begin(), to.begin() + 4 * q, want.begin()), "neon: inverse radix-2 level, half out",
+                           q * 100000 + w2 * 100 + trial * 2 + upper);
+                }
+            }
+        }
+    }
+}
+
 // square<V>(f, out) against schoolbook (to 40 words, and short transforms) or the product by
 // evaluation, out of 2n - 1 words, at every length.
 template <class V>
@@ -168,7 +306,9 @@ int main() {
     test_bottom(Kind::product, "neon: product bottom against Bottom<Neon>");
     test_bottom(Kind::square, "neon: square bottom against Bottom<Neon>");
     test_bottom(Kind::stored, "neon: stored bottom against Bottom<Neon>");
+    test_terms();
     test_groups();
+    test_tops();
 #else
     std::printf("no SVE2: neon is intrinsics<Neon>\n");
 #endif
