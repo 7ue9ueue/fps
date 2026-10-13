@@ -48,6 +48,11 @@ struct Generated {
 //   inverse_top<kStore, kUpper>(from, f, q, words, ir, s)  inverse_radix4, inverse_radix4_part; -> bool
 //   inverse_radix2<kStore, kUpper>(from, f, half, words, s) inverse_radix2, inverse_radix2_part; -> bool
 //   inverse_terms(out, terms, n, count, first, r, ir) -> bool  Bottom::inverse_terms; count even
+//   kShareGroups                                           single groups in place (forward_group with kIn
+//                                                          4, inverse_group; quarters of 64 words and
+//                                                          more) run through forward_groups and
+//                                                          inverse_groups: one inlined copy of the
+//                                                          hooks' loops (avx512.hpp, issue #152)
 
 // Lazy arithmetic mod P on S: values < 4P in forward transforms, < 2P in inverse ones.
 template <class S>
@@ -342,6 +347,8 @@ struct Butterflies : Arith<S> {
     // Group k of `from` into f (may be from). In < kIn P, out < 4P.
     template <int kIn = 4>
     static void forward_group(const u32* from, u32* f, std::size_t q, std::size_t k, const u32* r) {
+        if constexpr (kIn == 4 && requires { Generated<S>::kShareGroups; })
+            if (from == f && q % 64 == 0) return forward_groups(f, q, k, 1, r);
         forward_group_inline<kIn>(from, f, q, k, r);
     }
     template <int kIn = 4>
@@ -382,7 +389,11 @@ struct Butterflies : Arith<S> {
         }
     }
 
-    static void inverse_group(u32* f, std::size_t q, std::size_t k, const u32* ir) { inverse_group_inline(f, q, k, ir); }
+    static void inverse_group(u32* f, std::size_t q, std::size_t k, const u32* ir) {
+        if constexpr (requires { Generated<S>::kShareGroups; })
+            if (q % 64 == 0) return inverse_groups(f, q, k, 1, ir);
+        inverse_group_inline(f, q, k, ir);
+    }
     [[gnu::always_inline]] static void inverse_group_inline(u32* f, std::size_t q, std::size_t k, const u32* ir) {
         if constexpr (requires { Generated<S>::inverse(f, q, k, ir); })
             if (Generated<S>::inverse(f, q, k, ir)) return;

@@ -284,11 +284,20 @@ issue #152, below). A candidate on both targets; on zen5 also `Native` (the leaf
   level forward and inverse in statements of 4 and 2 pairs, and the product bottoms as on Emerald
   Rapids (one pair per stage; `multiply_*` scheduled on the Emerald Rapids model, which ran faster
   on Zen 5). Kernels on L1 data against the intrinsics: groups 0.86-0.91, two-column forward
-  groups 0.77, bottom forward 0.80, inverse 0.85, product bottom 0.91, square 0.82.
-- Zen 5 cares about code size and store forwarding more than the model says: the product bottom two
-  pairs per stage (0.88 on L1 data) and inverse two-column groups (0.86) made whole products slower
-  (more hot code than the op cache holds, a guess), and loads 4 bytes past a column (odd words)
-  in the two-column groups ran 1.36x slower (loads across two recent stores do not forward).
+  groups 0.77, bottom forward 0.80, inverse 0.85, product bottom 0.91, square 0.82. Round 2
+  (notes/152-r2.md): the scaled inverse top groups (`inverse_group_scaled`, 0.88-0.95) and first
+  levels from other memory with inputs < 2P (`forward_from`, 0.87-0.98); single groups run
+  through the level functions (`kShareGroups`), so each asm loop is inlined once in the hot code.
+- Zen 5 cares about code size: its op cache holds about 5.9K instructions, and past it a thread
+  decodes about 3 per cycle (16-20 bytes; probe in notes/152-r2.md), where the kernels run 4-5. A
+  product at 2^12-2^16 runs 5.6-5.7K distinct instructions per call (2^14: 6.8K before the
+  sharing), a forward transform at 2^10 2.0K (intrinsics 1.0K), evaluate/10 and the series at
+  2^11 11-15K (decode-bound whatever the variant; the asm adds 15-35% to the ntt's share). Bigger
+  statements that win on L1 data lose in whole ops: the product bottom two pairs per stage (0.88
+  on L1 data), inverse two-column groups (0.86; products at 2^10-2^11 3-4% slower). Code layout
+  alone moves single ops by up to 10% between builds (forward/11, product/10): compare in one
+  binary (run-time switches) or over several builds. Loads 4 bytes past a column (odd words) in the
+  two-column groups ran 1.36x slower (loads across two recent stores do not forward).
 
 ### neon (issue #151)
 
