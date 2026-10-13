@@ -26,7 +26,7 @@
 // a[k]: fps::bostan_mori::coefficient (backend/bostan_mori, Bostan and Mori) on p and q as
 // they are, one call: p(x) q(-x) = U_0(x^2) + x U_1(x^2), q(x) q(-x) = V(x^2), and
 // [x^k] p / q = [x^(k / 2)] U_(k mod 2) / V, with p and q cut to k + 1 coefficients. Schoolbook
-// steps while p and q are short (76 to 96 words by target), steps in the NTT's values form beyond:
+// steps while p and q are short (64 to 96 words by target), steps in the NTT's values form beyond:
 // O(d log d log k), d the larger of p.size() and q.size(). Nothing is cached: each [k] is a full
 // computation; for many small indices, call take(n) once. k = 10^18: 0.8 to 1.2 us for
 // Fibonacci; d = 10^5: 21 to 59 ms, d = 2^20: 0.36 to 1.06 s (Zen 5 to Neoverse V2;

@@ -208,7 +208,7 @@ void test_coefficients() {
     CHECK(Frac(Poly{1, 2, 3})[2] == 3 && Frac(Poly{1, 2, 3})[3] == 0 && Frac(Poly{1, 2, 3})[~u64(0)] == 0);
 }
 
-// [k] is fps::bostan_mori::coefficient: schoolbook steps up to kSchoolbookMax words (76 to 96 by
+// [k] is fps::bostan_mori::coefficient: schoolbook steps up to kSchoolbookMax words (64 to 96 by
 // target), the values form beyond, which hands off to schoolbook once the cut to k + 1 words
 // fits. Sizes on both sides of each limit; every k below the reference's length, and huge k
 // against Kitamasa (on q without its trailing zeros, the same series).
