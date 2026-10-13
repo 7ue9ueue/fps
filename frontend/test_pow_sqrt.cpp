@@ -553,6 +553,27 @@ void test_limits() {
     Vec root(big, 0);
     root[0] = 1, root[1] = P - 1;
     CHECK(s && vec(*s) == root);
+    // sqrt past 2^25 with 5 and 16 terms past u[0]: the recurrence, where only n > kBackendMax
+    // sends them. Its first 2^12 coefficients against the kernel's sqrt(u, 2^12); further on,
+    // 2 u g' = u' g (from g^2 = u mod x^n) at coefficient k < n - 1, both sides O(t).
+    for (std::size_t t : {5, 16}) {
+        Poly u(64 * t + 1);
+        u[0] = 9;
+        for (std::size_t i = 1; i <= t; ++i) u[64 * i] = u32(rng() % (P - 1) + 1);
+        const auto g = fps::sqrt(u, big), head = fps::sqrt(u, std::size_t(1) << 12);
+        CHECK(g && head && g->size() == big, t);
+        if (!g || !head) continue;
+        CHECK(std::equal(head->span().begin(), head->span().end(), g->span().begin()), t);
+        for (std::size_t k : {std::size_t(1) << 24, big - 100, big - 2}) {
+            u32 left = 0, right = 0;
+            for (std::size_t j = 0; j < u.size(); ++j) {
+                const u32 next = (*g)[k - j + 1];  // g_(k - j + 1)
+                left = add(left, mul(mul(2, u[j]), mul(u32(k - j + 1), next)));
+                right = add(right, mul(mul(u32(j), u[j]), next));
+            }
+            CHECK(left == right, t, k);
+        }
+    }
 }
 
 }  // namespace
