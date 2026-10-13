@@ -126,7 +126,9 @@ docs. You decide what is worth doing.
   gate whose units it touches.
 - The VMs are shared: keep them running, never delete one you did not create, and leave `~/lc-opt`
   alone. Time only under `flock /tmp/bench.lock` (`kernel.py bench` takes it), and never time x86
-  code on the Mac (Rosetta).
+  code on the Mac (Rosetta). Other agents run there at the same time: stop only processes you
+  started, by PID (`pkill -f` patterns match theirs too), and check on a running job with
+  `vm.py --no-sync` (a sync wipes the folder it runs in).
 - If the request is unclear, or you need access you lack (a VM, a login, a credential), ask the
   user rather than guess or work around it. Unattended: comment on your issue with the question and
   the options, add `blocked`, and return.
