@@ -153,7 +153,10 @@ void pair_step(u32* a, u32* b, std::size_t n, const u32* weights, const u32* inv
     using V = typename L::V;
     using M = Ops<L>;
     constexpr int W = L::lanes;
-    constexpr bool kColumns = std::is_same_v<Sums<L>, product_tree::detail::EvenOdd<L>> && W == 8;
+#ifndef FPS_ROOTS_COLUMNS
+#define FPS_ROOTS_COLUMNS 1
+#endif
+    constexpr bool kColumns = FPS_ROOTS_COLUMNS && std::is_same_v<Sums<L>, product_tree::detail::EvenOdd<L>> && W == 8;
     const V p = L::broadcast(kP);
     for (std::size_t q = 0; q < n / 8; q += W) {
         alignas(64) u32 c[2][16][W];  // even_parts of the even and the odd leaves, through memory

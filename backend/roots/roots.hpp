@@ -14,30 +14,39 @@
 //
 // Steps, for f = x^z u with u(0) != 0 and d = deg u >= 2 (0 is a root when z > 0; d = 1 directly):
 // - g = c u(x + t) for the first t of a fixed sequence with u(t) != 0 (t is a root otherwise:
-//   divided out, next t), c a nonzero constant: one middle product of length bit_ceil(2d + 1) with
-//   factorials (backend/factorials).
+//   divided out, next t), c a nonzero constant: one middle product of length 2 bit_ceil(d + 1)
+//   with factorials (backend/factorials); up to kShiftWrap coefficients past a power of two are
+//   added directly, so the product stays at twice that power.
 // - k Graeffe steps on (A, B) = (g, g') over F_P[eps]/(eps^2): A(y) + eps B(y) = (A + eps B)(x)
 //   (A + eps B)(-x), y = x^2, in the leaf form: leaves 2q and 2q + 1 of the transform of 2n words
 //   give leaf q of the transform of n words of the result (kernels.hpp, pair_step), then two
-//   inverses (n) and two forward_upper (2n) per step, n = bit_ceil(d + 1) >= 64. B carries 2^-k,
-//   so a simple zero z of A_k gives its root r = z A'(z) / B(z) directly.
-// - After k = 23 - l steps (l = bit_width(d) - 3) the roots in F_P sit in H, the subgroup of order
-//   119 2^l; other roots never land there. H = 119 cosets of the 2^l-th roots of unity, 8 cosets in
-//   the 8 lanes of a row: each polynomial folded mod (x^n - v^n) (64-bit sums), twisted by v^j, and
-//   one forward transform of 8 n words in the lanes layout (word 8 j + lane), whose leaf q holds
-//   the 8 values at v w^bitrev(q). A, x A' and B on H.
+//   inverses (n) and two forward_upper (2n) per step; n = bit_ceil(d + 1), or bit_floor(d) when d
+//   exceeds it by less than kWrap: the coefficients past n wrap onto the first ones and are
+//   computed directly (O(kWrap^2) a step). B carries 2^-k, so a simple zero z of A_k gives its
+//   root r = z A'(z) / B(z) directly.
+// - After k = 23 - l steps (8 2^l >= d) the roots in F_P sit in H, the subgroup of order 119 2^l;
+//   other roots never land there. H = 119 cosets of the 2^l-th roots of unity, 8 (or 16, Folds)
+//   cosets in the lanes of a vector: each polynomial folded mod (x^n - v^n) (64-bit sums), twisted
+//   by v^j, and one forward transform of 8 n words per 8 lanes in the lanes layout (word 8 j +
+//   lane), whose leaf q holds the 8 values at v w^bitrev(q). A on H; x A' and B only for groups of
+//   cosets with zeros (all three at once while the last group had zeros).
 // - A zero z of A on H with z A'(z) != 0 is simple: its root. Otherwise z is multiple (roots that
 //   collide under r -> r^(2^k), or a repeated root) and climbs: its 2^e-th roots are evaluated
 //   with the iterate saved at level k - e (A, x A' and B), at most kClimb levels at a time, and at
 //   level 0 with g itself, where every zero among the candidates is a root. A tracked point whose
 //   candidates hold one zero in its lane sends all its roots there: that zero is multiple without
-//   evaluating x A' and B. Points are kept as exponents of the generator 3.
+//   evaluating x A' and B. Points are kept as exponents of the generator 3. The roots are sorted
+//   by a radix sort (kernels.hpp).
+// Kernels per target (select.hpp): Graeffe steps on product_tree::Lanes; folds on Avx512 (16
+// lanes) with AVX-512, else on Lanes.
 //
-// Cost: O(d log d) for the shift, the Graeffe steps and the subgroup; each group of 8 multiple
-// zeros costs a fold of the d + 1 coefficients per climb, so inputs with many collisions or
-// repeated roots cost up to about d^2 / 300 more (lc-opt's design for d <= 4000).
-// Memory: one workspace per thread, kept across calls (about 12 bit_ceil(d + 1) + 20 d words);
-// transforms: series' per-thread ntt::Transform per length. Design and measurements: notes.md.
+// Cost: O(d log d) for the shift, the Graeffe steps and the subgroup; each group of 8 (16)
+// multiple zeros costs a fold of the d + 1 coefficients per climb, so inputs with many collisions
+// or repeated roots cost up to about d^2 / 300 more (lc-opt's design for d <= 4000; 21 ms at d =
+// 24576 with 4096 distinct roots, each of multiplicity about 4, on Zen 3: notes.md).
+// Memory: one workspace per thread, kept across calls (32 to 45 d words, about 9 d more with the
+// Avx512 folds, at least 22K); transforms: series' per-thread ntt::Transform per length. Design
+// and measurements: notes.md.
 #pragma once
 
 #include <algorithm>
@@ -294,8 +303,8 @@ void graeffe(u32* a, u32* b, std::size_t d, int k, std::span<const Save> saves, 
 // ---- Cosets -----------------------------------------------------------------------------------
 
 // GCC 15.2 at -O2 with AVX2 vectorizes the folds' loop over the terms wrongly for the Scalar
-// struct's u64 sums (a reduction into 8 lanes' sums; -O3 and SSE are right; a reproducer is
-// gcc_repro.cpp in the exploration folder, issue #122): that loop stays scalar.
+// struct's u64 sums (8 lanes' sums; -O3 and SSE are right; a reproducer in issue #183): that loop
+// stays scalar.
 #if defined(__GNUC__) && !defined(__clang__)
 #define FPS_ROOTS_NOVECTOR _Pragma("GCC novector")
 #else
