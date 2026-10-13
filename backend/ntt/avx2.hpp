@@ -1077,6 +1077,154 @@ inline void inverse_product(const LeafTerm* terms, int n, u32* words, u32* out, 
     inverse_radix8_out(words, nv / 8, out, count, ir, s);
 }
 
+// Hooked ops (Transform, issue #149): a forward from in whose runs of leaves go to a hook after
+// their bottom level, an inverse whose runs of leaves a hook writes before theirs; both pruned for
+// Kronecker layouts. width (vectors, a power of two; 0 or 1: none): vector bit log2(width) of the
+// index is zero in the forward's input, or unused in the inverse's output, so the groups above it
+// run only on the columns j with (j & width) == 0 (kernels::*_columns). As in lc-opt, groups with
+// quarters below kPruneForward (kPruneInverse) vectors run whole: narrow columns gain little. The
+// top level runs whole (the skipped columns of a forward hold zeros mod P from there on).
+inline constexpr std::size_t kPruneForward = 32, kPruneInverse = 8;
+
+inline bool prunes(std::size_t h, std::size_t width, std::size_t least) { return width >= 2 && h >= 2 * width && h >= least; }
+
+inline void forward_group_pruned(Vec* f, std::size_t h, std::size_t k, const u32* r, std::size_t width) {
+    if (prunes(h, width, kPruneForward)) return kernels::forward_columns(f, h, width, r + slot(k), r + slot(2 * k));
+    forward_group(f, h, k, r);
+}
+
+inline void inverse_group_pruned(Vec* f, std::size_t h, std::size_t k, const u32* ir, std::size_t width) {
+    if (prunes(h, width, kPruneInverse)) return kernels::inverse_columns(f, h, width, ir + slot(k), ir + slot(2 * k));
+    inverse_group(f, h, k, ir);
+}
+
+// forward_tiles() with pruned groups.
+template <class Tile>
+inline void forward_pruned_tiles(Vec* f, std::size_t nv, std::size_t count, std::size_t first, const u32* r,
+                                 std::size_t width, Tile tile) {
+    if (nv > kTile) {
+        for (std::size_t k = first; k < first + count; ++k, f += nv) {
+            forward_group_pruned(f, nv / 4, k, r, width);
+            forward_pruned_tiles(f, nv / 4, 4, 4 * k, r, width, tile);
+        }
+        return;
+    }
+    const std::size_t run = std::min(count, kTile / nv), total = run * nv;
+    for (std::size_t k = first; k < first + count; k += run, f += total) {
+        for (std::size_t h = nv / 4; h >= 4; h /= 4)
+            for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) forward_group_pruned(f + j, h, g, r, width);
+        forward_bottom(f, total / 4, k * (nv / 4), r);
+        tile(reinterpret_cast<u32*>(f), total);
+    }
+}
+
+// inverse_trees_with() with pruned groups.
+template <class Stage>
+inline void inverse_pruned_with(Vec* f, std::size_t nv, std::size_t count, std::size_t first, const u32* ir,
+                                std::size_t width, Stage stage) {
+    if (nv > kTile) {
+        for (std::size_t k = first; k < first + count; ++k, f += nv) {
+            inverse_pruned_with(f, nv / 4, 4, 4 * k, ir, width, stage);
+            inverse_group_pruned(f, nv / 4, k, ir, width);
+        }
+        return;
+    }
+    const std::size_t run = std::min(count, kTile / nv), total = run * nv;
+    for (std::size_t k = first; k < first + count; k += run, f += total) {
+        stage(reinterpret_cast<u32*>(f), total);
+        for (std::size_t h = 4; h < nv; h *= 4)
+            for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) inverse_group_pruned(f + j, h, g, ir, width);
+    }
+}
+
+// The top levels of the hooked ops, pruned (detail::PrunedLevel; width in vectors): the forward's
+// writes zeros to the skipped columns, the inverse's leaves them unwritten. As forward_radix4_from,
+// forward_radix2_from and the *_out functions above.
+inline void forward_radix4_from_pruned(const u32* f, std::size_t n, u32* to, std::size_t h, const u32* roots,
+                                       std::size_t width) {
+    first_level_pruned<4>(f, n, to, 8 * h, 16, 8 * width, [&] [[gnu::always_inline]] (auto blocks, const u32* s, u32* d, std::size_t words) {
+        forward_radix4_part<decltype(blocks)::value>(s, reinterpret_cast<Vec*>(d), words / 8, h, roots);
+    });
+}
+inline void forward_radix2_from_pruned(const u32* f, std::size_t n, u32* to, std::size_t h, std::size_t width) {
+    first_level_pruned<2>(f, n, to, 8 * h, 8, 8 * width, [&] [[gnu::always_inline]] (auto blocks, const u32* s, u32* d, std::size_t words) {
+        forward_radix2_part<decltype(blocks)::value>(s, reinterpret_cast<Vec*>(d), words / 8, h);
+    });
+}
+
+// The hooked inverse's top level: count words of the lower or upper half (upper) to out, scaled by
+// s; columns with (j & width) set unwritten.
+inline void inverse_top_pruned(u32* words, std::size_t nv, int lg, u32* out, std::size_t count, const u32* ir, u32 s,
+                               bool upper, std::size_t width) {
+    const std::size_t w = 8 * width;
+    if (!has_radix2(lg)) {
+        const std::size_t h = nv / 4;
+        const u32 sz = multiply_mod(s, ir[slot(1)]);
+        alignas(32) const Vec weights[4] = {broadcast(s), broadcast(quotient(s)), broadcast(sz), broadcast(quotient(sz))};
+        if (upper) {
+            return last_level_pruned<2>(words, 8 * h, out, count, 16, w, [&] [[gnu::always_inline]] (auto blocks, const u32* f, u32* d, std::size_t n) {
+                constexpr int T = decltype(blocks)::value;
+                if constexpr (T > 0) product_kernels::inverse_top4_upper_to<T>(reinterpret_cast<const Vec*>(f), d, n / 8, h, weights);
+            });
+        }
+        return last_level_pruned<4>(words, 8 * h, out, count, 16, w, [&] [[gnu::always_inline]] (auto blocks, const u32* f, u32* d, std::size_t n) {
+            constexpr int T = decltype(blocks)::value;
+            if constexpr (T > 0) inverse_radix4_part<T>(reinterpret_cast<const Vec*>(f), d, n / 8, h, weights);
+        });
+    }
+    if (nv == 8) {
+        if (upper) return scale_radix2_upper_out(words, 4, out, count, s);
+        return scale_radix2_out(words, 4, out, count, s);
+    }
+    const std::size_t q = nv / 8;
+    const u32 z0 = ir[slot(1)], y1 = ir[slot(2)], z1 = ir[slot(3)], x1 = ir[slot(1)];
+    const u32 twiddles[6] = {s, multiply_mod(s, z0), multiply_mod(s, y1), multiply_mod(s, z1), multiply_mod(s, x1), x1};
+    alignas(32) Vec weights[12];
+    for (int i = 0; i < 6; ++i) weights[2 * i] = broadcast(twiddles[i]), weights[2 * i + 1] = broadcast(quotient(twiddles[i]));
+    if (upper) {
+        return last_level_pruned<4>(words, 8 * q, out, count, 8, w, [&] [[gnu::always_inline]] (auto blocks, const u32* f, u32* d, std::size_t n) {
+            constexpr int T = decltype(blocks)::value;
+            if constexpr (T > 0) product_kernels::inverse_top_upper_to<T>(reinterpret_cast<const Vec*>(f), d, n / 8, q, weights);
+        });
+    }
+    last_level_pruned<8>(words, 8 * q, out, count, 8, w, [&] [[gnu::always_inline]] (auto blocks, const u32* f, u32* d, std::size_t n) {
+        constexpr int T = decltype(blocks)::value;
+        if constexpr (T > 0) inverse_radix8_part<T>(reinterpret_cast<const Vec*>(f), d, n / 8, q, weights);
+    });
+}
+
+// hook(leaves, first, count) on each run of leaves of the leaf form of in after its bottom level.
+template <class Hook>
+inline void forward_hooked(const u32* in, std::size_t n, u32* words, int lg, const u32* r, std::size_t width, Hook hook) {
+    auto* f = reinterpret_cast<Vec*>(words);
+    const std::size_t nv = (std::size_t(1) << lg) / 8;
+    const auto tile = [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) { hook(t, std::size_t(t - words) / 8, leaves); };
+    if (!has_radix2(lg)) {
+        forward_radix4_from_pruned(in, n, words, nv / 4, r, width);
+        return forward_pruned_tiles(f, nv / 4, 4, 0, r, width, tile);
+    }
+    forward_radix2_from_pruned(in, n, words, nv / 2, width);
+    forward_pruned_tiles(f, nv / 2, 2, 0, r, width, tile);
+}
+
+// hook(leaves, first, count) writes each run of leaves (canonical, times 2^-32) before its bottom
+// level; the top level writes count words of the half `output` picks to out.
+template <class Hook>
+inline void inverse_hooked(Hook hook, u32* words, u32* out, std::size_t count, int lg, const u32* ir, unsigned output,
+                           std::size_t width) {
+    const auto stage = [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
+        const std::size_t at = std::size_t(t - words);
+        hook(t, at / 8, leaves);
+        inverse_bottom(reinterpret_cast<Vec*>(t), leaves / 4, at / 32, ir);
+    };
+    auto* f = reinterpret_cast<Vec*>(words);
+    const std::size_t nv = (std::size_t(1) << lg) / 8;
+    if (!has_radix2(lg)) inverse_pruned_with(f, nv / 4, 4, 0, ir, width, stage);
+    else if (nv == 8) inverse_pruned_with(f, 4, 2, 0, ir, width, stage);
+    else inverse_pruned_with(f, nv / 8, 8, 0, ir, width, stage);
+    inverse_top_pruned(words, nv, lg, out, count, ir, output_scale(lg, output), output & kUpperHalf, width);
+}
+
 }  // namespace fps::ntt::detail::avx2
 
 namespace fps::ntt::variant {
@@ -1160,6 +1308,19 @@ struct avx2 {
                                 std::size_t count, int lg, const std::uint32_t* roots, const std::uint32_t* inverse_roots,
                                 unsigned output) {
         detail::avx2::inverse_product(terms, n, f, out, count, lg, roots, inverse_roots, output);
+    }
+
+    // Hooked ops; width in words (Transform::forward(in, F, hook, ...)).
+    template <class Hook>
+    static void forward_hooked(const std::uint32_t* in, std::size_t n, std::uint32_t* f, int lg, const std::uint32_t* roots,
+                               std::size_t width, Hook hook) {
+        detail::avx2::forward_hooked(in, n, f, lg, roots, width / 8, hook);
+    }
+
+    template <class Hook>
+    static void inverse_hooked(Hook hook, std::uint32_t* f, std::uint32_t* out, std::size_t count, int lg,
+                               const std::uint32_t*, const std::uint32_t* inverse_roots, unsigned output, std::size_t width) {
+        detail::avx2::inverse_hooked(hook, f, out, count, lg, inverse_roots, output, width / 8);
     }
 };
 

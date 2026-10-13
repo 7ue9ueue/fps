@@ -281,5 +281,43 @@ template <int K, class Run>
     run_blocks<K>(int(count >> std::countr_zero(block)), run, from, out, 0, block);
 }
 
+// Pruned first and last levels (Transform's hooked ops, issue #149): a run for first_level or
+// last_level that runs only the columns c with (c & width) == 0 (width: words, a power of two,
+// at least the step and below the block). A first level writes zeros to the K blocks of the other
+// columns (the levels below read them); a last level leaves them unwritten. The column of a call
+// is that of `to` from base (first level) or of `from` from base (last level).
+template <int K, bool kFirst, class Run>
+struct PrunedLevel {
+    Run& run;
+    const std::uint32_t* base;
+    std::size_t block, width;
+    template <class Blocks>
+    [[gnu::always_inline]] void operator()(Blocks blocks, const std::uint32_t* from, std::uint32_t* to,
+                                           std::size_t words) const {
+        const std::size_t column = std::size_t((kFirst ? static_cast<const std::uint32_t*>(to) : from) - base);
+        for (std::size_t c = 0; c < words;) {
+            const std::size_t at = column + c, end = std::min(words, c + width - (at & (width - 1)));
+            if (!(at & width)) run(blocks, from + c, to + c, end - c);
+            else if constexpr (kFirst)
+                for (int t = 0; t < K; ++t) std::fill(to + std::size_t(t) * block + c, to + std::size_t(t) * block + end, 0u);
+            c = end;
+        }
+    }
+};
+
+// first_level and last_level with PrunedLevel when step <= width < block, else whole.
+template <int K, class Run>
+[[gnu::always_inline]] inline void first_level_pruned(const std::uint32_t* from, std::size_t n, std::uint32_t* to,
+                                                      std::size_t block, std::size_t step, std::size_t width, Run run) {
+    if (width < step || width >= block) return first_level<K>(from, n, to, block, step, run);
+    first_level<K>(from, n, to, block, step, PrunedLevel<K, true, Run>{run, to, block, width});
+}
+template <int K, class Run>
+[[gnu::always_inline]] inline void last_level_pruned(std::uint32_t* from, std::size_t block, std::uint32_t* out,
+                                                     std::size_t count, std::size_t step, std::size_t width, Run run) {
+    if (width < step || width >= block) return last_level<K>(from, block, out, count, step, run);
+    last_level<K>(from, block, out, count, step, PrunedLevel<K, false, Run>{run, from, block, width});
+}
+
 }  // namespace detail
 }  // namespace fps::ntt

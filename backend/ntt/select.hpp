@@ -241,6 +241,22 @@ template <class... V>
     (void)((i++ == v && (V::inverse_product(terms, n, f, out, count, lg, r, ir, output), true)) || ...);
 }
 
+// Transform's hooked ops: by the forward's and the inverse's choice.
+template <class Hook, class... V>
+[[gnu::always_inline]] inline void run_forward_hooked(Candidates<V...>, int v, const std::uint32_t* in, std::size_t n,
+                                                      std::uint32_t* f, int lg, const std::uint32_t* r, std::size_t width,
+                                                      Hook& hook) {
+    int i = 0;
+    (void)((i++ == v && (V::forward_hooked(in, n, f, lg, r, width, hook), true)) || ...);
+}
+template <class Hook, class... V>
+[[gnu::always_inline]] inline void run_inverse_hooked(Candidates<V...>, int v, Hook& hook, std::uint32_t* f,
+                                                      std::uint32_t* out, std::size_t count, int lg, const std::uint32_t* r,
+                                                      const std::uint32_t* ir, unsigned output, std::size_t width) {
+    int i = 0;
+    (void)((i++ == v && (V::inverse_hooked(hook, f, out, count, lg, r, ir, output, width), true)) || ...);
+}
+
 }  // namespace detail
 
 namespace variant {
@@ -324,6 +340,21 @@ struct tuned {
                                 unsigned output) {
         detail::run_inverse_product(Selected{}, choice(kInverse, lg), terms, n, f, out, count, lg, roots, inverse_roots,
                                     output);
+    }
+
+    // Transform's hooked ops.
+    template <class Hook>
+    static void forward_hooked(const std::uint32_t* in, std::size_t n, std::uint32_t* f, int lg, const std::uint32_t* roots,
+                               std::size_t width, Hook hook) {
+        detail::run_forward_hooked(Selected{}, choice(kForward, lg), in, n, f, lg, roots, width, hook);
+    }
+
+    template <class Hook>
+    static void inverse_hooked(Hook hook, std::uint32_t* f, std::uint32_t* out, std::size_t count, int lg,
+                               const std::uint32_t* roots, const std::uint32_t* inverse_roots, unsigned output,
+                               std::size_t width) {
+        detail::run_inverse_hooked(Selected{}, choice(kInverse, lg), hook, f, out, count, lg, roots, inverse_roots, output,
+                                   width);
     }
 };
 

@@ -307,6 +307,25 @@ struct scalar {
         const std::uint32_t* from = f + (output & detail::kUpperHalf ? (std::size_t(1) << lg) / 2 : 0);
         for (std::size_t i = 0; i < count; ++i) out[i] = output & detail::kNegated ? detail::scalar::sub(0, from[i]) : from[i];
     }
+
+    // Hooked ops (Transform::forward(in, F, hook, ...)): one run of all the leaves; no pruning.
+    template <class Hook>
+    static void forward_hooked(const std::uint32_t* in, std::size_t n, std::uint32_t* f, int lg, const std::uint32_t* roots,
+                               std::size_t, Hook hook) {
+        forward_from(in, n, f, lg, roots);
+        hook(f, std::size_t(0), (std::size_t(1) << lg) / 8);
+    }
+
+    template <class Hook>
+    static void inverse_hooked(Hook hook, std::uint32_t* f, std::uint32_t* out, std::size_t count, int lg,
+                               const std::uint32_t*, const std::uint32_t* inverse_roots, unsigned output, std::size_t) {
+        const std::size_t len = std::size_t(1) << lg;
+        hook(f, std::size_t(0), len / 8);
+        detail::scalar::inverse_unscaled(f, lg, inverse_roots);
+        detail::scalar::scale(f, len, detail::product_scale(lg));  // the leaves carry 2^-32
+        const std::uint32_t* from = f + (output & detail::kUpperHalf ? len / 2 : 0);
+        for (std::size_t i = 0; i < count; ++i) out[i] = output & detail::kNegated ? detail::scalar::sub(0, from[i]) : from[i];
+    }
 };
 
 }  // namespace fps::ntt::variant

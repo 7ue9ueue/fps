@@ -647,6 +647,30 @@ def loop_function(loop):
 
 CLOBBERS = ', '.join(f'"xmm{i}"' for i in range(16)) + ', "memory"'
 
+# Pruned transforms (Transform's hooked ops, issue #149; as lc-opt's lib/poly/gen_kernels.py): the
+# loops of forward() and inverse() on the columns j < h of one group with (j & width) == 0, chunks
+# of width columns then a skip of width. Same scheduled body; the stride h separate from the count.
+COLUMNS = ['forward', 'inverse']
+
+
+def columns_function(name):
+    loop = next(l for l in LOOPS if l.name == name)
+    asm = loop_asm(loop)
+    head, body = asm[:asm.index('.p2align 5')], asm[asm.index('1:') + 1:-3]
+    asm = head + ['1:', 'lea (%[a],%[width]), %[stop]', '.p2align 5', '2:'] + body
+    asm += ['add $64, %[a]', 'cmp %[stop], %[a]', 'jne 2b', 'add %[width], %[a]', 'cmp %[end], %[a]', 'jne 1b']
+    lines = [f'// {name}() on the columns j < h with (j & width) == 0: chunks of width columns, each followed',
+             '// by width skipped. width >= 2 a power of two, h a multiple of 2 width.',
+             f'inline void {name}_columns(Vec* a, std::size_t h, std::size_t width, const std::uint32_t* x, const std::uint32_t* y) {{',
+             '    alignas(32) Vec w[3];  // twiddle values x, y, z; their quotients stay in ymm11-13',
+             '    Vec* const end = a + h;', '    Vec* stop;', '    asm volatile(']
+    lines += asm_lines(asm)
+    lines += ['        : [a] "+r"(a), [stop] "=&r"(stop)',
+              '        : [end] "r"(end), [h] "r"(32 * h), [h3] "r"(96 * h), [width] "r"(32 * width), [y] "r"(y),',
+              '          [x] "r"(x), [w] "r"(w), [P] "m"(kP), [P2] "m"(k2P)',
+              '        : ' + CLOBBERS + ', "cc");', '}']
+    return lines
+
 BOTTOM_DOC = {
     'first': 'Forward half of the bottom stage for the batch at a, b; fills buf.',
     'last': 'Leaf products from cur and the inverse butterfly; writes the batch at out.',
@@ -705,6 +729,8 @@ def generate():
     lines = HEADER.split('\n')
     for loop in LOOPS:
         lines += loop_function(loop) + ['']
+    for name in COLUMNS:
+        lines += columns_function(name) + ['']
     lines += ['// Bottom stage: a batch of four vectors is a radix-4 group with h = 1; each output vector',
               '// v_t is a leaf, a polynomial mod x^8 - w_t. buf, cur: leaf buffers (384 bytes, 64-byte',
               '// aligned); w: the four leaf weights, then their quotients.', '']
