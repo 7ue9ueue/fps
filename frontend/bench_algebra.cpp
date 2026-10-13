@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "backend/bench.hpp"
+#include "backend/roots/roots.hpp"
 #include "fps/fps.hpp"
 
 namespace {
