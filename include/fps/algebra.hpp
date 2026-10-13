@@ -32,8 +32,9 @@
 // A xorshift generator with a fixed seed draws b, so the run time is the same on every call.
 // Costs on the four timed targets (frontend/notes/168.md, 192.md), ns per degree: gcd and
 // inverse_mod of two random polynomials of degree 2^12 82-235, 2^16 137-385 (within 1% of the
-// kernel's from 2^8 on); roots of degree 2^12 (within 1% of the kernel's) 54-166 for a random f,
-// 102-337 for 2^12 distinct linear factors; ms: factor of a random polynomial of degree 256 16-29.
+// kernel's from 2^8 on); roots (within 1% of the kernel's from 2^8 on) of a random f of degree
+// 2^12 54-166, 2^20 48-146; of 2^12 distinct linear factors 102-337, of 2^20 1077-4903 (the
+// kernel's climbs, #185); ms: factor of a random polynomial of degree 256 16-29.
 #pragma once
 
 #include <algorithm>
