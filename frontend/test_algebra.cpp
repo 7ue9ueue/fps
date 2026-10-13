@@ -531,6 +531,10 @@ void test_errors() {
         big[D] = 1;
         CHECK(throws<length_error>([&] { (void)fps::roots(big); }));
         CHECK(throws<length_error>([] { (void)fps::roots(Poly::x(std::size_t(1) << 24)); }));
+        // The accepting side: deg f = 2^24 - 1, x^z included (the kernel splits x^z off first).
+        CHECK(fps::roots(Poly::x(D - 1)) == Vec{0});
+        CHECK(fps::roots(Poly::x(D - 2) * Poly{3, 1}) == (Vec{0, P - 3}));
+        CHECK(throws<length_error>([] { (void)fps::roots(Poly::x((std::size_t(1) << 24) - 1) * Poly{3, 1}); }));
         Poly padded(D + 5);
         padded[0] = P - 1, padded[2] = 1;
         CHECK(fps::roots(padded) == (Vec{1, P - 1}));
