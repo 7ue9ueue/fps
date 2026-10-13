@@ -83,17 +83,21 @@ struct Generated<neon::Vec> {
     // The top levels below: columns [0, words) of `from` into f (may be from) by run(from, f, n), 16
     // words per loop iteration. From other memory, words a multiple of 8 from 16 on: the last 16
     // again if needed (they read `from` only). False if not run.
-    // A loop of one or two calls, so that each kernel is inlined once (two calls in a row cost
-    // forward/8 3%: twice the code).
+    // A multiple of 16 is one inlined call, as before the rerun; the rest goes out of line (two
+    // calls in a row inlined each kernel twice: forward/8 1.03 of main).
     template <class Run>
     [[gnu::always_inline]] static bool by16(const u32* from, u32* f, std::size_t words, Run run) {
-        if (words < 16 || (words % 16 != 0 && from == f)) return false;
-        const std::size_t main = words / 16 * 16, calls = main < words ? 2 : 1;
-        for (std::size_t i = 0; i < calls; ++i) {
-            const std::size_t at = i ? words - 16 : 0;
-            run(from + at, f + at, i ? std::size_t(16) : main);
-        }
+        if (words % 16 == 0 && words != 0) return run(from, f, words), true;
+        if (words < 16 || from == f) return false;
+        by16_rest(from, f, words, run);
         return true;
+    }
+    template <class Run>
+    [[gnu::noinline]] static void by16_rest(const u32* from, u32* f, std::size_t words, Run run) {
+        for (std::size_t i = 0; i < 2; ++i) {
+            const std::size_t at = i ? words - 16 : 0;
+            run(from + at, f + at, i ? std::size_t(16) : words / 16 * 16);
+        }
     }
     // The inverse top group (inverse_radix4, inverse_radix4_part), times s if s != 0: in < 2P,
     // canonical out; all 4 outputs (in place or not), or outputs 0, 1 (2, 3 if kUpper) to quarters
