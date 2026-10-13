@@ -1,7 +1,8 @@
 // Tests of fps/fraction.hpp: take(n) and [k] against the series p / q by its O(n^2) recurrence on
 // edge sizes and random inputs; [k] at huge k against Kitamasa's method (x^k mod the reversed q,
-// O(d^2 log k)), partial fractions (q with distinct roots, d up to 2048) and closed forms; every
-// operation against its termwise definition; DESIGN.md's examples; threads; every error.
+// O(d^2 log k)), around the Bostan-Mori kernel's size limits, partial fractions (q with distinct
+// roots, d up to 2048) and closed forms; every operation against its termwise definition;
+// DESIGN.md's examples; threads; every error.
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -207,6 +208,36 @@ void test_coefficients() {
     CHECK(Frac(Poly{1, 2, 3})[2] == 3 && Frac(Poly{1, 2, 3})[3] == 0 && Frac(Poly{1, 2, 3})[~u64(0)] == 0);
 }
 
+// [k] is fps::bostan_mori::coefficient: schoolbook steps up to kSchoolbookMax words (64 to 96 by
+// target), the values form beyond, which hands off to schoolbook once the cut to k + 1 words
+// fits. Sizes on both sides of each limit; every k below the reference's length, and huge k
+// against Kitamasa (on q without its trailing zeros, the same series).
+void test_kernel_paths() {
+    // At least 2: -DFPS_BOSTAN_MORI_SCHOOLBOOK_MAX=0 (never schoolbook) is a valid choice.
+    const std::size_t m = std::max<std::size_t>(fps::bostan_mori::kSchoolbookMax, 2);
+    const std::size_t cap = fps::bostan_mori::kSchoolbookCapacity;
+    const auto check_all = [](const Vec& p, const Vec& q) {
+        const Frac a(poly(p), poly(q));
+        const std::size_t n = 2 * std::max(p.size(), q.size()) + 70;
+        const Vec want = naive_series(p, q, n);
+        for (std::size_t k = 0; k < n; ++k) CHECK(a[k] == want[k], p.size(), q.size(), k);
+        Vec t = q;
+        while (t.size() > 1 && t.back() == 0) t.pop_back();
+        for (const u64 k : {u64(1) << 32, K18, ~u64(0)}) CHECK(a[k] == kitamasa(p, t, k), p.size(), q.size(), k);
+    };
+    for (const std::size_t s : {m - 1, m, m + 1, 2 * m + 1, cap, cap + 1}) {
+        check_all(random_vec(s, 0), random_q(s, 0));
+        check_all(random_vec(s - 1, 0), random_q(s, 3));
+        check_all(random_vec(2 * s + 3, 0), random_q(s, 0));
+        check_all(random_vec(s, 1), random_q(9, 0));
+        // Trailing zeros: q of s words with 3 nonzero; p of s words with s / 2 nonzero.
+        Vec q(s), p = random_vec(s, 0);
+        q[0] = 3, q[1] = 5, q[2] = P - 1;
+        std::fill(p.begin() + std::ptrdiff_t(s / 2), p.end(), 0);
+        check_all(p, q);
+    }
+}
+
 // q = prod (1 - r_i x), r_i distinct and nonzero, deg p < d: a_k = sum_i c_i r_i^k with
 // c_i = p(1 / r_i) / prod_{j != i} (1 - r_j / r_i).
 void test_partial_fractions() {
@@ -379,6 +410,7 @@ void test_errors() {
 
 int main() {
     test_coefficients();
+    test_kernel_paths();
     test_partial_fractions();
     test_closed_forms();
     test_operations();
