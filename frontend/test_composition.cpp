@@ -177,11 +177,20 @@ void test_compose_large() {
     for (const std::size_t n : kSizes) {
         if (n <= 65) continue;
         for (const Vec& g : inner_functions(n)) {
-            // Short f against the schoolbook; f of n + 3 against Horner on fps::mul.
+            // Short f against the schoolbook; f of n + 3 against Horner on fps::mul up to 257, and
+            // above (Horner's n products cost seconds on the scalar target) by its split at k:
+            // F(g) = F_lo(g) + g^k F_hi(g), each part through compose on its own f.
             const Vec f = random_vec(1 + rng() % 6);
             CHECK(vec(fps::compose(poly(f), poly(g), n)) == naive_compose(f, g, n), n, f.size(), g.size());
-            const Poly F = poly(random_vec(n + 3));
-            CHECK(fps::compose(F, poly(g), n) == horner(F, poly(g), n), n, g.size());
+            const Poly F = poly(random_vec(n + 3)), G = poly(g);
+            if (n <= 257) {
+                CHECK(fps::compose(F, G, n) == horner(F, G, n), n, g.size());
+                continue;
+            }
+            const std::size_t k = 1 + rng() % (n + 2);
+            const Poly lo = F.truncate(k), hi = F / Poly::x(k);
+            const Poly want = fps::compose(lo, G, n) + fps::mul(fps::pow(G.truncate(n), k, n), fps::compose(hi, G, n), n);
+            CHECK(fps::compose(F, G, n) == want, n, g.size(), k);
         }
     }
 }
@@ -206,7 +215,7 @@ void test_defaults() {
 // Identities at large n, every path: f(g) for f the series of exp and of log(1 + y); a Taylor
 // shift there and back; a scaling there and back; long f with short n.
 void test_identities() {
-    for (const std::size_t n : {std::size_t(1) << 14, (std::size_t(1) << 14) + 1, std::size_t(100003)}) {
+    for (const std::size_t n : {std::size_t(1) << 14, (std::size_t(1) << 14) + 1, std::size_t(30011)}) {
         const fps::Factorials<P> fact(n + 1);
         Poly e(n), l(n);
         for (std::size_t i = 0; i < n; ++i) e[i] = fact.inverse(i);  // exp(y)
@@ -251,9 +260,12 @@ void test_inverse() {
                 if (n <= 129) {
                     CHECK(naive_compose(f, vec(g), n) == x_mod(n), n, m, kind);
                     CHECK(naive_compose(vec(g), f, n) == x_mod(n), n, m, kind);
-                } else {
+                } else if (n <= 257) {
                     CHECK(vec(horner(poly(f), g, n)) == x_mod(n), n, m, kind);
                     CHECK(vec(horner(g, poly(f), n)) == x_mod(n), n, m, kind);
+                } else {  // compose is tested against Horner above
+                    CHECK(vec(fps::compose(poly(f), g, n)) == x_mod(n), n, m, kind);
+                    CHECK(vec(fps::compose(g, poly(f), n)) == x_mod(n), n, m, kind);
                 }
             }
     // Closed forms: x / (1 - x) has inverse x / (1 + x); x e^x (Lambert): [x^k] = (-k)^(k-1) / k!.
@@ -270,7 +282,7 @@ void test_inverse() {
     // The default n, and n past f.size().
     CHECK(fps::compositional_inverse(Poly{0, 3}).size() == 2);
     CHECK(fps::compositional_inverse(Poly{0, 3}, 6) == poly(Vec{0, fps::mod_inverse<P>(3), 0, 0, 0, 0}));
-    for (const std::size_t big : {std::size_t(1) << 14, (std::size_t(1) << 14) + 1, std::size_t(100003)}) {
+    for (const std::size_t big : {std::size_t(1) << 14, (std::size_t(1) << 14) + 1, std::size_t(30011)}) {
         Poly f = poly(random_vec(big));
         f[0] = 0, f[1] = nonzero();
         const Poly gi = fps::compositional_inverse(f);
