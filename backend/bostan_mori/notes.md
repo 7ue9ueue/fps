@@ -55,25 +55,26 @@ New work: lc-opt has no Bostan-Mori kernel and no kth-term problem.
 
 ## Measurements
 
-Same run against the frontend's `Fraction::operator[]` (main f3d55c6 plus this kernel,
-`explore114/compare.cpp`: `fraction_at/<d>` as `frontend/bench_fraction.cpp`, p of d and q of
-d + 1 random words, d = 2 Fibonacci, k = 10^18), GCC 15.2 in the pinned image, each target's
-flags and timing machine, 5 rounds, median; outputs equal.
+Same run against the frontend's `Fraction::operator[]` (main 1e7e7a2 plus this kernel, issue
+114's exploration folder, `compare.cpp`: `fraction_at/<d>` as `frontend/bench_fraction.cpp`, p of
+d and q of d + 1 random words, d = 2 Fibonacci, k = 10^18), GCC 15.2 in the pinned image, each
+target's flags and timing machine, 7 rounds, median (IQRs within 1.5%); outputs equal.
 
 | d | Zen 3 (avx2) | Emerald Rapids (avx512) | Zen 5 (zen5) | Neoverse V2 (arm) |
 |---:|---|---|---|---|
-| 2 | 6.60 -> 1.15 us (5.75x) | 4.54 -> 0.96 us (4.72x) | 3.80 -> 0.81 us (4.71x) | 5.99 -> 0.97 us (6.17x) |
-| 16 | 12.2 -> 3.74 us (3.27x) | 8.82 -> 3.43 us (2.57x) | 6.41 -> 2.67 us (2.40x) | 16.3 -> 4.37 us (3.73x) |
-| 64 | 52.2 -> 20.0 us (2.62x) | 39.5 -> 20.8 us (1.90x) | 21.6 -> 14.5 us (1.49x) | 71.0 -> 36.0 us (1.97x) |
-| 1024 | 813 -> 499 us (1.63x) | 705 -> 525 us (1.34x) | 396 -> 302 us (1.31x) | 1214 -> 790 us (1.54x) |
-| 16384 | 16.2 -> 9.06 ms (1.78x) | 13.6 -> 9.09 ms (1.50x) | 6.85 -> 4.90 ms (1.40x) | 23.3 -> 14.2 ms (1.64x) |
-| 100000 | 95.4 -> 38.2 ms (2.50x) | 88.0 -> 39.7 ms (2.22x) | 40.7 -> 20.5 ms (1.98x) | 139 -> 60.2 ms (2.31x) |
+| 2 | 6.61 -> 1.15 us (5.74x) | 4.51 -> 0.96 us (4.68x) | 3.92 -> 0.80 us (4.93x) | 5.97 -> 0.97 us (6.15x) |
+| 16 | 12.2 -> 3.73 us (3.27x) | 8.85 -> 3.43 us (2.58x) | 6.50 -> 2.67 us (2.44x) | 16.4 -> 4.37 us (3.75x) |
+| 64 | 52.3 -> 19.9 us (2.63x) | 39.5 -> 20.7 us (1.91x) | 21.1 -> 14.5 us (1.45x) | 63.5 -> 36.0 us (1.76x) |
+| 1024 | 813 -> 498 us (1.63x) | 704 -> 525 us (1.34x) | 406 -> 306 us (1.33x) | 1205 -> 773 us (1.56x) |
+| 16384 | 16.2 -> 9.07 ms (1.78x) | 13.6 -> 9.07 ms (1.50x) | 6.79 -> 4.92 ms (1.38x) | 23.2 -> 14.0 ms (1.66x) |
+| 100000 | 95.6 -> 38.5 ms (2.49x) | 87.7 -> 39.6 ms (2.22x) | 40.6 -> 20.6 ms (1.97x) | 138 -> 59.4 ms (2.33x) |
 
 Per step (60 steps), in units of `multiply@kernel/<lg>` of the same run (frontend -> kernel):
-d = 1024 (lg 11) 2.88 -> 1.76, 2.82 -> 2.10, 3.00 -> 2.29, 2.75 -> 1.79; d = 10^5 (lg 18)
-1.55 -> 0.62, 1.54 -> 0.69, 1.61 -> 0.81, 1.54 -> 0.67.
+d = 1024 (lg 11) 2.87 -> 1.76, 2.80 -> 2.09, 2.90 -> 2.18, 2.76 -> 1.77; d = 10^5 (lg 18)
+1.53 -> 0.62, 1.53 -> 0.69, 1.61 -> 0.82, 1.54 -> 0.66 (the scheme's four transforms of N are
+about 2/3 of one product's six of N, plus the values conversions and the pass).
 
-Parts of a step at N = 2^11 and 2^17 (`explore114/parts.cpp`, ns, median of 3): the values
+Parts of a step at N = 2^11 and 2^17 (`parts.cpp` in the exploration folder, ns, median of 3): the values
 conversions (join before the inverse, split after forward_upper) against the leaf-form ops:
 
 | | Zen 3 | Emerald Rapids | Zen 5 | Neoverse V2 |
@@ -90,7 +91,7 @@ The values conversions cost 0.3-0.45 ns per word each on every machine; on Zen 5
 Rapids, where the transforms are fastest, that is more than the transform itself at 2^11
 (issue #98). A step at 2^11 on Zen 5: 5.8 us, of which 2.1 us transforms, 2.8 us conversions.
 
-Schoolbook against values (`explore114/small.cpp`, us, k = 10^18; values is flat per N: 2^6 for
+Schoolbook against values (`small.cpp` there, us, k = 10^18; values is flat per N: 2^6 for
 d < 64, 2^7 below 128): crossovers at about d = 95 (Zen 3, Emerald Rapids), 85 (Zen 5), 75
 (Neoverse V2), hence `kSchoolbookMax` 96, 96, 88, 76 (sse and scalar, not timed: 64).
 
