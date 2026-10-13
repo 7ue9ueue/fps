@@ -53,6 +53,7 @@
 #include "backend/ntt/ntt.hpp"
 #include "backend/product_tree/select.hpp"
 #include "backend/roots/kernels.hpp"
+#include "backend/roots/select.hpp"
 #include "backend/series/series.hpp"
 #include "backend/simd/select.hpp"
 
@@ -292,20 +293,32 @@ void graeffe(u32* a, u32* b, std::size_t d, int k, std::span<const Save> saves, 
 
 // ---- Cosets -----------------------------------------------------------------------------------
 
+// GCC 15.2 at -O2 with AVX2 vectorizes the folds' loop over the terms wrongly for the Scalar
+// struct's u64 sums (a reduction into 8 lanes' sums; -O3 and SSE are right; a reproducer is
+// gcc_repro.cpp in the exploration folder, issue #122): that loop stays scalar.
+#if defined(__GNUC__) && !defined(__clang__)
+#define FPS_ROOTS_NOVECTOR _Pragma("GCC novector")
+#else
+#define FPS_ROOTS_NOVECTOR
+#endif
+
 // Up to 3 polynomials on cosets v W of the n-th roots of unity, n = 2^log_n: with V = v^n, a(v y)
-// for y^n = 1 is C(y), c_j = v^j sum_t a[j + n t] V^t. Eight cosets in the lanes of a row; the
-// forward transform of 8 n words in the lanes layout (word 8 j + lane: c_j of that lane) has in
-// its leaf q the 8 values at v w^bitrev(q), w = 3^((P - 1) / n) (the leaf weights).
-template <class L>
+// for y^n = 1 is C(y), c_j = v^j sum_t a[j + n t] V^t. A group of G = 8 R cosets, one per lane of
+// F (8 words of 8 lanes, or 16 lanes of a zmm: R = 2 rows); the forward transform of 8 n words in
+// the lanes layout (word 8 j + lane: c_j of that lane of the row) has in its leaf q the 8 values at
+// v w^bitrev(q), w = 3^((P - 1) / n) (the leaf weights).
+template <class F>
 class Cosets {
 public:
     static constexpr int kPolys = 3;
+    static constexpr int W = F::lanes, G = W > 8 ? W : 8, R = G / 8, kVectors = G / W;
 
     void init(Arena& arena, std::size_t d, int log_max) {
         const std::size_t n = std::size_t(1) << log_max;
         for (auto& r : rows_) r = arena.take(d + 1 + n);  // terms n <= d + n
-        for (auto& v : values_) v = arena.take(std::max<std::size_t>(64, 8 * n));
-        partial_ = arena.take(16 * kPolys * n);
+        for (auto& rows : values_)
+            for (auto& v : rows) v = arena.take(std::max<std::size_t>(64, 8 * n));
+        partial_ = arena.take(2 * G * kPolys * n);
     }
 
     // polys[0, count) of size coefficients (zero past their spans), on cosets of n = 2^log_n
@@ -332,7 +345,8 @@ public:
     }
 
     // Polynomial 0 (which = 1), 1 and 2 (which = 6) or all three (which = 7) on the cosets v W, v:
-    // 8 words in Montgomery form; value(i, q): the 8 lanes' values at v w^bitrev(q), canonical.
+    // G words in Montgomery form; value(i, r, q): the values of lanes 8 r .. 8 r + 7 at v
+    // w^bitrev(q), canonical.
     void evaluate(unsigned which, const u32* v) {
         switch (which) {
             case 1: return evaluate<1>({0}, v);
@@ -341,19 +355,28 @@ public:
         }
     }
 
-    const u32* value(int i, std::size_t q) const { return values_[i] + 8 * q; }
+    const u32* value(int i, int r, std::size_t q) const { return values_[i][r] + 8 * q; }
 
 private:
-    using S = Sums<L>;
-    using V = typename L::V;
+    using S = Sums<F>;
+    using V = typename F::V;
     using Acc = typename S::Acc;
-    static constexpr int W = L::lanes, kVectors = 8 / W;
 
     template <int K>
     void evaluate(const int (&which)[K], const u32* v) {
         constexpr int J = K == 1 ? 4 : K == 2 ? 2 : 1;
         if (points() >= J) return evaluate<K, J>(which, v);
         evaluate<K, 1>(which, v);
+    }
+
+    // Lanes [u W, u W + W) of the group: word `at` on of their rows.
+    static void store_lanes(u32* const (&rows)[R], std::size_t at, int u, V x) {
+        if constexpr (W <= 8) {
+            F::store(rows[u * W / 8] + at + u * W % 8, x);
+        } else {
+            F::template store_half<0>(rows[0] + at, x);
+            F::template store_half<1>(rows[1] + at, x);
+        }
     }
 
     // K polynomials, J outputs j at a time: K J sums per vector in registers, sharing the loads of
@@ -364,30 +387,29 @@ private:
     void evaluate(const int (&which)[K], const u32* v) {
         const std::size_t n = points(), terms = terms_;
         const u32* rows[K];
-        u32* out[K];
-        for (int i = 0; i < K; ++i) rows[i] = rows_[which[i]], out[i] = values_[which[i]];
+        for (int i = 0; i < K; ++i) rows[i] = rows_[which[i]];
         const bool fold = terms > 9;
         V f[J][kVectors], step[kVectors], big[kVectors], y[kVectors];  // f[b] = v^(j + b) 2^32
 #pragma GCC unroll 8
         for (int u = 0; u < kVectors; ++u) {
-            const V x = L::load(v + u * W);
-            f[0][u] = L::broadcast(kR), step[u] = x, big[u] = x, y[u] = L::broadcast(kR);
+            const V x = F::load(v + u * W);
+            f[0][u] = F::broadcast(kR), step[u] = x, big[u] = x, y[u] = F::broadcast(kR);
 #pragma GCC unroll 4
             for (int b = 1; b < J; ++b) {
-                f[b][u] = montgomery_canonical<L>(f[b - 1][u], x);
-                step[u] = montgomery_canonical<L>(step[u], x);
+                f[b][u] = montgomery_canonical<F>(f[b - 1][u], x);
+                step[u] = montgomery_canonical<F>(step[u], x);
             }
-            for (int m = 0; m < log_n_; ++m) big[u] = montgomery_canonical<L>(big[u], big[u]);  // V
+            for (int m = 0; m < log_n_; ++m) big[u] = montgomery_canonical<F>(big[u], big[u]);  // V
         }
-        alignas(64) u32 powers[8 * 16 + 8];  // V^t 2^32 for the chunk's t; EvenOdd::load reads a word more
+        alignas(64) u32 powers[G * 16 + 16];  // V^t 2^32 for the chunk's t; EvenOdd::load reads a word more
         for (std::size_t first = 0; first < terms; first += 16) {
             const std::size_t count = std::min<std::size_t>(16, terms - first);
             const bool initial = first == 0, final = first + count == terms;
             for (std::size_t t = 0; t < count; ++t)
 #pragma GCC unroll 8
                 for (int u = 0; u < kVectors; ++u) {
-                    L::store(powers + 8 * t + u * W, y[u]);
-                    y[u] = montgomery_canonical<L>(y[u], big[u]);
+                    F::store(powers + G * t + u * W, y[u]);
+                    y[u] = montgomery_canonical<F>(y[u], big[u]);
                 }
             for (std::size_t j = 0; j < n; j += J) {
                 Acc s[K][J][kVectors];
@@ -404,10 +426,11 @@ private:
                             for (int u = 0; u < kVectors; ++u) s[i][b][u] = S::mul(c, power[u]);
                         }
                 }
+                FPS_ROOTS_NOVECTOR
                 for (std::size_t t = 1; t < count; ++t) {
                     typename S::Op power[kVectors];
 #pragma GCC unroll 8
-                    for (int u = 0; u < kVectors; ++u) power[u] = S::load(powers + 8 * t + u * W);
+                    for (int u = 0; u < kVectors; ++u) power[u] = S::load(powers + G * t + u * W);
 #pragma GCC unroll 3
                     for (int i = 0; i < K; ++i)
 #pragma GCC unroll 4
@@ -423,27 +446,28 @@ private:
                     for (int i = 0; i < K; ++i)
 #pragma GCC unroll 8
                         for (int u = 0; u < kVectors; ++u) {
-                            u32* const partial = partial_ + 16 * (K * (j + b) + i) + 16 / kVectors * u;
-                            Acc total = fold ? Wide<L>::folded(s[i][b][u]) : s[i][b][u];
+                            u32* const partial = partial_ + 2 * G * (K * (j + b) + i) + 2 * W * u;
+                            Acc total = fold ? Wide<F>::folded(s[i][b][u]) : s[i][b][u];
                             if (!initial) {
                                 Acc before;
                                 std::memcpy(&before, partial, sizeof before);
-                                total = Wide<L>::add(total, before);
+                                total = Wide<F>::add(total, before);
                             }
                             if (!final) {
-                                const Acc kept = Wide<L>::folded(total);
+                                const Acc kept = Wide<F>::folded(total);
                                 std::memcpy(partial, &kept, sizeof kept);
                                 continue;
                             }
-                            L::store(out[i] + 8 * (j + b) + u * W, montgomery_canonical<L>(S::reduce(total), f[b][u]));
+                            store_lanes(values_[which[i]], 8 * (j + b), u, montgomery_canonical<F>(S::reduce(total), f[b][u]));
                         }
                     if (final)
 #pragma GCC unroll 8
-                        for (int u = 0; u < kVectors; ++u) f[b][u] = montgomery_canonical<L>(f[b][u], step[u]);
+                        for (int u = 0; u < kVectors; ++u) f[b][u] = montgomery_canonical<F>(f[b][u], step[u]);
                 }
             }
         }
-        for (int i = 0; i < K; ++i) transform(out[i]);
+        for (int i = 0; i < K; ++i)
+            for (u32* c : values_[which[i]]) transform(c);
     }
 
     // In place: the values of the lanes (outputs in the leaves' order).
@@ -463,29 +487,34 @@ private:
     }
 
     u32* rows_[kPolys];
-    u32* values_[kPolys];
-    u32* partial_;  // 16 words per output and polynomial: the 8 lanes' 64-bit sums (Acc per vector)
+    u32* values_[kPolys][R];
+    u32* partial_;  // 2 G words per output and polynomial: the lanes' 64-bit sums (an Acc per vector)
     int log_n_ = 0;
     std::size_t terms_ = 0;
 };
 
 // ---- The root finder --------------------------------------------------------------------------
 
-// u^c 2^32 mod P for c < 120, u = 3^(2^23) of order 119: the cosets of H in groups of 8 (the
-// last group's lane 7, c = 119, repeats c = 0 and is skipped).
+// u^c 2^32 mod P for c < 128, u = 3^(2^23) of order 119: the cosets of H in groups of 8 or 16
+// (from c = 119 on they repeat and are skipped).
 struct CosetBases {
-    alignas(64) u32 v[120];
+    alignas(64) u32 v[128];
 };
 inline constexpr CosetBases kCosetBases = [] {
     CosetBases s{};
     const u32 u = power(3, u64(1) << kTwoAdic);
-    for (u32 c = 0, x = 1; c < 120; ++c, x = multiply_mod(x, u)) s.v[c] = to_montgomery(x);
+    for (u32 c = 0, x = 1; c < 128; ++c, x = multiply_mod(x, u)) s.v[c] = to_montgomery(x);
     return s;
 }();
+inline constexpr int kCosets = 119;
 
-template <class L>
+// The root finder with the Graeffe steps on L (rows of 8 words) and the cosets' folds on F (groups
+// of G = max(8, F::lanes) cosets or tracked points).
+template <class L, class F>
 class Finder {
 public:
+    static constexpr int G = Cosets<F>::G, R = Cosets<F>::R;
+
     // Arrays for degree d from arena (a counting arena: sizes only).
     Finder(std::size_t d, Arena& arena) : plan_(d) {
         const std::size_t n = d + 1, len = graeffe_length(d), points = std::size_t(1) << plan_.points_log();
@@ -493,7 +522,7 @@ public:
         for (auto& level : levels_) level = {arena.take(n), arena.take(n)};
         tracked_ = arena.take(n), next_ = arena.take(n);
         found_x_ = arena.take(n), found_b_ = arena.take(n), prefix_ = arena.take(n);
-        zero_q_ = arena.take(points), zero_mask_ = arena.take(points);
+        zero_q_ = arena.take(R * points), zero_mask_ = arena.take(R * points);
         // Also the shift's arrays: 2d + 1, d + 1 and d + 1 words.
         ta_ = arena.take(std::max(2 * len, 2 * n)), tb_ = arena.take(std::max(2 * len, n)), work_ = arena.take(std::max(len, n));
         cosets_.init(arena, d, plan_.points_log());
@@ -556,7 +585,21 @@ private:
         std::copy(f_ + 1, f_ + d + 1, f_);
     }
 
-    // Zeros of A_k (in g_, B in b_) on H, in 15 groups of 8 of its 119 cosets u^c W.
+    // The group's zeros of polynomial 0 in its first `lanes` lanes: zero_q_[z] = R q + row,
+    // zero_mask_[z] the row's lanes (bit l: lane 8 row + l). Returns their count.
+    std::size_t zeros(int lanes) {
+        std::size_t count = 0;
+        for (int r = 0; r < R && 8 * r < lanes; ++r) {
+            const unsigned valid = lanes >= 8 * r + 8 ? 0xFF : (1u << (lanes - 8 * r)) - 1;
+            for (std::size_t q = 0; q < cosets_.points(); ++q) {
+                const unsigned mask = zero_mask(cosets_.value(0, r, q)) & valid;
+                if (mask) zero_q_[count] = u32(R * q + std::size_t(r)), zero_mask_[count++] = mask;
+            }
+        }
+        return count;
+    }
+
+    // Zeros of A_k (in g_, B in b_) on H, in groups of G of its 119 cosets u^c W.
     void on_subgroup(int l) {
         const std::size_t d = d_;
         series::detail::multiply_by_index(g_, 0, x_, d + 1);
@@ -564,26 +607,23 @@ private:
         cosets_.prepare(polys, 3, d + 1, l);
         const u32 step = kOrder >> l;  // exponent of w
         bool dense = false;  // the last group had zeros: evaluate all three at once
-        for (int group = 0; group < 15; ++group) {
-            const u32* v = kCosetBases.v + 8 * group;
+        for (int first = 0; first < kCosets; first += G) {
+            const u32* v = kCosetBases.v + first;
             cosets_.evaluate(dense ? 7 : 1, v);
-            const unsigned valid = group == 14 ? 0x7F : 0xFF;
-            std::size_t q = 0;
-            while (q < cosets_.points() && !(zero_mask(cosets_.value(0, q)) & valid)) ++q;
-            const bool zeros = q < cosets_.points();
-            if (zeros && !dense) cosets_.evaluate(6, v);
-            dense = zeros;
-            for (; q < cosets_.points(); ++q) {
-                unsigned mask = zero_mask(cosets_.value(0, q)) & valid;
-                if (!mask) continue;
-                const u32 *x = cosets_.value(1, q), *b = cosets_.value(2, q);
-                for (; mask; mask &= mask - 1) {
+            const std::size_t count = zeros(std::min(G, kCosets - first));
+            if (count && !dense) cosets_.evaluate(6, v);
+            dense = count > 0;
+            for (std::size_t z = 0; z < count; ++z) {
+                const std::size_t q = zero_q_[z] / R;
+                const int r = int(zero_q_[z] % R);
+                const u32 *x = cosets_.value(1, r, q), *b = cosets_.value(2, r, q);
+                for (unsigned mask = zero_mask_[z]; mask; mask &= mask - 1) {
                     const int lane = std::countr_zero(mask);
                     if (x[lane] != 0) {
                         record(x[lane], b[lane]);
                         continue;
                     }
-                    const u32 e = (u32(8 * group + lane) << kTwoAdic) + u32(cosets_.reverse(q)) * step;
+                    const u32 e = (u32(first + 8 * r + lane) << kTwoAdic) + u32(cosets_.reverse(q)) * step;
                     tracked_[tracked_count_++] = e >= kOrder ? e - kOrder : e;
                 }
             }
@@ -592,6 +632,7 @@ private:
 
     // The tracked points (exponents, multiples of 2^climb) to their 2^climb-th roots: a, b the
     // iterate there, or b null for level 0, where every zero of a = g is a root (written to out).
+    // A tracked point whose candidates hold one zero sends all its roots there: a multiple zero.
     void climb_to(const u32* a, const u32* b, int climb, u32*& out) {
         const std::size_t d = d_, count = tracked_count_;
         const bool last = b == nullptr;
@@ -606,39 +647,35 @@ private:
         std::copy_n(tracked_, count, next_);
         tracked_count_ = 0;
         const u32 step = kOrder >> climb;
-        for (std::size_t first = 0; first < count; first += 8) {
-            alignas(64) u32 base[8] = {}, v[8];
-            const std::size_t lanes = std::min<std::size_t>(8, count - first);
-            for (std::size_t i = 0; i < lanes; ++i) base[i] = next_[first + i] >> climb;
-            for (int i = 0; i < 8; ++i) v[i] = power3(base[i]);
+        for (std::size_t first = 0; first < count; first += G) {
+            alignas(64) u32 base[G] = {}, v[G];
+            const int lanes = int(std::min<std::size_t>(G, count - first));
+            for (int i = 0; i < lanes; ++i) base[i] = next_[first + std::size_t(i)] >> climb;
+            for (int i = 0; i < G; ++i) v[i] = power3(base[i]);
             cosets_.evaluate(1, v);
-            const unsigned valid = (1u << lanes) - 1;
-            std::size_t zeros = 0;
-            int per_lane[8] = {};
-            for (std::size_t q = 0; q < cosets_.points(); ++q) {
-                const unsigned mask = zero_mask(cosets_.value(0, q)) & valid;
-                if (!mask) continue;
-                zero_q_[zeros] = u32(q), zero_mask_[zeros++] = mask;
-                for (unsigned m = mask; m; m &= m - 1) ++per_lane[std::countr_zero(m)];
-            }
+            const std::size_t found = zeros(lanes);
+            int per_lane[G] = {};
+            for (std::size_t z = 0; z < found; ++z)
+                for (unsigned m = zero_mask_[z]; m; m &= m - 1) ++per_lane[8 * (zero_q_[z] % R) + std::countr_zero(m)];
             if (last) {
-                for (std::size_t z = 0; z < zeros; ++z)
+                for (std::size_t z = 0; z < found; ++z)
                     for (unsigned m = zero_mask_[z]; m; m &= m - 1) {
-                        const u32 e = base[std::countr_zero(m)] + u32(cosets_.reverse(zero_q_[z])) * step;
+                        const u32 e = base[8 * (zero_q_[z] % R) + std::countr_zero(m)] + u32(cosets_.reverse(zero_q_[z] / R)) * step;
                         *out++ = add_mod(montgomery(power3(e), 1), shift_);
                     }
                 continue;
             }
-            const bool split = std::any_of(per_lane, per_lane + 8, [](int c) { return c > 1; });
+            const bool split = std::any_of(per_lane, per_lane + G, [](int c) { return c > 1; });
             if (split) cosets_.evaluate(6, v);
-            for (std::size_t z = 0; z < zeros; ++z) {
-                const std::size_t q = zero_q_[z];
+            for (std::size_t z = 0; z < found; ++z) {
+                const std::size_t q = zero_q_[z] / R;
+                const int r = int(zero_q_[z] % R);
                 for (unsigned m = zero_mask_[z]; m; m &= m - 1) {
-                    const int lane = std::countr_zero(m);
+                    const int l = std::countr_zero(m), lane = 8 * r + l;
                     if (per_lane[lane] > 1) {
-                        const u32 x = cosets_.value(1, q)[lane];
+                        const u32 x = cosets_.value(1, r, q)[l];
                         if (x != 0) {
-                            record(x, cosets_.value(2, q)[lane]);
+                            record(x, cosets_.value(2, r, q)[l]);
                             continue;
                         }
                     }
@@ -663,7 +700,7 @@ private:
     }
 
     Plan plan_;
-    Cosets<L> cosets_;
+    Cosets<F> cosets_;
     u32 *f_, *g_, *b_, *x_, *g0_, *tracked_, *next_, *found_x_, *found_b_, *prefix_, *zero_q_, *zero_mask_;
     u32 *ta_, *tb_, *work_;
     Iterate levels_[2];
@@ -671,9 +708,9 @@ private:
     u32 shift_ = 0;
 };
 
-// roots() with the kernels on L (product_tree::Lanes or another struct of 8-word rows) and the
-// shifts from state.
-template <class L>
+// roots() with the Graeffe steps on L (product_tree::Lanes or another struct of 8-word rows), the
+// cosets' folds on F (L, or a wider struct: groups of 16 lanes) and the shifts from state.
+template <class L, class F = L>
 std::size_t roots(std::span<const u32> f, std::span<u32> out, u64 state = kSeed) {
     std::size_t size = f.size();
     while (size > 0 && f[size - 1] == 0) --size;
@@ -690,9 +727,9 @@ std::size_t roots(std::span<const u32> f, std::span<u32> out, u64 state = kSeed)
     if (e == 1) *end++ = multiply_mod(kP - u[0], inverse_mod(u[1]));
     if (e >= 2) {
         Arena counting;
-        const Finder<L> sizes(e, counting);
+        const Finder<L, F> sizes(e, counting);
         Arena arena(workspace(counting.used()));
-        Finder<L> finder(e, arena);
+        Finder<L, F> finder(e, arena);
         end = finder.solve(u, end, state);  // after 0, nonzero roots
     }
     return std::size_t(end - out.data());
@@ -702,7 +739,7 @@ std::size_t roots(std::span<const u32> f, std::span<u32> out, u64 state = kSeed)
 
 // out[0, m) = the distinct roots of f in [0, P), increasing; returns m <= deg f.
 inline std::size_t roots(std::span<const u32> f, std::span<u32> out) {
-    return detail::roots<product_tree::Lanes>(f, out);
+    return detail::roots<Steps, Folds>(f, out);
 }
 
 }  // namespace fps::root_finding

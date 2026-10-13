@@ -100,30 +100,103 @@ template <class L>
 // leaf 2q + 1, the result mod (y^8 - r^2) is (C + C') + y^4 (C - C') / r, without the factor 1/2.
 // weights[q] = r(q) 2^32 and inverse_weights[q] = r(q)^-1 2^32 mod P for q < n / 8; n / 8 a
 // multiple of L::lanes.
+// even_parts for x86 (Sums' EvenOdd), from columns in memory: column j (a word per pair) at cols
+// + 16 j, 8 words and 8 more that the odd words' loads read (one word on). Each lane parity runs
+// its own pass of 64-bit sums, so an operand is one register or a memory operand, not two: GCC
+// spilled 678 times per 8 pairs with all of even_parts' operands live (#122). Columns: 0-7 a,
+// 8-15 b, 16-19 P - a odd (n), 20-22 2 a even (d1-d3), 23-25 2 a odd (q1-q3).
+template <class L>
+[[gnu::always_inline]] inline void even_parts_columns(const u32* cols, typename L::V (&out)[16]) {
+    using V = typename L::V;
+    constexpr int W = L::lanes;
+    static_assert(W == 8);
+    enum : int { e0 = 0, o0 = 1, e1 = 2, o1 = 3, e2 = 4, o2 = 5, e3 = 6, o3 = 7 };
+    enum : int { f0 = 8, g0 = 9, f1 = 10, g1 = 11, f2 = 12, g2 = 13, f3 = 14, g3 = 15 };
+    enum : int { n0 = 16, n1 = 17, n2 = 18, n3 = 19, d1 = 20, d2 = 21, d3 = 22, q1 = 23, q2 = 24, q3 = 25 };
+    static constexpr int kTerms[16][7][2] = {
+        {{e0, e0}},
+        {{e0, d1}, {n0, o0}},
+        {{e0, d2}, {e1, e1}, {n0, q1}},
+        {{e0, d3}, {e1, d2}, {n0, q2}, {n1, o1}},
+        {{e1, d3}, {e2, e2}, {n0, q3}, {n1, q2}},
+        {{e2, d3}, {n1, q3}, {n2, o2}},
+        {{e3, e3}, {n2, q3}},
+        {{n3, o3}},
+        {{e0, f0}},
+        {{e0, f1}, {e1, f0}, {n0, g0}},
+        {{e0, f2}, {e1, f1}, {e2, f0}, {n0, g1}, {n1, g0}},
+        {{e0, f3}, {e1, f2}, {e2, f1}, {e3, f0}, {n0, g2}, {n1, g1}, {n2, g0}},
+        {{e1, f3}, {e2, f2}, {e3, f1}, {n0, g3}, {n1, g2}, {n2, g1}, {n3, g0}},
+        {{e2, f3}, {e3, f2}, {n1, g3}, {n2, g2}, {n3, g1}},
+        {{e3, f3}, {n2, g3}, {n3, g2}},
+        {{n3, g3}},
+    };
+    static constexpr int kCount[16] = {1, 2, 3, 4, 4, 3, 2, 1, 1, 3, 5, 7, 7, 5, 3, 1};
+    const V ninv = L::broadcast(product_tree::detail::kNegInverse), p = L::broadcast(kP);
+    alignas(64) u32 half[2][16][8];  // the parities' reduced sums: results in the high words
+#pragma GCC unroll 2
+    for (int parity = 0; parity < 2; ++parity)
+#pragma GCC unroll 16
+        for (int i = 0; i < 16; ++i) {
+            const auto column = [&](int j) { return L::load(cols + 16 * j + parity); };
+            V s = L::mul_even(column(kTerms[i][0][0]), column(kTerms[i][0][1]));
+#pragma GCC unroll 7
+            for (int t = 1; t < kCount[i]; ++t) s = L::add64(s, L::mul_even(column(kTerms[i][t][0]), column(kTerms[i][t][1])));
+            L::store(half[parity][i], L::add64(s, L::mul_even(L::mul_even(s, ninv), p)));
+        }
+#pragma GCC unroll 16
+    for (int i = 0; i < 16; ++i) out[i] = canonical4<L>(L::join_high(L::load(half[0][i]), L::load(half[1][i])));
+}
+
 template <class L>
 void pair_step(u32* a, u32* b, std::size_t n, const u32* weights, const u32* inverse_weights) {
     using V = typename L::V;
     using M = Ops<L>;
     constexpr int W = L::lanes;
+    constexpr bool kColumns = std::is_same_v<Sums<L>, product_tree::detail::EvenOdd<L>> && W == 8;
     const V p = L::broadcast(kP);
     for (std::size_t q = 0; q < n / 8; q += W) {
-        V x[2][8], y[2][8];  // [even leaves, odd leaves][coefficient], lane t: pair q + t
+        alignas(64) u32 c[2][16][W];  // even_parts of the even and the odd leaves, through memory
+        if constexpr (kColumns) {
+            alignas(64) u32 cols[26 * 16];
 #pragma GCC unroll 2
-        for (int s = 0; s < 2; ++s) {
-            load_columns<L>(a + 16 * q + 8 * s, 16, x[s]);
-            load_columns<L>(b + 16 * q + 8 * s, 16, y[s]);
+            for (int s = 0; s < 2; ++s) {
+                V x[8], y[8];  // lane t: pair q + t
+                load_columns<L>(a + 16 * q + 8 * s, 16, x);
+                load_columns<L>(b + 16 * q + 8 * s, 16, y);
+#pragma GCC unroll 8
+                for (int j = 0; j < 8; ++j) L::store(cols + 16 * j, x[j]), L::store(cols + 16 * (8 + j), y[j]);
+#pragma GCC unroll 4
+                for (int j = 0; j < 4; ++j) L::store(cols + 16 * (16 + j), L::sub(p, x[2 * j + 1]));
+#pragma GCC unroll 3
+                for (int j = 1; j < 4; ++j) {
+                    L::store(cols + 16 * (19 + j), L::add(x[2 * j], x[2 * j]));
+                    L::store(cols + 16 * (22 + j), L::add(x[2 * j + 1], x[2 * j + 1]));
+                }
+                V e[16];
+                even_parts_columns<L>(cols, e);
+#pragma GCC unroll 16
+                for (int i = 0; i < 16; ++i) L::store(c[s][i], e[i]);
+            }
+        } else {
+#pragma GCC unroll 2
+            for (int s = 0; s < 2; ++s) {
+                V x[8], y[8], e[16];  // lane t: pair q + t
+                load_columns<L>(a + 16 * q + 8 * s, 16, x);
+                load_columns<L>(b + 16 * q + 8 * s, 16, y);
+                even_parts<L>(x, y, e);
+#pragma GCC unroll 16
+                for (int i = 0; i < 16; ++i) L::store(c[s][i], e[i]);
+            }
         }
-        V c[2][16];
-        even_parts<L>(x[0], y[0], c[0]);
-        even_parts<L>(x[1], y[1], c[1]);
         const V r = L::load(weights + q), r_inverse = L::load(inverse_weights + q);
         V out[2][8];
 #pragma GCC unroll 2
         for (int f = 0; f < 2; ++f)
 #pragma GCC unroll 4
             for (int k = 0; k < 4; ++k) {
-                const V u0 = c[0][8 * f + k], v0 = c[0][8 * f + 4 + k];
-                const V u1 = c[1][8 * f + k], v1 = c[1][8 * f + 4 + k];
+                const V u0 = L::load(c[0][8 * f + k]), v0 = L::load(c[0][8 * f + 4 + k]);
+                const V u1 = L::load(c[1][8 * f + k]), v1 = L::load(c[1][8 * f + 4 + k]);
                 const V lo = L::add(M::add(u0, u1), M::montgomery(L::add(L::sub(v0, v1), p), r));
                 const V hi = L::add(M::montgomery(L::add(L::sub(u0, u1), p), r_inverse), M::add(v0, v1));
                 out[f][k] = canonical4<L>(lo), out[f][4 + k] = canonical4<L>(hi);  // < 3P

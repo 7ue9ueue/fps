@@ -32,7 +32,7 @@ int failures = 0, checks = 0;
 std::mt19937_64 rng(122);
 
 void fail(const std::string& what) {
-    if (++failures <= 20) std::printf("FAIL %s\n", what.c_str());
+    if (++failures <= 200) std::printf("FAIL %s\n", what.c_str());
 }
 
 u32 mul(u32 a, u32 b) { return u32(u64(a) * b % P); }
@@ -165,67 +165,79 @@ std::size_t root_count_fast(const Vec& f) {
 
 // ---- checks -----------------------------------------------------------------------------------
 
-template <class L>
+// The kernels' structs: Graeffe steps on L, cosets' folds on F.
+template <class L, class F = L>
+struct Structs {
+    using Steps = L;
+    using Folds = F;
+    static std::string name() { return std::string(L::name) + "/" + F::name; }
+};
+using Selected = Structs<fps::root_finding::Steps, fps::root_finding::Folds>;
+
+template <class C>
 Vec run(const Vec& f, u64 state = rd::kSeed) {
     std::size_t d = f.size();
     while (d > 0 && f[d - 1] == 0) --d;
     Vec out(d ? d - 1 : 0, 0xFFFFFFFFu);
     out.resize(out.size() + 4, 0xFFFFFFFFu);  // guard words
-    const std::size_t m = rd::roots<L>(f, std::span<u32>(out).first(d - 1), state);
+    const std::size_t m = rd::roots<typename C::Steps, typename C::Folds>(f, std::span<u32>(out).first(d - 1), state);
     for (std::size_t i = d - 1; i < out.size(); ++i)
-        if (out[i] != 0xFFFFFFFFu) fail(std::string("guard word written, struct ") + L::name);
+        if (out[i] != 0xFFFFFFFFu) fail(std::string("guard word written, structs ") + C::name());
     out.resize(m);
     return out;
 }
 
-// f's roots, on struct L, against `expected` (a set of distinct roots) or, if `count` is set,
+// f's roots, on the structs C, against `expected` (a set of distinct roots) or, if `count` is set,
 // against a root count with each output checked by evaluation.
-template <class L>
+template <class C>
 void check(const std::string& name, const Vec& f, const Vec* expected, std::size_t count = 0, u64 state = rd::kSeed) {
     ++checks;
     Vec got;
     try {
-        got = run<L>(f, state);
+        got = run<C>(f, state);
     } catch (const std::exception& e) {
-        return fail(name + ": threw " + e.what() + " (" + L::name + ")");
+        return fail(name + ": threw " + e.what() + " (" + C::name() + ")");
     }
     if (!std::is_sorted(got.begin(), got.end()) || std::adjacent_find(got.begin(), got.end()) != got.end())
-        return fail(name + ": not increasing (" + L::name + ")");
+        return fail(name + ": not increasing (" + C::name() + ")");
     if (expected) {
         Vec e = *expected;
         std::sort(e.begin(), e.end());
         e.erase(std::unique(e.begin(), e.end()), e.end());
         if (got != e) {
             char buf[128];
-            std::snprintf(buf, sizeof buf, ": %zu roots, expected %zu (%s)", got.size(), e.size(), L::name);
+            std::snprintf(buf, sizeof buf, ": %zu roots, expected %zu (%s)", got.size(), e.size(), C::name().c_str());
             return fail(name + buf);
         }
         return;
     }
     for (u32 r : got)
-        if (r >= P || eval(f, r) != 0) return fail(name + ": a non-root (" + L::name + ")");
+        if (r >= P || eval(f, r) != 0) return fail(name + ": a non-root (" + C::name() + ")");
     if (got.size() != count) {
         char buf[128];
-        std::snprintf(buf, sizeof buf, ": %zu roots, expected %zu (%s)", got.size(), count, L::name);
+        std::snprintf(buf, sizeof buf, ": %zu roots, expected %zu (%s)", got.size(), count, C::name().c_str());
         fail(name + buf);
     }
 }
 
-// Every struct of 8-word rows this target runs.
+// Every struct of 8-word rows this target runs, and Avx512 for the folds.
 template <class F>
 void each_struct(F f) {
-    f.template operator()<fps::simd::Scalar>();
+    f.template operator()<Structs<fps::simd::Scalar>>();
 #if defined(__SSE4_1__)
-    f.template operator()<fps::simd::Sse>();
+    f.template operator()<Structs<fps::simd::Sse>>();
 #endif
 #if defined(__AVX2__)
-    f.template operator()<fps::simd::Avx2>();
+    f.template operator()<Structs<fps::simd::Avx2>>();
 #endif
 #if defined(__AVX2__) && defined(__AVX512VL__)
-    f.template operator()<fps::simd::Avx512Vl>();
+    f.template operator()<Structs<fps::simd::Avx512Vl>>();
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+    f.template operator()<Structs<fps::simd::Avx512Vl, fps::simd::Avx512>>();
 #endif
 #if defined(__ARM_NEON) && defined(__aarch64__)
-    f.template operator()<fps::simd::Neon>();
+    f.template operator()<Structs<fps::simd::Neon>>();
 #endif
 }
 
@@ -234,8 +246,8 @@ void check_planted(const std::string& name, const Vec& roots, std::size_t quadra
     Vec f = multiply(from_roots(roots), junk(quadratics));
     const u32 c = random_nonzero();
     for (u32& x : f) x = mul(x, c);
-    if (all_structs) each_struct([&]<class L> { check<L>(name, f, &roots); });
-    else check<fps::product_tree::Lanes>(name, f, &roots);
+    if (all_structs) each_struct([&]<class C> { check<C>(name, f, &roots); });
+    else check<Selected>(name, f, &roots);
 }
 
 Vec random_roots(std::size_t n) {
@@ -276,9 +288,8 @@ Vec colliding(std::size_t groups, int c, std::size_t per_group, u32 s) {
 }  // namespace
 
 int main() {
-    using fps::product_tree::Lanes;
     const auto all = [](const std::string& name, const Vec& f, const Vec* expected, std::size_t count = 0) {
-        each_struct([&]<class L> { check<L>(name, f, expected, count); });
+        each_struct([&]<class C> { check<C>(name, f, expected, count); });
     };
 
     // Small cases.
@@ -410,14 +421,14 @@ int main() {
         for (u32& x : f) x = random_word();
         f[d] = 1;
         f = multiply(f, from_roots(repeated_roots(d / 4, d / 8)));
-        check<Lanes>("random times planted d=" + std::to_string(f.size() - 1), f, nullptr, root_count_fast(f));
+        check<Selected>("random times planted d=" + std::to_string(f.size() - 1), f, nullptr, root_count_fast(f));
     }
 
     // Other seeds of the shifts (the results do not depend on them).
     for (u64 seed : {1ull, 2ull, 12345ull}) {
         const Vec r = repeated_roots(500, 300);
         Vec f = multiply(from_roots(r), junk(40));
-        check<Lanes>("seed " + std::to_string(seed), f, &r, 0, seed);
+        check<Selected>("seed " + std::to_string(seed), f, &r, 0, seed);
     }
 
     // Argument checks.
