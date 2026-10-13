@@ -1,8 +1,10 @@
 // Times fps/algebra.hpp modulo P = 998244353; tools/kernel.py runs it, a binary of its own. Items
 // are the degree of the input.
-//   "<op>/<lg>"   through the API (gated)
-// The backend has no gcd, root or factorization kernel yet (backend issues #103, #122, #123 move
-// lc-opt's), so there are no "<op>@kernel" pairs: the algorithms are plain, on f % g and f * g.
+//   "<op>/<lg>"          through the API (gated)
+//   "<op>@kernel/<lg>"   gcd, inverse_mod: fps::half_gcd (backend/gcd) on the same inputs, into
+//                        kept memory
+// roots and factor have no kernel yet (backend issues #122, #123 move lc-opt's): they run on gcd,
+// f % g and f * g.
 #include <cstddef>
 #include <cstdint>
 #include <random>
@@ -40,15 +42,27 @@ Poly split_poly(std::size_t n, unsigned seed) {
 int main(int argc, char** argv) {
     bench::Suite suite(argc, argv);
     // gcd and inverse_mod of two random polynomials of degree n: coprime, n steps of Euclid.
-    for (int lg : {6, 8, 10, 12}) {
+    for (int lg : {6, 8, 10, 12, 14, 16}) {
         const std::size_t n = std::size_t(1) << lg;
         const std::string size = "/" + std::to_string(lg);
         const unsigned seed = unsigned(3 * lg);
         suite.add("gcd" + size, [n, seed] {
             return [f = random_poly(n, seed), g = random_poly(n, seed + 1)] { bench::keep(fps::gcd(f, g)); };
         }, n);
+        suite.add("gcd@kernel" + size, [n, seed] {
+            return [f = random_poly(n, seed), g = random_poly(n, seed + 1), out = std::vector<std::uint32_t>(n + 1)]() mutable {
+                bench::keep(fps::half_gcd::gcd(f.span(), g.span(), out));
+                bench::keep(out);
+            };
+        }, n);
         suite.add("inverse_mod" + size, [n, seed] {
             return [f = random_poly(n, seed), m = random_poly(n, seed + 1)] { bench::keep(fps::inverse_mod(f, m)); };
+        }, n);
+        suite.add("inverse_mod@kernel" + size, [n, seed] {
+            return [f = random_poly(n, seed), m = random_poly(n, seed + 1), h = std::vector<std::uint32_t>(n)]() mutable {
+                bench::keep(fps::half_gcd::inverse_mod(f.span(), m.span(), h));
+                bench::keep(h);
+            };
         }, n);
     }
     // roots: of a random polynomial (about one root: the cost of x^(P-1) mod f and one gcd), and
