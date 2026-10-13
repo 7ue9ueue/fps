@@ -232,9 +232,6 @@ struct Save {
     u32 *a, *b;
 };
 
-// A + eps B = (a + eps b)(x) (a + eps b)(-x) as a polynomial in x^2, k >= 1 times: a = A_k and b =
-// B_k / 2^k (d + 1 and d words), both times one common factor; saves get the iterates of their
-// levels (< k). ta, tb: 2 n words, work: n (n = graeffe_length(d)).
 // The step's factor: pair_step's leaves hold 2^-31 (A(x) A(-x)) and 2^-31 (A(x) B(-x) + B(x)
 // A(-x)) / 2 (its Montgomery sums and the CRT without 1/2).
 inline constexpr u32 kStepScale = multiply_mod(2, inverse_mod(kR));
@@ -263,6 +260,9 @@ inline void subtract(u32* x, const u32* y, std::size_t count) {
     for (std::size_t i = 0; i < count; ++i) x[i] = x[i] >= y[i] ? x[i] - y[i] : x[i] + kP - y[i];
 }
 
+// A + eps B = (a + eps b)(x) (a + eps b)(-x) as a polynomial in x^2, k >= 1 times: a = A_k and b =
+// B_k / 2^k (d + 1 and d words), both times one common factor; saves get the iterates of their
+// levels (< k). ta, tb: 2 n words, work: n (n = graeffe_length(d)).
 template <class L>
 void graeffe(u32* a, u32* b, std::size_t d, int k, std::span<const Save> saves, u32* ta, u32* tb, u32* work) {
     const std::size_t n = graeffe_length(d);
@@ -356,7 +356,9 @@ public:
     // Polynomial 0 (which = 1), 1 and 2 (which = 6) or all three (which = 7) on the cosets v W, v:
     // G words in Montgomery form; value(i, r, q): the values of lanes 8 r .. 8 r + 7 at v
     // w^bitrev(q), canonical.
-    void evaluate(unsigned which, const u32* v) {
+    // Only the rows of the first `lanes` lanes are transformed (the others hold garbage).
+    void evaluate(unsigned which, const u32* v, int lanes = G) {
+        rows_used_ = (lanes + 7) / 8;
         switch (which) {
             case 1: return evaluate<1>({0}, v);
             case 6: return evaluate<2>({1, 2}, v);
@@ -476,7 +478,7 @@ private:
             }
         }
         for (int i = 0; i < K; ++i)
-            for (u32* c : values_[which[i]]) transform(c);
+            for (int r = 0; r < rows_used_; ++r) transform(values_[which[i]][r]);
     }
 
     // In place: the values of the lanes (outputs in the leaves' order).
@@ -498,7 +500,7 @@ private:
     u32* rows_[kPolys];
     u32* values_[kPolys][R];
     u32* partial_;  // 2 G words per output and polynomial: the lanes' 64-bit sums (an Acc per vector)
-    int log_n_ = 0;
+    int log_n_ = 0, rows_used_ = R;
     std::size_t terms_ = 0;
 };
 
@@ -618,9 +620,10 @@ private:
         bool dense = false;  // the last group had zeros: evaluate all three at once
         for (int first = 0; first < kCosets; first += G) {
             const u32* v = kCosetBases.v + first;
-            cosets_.evaluate(dense ? 7 : 1, v);
-            const std::size_t count = zeros(std::min(G, kCosets - first));
-            if (count && !dense) cosets_.evaluate(6, v);
+            const int lanes = std::min(G, kCosets - first);
+            cosets_.evaluate(dense ? 7 : 1, v, lanes);
+            const std::size_t count = zeros(lanes);
+            if (count && !dense) cosets_.evaluate(6, v, lanes);
             dense = count > 0;
             for (std::size_t z = 0; z < count; ++z) {
                 const std::size_t q = zero_q_[z] / R;
@@ -661,7 +664,7 @@ private:
             const int lanes = int(std::min<std::size_t>(G, count - first));
             for (int i = 0; i < lanes; ++i) base[i] = next_[first + std::size_t(i)] >> climb;
             for (int i = 0; i < G; ++i) v[i] = power3(base[i]);
-            cosets_.evaluate(1, v);
+            cosets_.evaluate(1, v, lanes);
             const std::size_t found = zeros(lanes);
             int per_lane[G] = {};
             for (std::size_t z = 0; z < found; ++z)
@@ -675,7 +678,7 @@ private:
                 continue;
             }
             const bool split = std::any_of(per_lane, per_lane + G, [](int c) { return c > 1; });
-            if (split) cosets_.evaluate(6, v);
+            if (split) cosets_.evaluate(6, v, lanes);
             for (std::size_t z = 0; z < found; ++z) {
                 const std::size_t q = zero_q_[z] / R;
                 const int r = int(zero_q_[z] % R);
