@@ -194,8 +194,60 @@ void test_kernels() {
         const u32 a = word(), b = word();
         Vec expect(std::size_t(fd::round_up(len, W)));
         for (std::size_t t = 0; t < expect.size(); ++t) expect[t] = fd::add(fd::mul(a, x[t]), fd::mul(b, y[t]));
+        Vec x0 = x;
         fz::lincomb<S>(x.data(), x.data(), a, y.data(), b, len);
         check(std::equal(expect.begin(), expect.end(), x.begin()), name + " lincomb len " + std::to_string(len));
+        // axpy, in place.
+        for (std::size_t t = 0; t < expect.size(); ++t) expect[t] = fd::add(x0[t], fd::mul(b, y[t]));
+        fz::axpy<S>(x0.data(), x0.data(), b, y.data(), len);
+        check(std::equal(expect.begin(), expect.end(), x0.begin()), name + " axpy len " + std::to_string(len));
+    }
+    // times_x: y = x a mod g, g monic of degree m.
+    for (int m = 1; m <= 70; ++m) {
+        Vec a(std::size_t(fd::round_up(m, 16)) + 16, 0), g(a.size(), 0), y(a.size(), 4242);
+        for (int t = 0; t < m; ++t) a[t] = m % 5 == 0 ? P - 1 : rand_word(), g[t] = rand_word();
+        g[m] = fd::kOne;
+        fz::times_x<S>(y.data(), a.data(), g.data(), m);
+        bool ok = true;
+        for (int t = 0; t < fd::round_up(m, W); ++t) {
+            const u32 e = fd::sub(t >= 1 && t <= m ? a[t - 1] : 0, fd::mul(a[m - 1], g[t]));
+            ok &= y[t] == e;
+        }
+        check(ok, name + " times_x m " + std::to_string(m));
+    }
+    // combine_rows: 1 to 9 rows, in place or from other rows, init null or not.
+    for (int trial = 0; trial < 200; ++trial) {
+        const int rows = 1 + trial % 9, len = 1 + int(rng() % 140);
+        const int count = std::vector<int>{0, 1, 5, 16, 17, 18, 40, 100}[trial % 8];
+        const bool extreme = trial % 7 == 3, in_place = trial % 3 == 1, with_init = trial % 3 != 0;
+        const int stride = fd::round_up(len, 16) + 16 * int(trial % 2);
+        // Coefficients by rows (cstride, step 1) or by columns (step sstride, rows 1 apart).
+        const bool by_columns = trial % 4 == 2;
+        const int cstride = by_columns ? 1 : count + int(trial % 5), sstride = by_columns ? rows + int(trial % 3) : 1;
+        auto word = [&] { return extreme ? P - 1 : rand_word(); };
+        Vec base(std::size_t(std::max(count, 1)) * stride + 16, 0), coef(std::size_t(rows) * cstride + std::size_t(count) * sstride + 1, 0);
+        Vec init(std::size_t(rows) * stride + 16, 0), out(std::size_t(rows) * stride + 16, 999);
+        for (int s = 0; s < count; ++s)
+            for (int t = 0; t < len; ++t) base[std::size_t(s) * stride + t] = word();
+        for (int r = 0; r < rows; ++r) {
+            for (int t = 0; t < len; ++t) init[std::size_t(r) * stride + t] = word();
+            for (int s = 0; s < count; ++s) coef[std::size_t(r) * cstride + std::size_t(s) * sstride] = word();
+        }
+        const u32 scale = word();
+        const Vec init0 = init;
+        u32* target = in_place ? init.data() : out.data();
+        fz::combine_rows<S>(target, stride, rows, len, with_init ? init.data() : nullptr, stride, scale, coef.data(), cstride,
+                            sstride, count, base.data(), stride);
+        bool ok = true;
+        for (int r = 0; r < rows; ++r)
+            for (int t = 0; t < fd::round_up(len, W); ++t) {
+                u32 e = with_init ? fd::mul(scale, init0[std::size_t(r) * stride + t]) : 0;
+                for (int s = 0; s < count; ++s)
+                    e = fd::add(e, fd::mul(coef[std::size_t(r) * cstride + std::size_t(s) * sstride], base[std::size_t(s) * stride + t]));
+                ok &= target[std::size_t(r) * stride + t] == e;
+            }
+        check(ok, name + " combine_rows rows " + std::to_string(rows) + " len " + std::to_string(len) + " count " +
+                      std::to_string(count));
     }
     // Products: every size pair to 40, then random ones to 300.
     for (int trial = 0; trial < 1800; ++trial) {
@@ -495,6 +547,16 @@ void test_factor() {
         parts.clear();
         for (int i = 0; i < 6; ++i) parts.emplace_back(Vec{i ? rand_word() : 0, 1}, 1 + u32(rng() % 20));
         check(factor_with<S>(product_of(parts, 1)) == expected(parts), name + " repeated roots");
+        // Roots r c^i, c = 3^(2^23) (order 119): every 2-power character x^((P-1)/2^k) agrees on
+        // them, so the first split (at x, no shift) cannot separate them; and 0 with them.
+        for (int count : {2, 3, 9, 40}) {
+            parts.clear();
+            const u32 c = pw(3, u64(1) << 23), r = rand_nonzero();
+            for (int i = 0; i < count; ++i) parts.emplace_back(Vec{P - mul(r, pw(c, u64(i))), 1}, 1);
+            if (count == 9) parts.emplace_back(Vec{0, 1}, 1);
+            for (const Vec& g : {random_irreducible(3), random_irreducible(5)}) parts.emplace_back(g, 1);
+            check(factor_with<S>(product_of(parts, 1)) == expected(parts), name + " roots with equal characters");
+        }
     }
     // Irreducible binomials: x^n - 3 for n with every prime factor dividing P - 1 = 2^23 7 17
     // (3 is a primitive root), shifted: (x + b)^n - 3.

@@ -80,69 +80,72 @@ struct Echelon {
     }
 };
 
+// Pivot t ends at row t of A: a chosen row is swapped to the front of the trailing rows, so they
+// stay contiguous (rows r0 .. rows - 1) and a block's update of them is one combine_rows.
 template <class S>
 Echelon eliminate(Matrix& A) {
     constexpr int kBlockColumns = 16;
     const int rows = A.rows, cols = A.cols, ld = A.ld;
     Echelon E;
     E.cols = cols;
-    std::vector<int> trailing(rows);
     std::vector<int>&pivots = E.pivots, &pivot_rows = E.pivot_rows;
     std::vector<u32>& pivot_values = E.scales;
-    for (int i = 0; i < rows; ++i) trailing[i] = i;
     const int pstride = round_up(rows, 16);
     std::vector<u32> panel(std::size_t(kBlockColumns + 1) * pstride);  // M_0 .. M_(nb-1), then the work column
-    std::vector<u32> block(std::size_t(kBlockColumns + 1) * ld);         // P_0 .. P_(nb-1)
-    std::vector<char> chosen(rows);
+    std::vector<u32> block(std::size_t(kBlockColumns) * ld);              // P_0 .. P_(nb-1)
+    int r0 = 0;  // rows r0 on: trailing, zero at every column before c0
     for (int c0 = 0; c0 < cols; c0 += kBlockColumns) {
-        const int c1 = std::min(cols, c0 + kBlockColumns), n = int(trailing.size());
-        const int from = c0 & ~15, len = cols - from;
+        const int c1 = std::min(cols, c0 + kBlockColumns), n = rows - r0;
+        const int from = c0, len = cols - from;  // c0 is a multiple of 16
         u32* P = block.data();
-        int nb = 0;
+        u32* R0 = A.row(r0);
+        int nb = 0;  // positions 0 .. nb - 1 of the trailing rows: this block's pivots
         u32 lambda = kOne, sigma[kBlockColumns], coef[kBlockColumns + 1];  // L_nb and S_(s,nb)
-        std::fill(chosen.begin(), chosen.begin() + n, 0);
         for (int c = c0; c < c1; ++c) {
-            if (n == 0) {
+            if (nb == n) {
                 E.free.push_back(c);
                 continue;
             }
             // Work column: R^(nb)[c] = L_nb R[c] - sum_s M_s S_(s,nb) P_s[c].
             u32* work = &panel[std::size_t(nb) * pstride];
-            for (int i = 0; i < n; ++i) work[i] = A.row(trailing[i])[c];
+            for (int i = 0; i < n; ++i) work[i] = R0[std::size_t(i) * ld + c];
             std::fill(work + n, work + pstride, 0);
             for (int s = 0; s < nb; ++s) coef[s] = neg(mul(sigma[s], P[s * ld + c]));
             coef[nb] = lambda;
             combine<S>(work, n, nullptr, coef, nb + 1, panel.data(), pstride);
-            int i = 0;
-            while (i < n && (chosen[i] || work[i] == 0)) ++i;
+            int i = nb;
+            while (i < n && work[i] == 0) ++i;
             if (i == n) {
                 E.free.push_back(c);
                 continue;
             }
-            // Pivot row: P_nb = L_nb R - sum_s M_s[i] S_(s,nb) P_s, from a copy of R after P_(nb-1).
-            chosen[i] = 1;
+            if (i != nb) {  // the pivot's row to position nb
+                std::swap_ranges(R0 + std::size_t(i) * ld, R0 + std::size_t(i + 1) * ld, R0 + std::size_t(nb) * ld);
+                for (int s = 0; s <= nb; ++s) std::swap(panel[std::size_t(s) * pstride + i], panel[std::size_t(s) * pstride + nb]);
+            }
+            // Pivot row: P_nb = L_nb R - sum_s M_s[nb] S_(s,nb) P_s, from a copy of R after P_(nb-1).
             u32* pivot = P + nb * ld;
-            std::copy(A.row(trailing[i]), A.row(trailing[i]) + ld, pivot);
-            for (int s = 0; s < nb; ++s) coef[s] = neg(mul(panel[std::size_t(s) * pstride + i], sigma[s]));
+            u32* row = R0 + std::size_t(nb) * ld;
+            std::copy(row, row + ld, pivot);
+            for (int s = 0; s < nb; ++s) coef[s] = neg(mul(panel[std::size_t(s) * pstride + nb], sigma[s]));
             coef[nb] = lambda;
             combine<S>(pivot + from, len, nullptr, coef, nb + 1, P + from, ld);
-            std::copy(pivot, pivot + ld, A.row(trailing[i]));
-            const u32 pi = work[i];
-            pivots.push_back(c), pivot_rows.push_back(trailing[i]), pivot_values.push_back(pi);
+            std::copy(pivot, pivot + ld, row);
+            const u32 pi = work[nb];
+            pivots.push_back(c), pivot_rows.push_back(r0 + nb), pivot_values.push_back(pi);
             for (int s = 0; s < nb; ++s) sigma[s] = mul(sigma[s], pi);
             sigma[nb] = kOne, lambda = mul(lambda, pi), ++nb;
         }
         if (nb == 0) continue;
-        // Other rows: R^(nb) = L_nb R - sum_s M_s S_(s,nb) P_s.
-        int kept = 0;
-        for (int i = 0; i < n; ++i) {
-            if (chosen[i]) continue;
-            for (int s = 0; s < nb; ++s) coef[s] = neg(mul(panel[std::size_t(s) * pstride + i], sigma[s]));
-            u32* r = A.row(trailing[i]) + from;
-            combine_scaled<S>(r, len, r, lambda, coef, nb, P + from, ld);
-            trailing[kept++] = trailing[i];
+        // Other rows: R^(nb) = L_nb R - sum_s M_s S_(s,nb) P_s, the coefficients -M_s S_(s,nb) in
+        // place of M_s (panel column s), read at position i of each.
+        for (int s = 0; s < nb; ++s) {
+            u32* column = &panel[std::size_t(s) * pstride];
+            combine_scaled<S>(column, n, column, neg(sigma[s]), nullptr, 0, column, 0);
         }
-        trailing.resize(kept);
+        u32* first = R0 + std::size_t(nb) * ld + from;
+        combine_rows<S>(first, ld, n - nb, len, first, ld, lambda, panel.data() + nb, 1, pstride, nb, P + from, ld);
+        r0 += nb;
     }
     invert_all(pivot_values.data(), int(pivot_values.size()));
     for (u32& s : pivot_values) s = neg(s);

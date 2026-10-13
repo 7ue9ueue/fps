@@ -126,7 +126,7 @@ public:
     static constexpr int cap(int limit) { return round_up(limit, 16) + 16; }
 
     explicit Ring(int limit)
-        : pool_(cap(limit)), scratch_(std::size_t(15) * cap(limit) + 2 * kBlock<S> * W) {}
+        : pool_(cap(limit)), scratch_(std::size_t(23) * cap(limit) + 2 * kBlock<S> * W) {}
 
     Pool& pool() { return pool_; }
     int stride(int m) const { return round_up(m, std::max(W, 8)); }  // rows of m words
@@ -193,7 +193,7 @@ public:
         for (int i = hn - 1; i >= dd; --i) {
             const u32 c = a[i];
             if (q) q->c[i - dd] = c;
-            if (c != 0) lincomb<S>(a + i - dd, a + i - dd, kOne, d.c, neg(c), dd + 1);  // a[i] -> 0
+            if (c != 0) axpy<S>(a + i - dd, a + i - dd, neg(c), d.c, dd + 1);  // a[i] -> 0
         }
         if (q) q->set_size(std::max(0, hn - dd));
         if (r) {
@@ -217,13 +217,20 @@ public:
 
     // y = x a mod g for a of degree < m = deg g (y may be a).
     void times_x(const u32* a, u32* y, const Poly& g) {
-        const int m = g.n - 1;
-        u32* shifted = scratch_.data();
-        shifted[0] = 0;
-        std::copy(a, a + m, shifted + 1);
-        std::fill(shifted + m + 1, shifted + round_up(m, 16) + 16, 0);
-        lincomb<S>(y, shifted, kOne, g.c, neg(a[m - 1]), m);  // y[m] = a[m-1] - a[m-1] = 0
+        if (a == y) {
+            u32* copy = scratch_.data();
+            std::copy(a, a + round_up(g.n - 1, 16), copy);
+            a = copy;
+        }
+        factorization::times_x<S>(y, a, g.c, g.n - 1);
     }
+
+    // Column s = x column_(s-1) mod g at first + s stride for s = 1 .. count - 1, from column 0;
+    // columns of m = deg g words, zero from m to the stride.
+    void times_x_chain(u32* first, int count, std::ptrdiff_t stride, const Poly& g) {
+        factorization::times_x_chain<S>(first, count, stride, g.c, g.n - 1);
+    }
+
     Poly times_x(const Poly& a, const Modulus& M) {
         Poly r = zero();
         if (a.n == 0) return r;
@@ -242,7 +249,7 @@ public:
         if (M.m >= 2) {
             u32* t = M.table.data();
             for (int i = 0; i < M.m; ++i) t[i] = neg(g.c[i]);
-            for (int j = 1; j < M.m - 1; ++j) times_x(t + (j - 1) * M.stride, t + j * M.stride, g);
+            times_x_chain(t, M.m - 1, M.stride, g);
         }
         return M;
     }
@@ -312,7 +319,7 @@ public:
             r = multiply_mod(r, r, M);
             if (e >> bit & 1) {
                 Poly s = times_x(r, M);
-                lincomb<S>(s.c, s.c, kOne, r.c, a, M.m);
+                axpy<S>(s.c, s.c, a, r.c, M.m);
                 s.set_size(M.m);
                 r = std::move(s);
             }
@@ -347,13 +354,13 @@ public:
         return x0;
     }
 
-    // 8 rows of stride(limit) words, not used by Ring's functions.
+    // 16 rows of stride(limit) words, not used by Ring's functions.
     u32* rows() { return scratch_.data() + 7 * pool_.cap() + 2 * kBlock<S> * W; }
 
 private:
     Pool pool_;
     // Words from 0: gcd (2 (lead + span) <= 4 cap), divide and times_x (cap + 16); from 4 cap: a
-    // product (2 cap), then multiply's scratch (cap + 2 kBlock W); then rows() (8 cap).
+    // product (2 cap), then multiply's scratch (cap + 2 kBlock W); then rows() (16 cap).
     std::vector<u32> scratch_;
 
 #if defined(__AVX2__)

@@ -38,8 +38,10 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -53,6 +55,9 @@
 namespace fps::factorization {
 
 inline constexpr int kMaxDegree = 1 << 12;
+// Up to this degree, each thread keeps its factorizer's memory between calls (two matrices of
+// 256 x 256 words and polynomial buffers: about 0.6 MiB at most).
+inline constexpr int kKeepDegree = 256;
 
 struct Factor {
     std::vector<u32> coefficients;  // b_0 .. b_d in [0, P), b_d = 1
@@ -68,11 +73,16 @@ template <class S, bool Collide = false>
 class Factorizer {
 public:
     // Polynomials of degree <= n.
-    explicit Factorizer(int n) : R_(n + 1) {}
+    explicit Factorizer(int n) : n_(n), R_(n + 1) {}
 
-    // f: n + 1 words, f[n] != 0, n >= 1, in [0, P).
+    int limit() const { return n_; }
+
+    // f: deg + 1 words, f[deg] != 0, 1 <= deg <= limit(), in [0, P). Runs again from the same
+    // state (the same random choices) on every call.
     std::vector<Factor> run(std::span<const u32> f) {
         const int n = int(f.size()) - 1;
+        state_ = kSeed, collisions_ = 0;
+        factors_.clear();
         Poly g = R_.zero();
         const u32 scale = mul(inverse(to_montgomery(f[n])), kR2);  // f[n]^-1 2^64: to Montgomery and monic
         for (int i = 0; i <= n; ++i) g.c[i] = mul(f[i], scale);
@@ -88,8 +98,11 @@ public:
 private:
     static constexpr int kSamples = 2;  // random kernel elements per Berlekamp step
 
+    static constexpr u64 kSeed = 0x9E3779B97F4A7C15ull;
+
+    int n_;
     Ring<S> R_;
-    u64 state_ = 0x9E3779B97F4A7C15ull;
+    u64 state_ = kSeed;
     u32 multiplicity_ = 1;
     std::vector<Factor> factors_;
     // Storage for the m x m arrays, reused so their pages fault in once: the reduction table, then
@@ -140,16 +153,21 @@ private:
     // M.table is scratch afterwards.
     void split_square_free(Modulus& M) {
         Poly g = M.g;
-        const Poly s = R_.power_of_x((kP - 1) / 2, M);
-        Poly r = R_.times_x(R_.multiply_mod(s, s, M), M);  // x^P mod g
+        // powers[j] = x^((P-1)/2^j) mod g, j = 1 .. K: the squarings to s = x^((P-1)/2) pass them.
+        const int K = levels(M.m);
+        std::vector<Poly> powers(K + 1, R_.zero());
+        powers[K] = R_.power_of_x((kP - 1) >> K, M);
+        for (int j = K - 1; j >= 1; --j) powers[j] = R_.multiply_mod(powers[j + 1], powers[j + 1], M);
+        Poly r = R_.times_x(R_.multiply_mod(powers[1], powers[1], M), M);  // x^P mod g
         Poly u = r;
         u.c[1] = sub(u.c[1], kOne);
         u.set_size(std::max(u.n, 2));
         const Poly linear = R_.gcd(g, u);
         if (linear.n > 1) {
-            const Poly hint = R_.remainder(s, linear);
             std::vector<u32> roots;
-            find_roots(linear, &hint, roots);
+            const int k = std::min(K, levels(linear.n - 1));
+            if (linear.n <= 3) small_roots(linear, roots);
+            else split_roots(linear, R_.remainder(powers[k], linear), 0, 0, k, roots);
             for (const u32 z : roots) emit(R_.linear(z));
             if (linear.n == g.n) return;
             g = R_.quotient(g, linear);
@@ -160,32 +178,63 @@ private:
         berlekamp(M, r);
     }
 
-    // Roots of a monic Q that splits into distinct linear factors; hint: x^((P-1)/2) mod Q or null.
-    void find_roots(const Poly& Q, const Poly* hint, std::vector<u32>& roots) {
-        const int d = Q.n - 1;
-        if (d == 1) return roots.push_back(neg(Q.c[0]));
-        if (d == 2) {
-            const u32 b = Q.c[1], c = Q.c[0];
-            const u32 disc = sub(mul(b, b), mul(to_montgomery(4), c));
-            const u32 root = Ring<S>::sqrt(disc), half = inverse(to_montgomery(2));
-            roots.push_back(mul(sub(root, b), half));
-            roots.push_back(mul(sub(neg(b), root), half));
-            return;
-        }
-        const Modulus M = R_.modulus(Q);
-        Poly w = hint ? *hint : R_.power_of_linear(random_residue(), (kP - 1) / 2, M);
-        for (;;) {
-            w.c[0] = sub(w.c[0], kOne);
-            w.set_size(std::max(w.n, 1));
-            const Poly G = R_.gcd(Q, w);
-            if (G.n > 1 && G.n < Q.n) {
-                find_roots(G, nullptr, roots);
-                find_roots(R_.quotient(Q, G), nullptr, roots);
-                return;
-            }
-            w = R_.power_of_linear(random_residue(), (kP - 1) / 2, M);
-        }
+    // The 2^k-th roots of unity split the roots: k with 2^k >= 4 d^2 (at most 23: 2^23 | P - 1), so
+    // that two of d roots get the same value with probability below 1/8.
+    static int levels(int d) {
+        int k = 2;
+        while (k < 23 && (u64(1) << k) < u64(4) * u64(d) * u64(d)) ++k;
+        return k;
     }
+
+    // Roots of a monic Q of degree 1 or 2.
+    void small_roots(const Poly& Q, std::vector<u32>& roots) {
+        if (Q.n == 2) return roots.push_back(neg(Q.c[0]));
+        const u32 b = Q.c[1], c = Q.c[0];
+        const u32 disc = sub(mul(b, b), mul(to_montgomery(4), c));
+        const u32 root = Ring<S>::sqrt(disc), half = inverse(to_montgomery(2));
+        roots.push_back(mul(sub(root, b), half));
+        roots.push_back(mul(sub(neg(b), root), half));
+    }
+
+    // Roots of a monic Q that splits into distinct linear factors.
+    void find_roots(const Poly& Q, std::vector<u32>& roots) {
+        if (Q.n <= 3) return small_roots(Q, roots);
+        const int k = levels(Q.n - 1);
+        const Modulus M = R_.modulus(Q);
+        split_roots(Q, R_.power_of_linear(random_residue(), (kP - 1) >> k, M), 0, 0, k, roots);
+    }
+
+    // Roots of Q (monic, distinct linear factors) by the values of w = (x + a)^((P-1)/2^k) mod Q
+    // at them: 2^k-th roots of unity w_k^e (w_k = 3^((P-1)/2^k), 3 a generator mod P), or 0 at
+    // x = -a. Q's roots share the low j bits of e, `low`; bit j splits them: the roots with bit j
+    // 0 are those of gcd(Q, w^(2^(k-j-1)) - w_(j+1)^low), k - j - 1 squarings modulo Q, fewer at
+    // each level down (Cantor and Zassenhaus take about 29 at every node, and a new shift when a
+    // node does not split). Roots whose values agree to all k bits (or -a) start again with a new
+    // shift.
+    void split_roots(const Poly& Q, const Poly& w, int j, u32 low, int k, std::vector<u32>& roots) {
+        if (Q.n <= 3) return small_roots(Q, roots);
+        if (j == k) return find_roots(Q, roots);
+        Poly u = w;  // w^(2^(k-j-1)) mod Q
+        if (j + 1 < k) {
+            const Modulus M = R_.modulus(Q);
+            for (int i = j + 1; i < k; ++i) u = R_.multiply_mod(u, u, M);
+        }
+        u.c[0] = sub(u.c[0], power(kRootsOfUnity[j + 1], low));
+        u.set_size(std::max(u.n, 1));
+        const Poly G = R_.gcd(Q, u);
+        if (G.n == 1) return split_roots(Q, w, j + 1, low | 1u << j, k, roots);
+        if (G.n == Q.n) return split_roots(Q, w, j + 1, low, k, roots);
+        const Poly H = R_.quotient(Q, G);
+        split_roots(G, R_.remainder(w, G), j + 1, low, k, roots);
+        split_roots(H, R_.remainder(w, H), j + 1, low | 1u << j, k, roots);
+    }
+
+    // w_t = 3^((P-1)/2^t), a primitive 2^t-th root of unity (Montgomery form), t <= 23.
+    static constexpr std::array<u32, 24> kRootsOfUnity = [] {
+        std::array<u32, 24> w{};
+        for (int t = 0; t < 24; ++t) w[t] = power(to_montgomery(3), (kP - 1) >> t);
+        return w;
+    }();
 
     // Columns x^s u mod g, s < m, of the multiplication by u, into M.table.
     void multiplication_matrix(Modulus& M, const Poly& u) {
@@ -193,39 +242,60 @@ private:
         std::vector<u32>& columns = M.table;
         columns.assign(std::size_t(m) * stride, 0);
         std::copy(u.c, u.c + u.n, columns.begin());
-        for (int s = 1; s < m; ++s)
-            R_.times_x(&columns[std::size_t(s - 1) * stride], &columns[std::size_t(s) * stride], M.g);
+        R_.times_x_chain(columns.data(), m, stride, M.g);
     }
 
+    // Rows j0 .. j0 + 7 (< count) of the sequence u_j = u_(j-1) X, u_0 = 1, at rows + (j - j0) stride
+    // (the rest zero), for X the multiplication matrix of u_1 in M.table: mat-vecs for the first
+    // block, then M.table becomes the multiplication matrix of u_8 (from u_7, so u_8 = u_7 X), and
+    // each later block is the one before times it (combine_rows: each column word serves several
+    // rows). next(j0, rows) for j0 = 0, 8, 16, ...; rows has 16 rows (two blocks, alternating).
+    struct Sequence {
+        Factorizer& F;
+        Modulus& M;
+        u32* buffer;
+        int count;
+        u32* next(int j0) {
+            const int m = M.m, stride = M.stride, width = std::min(8, count - j0);
+            u32* rows = buffer + (j0 / 8 % 2) * 8 * stride;
+            if (j0 == 0) {
+                std::fill(rows, rows + 8 * stride, 0);
+                rows[0] = kOne;
+                if (width > 1) std::copy(M.table.data(), M.table.data() + stride, rows + stride);  // u_1: column 0
+                for (int q = 2; q < width; ++q)
+                    combine<S>(rows + q * stride, m, nullptr, rows + (q - 1) * stride, m, M.table.data(), stride);
+                if (count > 8) {  // X becomes the multiplication matrix of u_8
+                    Poly u = F.R_.zero();
+                    combine<S>(u.c, m, nullptr, rows + 7 * stride, m, M.table.data(), stride);
+                    u.set_size(m);
+                    F.multiplication_matrix(M, u);
+                }
+                return rows;
+            }
+            const u32* previous = buffer + ((j0 / 8 + 1) % 2) * 8 * stride;
+            combine_rows<S>(rows, stride, width, m, nullptr, 0, kOne, previous, stride, 1, m, M.table.data(), stride);
+            return rows;
+        }
+    };
+
     void berlekamp(Modulus& M, const Poly& r) {
-        const int m = M.m, stride = M.stride;
+        const int m = M.m;
         multiplication_matrix(M, r);
         // A = (Q - I)^T for the rows q_j = x^(P j) mod g, 8 rows at a time: the kernel of A is
         // {v : v^P = v mod g}.
         Matrix A(m, m, std::move(matrix_));
-        u32* rows = R_.rows();
+        Sequence sequence{*this, M, R_.rows(), m};
         for (int j0 = 0; j0 < m; j0 += 8) {
-            for (int q = 0; q < 8; ++q) {
-                u32* row = rows + q * stride;
-                const int j = j0 + q;
-                if (j == 0) {
-                    std::fill(row, row + stride, 0);
-                    row[0] = kOne;
-                } else if (j < m) {
-                    const u32* previous = q ? row - stride : rows + 7 * stride;
-                    combine<S>(row, m, nullptr, previous, m, M.table.data(), stride);
-                } else {
-                    std::fill(row, row + stride, 0);
-                }
-            }
+            const u32* rows = sequence.next(j0);
             const int width = std::min(8, m - j0);
             if (width == 8) {
-                transpose_rows<S>(A.a.data(), A.ld, m, j0, rows, stride);
+                transpose_rows<S>(A.a.data(), A.ld, m, j0, rows, M.stride);
             } else {
                 for (int i = 0; i < m; ++i)
-                    for (int q = 0; q < width; ++q) A.row(i)[j0 + q] = rows[q * stride + i];
+                    for (int q = 0; q < width; ++q) A.row(i)[j0 + q] = rows[q * M.stride + i];
             }
         }
+        const int stride = M.stride;
         for (int i = 0; i < m; ++i) A.row(i)[i] = sub(A.row(i)[i], kOne);
         const Echelon E = eliminate<S>(A);
         const int k = E.dimension();
@@ -255,10 +325,11 @@ private:
         multiplication_matrix(M, v);
         std::vector<u32>& powers = matrix_;  // v^j mod g, j <= k
         powers.assign(std::size_t(k + 1) * stride, 0);
-        powers[0] = kOne;
-        for (int j = 0; j < k; ++j)
-            combine<S>(&powers[std::size_t(j + 1) * stride], m, nullptr, &powers[std::size_t(j) * stride], m,
-                       M.table.data(), stride);
+        Sequence sequence{*this, M, R_.rows(), k + 1};
+        for (int j0 = 0; j0 <= k; j0 += 8) {
+            const u32* rows = sequence.next(j0);
+            std::copy(rows, rows + std::min(8, k + 1 - j0) * stride, &powers[std::size_t(j0) * stride]);
+        }
         Matrix C(k, k + 1, std::move(M.table));
         for (int t = 0; t < k; ++t)
             for (int j = 0; j <= k; ++j) C.row(t)[j] = powers[std::size_t(j) * stride + free[t]];
@@ -271,7 +342,7 @@ private:
         minimal.n = groups + 1;
         M.table = C.release();
         std::vector<u32> roots;
-        find_roots(minimal, nullptr, roots);
+        find_roots(minimal, roots);
         if (groups == k) return extract(M.g, v, roots, 0, k, powers, stride, m, nullptr);
         std::vector<Poly> pieces;
         pieces.reserve(groups);
@@ -365,7 +436,12 @@ std::vector<Factor> factor_as(std::span<const u32> f) {
     if (n == 0) throw std::invalid_argument("fps::factorization::factor: f = 0");
     if (n - 1 > std::size_t(kMaxDegree)) throw std::length_error("fps::factorization::factor: deg f > kMaxDegree");
     if (n == 1) return {};
-    return detail::Factorizer<S>(int(n) - 1).run(f.first(n));
+    const int degree = int(n) - 1;
+    if (degree > kKeepDegree) return detail::Factorizer<S>(degree).run(f.first(n));
+    // This thread's factorizer: its buffers and matrices stay allocated between calls.
+    thread_local std::unique_ptr<detail::Factorizer<S>> kept;
+    if (!kept || kept->limit() < degree) kept = std::make_unique<detail::Factorizer<S>>(std::max(degree, 64));
+    return kept->run(f.first(n));
 }
 
 inline std::vector<Factor> factor(std::span<const u32> f) { return factor_as<simd::Native>(f); }

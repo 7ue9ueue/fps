@@ -24,6 +24,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
@@ -85,29 +86,41 @@ concept HasMulEven = requires(typename S::V a) { S::mul_even(a, a); };
 template <class S>
 concept HasMulWide = requires(typename S::V a) { S::mul_wide_lo(a, a); };
 
-// zero(), mac(s, c, x): s += c x lane-wise for c a broadcast word; fold(s); reduce(s): the folded
-// sums times 2^-32, canonical.
+// zero(), mac(s, c, x): s += c x lane-wise for c a broadcast word; op(x): x as mac's operand, to
+// share among several sums (mac(s, c, op)); fold(s); reduce(s): the folded sums times 2^-32,
+// canonical.
 template <class S>
 struct EvenOdd {  // x86: 64-bit lanes by mul_even
     using V = typename S::V;
     struct Acc {
         V even, odd;
     };
+    struct Op {
+        V even, odd;  // the odd words moved to the even ones
+    };
     [[gnu::always_inline]] static Acc zero() { return {S::broadcast(0), S::broadcast(0)}; }
-    [[gnu::always_inline]] static void mac(Acc& s, V c, V x) {
-        s.even = S::add64(s.even, S::mul_even(c, x));
-        s.odd = S::add64(s.odd, S::mul_even(c, S::template shr64<32>(x)));
+    [[gnu::always_inline]] static Op op(V x) { return {x, S::template shr64<32>(x)}; }
+    [[gnu::always_inline]] static void mac(Acc& s, V c, const Op& x) {
+        s.even = S::add64(s.even, S::mul_even(c, x.even));
+        s.odd = S::add64(s.odd, S::mul_even(c, x.odd));
+    }
+    [[gnu::always_inline]] static void mac(Acc& s, V c, V x) { mac(s, c, op(x)); }
+    // Sums x 2^32 (x < P), so that reduce() returns x plus the products: a shift and a mask.
+    [[gnu::always_inline]] static Acc shifted(V x) {
+        return {S::template shl64<32>(x), S::template blend<0x5555>(x, S::broadcast(0))};
     }
     [[gnu::always_inline]] static V fold(V s) {
         return S::sub64(s, S::mul_even(S::template shr64<32>(s), S::broadcast(kQ)));
     }
     [[gnu::always_inline]] static void fold(Acc& s) { s.even = fold(s.even), s.odd = fold(s.odd); }
-    [[gnu::always_inline]] static V reduce(const Acc& s) {
+    // Montgomery's step without the last reduction: below P + s / 2^32.
+    [[gnu::always_inline]] static V reduce_lazy(const Acc& s) {
         const V ninv = S::broadcast(kNegPinv), p = S::broadcast(kP);
         const V even = S::add64(s.even, S::mul_even(S::mul_even(s.even, ninv), p));
         const V odd = S::add64(s.odd, S::mul_even(S::mul_even(s.odd, ninv), p));
-        return modarith::Ops<S, kP>::template reduce<kP>(S::join_high(even, odd));
+        return S::join_high(even, odd);
     }
+    [[gnu::always_inline]] static V reduce(const Acc& s) { return modarith::Ops<S, kP>::template reduce<kP>(reduce_lazy(s)); }
 };
 
 template <class S>
@@ -117,7 +130,13 @@ struct Halves {  // Neon: words 0-1 and 2-3 in 64-bit lanes
     struct Acc {
         W lo, hi;
     };
+    using Op = V;
     [[gnu::always_inline]] static Acc zero() { return {W{}, W{}}; }
+    [[gnu::always_inline]] static Op op(V x) { return x; }
+    [[gnu::always_inline]] static Acc shifted(V x) {  // x 2^32 mod P: one umull each
+        const V one = S::broadcast(kOne);
+        return {S::mul_wide_lo(x, one), S::mul_wide_hi(x, one)};
+    }
     [[gnu::always_inline]] static void mac(Acc& s, V c, V x) {
         s.lo = S::mla_wide_lo(s.lo, x, c);
         s.hi = S::mla_wide_hi(s.hi, x, c);
@@ -127,25 +146,32 @@ struct Halves {  // Neon: words 0-1 and 2-3 in 64-bit lanes
         s.lo = S::mls_wide_lo(s.lo, high, q);
         s.hi = S::mls_wide_hi(s.hi, high, q);
     }
-    [[gnu::always_inline]] static V reduce(const Acc& s) {
+    [[gnu::always_inline]] static V reduce_lazy(const Acc& s) {
         const V m = S::mul_lo(S::lo_halves(s.lo, s.hi), S::broadcast(kNegPinv)), p = S::broadcast(kP);
-        const V r = S::hi_halves(S::mla_wide_lo(s.lo, m, p), S::mla_wide_hi(s.hi, m, p));
-        return modarith::Ops<S, kP>::template reduce<kP>(r);
+        return S::hi_halves(S::mla_wide_lo(s.lo, m, p), S::mla_wide_hi(s.hi, m, p));
     }
+    [[gnu::always_inline]] static V reduce(const Acc& s) { return modarith::Ops<S, kP>::template reduce<kP>(reduce_lazy(s)); }
 };
 
 template <class S>
 struct Single {  // one word per vector
     using V = u32;
     using Acc = u64;
+    using Op = u32;
     [[gnu::always_inline]] static Acc zero() { return 0; }
+    [[gnu::always_inline]] static Op op(V x) { return x; }
+    [[gnu::always_inline]] static Acc shifted(V x) { return u64(x) << 32; }
     [[gnu::always_inline]] static void mac(Acc& s, V c, V x) { s += u64(c) * x; }
     [[gnu::always_inline]] static void fold(Acc& s) { s = detail::fold(s); }
+    [[gnu::always_inline]] static V reduce_lazy(Acc s) { return u32((s + u64(u32(s) * kNegPinv) * kP) >> 32); }
     [[gnu::always_inline]] static V reduce(Acc s) { return detail::reduce(s); }
 };
 
 template <class S>
 using Sums = std::conditional_t<HasMulEven<S>, EvenOdd<S>, std::conditional_t<HasMulWide<S>, Halves<S>, Single<S>>>;
+
+template <class S>
+inline constexpr bool kSingle = !HasMulEven<S> && !HasMulWide<S>;
 
 // Vectors per block of combine: the sums of a block stay in registers (2 per vector).
 template <class S>
@@ -168,14 +194,19 @@ template <class S, int V>
     }
     // One product (init) and kChunk - 1 columns, then folds every kChunk columns.
     for (int s0 = 0, s1 = std::min(count, kChunk - 1);; s0 = s1, s1 = std::min(count, s1 + kChunk)) {
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC novector  // GCC 15.2 vectorizes Single's sums wrongly at -O2 -march=x86-64-v3 (#183)
-#endif
-        for (int s = s0; s < s1; ++s) {
+        const auto step = [&](int s) {
             const typename S::V c = S::broadcast(coef[s]);
             const u32* column = base + s * stride;
 #pragma GCC unroll 8
             for (int v = 0; v < V; ++v) A::mac(acc[v], c, S::load(column + W * v));
+        };
+        if constexpr (kSingle<S>) {
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC novector  // GCC 15.2 vectorizes Single's sums wrongly at -O2 -march=x86-64-v3 (#183)
+#endif
+            for (int s = s0; s < s1; ++s) step(s);
+        } else {
+            for (int s = s0; s < s1; ++s) step(s);
         }
 #pragma GCC unroll 8
         for (int v = 0; v < V; ++v) A::fold(acc[v]);
@@ -194,7 +225,115 @@ inline void combine_rest(int vectors, u32* out, const u32* init, u32 scale, cons
     }
 }
 
+// Rows and vectors per block of combine_rows: R rows x V vectors of sums in registers. 8 rows x m
+// x m products per ns (notes/123-r1.md): Zen 3 R4V1 18.1 at m = 100 (R2V2 17.5, R8V1 16.1, R4V2
+// 15.9); Emerald Rapids (zmm) R8V1 23.2 (R4V2 23.0, R4V1 21.9); Zen 5 R8V1 44.4 (R4V2 44.0, R4V1
+// 43.7); Neoverse V2 R4V1 10.3 (R2V2 10.2, R4V2 9.1, R8V1 8.7).
+template <class S>
+inline constexpr int kRows = S::registers >= 32 && HasMulEven<S> ? 8 : 4;
+template <class S>
+inline constexpr int kRowVectors = 1;
+
+// Row r < R: out_r[t] = scale init_r[t] + sum_s coef_r[s] column_s[t], t < V W, with out_r =
+// out + r ostride, init_r = init + r istride, coef_r[s] = coef[r cstride + s sstride], column_s =
+// base + s stride. Each column vector loaded serves the R rows.
+template <class S, int R, int V>
+[[gnu::always_inline]] inline void rows_block(u32* out, std::ptrdiff_t ostride, const u32* init, std::ptrdiff_t istride,
+                                              u32 scale, const u32* coef, std::ptrdiff_t cstride, std::ptrdiff_t sstride,
+                                              int count, const u32* base, std::ptrdiff_t stride) {
+    using A = Sums<S>;
+    constexpr int W = S::lanes;
+    typename A::Acc acc[R][V];
+    const typename S::V vscale = S::broadcast(scale);
+#pragma GCC unroll 8
+    for (int r = 0; r < R; ++r)
+#pragma GCC unroll 4
+        for (int v = 0; v < V; ++v) {
+            acc[r][v] = A::zero();
+            A::mac(acc[r][v], vscale, S::load(init + r * istride + W * v));
+        }
+    for (int s0 = 0, s1 = std::min(count, kChunk - 1);; s0 = s1, s1 = std::min(count, s1 + kChunk)) {
+        const auto step = [&](int s) {
+            typename A::Op x[V];
+#pragma GCC unroll 4
+            for (int v = 0; v < V; ++v) x[v] = A::op(S::load(base + s * stride + W * v));
+#pragma GCC unroll 8
+            for (int r = 0; r < R; ++r) {
+                const typename S::V c = S::broadcast(coef[r * cstride + s * sstride]);
+#pragma GCC unroll 4
+                for (int v = 0; v < V; ++v) A::mac(acc[r][v], c, x[v]);
+            }
+        };
+        if constexpr (kSingle<S>) {
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC novector  // #183
+#endif
+            for (int s = s0; s < s1; ++s) step(s);
+        } else {
+            for (int s = s0; s < s1; ++s) step(s);
+        }
+#pragma GCC unroll 8
+        for (int r = 0; r < R; ++r)
+#pragma GCC unroll 4
+            for (int v = 0; v < V; ++v) A::fold(acc[r][v]);
+        if (s1 == count) break;
+    }
+#pragma GCC unroll 8
+    for (int r = 0; r < R; ++r)
+#pragma GCC unroll 4
+        for (int v = 0; v < V; ++v) S::store(out + r * ostride + W * v, A::reduce(acc[r][v]));
+}
+
+// R rows over len words.
+template <class S, int R>
+inline void rows_group(u32* out, std::ptrdiff_t ostride, int len, const u32* init, std::ptrdiff_t istride, u32 scale,
+                       const u32* coef, std::ptrdiff_t cstride, std::ptrdiff_t sstride, int count, const u32* base,
+                       std::ptrdiff_t stride) {
+    constexpr int W = S::lanes, V = kRowVectors<S>;
+    const int vectors = (len + W - 1) / W, step = init == kZeros ? 0 : W;  // kZeros: one block's words
+    int v = 0;
+    for (; v + V <= vectors; v += V)
+        rows_block<S, R, V>(out + W * v, ostride, init + step * v, istride, scale, coef, cstride, sstride, count,
+                            base + W * v, stride);
+    if constexpr (V > 1)
+        for (; v < vectors; ++v)
+            rows_block<S, R, 1>(out + W * v, ostride, init + step * v, istride, scale, coef, cstride, sstride, count,
+                                base + W * v, stride);
+}
+
+template <class S, int R = kRows<S> - 1>
+inline void rows_rest(int rows, u32* out, std::ptrdiff_t ostride, int len, const u32* init, std::ptrdiff_t istride,
+                      u32 scale, const u32* coef, std::ptrdiff_t cstride, std::ptrdiff_t sstride, int count,
+                      const u32* base, std::ptrdiff_t stride) {
+    if constexpr (R > 0) {
+        if (rows == R)
+            return rows_group<S, R>(out, ostride, len, init, istride, scale, coef, cstride, sstride, count, base, stride);
+        rows_rest<S, R - 1>(rows, out, ostride, len, init, istride, scale, coef, cstride, sstride, count, base, stride);
+    }
+}
+
 }  // namespace detail
+
+// Row r < rows: out_r[t] = scale init_r[t] + sum_{s < count} coef_r[s] (base + s stride)[t] for t
+// < len rounded up to W, with out_r = out + r ostride, init_r = init + r istride (init may be null:
+// zero), coef_r[s] = coef[r cstride + s sstride]. As combine_scaled for each row, but a column's
+// words, loaded once, serve kRows rows (their sums held in registers): a matrix product, rows times
+// columns. out_r may be init_r; not another row's init or coefficients.
+template <class S>
+inline void combine_rows(u32* out, std::ptrdiff_t ostride, int rows, int len, const u32* init, std::ptrdiff_t istride,
+                         u32 scale, const u32* coef, std::ptrdiff_t cstride, std::ptrdiff_t sstride, int count,
+                         const u32* base, std::ptrdiff_t stride) {
+    using namespace detail;
+    constexpr int R = kRows<S>;
+    if (!init) init = kZeros, istride = 0;
+    int r = 0;
+    for (; r + R <= rows; r += R)
+        rows_group<S, R>(out + r * ostride, ostride, len, init + r * istride, istride, scale, coef + r * cstride, cstride,
+                         sstride, count, base, stride);
+    if (r < rows)
+        rows_rest<S>(rows - r, out + r * ostride, ostride, len, init + r * istride, istride, scale, coef + r * cstride,
+                     cstride, sstride, count, base, stride);
+}
 
 // out[t] = scale init[t] + sum_{s < count} coef[s] (base + s stride)[t] for t < len rounded up to
 // W; init may be null (zero). Columns and init are read over the same rounded range.
@@ -229,6 +368,100 @@ inline void lincomb(u32* out, const u32* x, u32 a, const u32* y, u32 b, int len)
         A::mac(s, va, S::load(x + t));
         A::mac(s, vb, S::load(y + t));  // 2 products < 2^32 P: no fold
         S::store(out + t, A::reduce(s));
+    }
+}
+
+// out[t] = x[t] + c y[t] for t < len rounded up to W; out may alias x or y. Sums x 2^32 + c y <
+// P 2^32 + P^2, so Montgomery's step gives less than 2.24 P: two min-reductions.
+template <class S>
+inline void axpy(u32* out, const u32* x, u32 c, const u32* y, int len) {
+    using A = detail::Sums<S>;
+    using M = modarith::Ops<S, kP>;
+    constexpr int W = S::lanes;
+    const typename S::V vc = S::broadcast(c);
+    for (int t = 0; t < len; t += W) {
+        typename A::Acc s = A::shifted(S::load(x + t));
+        A::mac(s, vc, S::load(y + t));
+        S::store(out + t, M::template reduce<kP>(M::template reduce<2 * kP>(A::reduce_lazy(s))));
+    }
+}
+
+namespace detail {
+
+// [p[W-1], c[0], .., c[W-2]]: c one lane up, the lane in from p (one or two shuffles).
+inline u32 shift_in(u32 p, u32) { return p; }
+#if defined(__SSE4_1__)
+inline __m128i shift_in(__m128i p, __m128i c) { return _mm_alignr_epi8(c, p, 12); }
+#endif
+#if defined(__AVX2__)
+inline __m256i shift_in(__m256i p, __m256i c) {
+    return _mm256_alignr_epi8(c, _mm256_permute2x128_si256(p, c, 0x21), 12);
+}
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+inline __m512i shift_in(__m512i p, __m512i c) { return _mm512_alignr_epi32(c, p, 15); }
+#endif
+#if defined(__ARM_NEON) && defined(__aarch64__)
+inline uint32x4_t shift_in(uint32x4_t p, uint32x4_t c) { return vextq_u32(p, c, 3); }
+#endif
+
+}  // namespace detail
+
+namespace detail {
+
+// y = x a mod g given c = -a[m-1] in every lane; returns y's vector at word `last` (the one with
+// word m - 1), computed first, so that the next step of a chain can start before this one ends.
+template <class S>
+[[gnu::always_inline]] inline typename S::V times_x_step(u32* y, const u32* a, const u32* g, int last,
+                                                         typename S::V c) {
+    using A = Sums<S>;
+    using M = modarith::Ops<S, kP>;
+    using V = typename S::V;
+    constexpr int W = S::lanes;
+    const auto word = [&](V previous, V current, int t) {
+        typename A::Acc sum = A::shifted(shift_in(previous, current));
+        A::mac(sum, c, S::load(g + t));
+        const V r = M::template reduce<kP>(M::template reduce<2 * kP>(A::reduce_lazy(sum)));
+        S::store(y + t, r);
+        return r;
+    };
+    const V top = word(last ? S::load(a + last - W) : S::broadcast(0), S::load(a + last), last);
+    V previous = S::broadcast(0);
+    for (int t = 0; t < last; t += W) {
+        const V current = S::load(a + t);
+        word(previous, current, t);
+        previous = current;
+    }
+    return top;
+}
+
+}  // namespace detail
+
+// y = x a mod g for g monic of degree m, a of m words (zero from m to m rounded up to W), y not
+// overlapping a: y[t] = a[t-1] - a[m-1] g[t], written to m rounded up to W (zeros past m). The
+// shift is done in registers from aligned loads of a.
+template <class S>
+inline void times_x(u32* y, const u32* a, const u32* g, int m) {
+    detail::times_x_step<S>(y, a, g, (m - 1) / S::lanes * S::lanes, S::broadcast(detail::neg(a[m - 1])));
+}
+
+// Column s = x column_(s-1) mod g at first + s stride for s = 1 .. count - 1, from column 0
+// (times_x down a chain). Each column's loads of the one before match its stores (store
+// forwarding), and its top word comes from the register that held it, broadcast: a word load from
+// inside a vector store was not forwarded on Zen 3 (40 ns per column at m = 100 against about 10).
+template <class S>
+inline void times_x_chain(u32* first, int count, std::ptrdiff_t stride, const u32* g, int m) {
+    using M = modarith::Ops<S, kP>;
+    using V = typename S::V;
+    constexpr int W = S::lanes;
+    const int last = (m - 1) / W * W;
+    std::array<int, W> lane;
+    lane.fill((m - 1) % W);
+    const auto index = S::index(lane);
+    V top = S::load(first + last);
+    for (int s = 1; s < count; ++s) {
+        const V c = M::sub(S::broadcast(0), S::permute(top, index));  // -column_(s-1)[m-1]
+        top = detail::times_x_step<S>(first + s * stride, first + (s - 1) * stride, g, last, c);
     }
 }
 
