@@ -29,8 +29,8 @@ For each issue:
    and returns; then review again with a new reviewer. After two reviews with changes, label the
    issue `blocked` and comment for the user what is unresolved.
 5. On `Review: pass`, gate it yourself: `python3 tools/gate.py <pr> --merge`, in the background,
-   while you keep coordinating (gates queue on a lock; start each one when its review passes). On a
-   fail (a test or a slowdown), send the implementer the gate's comment with SendMessage; it fixes,
+   while you keep coordinating (gates run side by side; start each one when its review passes). On
+   a fail (a test), send the implementer the gate's comment with SendMessage; it fixes,
    pushes and returns, and you gate again. A conflict with main is not a failed gate: nothing was
    tested. Resolve a small conflict yourself (notes, DESIGN.md, an include line, a few lines of
    code): rebase the branch in your worktree, build and test what the conflict touched, force-push,
