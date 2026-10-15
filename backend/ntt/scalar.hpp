@@ -3,6 +3,7 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 
@@ -78,9 +79,11 @@ inline void inverse_group(u32* g, std::size_t q, std::size_t k, const u32* ir) {
     }
 }
 
-// forward_levels undone, times the leaves per group at quarters of `top` words.
-inline void inverse_levels(u32* f, std::size_t top, std::size_t first, std::size_t count, const u32* ir) {
-    for (std::size_t q = 8; q <= top; q *= 4)
+// forward_levels undone, times the leaves per group at quarters of `top` words; from the level with
+// quarters of `from` words (the ones below already undone).
+inline void inverse_levels(u32* f, std::size_t top, std::size_t first, std::size_t count, const u32* ir,
+                           std::size_t from = 8) {
+    for (std::size_t q = from; q <= top; q *= 4)
         for (std::size_t k = 0; k < count * (top / q); ++k) inverse_group(f + 4 * q * k, q, first * (top / q) + k, ir);
 }
 
@@ -308,12 +311,83 @@ struct scalar {
         for (std::size_t i = 0; i < count; ++i) out[i] = output & detail::kNegated ? detail::scalar::sub(0, from[i]) : from[i];
     }
 
-    // Hooked ops (Transform::forward(in, F, hook, ...)): one run of all the leaves; no pruning.
+    // Hooked ops (Transform::forward(in, F, hook, ...)): one run of all the leaves; no pruning. The
+    // words of in with (i & width) != 0 are not read (zeros in the copy).
     template <class Hook>
     static void forward_hooked(const std::uint32_t* in, std::size_t n, std::uint32_t* f, int lg, const std::uint32_t* roots,
-                               std::size_t, Hook hook) {
-        forward_from(in, n, f, lg, roots);
+                               std::size_t width, Hook hook) {
+        for (std::size_t i = 0; i < n; ++i) f[i] = i & width ? 0 : in[i];
+        std::fill(f + n, f + (std::size_t(1) << lg), 0u);
+        forward(f, lg, roots);
         hook(f, std::size_t(0), (std::size_t(1) << lg) / 8);
+    }
+
+    // Doubling ops (Transform::truncate_blocks, join_blocks, forward_upper_hooked; issue #149 round
+    // 2). A block of b words at f + j b is group j with quarters of b / 4 words if b / 8 is a power
+    // of 4 ("aligned"), else half of group j / 2 with quarters of b / 2: groups 2j, 2j + 1 with
+    // quarters of b / 8 under a radix-2 level with r(j).
+    static bool aligned_block(std::size_t b) { return std::countr_zero(b / 8) % 2 == 0; }
+
+    template <class Hook>
+    static void truncate_blocks(std::uint32_t* f, std::size_t b, std::uint32_t* copy, int lg, const std::uint32_t* roots,
+                                const std::uint32_t* inverse_roots, Hook hook) {
+        const std::size_t len = std::size_t(1) << lg, h = b / 2;
+        for (std::size_t j = 0; j < len / b; ++j) {
+            std::uint32_t* g = f + j * b;
+            if (aligned_block(b)) {
+                detail::scalar::inverse_levels(g, b / 4, j, 1, inverse_roots);
+                std::fill(g + h, g + b, 0u);
+                std::copy_n(g, h, copy + j * b);
+                detail::scalar::forward_levels(g, b / 4, j, 1, roots);
+            } else {  // the radix-2 level: lower outputs u + v (times 2), then u in both halves
+                detail::scalar::inverse_levels(g, b / 8, 2 * j, 2, inverse_roots);
+                for (std::size_t i = 0; i < h; ++i) g[i] = detail::scalar::add(g[i], g[i + h]);
+                std::copy_n(g, h, g + h);
+                std::copy_n(g, h, copy + j * b);
+                detail::scalar::forward_levels(g, b / 8, 2 * j, 2, roots);
+            }
+        }
+        hook(f, std::size_t(0), len / 8);
+    }
+
+    // The levels above the blocks undone on copy: rows of b words, x < b / 2 kept, times scale.
+    static void join_blocks(std::uint32_t* f, std::size_t b, std::uint32_t scale, int lg, const std::uint32_t* inverse_roots) {
+        const std::size_t len = std::size_t(1) << lg, h = b / 2;
+        for (std::size_t j = 0; j < len / b; ++j) std::fill(f + j * b + h, f + (j + 1) * b, 0u);
+        std::size_t q = b;  // the quarters of the lowest level above the blocks
+        if (!aligned_block(b)) {  // the first stage of the groups with quarters of b / 2
+            for (std::size_t k = 0; k < len / (2 * b); ++k) {
+                std::uint32_t* g = f + 2 * b * k;
+                const std::uint32_t x = inverse_roots[detail::slot(k)];
+                for (std::size_t i = 0; i < h; ++i) {
+                    const std::uint32_t a = g[i], c = g[i + b];
+                    g[i] = detail::scalar::add(a, c), g[i + b] = detail::scalar::mul(x, detail::scalar::sub(a, c));
+                }
+            }
+            q = 2 * b;
+        }
+        if (q <= detail::scalar::top_quarter(lg))
+            detail::scalar::inverse_levels(f, detail::scalar::top_quarter(lg), 0, len / (4 * detail::scalar::top_quarter(lg)),
+                                           inverse_roots, q);
+        if (detail::has_radix2(lg)) {
+            for (std::size_t i = 0; i < len / 2; ++i) {
+                const std::uint32_t x = f[i], y = f[i + len / 2];
+                f[i] = detail::scalar::add(x, y), f[i + len / 2] = detail::scalar::sub(x, y);
+            }
+        }
+        detail::scalar::scale(f, len, detail::multiply_mod(scale, detail::power(std::uint32_t(len / b), detail::kP - 2)));
+    }
+
+    // forward_upper on h (2^lg words) with the words (i & width) != 0 counted as 0; hook on all of
+    // the half's leaves (leaf indices from 2^lg / 8).
+    template <class Hook>
+    static void forward_upper_hooked(std::uint32_t* h, int lg, const std::uint32_t* roots, std::size_t width, Hook hook) {
+        const std::size_t n = std::size_t(1) << lg;
+        if (width)
+            for (std::size_t i = 0; i < n; ++i)
+                if (i & width) h[i] = 0;
+        forward_upper(h, lg, roots);
+        hook(h, n / 8, n / 8);
     }
 
     template <class Hook>

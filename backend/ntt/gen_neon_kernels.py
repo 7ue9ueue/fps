@@ -7,7 +7,7 @@ budget, reordered so that its multiplies and other vector ops alternate (repatte
 onto v0-v28 by linear scan and emitted as one asm statement. The arithmetic is intrinsics.hpp's
 (Bottom<Neon>, Butterflies<Neon>): outputs equal the intrinsics' mod P, in the same ranges.
 
-Kernels (neon.hpp calls them; design and measurements in notes.md, notes/151-r1.md, 151-r2.md):
+Kernels (neon.hpp calls them; design and measurements in notes.md, notes/151-r1.md to 151-r3.md):
   bottom_first, bottom_last, bottom_both: the bottom stage of a product, two groups k, k + 1 (k
     even) per statement. first: forward butterflies of a and b (h = 1), the leaf rows [w_t A_t,
     A_t] and B_t into a leaf buffer; last: the 8 x 8 leaf products from the buffer (umull/umlal
@@ -15,6 +15,10 @@ Kernels (neon.hpp calls them; design and measurements in notes.md, notes/151-r1.
     into a; both: last for one pair interleaved with first for the next.
   bottom_rows_first, bottom_square_*, bottom_stored_*: the same for a square (B_t = A_t, from the
     rows) and for a product by stored leaves (B_t from memory; Transform's fused ops).
+  bottom_fill_*, bottom_terms_*: Transform::inverse_product (Bottom::inverse_terms): rows from
+    canonical leaves (no butterflies); one term a b with bottom_stored_last, several as one pass per
+    product term whose leaf products add into out (the first pass with the plain term a times
+    2^-32, the last one with the inverse butterflies).
   bottom_forward_pair, bottom_inverse_pair: the bottom level of a transform, two groups.
   forward_group, inverse_group (and _identity_, group 0; forward_group2: inputs < 2P from other
     memory): one radix-4 group on quarters of q words, an asm loop of 4 columns per iteration.
@@ -55,6 +59,12 @@ LOADS_PER_CYCLE, STORES_PER_CYCLE = 3, 2
 # Registers: v0-v28 for values, v29 = P, v30 = 2P, v31 = -P^-1 mod 2^32 (broadcast).
 VALUE_REGS = 29
 CONST = {'P': 29, '2P': 30, 'NI': 31}
+# Reduction of the leaf products' 64-bit sums s = H 2^32 + L, per kernel (Kernel.reduce; set here while
+# one is built): 'montgomery', (s + m P) / 2^32 with m = -L P^-1 (umlal of m P into the sums; v31 =
+# -P^-1), or 'sub', H - umulh(m', P) with m' = L P^-1 (v31 = P^-1): one multiply fewer and two other
+# ops more per 4 words. Whole ops on lc-arm (notes/151-r3.md): 'sub' made products 0.6-0.9% and the
+# sums of inverse_product 2-3% faster, squares 2-3% and products by stored leaves 1-2% slower.
+LEAF_REDUCE = 'montgomery'
 
 
 class ScheduleError(Exception):
@@ -116,6 +126,9 @@ class Graph:
     def dup(self, x, lane):
         return self.emit('A', f'dup v{{d}}.4s, v{{s0}}.s[{lane}]', [x])
 
+    def nonzero(self, x):  # all ones in the lanes where x != 0
+        return self.emit('A', 'cmtst v{d}.4s, v{s0}.4s, v{s0}.4s', [x])
+
     def mul(self, x, w, lane=None):
         e = '4s' if lane is None else f's[{lane}]'
         return self.emit('M', f'mul v{{d}}.4s, v{{s0}}.4s, v{{s1}}.{e}', [x, w])
@@ -149,6 +162,14 @@ class Graph:
     def low_diff(self, x, y):  # x - y mod 2P in [0, 2P) for x, y < 2P
         t = self.sub(x, y)
         return self.umin(t, self.add(t, self.c['2P']))
+
+    def montgomery(self, x):
+        """x 2^-32 mod P in [0, P] for any x < 2^32: (x + m P) / 2^32 with m = -x P^-1 mod 2^32, which
+        is the high word of m P, plus 1 where x != 0 (the low words of x and m P add to 2^32)."""
+        if LEAF_REDUCE == 'sub':  # (x - m' P) / 2^32 = -umulh(m', P), m' = x P^-1: P minus it, in (0, P]
+            return self.sub(self.c['P'], self.umulh(self.mul(x, self.c['NI']), self.c['P']))
+        hi = self.umulh(self.mul(x, self.c['NI']), self.c['P'])
+        return self.sub(hi, self.nonzero(x))
 
     def shoup(self, x, w, q):
         """x w mod P in [0, 2P) for any x < 2^32. w = (register, lane): the twiddle by element;
@@ -302,17 +323,22 @@ def leaf_product(g, window, B, u):
             lo, hi = g.umull(x, b, lane, False), g.umull(x, b, lane, True)
         else:
             lo, hi = g.umlal(lo, x, b, lane, False), g.umlal(hi, x, b, lane, True)
+    if LEAF_REDUCE == 'sub':  # y = H - umulh(L P^-1, P) in (-P, 1.86P); y + P or y - P, < 2P
+        y = g.sub(g.uzp(2, lo, hi), g.umulh(g.mul(g.uzp(1, lo, hi), g.c['NI']), g.c['P']))
+        return g.umin(g.add(y, g.c['P']), g.sub(y, g.c['P']))
     m = g.mul(g.uzp(1, lo, hi), g.c['NI'])
     lo, hi = g.umlal(lo, m, g.c['P'], None, False), g.umlal(hi, m, g.c['P'], None, True)
     return g.low(g.uzp(2, lo, hi))
 
 
-def product_half(g, m, iw, kind):
+def product_half(g, m, iw, kind, acc=None, butterflies=True):
     """Group m's leaf products from its leaf buffer at cur<m> (an operand: the windows' offsets must
     fit ldur's 9 bits), then the inverse butterflies into out + 128 m bytes, out < 2P. B_t: the
     buffer's (product), A_t from the row (square), or b's leaves at bs + 128 m bytes (stored).
     Column by column: each column's windows and B are loaded for it (loads are cheap, registers
-    are not)."""
+    are not). Sums of terms (Bottom::inverse_terms): acc 'out' adds out's words (< 2P), 'plain'
+    the canonical leaves at pa + 128 m bytes times 2^-32; without butterflies the sums (< 2P) go to
+    out as they are."""
     cur = f'cur{m}'
     for u in range(2):
         c = []
@@ -320,8 +346,13 @@ def product_half(g, m, iw, kind):
             base, at = {'product': (cur, 256 + 32 * t), 'square': (cur, 64 * t + 32),
                         'stored': ('bs', 128 * m + 32 * t)}[kind]
             B = [g.load(base, at + 16 * h) for h in range(2)]
-            c.append(leaf_product(g, lambda o, t=t: g.load(cur, 64 * t + 4 * o), B, u))
-        for t, v in enumerate(inverse4(g, c, iw.group(g, m))):
+            v = leaf_product(g, lambda o, t=t: g.load(cur, 64 * t + 4 * o), B, u)
+            if acc == 'out':
+                v = g.low(g.add(v, g.load('out', 128 * m + 32 * t + 16 * u)))
+            elif acc == 'plain':
+                v = g.low(g.add(v, g.montgomery(g.load('pa', 128 * m + 32 * t + 16 * u))))
+            c.append(v)
+        for t, v in enumerate(inverse4(g, c, iw.group(g, m)) if butterflies else c):
             g.store(v, 'out', 128 * m + 32 * t + 16 * u)
 
 
@@ -332,11 +363,12 @@ def interleave(first, second, shift=0.0):
     return [o for *_, o in sorted(keyed, key=lambda t: t[:3])]
 
 
-def bottom(g, part, kind='product', groups=2, shift=0.0):
+def bottom(g, part, kind='product', groups=2, shift=0.0, acc=None, butterflies=True):
     """The bottom stage of `groups` groups k + m (k even) per statement, in two halves: first
     (forward_half of the batch at a, b into buf) and last (product_half of the batch in cur0,
     cur1 into out); both: last for the current batch interleaved with first for the next one.
-    kind 'fill': rows from leaves, then the stored form's last half. Returns the source order."""
+    kind 'fill': rows from leaves, then the stored form's last half (with acc and butterflies as
+    product_half's). Returns the source order."""
     ops = {}
     for half in ('last', 'first'):
         if part not in (half, 'both'):
@@ -349,7 +381,7 @@ def bottom(g, part, kind='product', groups=2, shift=0.0):
         else:
             iw = Twiddles('ix', 'iyz')
             for m in range(groups):
-                product_half(g, m, iw, 'stored' if kind == 'fill' else kind)
+                product_half(g, m, iw, 'stored' if kind == 'fill' else kind, acc, butterflies)
         ops[half] = g.ops[start:]
     seq = interleave(ops['last'], ops['first'], shift) if part == 'both' else g.ops
     return prune(seq) if kind == 'fill' else seq  # fill: x's twiddle unused
@@ -636,6 +668,7 @@ class Kernel:
     args: list
     doc: str
     knobs: Knobs = field(default_factory=Knobs)
+    reduce: str = 'montgomery'  # LEAF_REDUCE
 
 
 @dataclass
@@ -685,6 +718,12 @@ BOTTOM_MERGE = {'shift': 0.0}  # interleave() of 'both'
 LOOP_KNOBS = dict(window=None, **PATTERN)
 
 
+# Passes of Bottom::inverse_terms with several terms: (name, what is added to the leaf products,
+# inverse butterflies after).
+TERM_PASSES = [('bottom_terms', None, False), ('bottom_terms_plain', 'plain', False), ('bottom_terms_add', 'out', False),
+               ('bottom_terms_add_inverse', 'out', True), ('bottom_terms_plain_inverse', 'plain', True)]
+
+
 def bottom_kernels():
     """Products (bottom_first, _last, _both), squares (bottom_rows_first, bottom_square_*),
     products by stored leaves (bottom_rows_first, bottom_stored_*), transform bottoms."""
@@ -707,7 +746,7 @@ def bottom_kernels():
                    'both': BOTH_DOC.format(last=names[build_kind].format('last'),
                                            first='bottom_first' if fk == 'product' else 'bottom_rows_first')}[part]
             out.append(Kernel(name, (lambda g, part=part, k=build_kind: bottom(g, part, k, **BOTTOM_MERGE)), args, doc,
-                              copy.deepcopy(BOTTOM_KNOBS[part])))
+                              copy.deepcopy(BOTTOM_KNOBS[part]), 'sub' if kind == 'product' else 'montgomery'))
     out += [Kernel(f'bottom_{d}_pair', (lambda g, d=d: transform_bottom(g, d)), ['f', 'x', 'yz'],
                    TRANSFORM_BOTTOM_DOC[d], copy.deepcopy(BOTTOM_KNOBS['first'])) for d in ('forward', 'inverse')]
     # Transform::inverse_product of one term a b: rows from a's leaves (no butterflies), the stored
@@ -717,6 +756,22 @@ def bottom_kernels():
                    copy.deepcopy(BOTTOM_KNOBS['first'])),
             Kernel('bottom_fill_both', (lambda g: bottom(g, 'both', 'fill', **BOTTOM_MERGE)), first['rows'] + last['stored'],
                    BOTH_DOC.format(last='bottom_stored_last', first='bottom_fill_first'), copy.deepcopy(BOTTOM_KNOBS['both']))]
+    # Transform::inverse_product of several terms: one pass over the groups per product term (rows
+    # from a's leaves by bottom_fill_first/_both's first half), its leaf products summed into out;
+    # the first pass adds the plain term (if any), the last one runs the inverse butterflies.
+    for name, acc, fly in TERM_PASSES:
+        args = ['out', 'cur0', 'cur1', 'bs'] + (['pa'] if acc == 'plain' else []) + (['ix', 'iyz'] if fly else [])
+        what = {None: 'the leaf products', 'out': 'out plus the leaf products',
+                'plain': 'the leaf products plus the canonical leaves at pa times 2^-32'}[acc]
+        doc = (f'{what.capitalize()} of groups k, k + 1 from the leaf buffers at cur0, cur1 and the leaves of b at bs,\n'
+               + ('then the inverse butterflies into out, < 2P (2^-32 as bottom_stored_last). ix = ir + slot(k), iyz = '
+                  'ir + slot(2k).' if fly else 'into out, < 2P (with the factor 2^-32 on the products), no butterflies.'))
+        out.append(Kernel(f'{name}_last', (lambda g, a=acc, f=fly: bottom(g, 'last', 'fill', acc=a, butterflies=f)),
+                          args, doc, copy.deepcopy(BOTTOM_KNOBS['last']), 'sub'))
+        out.append(Kernel(f'{name}_both', (lambda g, a=acc, f=fly: bottom(g, 'both', 'fill', acc=a, butterflies=f,
+                                                                         **BOTTOM_MERGE)),
+                          first['rows'] + args, BOTH_DOC.format(last=f'{name}_last', first='bottom_fill_first'),
+                          copy.deepcopy(BOTTOM_KNOBS['both']), 'sub'))
     return out
 
 
@@ -767,6 +822,8 @@ for scaled in (True, False):
 
 
 def function(k):
+    global LEAF_REDUCE
+    LEAF_REDUCE = k.reduce
     g = Graph()
     seq, cycles = order_ops(k.build(g), VALUE_REGS, k.knobs)
     reg = allocate(seq)
@@ -777,7 +834,7 @@ def function(k):
     lines += [f'[[gnu::always_inline]] inline void {k.name}({params}) {{', '    asm volatile(']
     lines += asm_lines(body)
     lines += ['        :', '        : ' + ', '.join(f'[{a}] "r"({a})' for a in k.args) + ',',
-              '          [p] "r"(kP), [p2] "r"(2 * kP), [ni] "r"(kNegInverse)',
+              f'          [p] "r"(kP), [p2] "r"(2 * kP), [ni] "r"({"kInverse" if LEAF_REDUCE == "sub" else "kNegInverse"})',
               '        : ' + CLOBBERS + ');', '}']
     return lines
 
@@ -860,7 +917,7 @@ HEADER = '''\
 
 namespace fps::ntt::neon_kernels {
 
-inline constexpr std::uint32_t kP = 998244353, kNegInverse = 998244351;  // -P^-1 mod 2^32
+inline constexpr std::uint32_t kP = 998244353, kNegInverse = 998244351, kInverse = 3296722945;  // -+P^-1 mod 2^32
 '''
 
 

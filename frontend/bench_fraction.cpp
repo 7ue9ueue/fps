@@ -1,11 +1,13 @@
 // Times fps/fraction.hpp modulo P = 998244353; tools/kernel.py runs it, a binary of its own.
 //   "<op>/<size>"          through the API (gated)
 //   "<op>@kernel/<size>"   the backend calls the API makes, by hand, on the same inputs
+//   "<op>@api/<size>"      through the API, outside the gate's verdict: [k] at d = 2^20, 0.4-1.1 s
+//                          a call, timed for reports only (it would add minutes to every gate)
 // a * b and a + b are products of polynomials, so they have kernel pairs: ntt::multiply into new
-// memory, as the results hold them. [k] and take(n) run many products (Bostan-Mori; inverse and
-// mul), with no kernel of their own yet; frontend/notes/23.md gives them in units of the products'
-// pairs (multiply@kernel, mul@kernel in bench.cpp) from the same run. Sizes stop at 2^18 (and
-// d = 10^5 for [k], DESIGN.md's cost example) to keep a gate's run short.
+// memory, as the results hold them. [k] is one bostan_mori::coefficient call: its pair calls the
+// kernel on the same spans. take(n) runs inverse and mul, with no kernel of its own;
+// frontend/notes/23.md gives it in units of mul@kernel (bench.cpp) from the same run. Sizes stop
+// at 2^18 to keep a gate's run short, except [k]: d = 10^5 (DESIGN.md's cost example) and 2^20.
 #include <cstddef>
 #include <cstdint>
 #include <random>
@@ -15,6 +17,7 @@
 #include <vector>
 
 #include "backend/bench.hpp"
+#include "backend/bostan_mori/bostan_mori.hpp"
 #include "fps/fps.hpp"
 
 namespace {
@@ -43,14 +46,21 @@ Words ntt_product(const Poly& f, const Poly& g) {
     return out;
 }
 
-// a[k] at k = 10^18 (60 bits: 60 steps, two products each), p of d and q of d + 1 coefficients;
-// d = 2 is Fibonacci.
+// a[k] at k = 10^18 (60 bits: 60 steps), p of d and q of d + 1 coefficients; d = 2 is
+// Fibonacci, d = 16 and 64 run the kernel's schoolbook steps, d >= 1024 its values form (2^22
+// words at d = 2^20).
 void coefficient(bench::Suite& suite) {
     constexpr std::uint64_t k = 1'000'000'000'000'000'000ULL;
-    for (const std::size_t d : {2, 16, 1024, 16384, 100000}) {
+    for (const std::size_t d : {2, 16, 64, 1024, 16384, 100000, 1 << 20}) {
         const Frac a = d == 2 ? Frac(Poly{0, 1}, Poly{1, P - 1, P - 1})
                               : Frac(random_poly(d, 3, unsigned(d)), random_poly(d + 1, 1, unsigned(d) + 1));
-        suite.add("fraction_at/" + std::to_string(d), [a] { return [a] { bench::keep(a[k]); }; }, d);
+        const std::string size = "/" + std::to_string(d);
+        suite.add(std::string(d == 1 << 20 ? "fraction_at@api" : "fraction_at") + size, [a] { return [a] { bench::keep(a[k]); }; }, d);
+        suite.add("fraction_at@kernel" + size, [a] {
+            return [a] {
+                bench::keep(fps::bostan_mori::coefficient(a.numerator().span(), a.denominator().span(), k));
+            };
+        }, d);
     }
 }
 

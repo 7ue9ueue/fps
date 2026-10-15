@@ -204,6 +204,18 @@ Cantor and Zassenhaus) stopped near the same degree (its squares mod u, f = x^z 
 words for deg u > 2^24) and ran 6 to 114 times slower (8 to 16 times at 2^20), so it was not kept for the inputs in
 between (deg u = 2^24, or a factor x^z that takes deg f to 2^24 or more) (#192).
 
+`factor(f)` runs the backend's factorization (lc-opt's Yun and Berlekamp, #123) for deg f <= 2048
+(trailing zeros do not count): O(m^3) per square-free part of degree m, 7.2-11 us at degree 16
+and 0.05-0.21 s at 2^10 for a random f. Past 2048 it runs the frontend's own path (Yun, then per
+part a distinct-degree split by gcd(s, x^(P^d) - x) and Cantor and Zassenhaus; O(n^2 log n log P)),
+which is faster there: the kernel's cost passes it at degree 1700-3000 on the four timed targets
+(later for an irreducible f than a random one, and on Zen 5), and at 4096, the kernel's limit, the kernel
+took 5.6-20.6 s against 3.0-9.1 s (#209). Degree 2^20 is out of the kernel's reach (m x m
+matrices: 4 TiB), so the frontend path is the only one there (a guess from n^2 log n: days at
+2^20; its squares modulo a square-free part need it of degree <= 2^24, else the products'
+`std::length_error`). It stays until the backend has a path for large degrees (#201,
+Kaltofen and Shoup).
+
 `compose(f, g, n)`: a constant g mod x^n gives f(g[0]) (Horner), a linear one a Taylor shift by
 g[0] and a scaling by g[1]^k; any other g a Taylor shift by g[0], then the backend's Kinoshita and
 Li (#169), as does `compositional_inverse`. Both run for n up to 2^23, the kernel's limit, and
@@ -257,7 +269,7 @@ Costs, with d the larger of deg p and deg q:
 
 | Operation | Cost |
 |---|---|
-| `f[k]` | O(d log d log k). k = 10^18: 3-6 us for Fibonacci, 6-16 us at d = 16; d = 10^5: 120 products of factors of about d, 44 ms (Zen 5), 86-92 ms (Emerald Rapids), 94 ms (Zen 3), 167 ms (Neoverse V2), measured (#23); a Bostan-Mori kernel is #114 |
+| `f[k]` | O(d log d log k), one call into the Bostan-Mori kernel (`backend/bostan_mori`). k = 10^18: 0.8-1.2 us for Fibonacci, 2.7-4.4 us at d = 16; d = 10^5: 20.6 ms (Zen 5), 38.2 ms (Zen 3), 40.6 ms (Emerald Rapids), 59.4 ms (Neoverse V2), 2.0-2.5x faster than the frontend's own loop of two products per step; d = 2^20: 0.36 s (Zen 5) to 1.06 s (Neoverse V2), 1.6-1.9x (#191) |
 | `take(n)` | `mul(p, inverse(q, n), n)`; `inverse` runs a recurrence, O(n t), for q with t <= 16 nonzero terms past q[0] |
 | `a + b`, `a * b`, `a / b` | Three (`a + b`, `a - b`), two (`a * b`, `a / b`) or one (`a / f`, `f * a`) polynomial products; the degrees add |
 

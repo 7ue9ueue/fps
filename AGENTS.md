@@ -73,8 +73,8 @@ tests and times each are in `BACKEND.md` (Targets) and `TARGETS` in `tools/kerne
 | `lc-intel` | Xeon 8581C, AVX-512, PMU | `avx512` timing; `perf` |
 | `lc-zen5-test` | EPYC 9B45 (Zen 5), AVX-512 | `zen5` builds and tests |
 | `lc-zen5` | EPYC 9B45 (Zen 5), AVX-512 | `zen5` timing |
-| `lc-arm` | Axion (Neoverse V2), NEON, SVE2, PMU | `arm` builds, tests, timing; `perf` |
-| `lc-k68` | EPYC 7B13, Linux 6.8 | timing code heavy in page faults or huge pages |
+| `lc-arm-test` | Axion (Neoverse V2), NEON, SVE2 | `arm` builds and tests |
+| `lc-arm` | Axion (Neoverse V2), NEON, SVE2, PMU | `arm` timing; `perf` |
 
 GCP project `project-c73e6eb1-e167-4d7a-a31`, region `europe-west2`; `lc-intel` and
 `lc-intel-test` are in zone `europe-west2-c`, the rest in `europe-west2-b`. All run Ubuntu 24.04;

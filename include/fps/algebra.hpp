@@ -14,7 +14,7 @@
 // coefficients from the constant term up (lexicographic); results do not depend on the random
 // choices below.
 //
-// Paths (factor is plain; backend issue #123 moves lc-opt's factorization):
+// Paths:
 // - gcd, inverse_mod: one call each into the backend's half-gcd, fps::half_gcd (backend/gcd/gcd.hpp:
 //   lc-opt's, #103), O(n log^2 n), on f and g trimmed to their degrees (m too: the kernel needs its
 //   top word nonzero). An input of degree 2^25 or more (the transforms' limit; trailing zeros do
@@ -25,16 +25,23 @@
 //   or colliding roots (up to about d^2 / 300). Its transforms of 2 bit_ceil(d + 1) words need
 //   deg f <= 2^24 - 1 (trailing zeros do not count; a factor x^z counts): std::length_error past
 //   it, before any work. Its workspace, kept per thread, is 32 to 45 d words.
-// - factor: Yun's square-free decomposition (it needs deg f < P, so that f' = 0 only for a
-//   constant f), then per square-free part s the distinct-degree split gcd(s, x^(P^d) - x) for
-//   d = 1, 2, ... up to deg s / 2, then Cantor and Zassenhaus for each degree d: b^((P^d - 1)/2) - 1.
-// Powers modulo m are square and multiply on f * g and f % m: 30 squarings for an exponent near P.
-// A xorshift generator with a fixed seed draws b, so the run time is the same on every call.
-// Costs on the four timed targets (frontend/notes/168.md, 192.md), ns per degree: gcd and
+// - factor, deg f <= 2048 (trailing zeros do not count): one call into the backend's
+//   factorization, fps::factorization::factor (backend/factor/factor.hpp: lc-opt's Yun and
+//   Berlekamp, #123), O(m^3) per square-free part of degree m.
+// - factor, deg f > 2048: the frontend's own path, faster there (the kernel's m^3 passes it near
+//   degree 2^11; it stops at 4096, and degree 2^20 is out of its reach). Kept until the backend has
+//   a path for large degrees (#201, Kaltofen and Shoup). Yun's square-free decomposition (it needs
+//   deg f < P, so that f' = 0 only for a constant f), then per square-free part s the
+//   distinct-degree split gcd(s, x^(P^d) - x) for d = 1, 2, ... up to deg s / 2, then Cantor and
+//   Zassenhaus for each degree d: b^((P^d - 1)/2) - 1. Powers modulo m are square and multiply on
+//   f * g and f % m: 30 squarings for an exponent near P. A xorshift generator with a fixed seed
+//   draws b, so the run time is the same on every call. O(n^2 log n log P).
+// Costs on the four timed targets (frontend/notes/168.md, 192.md, 209.md), ns per degree: gcd and
 // inverse_mod of two random polynomials of degree 2^12 82-235, 2^16 137-385 (within 1% of the
 // kernel's from 2^8 on); roots (within 1% of the kernel's from 2^8 on) of a random f of degree
 // 2^12 54-166, 2^20 48-146; of 2^12 distinct linear factors 102-337, of 2^20 1077-4903 (the
-// kernel's climbs, #185); ms: factor of a random polynomial of degree 256 16-29.
+// kernel's climbs, #185); s: factor of a random polynomial of degree 2^10 0.05-0.21, 2^11
+// 0.31-1.9, 2^12 3.3-9.1 (the frontend's path).
 #pragma once
 
 #include <algorithm>
@@ -46,6 +53,7 @@
 #include <utility>
 #include <vector>
 
+#include "backend/factor/factor.hpp"
 #include "backend/gcd/gcd.hpp"
 #include "backend/roots/roots.hpp"
 #include "fps/division.hpp"
@@ -99,6 +107,11 @@ private:
     std::uint64_t state_ = 0x9e3779b97f4a7c15;
 };
 
+// fps::factor runs the backend's factorization up to this degree, the frontend's own path past it:
+// the kernel's O(m^3) passes the frontend's O(n^2 log n log P) near degree 2^11 (#209).
+inline constexpr int kFactorKernelMax = 2048;
+static_assert(kFactorKernelMax <= factorization::kMaxDegree);
+
 template <std::uint32_t P>
 using Factors = std::vector<std::pair<Polynomial<P>, int>>;
 
@@ -137,6 +150,27 @@ void factor_square_free(Polynomial<P> s, int e, Factors<P>& out, Random& random)
         h = h % s;
     }
     if (s.degree() > 0) out.emplace_back(std::move(s), e);
+}
+
+// fps::factor past kFactorKernelMax, until the backend has a path for large degrees (#201): Yun,
+// then factor_square_free per part, sorted. f != 0, deg f < P.
+template <std::uint32_t P>
+Factors<P> factor_by_splitting(const Polynomial<P>& f) {
+    Factors<P> out;
+    Random random;
+    // Yun: g = prod s_i^i, with w = prod_{j >= i} s_j and c = prod_{j > i} s_j^(j - i) at step i.
+    const Polynomial<P> g = monic(f);
+    Polynomial<P> c = gcd(g, derivative(g)), w = trimmed(g / c);
+    for (int i = 1; w.degree() > 0; ++i) {
+        Polynomial<P> y = gcd(w, c);
+        factor_square_free(trimmed(w / y), i, out, random);
+        c = trimmed(c / y), w = std::move(y);
+    }
+    std::ranges::sort(out, [](const auto& a, const auto& b) {
+        if (a.first.size() != b.first.size()) return a.first.size() < b.first.size();
+        return std::ranges::lexicographical_compare(a.first.span(), b.first.span());
+    });
+    return out;
 }
 
 }  // namespace detail::algebra
@@ -184,26 +218,19 @@ std::vector<std::uint32_t> roots(const Polynomial<P>& f) {
     return out;
 }
 
+// f trimmed for the kernel up to kFactorKernelMax, past it the frontend's own path. f = 0 is
+// checked here, so the kernel's std::invalid_argument never escapes.
 template <std::uint32_t P>
 std::vector<std::pair<Polynomial<P>, int>> factor(const Polynomial<P>& f) {
-    using namespace detail::algebra;
     const int n = f.degree();
     if (n < 0) throw std::domain_error("fps::factor: f = 0");
     if (std::uint64_t(n) >= P) throw std::domain_error("fps::factor: deg f >= P");
-    Factors<P> out;
-    Random random;
-    // Yun: g = prod s_i^i, with w = prod_{j >= i} s_j and c = prod_{j > i} s_j^(j - i) at step i.
-    const Polynomial<P> g = monic(f);
-    Polynomial<P> c = gcd(g, derivative(g)), w = trimmed(g / c);
-    for (int i = 1; w.degree() > 0; ++i) {
-        Polynomial<P> y = gcd(w, c);
-        factor_square_free(trimmed(w / y), i, out, random);
-        c = trimmed(c / y), w = std::move(y);
-    }
-    std::ranges::sort(out, [](const auto& a, const auto& b) {
-        if (a.first.size() != b.first.size()) return a.first.size() < b.first.size();
-        return std::ranges::lexicographical_compare(a.first.span(), b.first.span());
-    });
+    if (n > detail::algebra::kFactorKernelMax) return detail::algebra::factor_by_splitting(f);
+    std::vector<std::pair<Polynomial<P>, int>> out;
+    const std::vector<factorization::Factor> fs = factorization::factor(f.span().first(std::size_t(n) + 1));
+    out.reserve(fs.size());
+    for (const factorization::Factor& g : fs)
+        out.emplace_back(Polynomial<P>(std::span(g.coefficients)), int(g.multiplicity));
     return out;
 }
 

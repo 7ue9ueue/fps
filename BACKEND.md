@@ -30,7 +30,7 @@ A target is a set of compiler flags and the machines that test and time it.
 | `avx2` | `-march=x86-64-v3` | 16 ymm (256-bit) | `lc-amd` | `lc-bench` (Zen 3) |
 | `avx512` | `-march=x86-64-v4 -mavx512ifma -mavx512vbmi` | 32 zmm, 8 masks | `lc-intel-test` | `lc-intel` (Emerald Rapids) |
 | `zen5` | `-march=znver5` | 32 zmm, 8 masks | `lc-zen5-test` | `lc-zen5` (EPYC 9B45) |
-| `arm` | `-mcpu=neoverse-v2` | 32 v (128-bit NEON, SVE2) | `lc-arm`, Mac | `lc-arm` (Axion) |
+| `arm` | `-mcpu=neoverse-v2` | 32 v (128-bit NEON, SVE2) | `lc-arm-test`, Mac | `lc-arm` (Axion) |
 
 - `scalar` is the reference and the fallback; `sse` checks the generic code at 4 lanes. Neither is tuned.
 - Every kernel builds and passes its tests on every target. Guard ISA code with the compiler's

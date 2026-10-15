@@ -81,7 +81,7 @@ TARGETS = {
     'arm': {
         'flags': '-mcpu=neoverse-v2',
         'needs': ['asimd', 'sve2'],
-        'test': ['lc-arm', 'mac'],
+        'test': ['lc-arm-test', 'mac'],
         'time': 'lc-arm',
         'mac_flags': '-mcpu=apple-m4',
     },
