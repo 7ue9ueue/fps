@@ -504,6 +504,51 @@ inline void forward_radix8_from(const u32* f, std::size_t n, u32* to, std::size_
     });
 }
 
+// forward_radix8_part<kLoad> for kLoad <= 4 (a source in the lower half), one group per pass:
+// group 0's outputs (blocks 0-3) or group 1's (blocks 4-7), each from the same source blocks.
+template <int kLoad, int kGroup>
+[[gnu::noinline]] void forward_radix8_half_part(const u32* s, Vec* f, std::size_t columns, std::size_t q,
+                                                const u32* roots) {
+    static_assert(kLoad <= 4);
+    const Factor i = entry(roots, 1), y = entry(roots, 2), z = entry(roots, 3);
+    const Vec zero = _mm256_setzero_si256();
+    for (std::size_t j = 0; j < columns; ++j) {
+        const auto in = [&] [[gnu::always_inline]] (std::size_t t) { return t < kLoad ? loadu(s + 8 * (j + t * q)) : zero; };
+        const Vec f0 = in(0), f1 = in(1), f2 = in(2), f3 = in(3);
+        if constexpr (kGroup == 0) {  // twiddles 1, 1, i: every term < 2P
+            const Vec g0 = add(f0, f2), g1 = add(f1, f3);
+            const Vec h0 = diff_canonical(f0, f2), ih1 = kLoad > 1 ? multiply(diff_canonical(f1, f3), i) : zero;
+            f[j] = add(g0, g1), f[j + q] = diff(g0, g1);
+            f[j + 2 * q] = add(h0, ih1), f[j + 3 * q] = diff(h0, ih1);
+        } else {  // twiddles i, y, z
+            const Vec if2 = kLoad > 2 ? multiply(f2, i) : zero, if3 = kLoad > 3 ? multiply(f3, i) : zero;
+            const Vec u0 = reduce(add(f0, if2), 2 * kP), v0 = reduce(diff(f0, if2), 2 * kP);
+            const Vec yu1 = kLoad > 1 ? multiply(add(f1, if3), y) : zero, zv1 = kLoad > 1 ? multiply(diff(f1, if3), z) : zero;
+            f[j + 4 * q] = add(u0, yu1), f[j + 5 * q] = diff(u0, yu1);
+            f[j + 6 * q] = add(v0, zv1), f[j + 7 * q] = diff(v0, zv1);
+        }
+    }
+}
+
+// The radix-8 top level from a source of n <= 2^lg / 2 words, as forward_radix8_from, in two passes
+// (group 1, then group 0) of 4 input and 4 output streams each: in one pass, 12 streams 2^lg / 8
+// words apart; through a radix-2 copy, one pass more over the transform (forwards of 2^18, 2^20
+// in 0.94-0.96 of the time on Zen 3, notes/87-r2.md). Group 1 first: first_level stages a
+// boundary column in the lower half, which group 0's pass stages again.
+inline void forward_radix8_lower_from(const u32* f, std::size_t n, u32* to, std::size_t q, const u32* roots) {
+    first_level<4>(f, n, to, 8 * q, 8, [&] [[gnu::always_inline]] (auto blocks, const u32* s, u32* d, std::size_t words) {
+        forward_radix8_half_part<decltype(blocks)::value, 1>(s, reinterpret_cast<Vec*>(d), words / 8, q, roots);
+    });
+    first_level<4>(f, n, to, 8 * q, 8, [&] [[gnu::always_inline]] (auto blocks, const u32* s, u32* d, std::size_t words) {
+        forward_radix8_half_part<decltype(blocks)::value, 0>(s, reinterpret_cast<Vec*>(d), words / 8, q, roots);
+    });
+}
+
+// Whether a fused op's forward from a source of n words starts with forward_radix8_lower_from: a
+// radix-2 length of at least 2^kRadix8LowerMinLog and the source in the lower half.
+inline constexpr int kRadix8LowerMinLog = 8;
+inline bool radix8_lower(int lg, std::size_t n) { return has_radix2(lg) && lg >= kRadix8LowerMinLog && 2 * n <= (std::size_t(1) << lg); }
+
 // The last inverse level of each half, the radix-2 level and the scale in one pass over the 8q
 // vectors after the subtrees: canonical output, count words of it to out. w: as
 // product_kernels::inverse_top's.
@@ -583,9 +628,19 @@ inline void square(const Product& p, const u32* r, const u32* ir) {
 // Transforms alone. The bottom level (h = 1) has a group per 4 vectors, each with its own twiddles.
 
 // Forward groups [first, first + count) with h = 1, values < 4P in; canonical leaves out. first
-// and count even.
+// and count even; multiples of 8: one loop of 8 groups per step (forward_leaves_loop, lc-opt's;
+// with forward_h4 below, forwards of 2^17-2^21 in 0.96-0.97 of the time on Zen 3, notes/87-r2.md).
 inline void forward_bottom(Vec* f, std::size_t count, std::size_t first, const u32* r) {
+    if (count % 8 == 0 && first % 8 == 0) return kernels::forward_leaves_loop(f, count, r + slot(first), r + slot(2 * first));
     for (std::size_t k = first; k < first + count; k += 2, f += 8) kernels::forward_leaves(f, r + slot(k), r + slot(2 * k));
+}
+
+// The forward levels h = nv / 4 .. 4 of a run of total vectors at f, subtrees of nv vectors from
+// group k: a call per group down to h = 16, then h = 4 as one loop over the run (forward_h4).
+inline void forward_levels(Vec* f, std::size_t nv, std::size_t total, std::size_t k, const u32* r) {
+    for (std::size_t h = nv / 4; h >= 16; h /= 4)
+        for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) forward_group(f + j, h, g, r);
+    if (nv >= 16) kernels::forward_h4(f, total / 16, r, k * (nv / 16));
 }
 
 // Inverse groups [first, first + count) with h = 1; canonical in, < 2P out. first and count even.
@@ -605,8 +660,7 @@ inline void forward_trees(Vec* f, std::size_t nv, std::size_t count, std::size_t
     }
     const std::size_t run = std::min(count, kTile / nv), total = run * nv;
     for (std::size_t k = first; k < first + count; k += run, f += total) {
-        for (std::size_t h = nv / 4; h >= 4; h /= 4)
-            for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) forward_group(f + j, h, g, r);
+        forward_levels(f, nv, total, k, r);
         forward_bottom(f, total / 4, k * (nv / 4), r);
     }
 }
@@ -648,8 +702,7 @@ inline void forward_tiles(Vec* f, std::size_t nv, std::size_t count, std::size_t
     }
     const std::size_t run = std::min(count, kTile / nv), total = run * nv;
     for (std::size_t k = first; k < first + count; k += run, f += total) {
-        for (std::size_t h = nv / 4; h >= 4; h /= 4)
-            for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) forward_group(f + j, h, g, r);
+        forward_levels(f, nv, total, k, r);
         forward_bottom(f, total / 4, k * (nv / 4), r);
         tile(reinterpret_cast<u32*>(f), total);
     }
@@ -830,8 +883,7 @@ inline void cycle_trees(Vec* f, std::size_t nv, std::size_t count, std::size_t f
     }
     const std::size_t run = std::min(count, kTile / nv), total = run * nv;
     for (std::size_t k = first; k < first + count; k += run, f += total) {
-        for (std::size_t h = nv / 4; h >= 4; h /= 4)
-            for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) forward_group(f + j, h, g, r);
+        forward_levels(f, nv, total, k, r);
         stage(reinterpret_cast<u32*>(f), total);
         for (std::size_t h = 4; h < nv; h *= 4)
             for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) inverse_group(f + j, h, g, ir);
@@ -861,6 +913,8 @@ inline void inverse_trees_with(Vec* f, std::size_t nv, std::size_t count, std::s
 // A radix-2 level, not product()'s radix 8: from a source apart from words, its 16 streams 2^lg / 8
 // words apart ran forward(in, F) 1.48x slower than in place at 2^18 on Zen 3 (a guess: 16 streams
 // on the same sets of its 8-way L2); with the radix-2 level 1.04x, within 1% elsewhere (notes).
+// A source in the lower half (radix8_lower): radix 8 in two passes of 8 streams, the radix-2 level
+// a copy no longer.
 template <class Trees>
 [[gnu::always_inline]] inline void from_top(const u32* in, std::size_t n, u32* words, int lg, const u32* r, Trees trees) {
     auto* f = reinterpret_cast<Vec*>(words);
@@ -868,6 +922,10 @@ template <class Trees>
     if (!has_radix2(lg)) {
         forward_radix4_from(in, n, words, nv / 4, r);
         return trees(f, nv / 4, 4);
+    }
+    if (radix8_lower(lg, n)) {
+        forward_radix8_lower_from(in, n, words, nv / 8, r);
+        return trees(f, nv / 8, 8);
     }
     forward_radix2_from(in, n, words, nv / 2);
     trees(f, nv / 2, 2);
@@ -1040,6 +1098,10 @@ inline void cyclic_product(const u32* in, std::size_t n, const u32* b, u32* word
     if (!has_radix2(lg)) {
         if (upper) return inverse_radix4_upper_out(words, nv / 4, out, count, ir, s);
         return inverse_radix4_out(words, nv / 4, out, count, ir, s);
+    }
+    if (radix8_lower(lg, n)) {
+        if (upper) return inverse_radix8_upper_out(words, nv / 8, out, count, ir, s);
+        return inverse_radix8_out(words, nv / 8, out, count, ir, s);
     }
     if (upper) return scale_radix2_upper_out(words, nv / 2, out, count, s);
     scale_radix2_out(words, nv / 2, out, count, s);
