@@ -31,8 +31,9 @@
 // - log f = integral of f' / f mod x^(n-1) in B <= 4 blocks of k coefficients (lc-opt's blocked
 //   division, divide()): h = 1 / f mod x^k, then q_j = h (f' - f Q)[jk, (j+1)k) mod x^k, Q = q mod
 //   x^(jk), (f Q)[jk, (j+1)k) = sum over i < j of (W_(j-i) q_i)[k, 2k), W_t = f[(t-1)k, (t+1)k),
-//   as one inverse of a sum of leaf products of kept transforms of length 2k. About 11.5 T(n) + 6
-//   LP(n).
+//   as one inverse of a sum of leaf products of kept transforms of length 2k; for 4 blocks, blocks
+//   2 and 3 share lc-opt's Toeplitz product (ntt::Transform::toeplitz_product: 4 leaf products, not
+//   5). About 11.5 T(n) + 5.5 LP(n). h and log's q_j are transformed in place.
 // - exp: m -> 2m keeping h = 1 / g mod x^(m/2) and H = T_m(h), q = x f' (lc-opt's step, notes.md);
 //   8 transforms and 3.5 leaf products of 2m a step. The last step, to n <= 2m, runs at length m
 //   in two blocks of m/2 (lc-opt's exp_last_step): 14 transforms and 7 leaf products of m.

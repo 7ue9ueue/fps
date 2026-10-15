@@ -12533,7 +12533,7 @@ using avx2_kernels::Vec;
 // 2^32 mod P and its Shoup quotient: bottom_toeplitz_*'s exact sums (kr).
 alignas(8) inline constexpr std::uint32_t kExactR[2] = {301989884, 1299317818};
 
-// Forward half of the bottom stage for the two batches at a, b; fills buf. Toeplitz: m1 + m2 out, m1 + m3 exact over a3 (header).
+// Toeplitz: the rows of S, D1, D3 (header) for the two batches at a1, a2, a3, b0, b1; fills buf.
 [[gnu::always_inline]] inline void bottom_toeplitz_first(const void* a1, const void* a2, void* a3, const void* b0, const void* b1, void* buf, const void* x, const void* y) {
     asm volatile(
         "vpbroadcastd %[P], %%ymm15\n\t"
@@ -13021,7 +13021,7 @@ alignas(8) inline constexpr std::uint32_t kExactR[2] = {301989884, 1299317818};
         : "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15", "memory");
 }
 
-// Leaf products from cur and the inverse butterflies; writes the two batches at out. Toeplitz: m1 + m2 out, m1 + m3 exact over a3 (header).
+// Toeplitz: m1 + m2 from cur and a2, b1, b0, the inverse butterflies to out; m1 + m3 over a3.
 [[gnu::always_inline]] inline void bottom_toeplitz_last(void* out, const void* cur, const void* a2, const void* b1, const void* b0, void* a3, const void* ix, const void* iy) {
     asm volatile(
         "vpbroadcastd %[P], %%ymm15\n\t"
@@ -14481,7 +14481,8 @@ alignas(8) inline constexpr std::uint32_t kExactR[2] = {301989884, 1299317818};
         : "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15", "memory");
 }
 
-// bottom_last() for the current two batches interleaved with bottom_first() for the next two. Toeplitz: m1 + m2 out, m1 + m3 exact over a3 (header).
+// bottom_toeplitz_last() for the current two batches (at the next ones minus 256 bytes) interleaved
+// with bottom_toeplitz_first() for the next two.
 [[gnu::always_inline]] inline void bottom_toeplitz_both(const void* a1, const void* a2, void* a3, const void* b0, const void* b1, void* buf, const void* x, const void* y, void* out, const void* cur, const void* ix, const void* iy) {
     asm volatile(
         "vpbroadcastd %[P], %%ymm15\n\t"
@@ -16417,7 +16418,7 @@ alignas(8) inline constexpr std::uint32_t kExactR[2] = {301989884, 1299317818};
         : "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15", "memory");
 }
 
-// Leaf products from cur and the inverse butterflies; writes the two batches at out. Side: a times bs as leaves, plus the leaf form at side.
+// Side: the products of cur and bs plus the leaf form at side, the inverse butterflies to out.
 [[gnu::always_inline]] inline void bottom_side_last(void* out, const void* cur, const void* bs, const void* side, const void* ix, const void* iy) {
     asm volatile(
         "vpbroadcastd %[P], %%ymm15\n\t"
@@ -16989,7 +16990,8 @@ alignas(8) inline constexpr std::uint32_t kExactR[2] = {301989884, 1299317818};
         : "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15", "memory");
 }
 
-// bottom_last() for the current two batches interleaved with bottom_first() for the next two. Side: a times bs as leaves, plus the leaf form at side.
+// bottom_side_last() for the current two batches interleaved with bottom_leaves_first() for the
+// next two at a.
 [[gnu::always_inline]] inline void bottom_side_both(const void* a, void* buf, const void* x, const void* y, void* out, const void* cur, const void* bs, const void* side, const void* ix, const void* iy) {
     asm volatile(
         "vpbroadcastd %[P], %%ymm15\n\t"

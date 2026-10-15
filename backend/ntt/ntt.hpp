@@ -516,8 +516,9 @@ public:
     // Toeplitz sharing in log's blocked division): m1 = A2 (B0 + B1), m2 = (A1 - A2) B1, m3 = (A3 -
     // A2) B0; A2 B0 + A1 B1 = m1 + m2 and A3 B0 + A2 B1 = m1 + m3. A1, A2, A3, B0, B1: leaf forms;
     // work, o: as cyclic_product; out apart from the leaf forms. A3 then is a leaf form as any other
-    // (a term of inverse_product; avx2 runs a product and a term alone in one asm bottom). Zen 3,
-    // 2^18: 0.88 of the time of two inverse_products of 2 and 3 terms (notes/87-r2.md).
+    // (a term of inverse_product; avx2 runs a product and a term alone in one asm bottom). With
+    // inverse_product of A1 B2 and A3 after it (a division's blocks 2 and 3): 0.89-0.91 of the time
+    // of the inverse_products of 2 and 3 products it replaces (Zen 3, 2^16-2^20, notes/87-r2.md).
     template <class Variant = SelectedInverse>
     void toeplitz_product(const std::uint32_t* A1, const std::uint32_t* A2, std::uint32_t* A3, const std::uint32_t* B0,
                           const std::uint32_t* B1, std::uint32_t* work, std::span<std::uint32_t> out, Output o = {}) const {

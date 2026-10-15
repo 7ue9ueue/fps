@@ -89,6 +89,17 @@ def term_args(terms):
 
 def term_name(base, k):
     return base if k == 0 else f'{base}{k}'
+SPECIAL_DOC = {
+    'toeplitz': {
+        'first': 'Toeplitz: the rows of S, D1, D3 (header) for the two batches at a1, a2, a3, b0, b1; fills buf.',
+        'last': 'Toeplitz: m1 + m2 from cur and a2, b1, b0, the inverse butterflies to out; m1 + m3 over a3.',
+        'both': 'bottom_toeplitz_last() for the current two batches (at the next ones minus 256 bytes) interleaved\n'
+                '// with bottom_toeplitz_first() for the next two.'},
+    'side': {
+        'last': 'Side: the products of cur and bs plus the leaf form at side, the inverse butterflies to out.',
+        'both': 'bottom_side_last() for the current two batches interleaved with bottom_leaves_first() for the\n'
+                '// next two at a.'},
+}
 DOC = {
     'first': 'Forward half of the bottom stage for the two batches at a, b; fills buf.',
     'last': 'Leaf products from cur and the inverse butterflies; writes the two batches at out.',
@@ -304,11 +315,10 @@ def function(part, square=False):
             else SQUARE_ARGS[part] if square else ARGS[part])
     written = ('buf', 'out') + (('a3',) if square == 'toeplitz' else ())
     params = ', '.join(f'{"void*" if a in written else "const void*"} {a}' for a in args if a != 'kr')
-    doc = DOC[part] + (f' Leaves: the sum of {TERMS[square]} products of leaves (a.. times bs..).' if square in TERMS else
-                       ' Toeplitz: m1 + m2 out, m1 + m3 exact over a3 (header).' if square == 'toeplitz' else
-                       ' Side: a times bs as leaves, plus the leaf form at side.' if square == 'side' else
+    doc = (SPECIAL_DOC[square][part] if square in SPECIAL_DOC else
+           DOC[part] + (f' Leaves: the sum of {TERMS[square]} products of leaves (a.. times bs..).' if square in TERMS else
                        ' Leaves: a and b as leaves (a at a, b at bs).' if square == 'leaves' else
-                       ' Stored: b as leaves at bs.' if stored else ' Square: a times a.' if square else '')
+                       ' Stored: b as leaves at bs.' if stored else ' Square: a times a.' if square else ''))
     name = f'bottom_{square}_{part}' if stored else f'bottom_square_{part}' if square else f'bottom_{part}'
     lines = [f'// {doc}', f'[[gnu::always_inline]] inline void {name}({params}) {{', '    asm volatile(']
     lines += gk.asm_lines(body(part, square))

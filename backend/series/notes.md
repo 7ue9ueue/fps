@@ -59,8 +59,13 @@ power of two >= (n - 1) / 4 (at least 32; B = 2 .. 4), with h = 1 / f mod x^k an
 inverse_product of the sum over i < j of T(W_(j-i)) T(q_i), W_t = f[(t-1)k, (t+1)k) (upper half
 exact; on avx2 the sums of 2 and 3 products have asm bottoms of their own). (3 + 5B) transforms
 and 2 + B + B(B-1)/2 leaf products of 2k: 23 and 12 for B = 4, 11.5 T(n) + 6 LP(n). Block j
-reads f'[jk, (j+1)k) from f (a copy of f if out overlaps it). Not done: lc-opt's Toeplitz
-sharing of blocks 2 and 3 (one leaf product of 2k fewer, about 2% at 2^21).
+reads f'[jk, (j+1)k) from f (a copy of f if out overlaps it). For B = 4, lc-opt's Toeplitz
+sharing (issue #87 r2): block 2's residual and W_3 = W_3 Q_0 + W_2 Q_1 from one
+`ntt::Transform::toeplitz_product` (3 leaf products), block 3's from W_1 Q_2 + W_3 (one product
+and a term alone, one asm bottom on avx2): 11 leaf products, 5.5 LP(n). h goes to H's lower half
+and log's q_j to Q_j's, so T(h) and T(q_j) run in place (`forward(in, F)` with in at F: lc-opt's
+one-pass radix 8 on avx2); pow keeps q_j in q (exp reads it), so its T(q_j) stay out of place
+(the two-pass radix 8 of ntt's notes/87-r2.md).
 
 ### exp
 
@@ -142,6 +147,8 @@ ns per coefficient at lg 22 (n = 2^21), inverse / log / exp: `lc-bench` 16.7 / 2
 - Ragged sizes (`_ragged`, n = 1.25 2^(lg-1)): inverse and exp run their half-length last steps;
   ns per coefficient against the power of two at lg 18 on Zen 3: inverse 19.0 / 13.5, log 21.9 /
   18.1, exp 27.1 / 23.4. Before the inverse's half step: inverse_ragged/18 3.72 ms, after 3.12.
+- Against lc-opt in the same run after issue #87 r2 (Zen 3, n = 2^14 .. 2^21): inverse, exp, pow,
+  sqrt 0.93-0.99, log 0.97-1.01 (notes/87-r2.md).
 - pow and sqrt (`bench_pow_sqrt.cpp`, commit 934233f, 3 rounds), ratios to `multiply@ntt/<lg>`
   at lg 14 / 18 / 22: pow 4.59 / 4.33 / 4.46 (Zen 3), 4.57 / 4.28 / 4.44 (Emerald Rapids), 5.14 /
   4.82 / 4.34 (Zen 5), 4.24 / 4.25 / 4.24 (Neoverse V2); sqrt 1.62 / 1.48 / 1.57, 1.60 / 1.47 /

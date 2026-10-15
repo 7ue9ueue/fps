@@ -547,7 +547,9 @@ inline void forward_radix8_lower_from(const u32* f, std::size_t n, u32* to, std:
 // Whether a fused op's forward from a source of n words starts with forward_radix8_lower_from: a
 // radix-2 length of at least 2^kRadix8LowerMinLog and the source in the lower half.
 inline constexpr int kRadix8LowerMinLog = 8;
-inline bool radix8_lower(int lg, std::size_t n) { return has_radix2(lg) && lg >= kRadix8LowerMinLog && 2 * n <= (std::size_t(1) << lg); }
+inline bool radix8_lower(int lg, std::size_t n) {
+    return has_radix2(lg) && lg >= kRadix8LowerMinLog && 2 * n <= (std::size_t(1) << lg);
+}
 
 // The last inverse level of each half, the radix-2 level and the scale in one pass over the 8q
 // vectors after the subtrees: canonical output, count words of it to out. w: as
@@ -1189,7 +1191,8 @@ inline void inverse_product(const LeafTerm* terms, int n, u32* words, u32* out, 
         if (products == 1) LeavesBottom::run(v, terms[0].a + at, terms[0].b + at, leaves, at / 32, r, ir);
         else if (products == 2) SumBottom<2>::run(v, terms, at, leaves, at / 32, r, ir);
         else if (products == 3) SumBottom<3>::run(v, terms, at, leaves, at / 32, r, ir);
-        else if (side >= 0) SideBottom::run(v, terms[1 - side].a + at, terms[1 - side].b + at, terms[side].a + at, leaves, at / 32, r, ir);
+        else if (side >= 0)
+            SideBottom::run(v, terms[1 - side].a + at, terms[1 - side].b + at, terms[side].a + at, leaves, at / 32, r, ir);
         else TermsLeaf::inverse_terms(t, terms, n, leaves / 4, at / 32, r, ir);
     });
 }
