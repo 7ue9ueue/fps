@@ -465,14 +465,14 @@ public:
     // in at F, in.size() <= length() / 2 (F's upper half is not read).
     template <class Variant = SelectedForward>
     void forward(std::span<const std::uint32_t> in, std::uint32_t* F) const {
-        Variant::forward_from(in.data(), checked_source(in, length()), F, lg_, roots());
+        Variant::forward_from(source(in, F), checked_source(in, length()), F, lg_, roots());
     }
 
     // F = the leaf form of in times B, leaf by leaf: forward(in, F) then multiply(F, B, F) in one
     // pass. F apart from in and B.
     template <class Variant = SelectedForward>
     void forward_product(std::span<const std::uint32_t> in, const std::uint32_t* B, std::uint32_t* F) const {
-        Variant::forward_product(in.data(), checked_source(in, length()), B, F, lg_, roots());
+        Variant::forward_product(source(in, F), checked_source(in, length()), B, F, lg_, roots());
     }
 
     // H (length() / 2 words) = forward_upper of h = in, zero past it (in.size() <= length() / 2):
@@ -480,7 +480,7 @@ public:
     template <class Variant = SelectedForward>
     void forward_upper(std::span<const std::uint32_t> in, std::uint32_t* H) const {
         if (lg_ == kMinLog) throw std::length_error("fps::ntt::Transform::forward_upper: needs lg > kMinLog");
-        Variant::forward_upper_from(in.data(), checked_source(in, length() / 2), H, lg_ - 1, roots());
+        Variant::forward_upper_from(source(in, H), checked_source(in, length() / 2), H, lg_ - 1, roots());
     }
 
     // out[i] = coefficient o.offset + i of in b mod (x^L - 1), negated if o.negate, for B the leaf
@@ -494,7 +494,8 @@ public:
         const std::size_t n = checked_source(in, length());
         const unsigned output = checked_output(out, o);
         if (out.empty()) return;
-        Variant::cyclic_product(in.data(), n, B, work, out.data(), out.size(), lg_, roots(), inverse_roots(), output);
+        Variant::cyclic_product(source(in, work), n, B, work, out.data(), out.size(), lg_, roots(), inverse_roots(),
+                                output);
     }
 
     // out[i] = coefficient o.offset + i of the polynomial whose leaf form is the sum over the terms
@@ -542,7 +543,7 @@ public:
     // are not used (detail::kUnreadWidth) and may hold anything.
     template <class Variant = SelectedForward, class Hook>
     void forward_hooked(std::span<const std::uint32_t> in, std::uint32_t* F, Hook hook, std::size_t zero = 0) const {
-        Variant::forward_hooked(in.data(), checked_source(in, length()), F, lg_, roots(), checked_bit(zero), hook);
+        Variant::forward_hooked(source(in, F), checked_source(in, length()), F, lg_, roots(), checked_bit(zero), hook);
     }
 
     // out[i] = coefficient o.offset + i of the polynomial whose leaf form times 2^-32 (as Montgomery
@@ -603,6 +604,11 @@ private:
     static std::size_t checked_bit(std::size_t bit) {
         if (bit & (bit - 1)) throw std::invalid_argument("fps::ntt::Transform: column bit not a power of two");
         return bit;
+    }
+    // An empty source's words: at the array written (any pointer reads none; an empty span's may be
+    // null, and the variants form pointers from it).
+    static const std::uint32_t* source(std::span<const std::uint32_t> in, const std::uint32_t* at) {
+        return in.empty() ? at : in.data();
     }
     static std::size_t checked_source(std::span<const std::uint32_t> in, std::size_t most) {
         if (in.size() > most) throw std::out_of_range("fps::ntt::Transform: source longer than the transform");
