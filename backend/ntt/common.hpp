@@ -175,11 +175,13 @@ inline void build_value_rows(std::uint32_t* rows, int lg) {
 }
 
 // A product from spans for the variants (ntt::multiply): words [0, count) of f g into out. f: n
-// words, g: m words, values < P, in caller memory of any alignment, read only there; n, m >= 1,
-// n + m - 1 <= 2^lg, 1 <= count <= 2^lg. out: count words of caller memory, any alignment, written
-// only there; it may overlap f or g, as the variants read f and g before they write out. a, b: the
-// variants' scratch, 2^lg + kPadding words each, 64-byte aligned. g may be b itself, with m = 2^lg
-// (read in place: ntt::middle_product). The variants' square(p) ignores g, m and b: f^2.
+// words, g: m words, values < P, in caller memory of any alignment, read only there; 1 <= n, m <=
+// 2^lg, 1 <= count <= 2^lg; for n + m - 1 > 2^lg the product is cyclic, f g mod (x^(2^lg) - 1)
+// (ntt::middle_product; the main product of a ragged one, ragged.hpp). out: count words of caller
+// memory, any alignment, written only there; it may overlap f or g, as the variants read f and g
+// before they write out. a, b: the variants' scratch, 2^lg + kPadding words each, 64-byte aligned.
+// g may be b itself, with m = 2^lg (read in place: ntt::middle_product). The variants' square(p)
+// ignores g, m and b: f^2.
 struct Product {
     const std::uint32_t* f;
     std::size_t n;

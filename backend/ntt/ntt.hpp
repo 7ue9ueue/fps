@@ -325,9 +325,10 @@ void middle_into(const std::uint32_t* v, std::size_t n, const std::uint32_t* g, 
 }
 
 // middle_product(f, g, out) by a split plan: f of m - 1 + count words read, out of count words.
+// Out of line, as ragged_product.
 template <class Variant>
-void ragged_middle(const std::uint32_t* f, const std::uint32_t* g, std::size_t m, std::uint32_t* out, std::size_t count,
-                   const ragged::Plan& p) {
+[[gnu::noinline]] void ragged_middle(const std::uint32_t* f, const std::uint32_t* g, std::size_t m, std::uint32_t* out,
+                                     std::size_t count, const ragged::Plan& p) {
     const std::size_t n = m - 1 + count;
     const auto apart = [out, count](const std::uint32_t* x, std::size_t len) {
         const auto o = reinterpret_cast<std::uintptr_t>(out), b = reinterpret_cast<std::uintptr_t>(x);
@@ -346,9 +347,11 @@ void ragged_middle(const std::uint32_t* f, const std::uint32_t* g, std::size_t m
 }
 
 // multiply(f, g, out) or square(f, out) by a split plan (ragged.hpp): count words of f g to out.
+// Out of line: inlined into multiply(), it cost the frontend's products at 2^10-2^11 (plain plans)
+// 23-36% on Zen 5 (code layout, notes/155-r1.md).
 template <class Variant, bool kSquare>
-void ragged_product(const std::uint32_t* f, std::size_t n, const std::uint32_t* g, std::size_t m, std::uint32_t* out,
-                    std::size_t count, const ragged::Plan& p) {
+[[gnu::noinline]] void ragged_product(const std::uint32_t* f, std::size_t n, const std::uint32_t* g, std::size_t m,
+                                      std::uint32_t* out, std::size_t count, const ragged::Plan& p) {
     const std::size_t N = n + m - 1, L = std::size_t(1) << p.lg;
     const auto apart = [N, out](const std::uint32_t* x, std::size_t len) {
         const auto o = reinterpret_cast<std::uintptr_t>(out), b = reinterpret_cast<std::uintptr_t>(x);
