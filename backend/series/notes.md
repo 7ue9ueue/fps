@@ -148,7 +148,7 @@ ns per coefficient at lg 22 (n = 2^21), inverse / log / exp: `lc-bench` 16.7 / 2
   ns per coefficient against the power of two at lg 18 on Zen 3: inverse 19.0 / 13.5, log 21.9 /
   18.1, exp 27.1 / 23.4. Before the inverse's half step: inverse_ragged/18 3.72 ms, after 3.12.
 - Against lc-opt in the same run after issue #87 r2 (Zen 3, n = 2^14 .. 2^21): inverse, exp, pow,
-  sqrt 0.93-0.99, log 0.97-1.01 (notes/87-r2.md).
+  sqrt 0.93-0.99, log 0.95-1.01 (notes/87-r2.md).
 - pow and sqrt (`bench_pow_sqrt.cpp`, commit 934233f, 3 rounds), ratios to `multiply@ntt/<lg>`
   at lg 14 / 18 / 22: pow 4.59 / 4.33 / 4.46 (Zen 3), 4.57 / 4.28 / 4.44 (Emerald Rapids), 5.14 /
   4.82 / 4.34 (Zen 5), 4.24 / 4.25 / 4.24 (Neoverse V2); sqrt 1.62 / 1.48 / 1.57, 1.60 / 1.47 /
