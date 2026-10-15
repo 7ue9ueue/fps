@@ -376,14 +376,14 @@ public:
 
     // forward_upper(h), then (Form::values) those leaves on to their values: the upper half of p's
     // values form, so a values form doubles too (backend/gcd). The split is intrinsics'
-    // (Values<Native>; its words are every variant's). Throws std::length_error past 2^kValuesMaxLog.
+    // (ValuesFor<Native>; its words are every variant's). Throws std::length_error past 2^kValuesMaxLog.
     template <class Variant = SelectedForward>
     void forward_upper(std::uint32_t* h, Form form) const {
         if (form == Form::leaves) return forward_upper<Variant>(h);
         const std::uint32_t* rows = checked_rows();
         forward_upper<Variant>(h);
         const std::size_t blocks = length() / 128;  // of 64 words in each half
-        detail::intrinsics::Values<detail::intrinsics::Ntt<simd::Native>::N>::split(h, h, blocks, blocks, rows);
+        detail::intrinsics::ValuesFor<simd::Native>::split(h, h, blocks, blocks, rows);
     }
 
     // forward_upper undone: h (length() / 2 words, 32-byte aligned, kPadding after), leaves L / 16

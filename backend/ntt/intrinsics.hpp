@@ -1327,6 +1327,109 @@ struct Values : Arith<L> {
     }
 };
 
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+// The values form on 16 lanes (issue #157): two blocks per step, g even, lane 8h + t of a vector
+// is leaf t of block g + h, so each 256-bit half is Values' 8 lanes; the twist and the 8-point
+// transform run on zmm, the transposes in both halves at once. A lone first or last block (odd
+// first or count) on Values<Narrow>. The same words as Values. Emerald Rapids ran the split and
+// join on ymm at 0.5-0.9 ns per word added to a transform of 0.4-1.0 (notes/157-r1.md).
+template <class S>
+struct WideValues : Values<S> {
+    using Base = Values<S>;
+    using Lone = Values<typename Narrow<S>::type>;
+    using V = typename S::V;
+    using F = typename Base::F;
+    using M = typename Base::M;
+    using Base::forward8, Base::inverse8, Base::factors, Base::canonical, Base::mul;
+    using Set = V[8];
+    static_assert(S::lanes == 16);
+
+    // In each 256-bit half: lane u of r[i] <-> lane i of r[u] (Values::transpose on 8 lanes).
+    [[gnu::always_inline]] static void transpose(Set& r) {
+        V t[8], u[8];
+        #pragma GCC unroll 8
+        for (int i = 0; i < 8; i += 2) t[i] = _mm512_unpacklo_epi32(r[i], r[i + 1]), t[i + 1] = _mm512_unpackhi_epi32(r[i], r[i + 1]);
+        #pragma GCC unroll 8
+        for (int i = 0; i < 8; i += 4) {
+            u[i] = _mm512_unpacklo_epi64(t[i], t[i + 2]), u[i + 1] = _mm512_unpackhi_epi64(t[i], t[i + 2]);
+            u[i + 2] = _mm512_unpacklo_epi64(t[i + 1], t[i + 3]), u[i + 3] = _mm512_unpackhi_epi64(t[i + 1], t[i + 3]);
+        }
+        const __m512i low = _mm512_setr_epi64(0, 1, 8, 9, 4, 5, 12, 13), high = _mm512_setr_epi64(2, 3, 10, 11, 6, 7, 14, 15);
+        #pragma GCC unroll 4
+        for (int i = 0; i < 4; ++i) {
+            r[i] = _mm512_permutex2var_epi64(u[i], low, u[i + 4]);
+            r[i + 4] = _mm512_permutex2var_epi64(u[i], high, u[i + 4]);
+        }
+    }
+
+    // x w per lane, w and its quotient from the rows of blocks g and g + 1 (any x -> [0, 2P)).
+    [[gnu::always_inline]] static V mul_lanes(V x, const u32* row0, const u32* row1) {
+        return Base::whole(M::shoup(x, S::load_halves(row0, row1), S::load_halves(row0 + 8, row1 + 8)));
+    }
+
+    // Blocks g, g + 1 (g even) at from -> to; z: factors(z, 0).
+    [[gnu::always_inline]] static void split2(const u32* from, u32* to, std::size_t g, const u32* rows, const F (&z)[4]) {
+        const auto &b0 = kValueLanes.forward[g % 8], &b1 = kValueLanes.forward[(g + 1) % 8];
+        const u32* a = rows + 32 * (g / 8);  // g / 8 = (g + 1) / 8
+        Set x;
+        #pragma GCC unroll 8
+        for (int u = 0; u < 8; ++u) x[u] = S::load_halves(from + 8 * u, from + 64 + 8 * u);
+        transpose(x);
+        #pragma GCC unroll 8
+        for (int k = 1; k < 8; ++k) x[k] = mul(mul_lanes(x[k], b0[k], b1[k]), Base::A::factor(a[k], a[8 + k]));
+        forward8(x, z);
+        #pragma GCC unroll 8
+        for (int i = 0; i < 8; ++i) S::template store_half<0>(to + 8 * i, x[i]), S::template store_half<1>(to + 64 + 8 * i, x[i]);
+    }
+
+    [[gnu::always_inline]] static void join2(const u32* from, u32* to, std::size_t g, const u32* rows, const F (&z)[4]) {
+        const auto &b0 = kValueLanes.inverse[g % 8], &b1 = kValueLanes.inverse[(g + 1) % 8];
+        const u32* a = rows + 32 * (g / 8) + 16;
+        Set x;
+        #pragma GCC unroll 8
+        for (int i = 0; i < 8; ++i) x[i] = S::load_halves(from + 8 * i, from + 64 + 8 * i);
+        inverse8(x, z);
+        x[0] = canonical(mul_lanes(x[0], b0[0], b1[0]));
+        #pragma GCC unroll 8
+        for (int k = 1; k < 8; ++k) x[k] = canonical(mul(mul_lanes(x[k], b0[k], b1[k]), Base::A::factor(a[k], a[8 + k])));
+        transpose(x);
+        #pragma GCC unroll 8
+        for (int u = 0; u < 8; ++u) S::template store_half<0>(to + 8 * u, x[u]), S::template store_half<1>(to + 64 + 8 * u, x[u]);
+    }
+
+    // As Values::split and join.
+    static void split(const u32* from, u32* to, std::size_t count, std::size_t first, const u32* rows) {
+        if (count && first % 2) Lone::split(from, to, 1, first, rows), from += 64, to += 64, ++first, --count;
+        F z[4];
+        factors(z, 0);
+        for (; count >= 2; count -= 2, first += 2, from += 128, to += 128) split2(from, to, first, rows, z);
+        if (count) Lone::split(from, to, 1, first, rows);
+    }
+    static void join(const u32* from, u32* to, std::size_t count, std::size_t first, const u32* rows) {
+        if (count && first % 2) Lone::join(from, to, 1, first, rows), from += 64, to += 64, ++first, --count;
+        F z[4];
+        factors(z, 1);
+        for (; count >= 2; count -= 2, first += 2, from += 128, to += 128) join2(from, to, first, rows, z);
+        if (count) Lone::join(from, to, 1, first, rows);
+    }
+};
+#endif
+
+// The values form's split and join for transforms on S: WideValues for 16 lanes (AVX-512).
+template <class S>
+struct ValuesOf {
+    using type = Values<typename Narrow<S>::type>;
+};
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+template <class S>
+    requires(S::lanes == 16)
+struct ValuesOf<S> {
+    using type = WideValues<S>;
+};
+#endif
+template <class S>
+using ValuesFor = typename ValuesOf<S>::type;
+
 template <class S>
 struct Ntt : Butterflies<S> {
     using N = typename Narrow<S>::type;
@@ -1896,10 +1999,10 @@ struct Ntt : Butterflies<S> {
         const std::size_t len = std::size_t(1) << lg, nv = len / 8;
         if (lg < 8) {
             forward(f, lg, r);
-            return Values<N>::split(f, f, len / 64, 0, rows);
+            return ValuesFor<S>::split(f, f, len / 64, 0, rows);
         }
         const auto tile = [f, rows] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
-            Values<N>::split(t, t, leaves / 8, std::size_t(t - f) / 64, rows);
+            ValuesFor<S>::split(t, t, leaves / 8, std::size_t(t - f) / 64, rows);
         };
         if (!has_radix2(lg)) return forward_tiles<1>(f, nv, 0, r, tile);
         forward_radix2(f, len / 2, false);
@@ -1914,13 +2017,13 @@ struct Ntt : Butterflies<S> {
                         const u32* rows) {
         const std::size_t len = std::size_t(1) << lg;
         if (rows && lg < 8) {
-            Values<N>::join(from, f, len / 64, 0, rows);
+            ValuesFor<S>::join(from, f, len / 64, 0, rows);
             return inverse_into(f, out, count, lg, ir, s, NoTile{});
         }
         if (rows) {
             return inverse_into(f, out, count, lg, ir, s, [from, f, rows] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
                 const std::size_t at = std::size_t(t - f);
-                Values<N>::join(from + at, t, leaves / 8, at / 64, rows);
+                ValuesFor<S>::join(from + at, t, leaves / 8, at / 64, rows);
             });
         }
         if (from != f) {
