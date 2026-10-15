@@ -257,6 +257,28 @@ template <class Hook, class... V>
     (void)((i++ == v && (V::inverse_hooked(hook, f, out, count, lg, r, ir, output, width), true)) || ...);
 }
 
+// Transform's doubling ops: by the forward's choice (truncate_blocks, forward_upper_hooked; the
+// latter at the half length it runs, as forward_upper) and the inverse's (join_blocks).
+template <class Hook, class... V>
+[[gnu::always_inline]] inline void run_truncate_blocks(Candidates<V...>, int v, std::uint32_t* f, std::size_t block,
+                                                       std::uint32_t* copy, int lg, const std::uint32_t* r,
+                                                       const std::uint32_t* ir, Hook& hook) {
+    int i = 0;
+    (void)((i++ == v && (V::truncate_blocks(f, block, copy, lg, r, ir, hook), true)) || ...);
+}
+template <class... V>
+[[gnu::always_inline]] inline void run_join_blocks(Candidates<V...>, int v, std::uint32_t* f, std::size_t block,
+                                                   std::uint32_t scale, int lg, const std::uint32_t* ir) {
+    int i = 0;
+    (void)((i++ == v && (V::join_blocks(f, block, scale, lg, ir), true)) || ...);
+}
+template <class Hook, class... V>
+[[gnu::always_inline]] inline void run_forward_upper_hooked(Candidates<V...>, int v, std::uint32_t* f, int lg,
+                                                            const std::uint32_t* r, std::size_t width, Hook& hook) {
+    int i = 0;
+    (void)((i++ == v && (V::forward_upper_hooked(f, lg, r, width, hook), true)) || ...);
+}
+
 }  // namespace detail
 
 namespace variant {
@@ -355,6 +377,23 @@ struct tuned {
                                std::size_t width) {
         detail::run_inverse_hooked(Selected{}, choice(kInverse, lg), hook, f, out, count, lg, roots, inverse_roots, output,
                                    width);
+    }
+
+    // Transform's doubling ops.
+    template <class Hook>
+    static void truncate_blocks(std::uint32_t* f, std::size_t block, std::uint32_t* copy, int lg, const std::uint32_t* roots,
+                                const std::uint32_t* inverse_roots, Hook hook) {
+        detail::run_truncate_blocks(Selected{}, choice(kForward, lg), f, block, copy, lg, roots, inverse_roots, hook);
+    }
+
+    static void join_blocks(std::uint32_t* f, std::size_t block, std::uint32_t scale, int lg,
+                            const std::uint32_t* inverse_roots) {
+        detail::run_join_blocks(Selected{}, choice(kInverse, lg), f, block, scale, lg, inverse_roots);
+    }
+
+    template <class Hook>
+    static void forward_upper_hooked(std::uint32_t* f, int lg, const std::uint32_t* roots, std::size_t width, Hook hook) {
+        detail::run_forward_upper_hooked(Selected{}, choice(kForward, lg), f, lg, roots, width, hook);
     }
 };
 

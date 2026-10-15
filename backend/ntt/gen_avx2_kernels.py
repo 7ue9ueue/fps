@@ -560,7 +560,8 @@ BOTTOM_SHIFT = -0.05  # 'both': the first stage's ops start this fraction earlie
 LEAVES_KNOBS = {'forward_leaves': Knobs(window=20), 'inverse_leaves': Knobs(window=20)}
 
 
-def loop_body(loop):
+def loop_body(loop, spacing=32):
+    """Two butterflies, the second spacing bytes after the first (32: consecutive columns)."""
     consts = {'P': Value('creg', reg=15), '2P': Value('creg', reg=14)}
     reserved = {14, 15}
     if loop.twiddles == 'z':
@@ -573,7 +574,7 @@ def loop_body(loop):
             reserved.add(11 + i)
     ops = []
     for k in range(2):
-        g = Graph(consts, disp=0 if loop.pair else 32 * k, array='b' if loop.pair and k else 'a',
+        g = Graph(consts, disp=0 if loop.pair else spacing * k, array='b' if loop.pair and k else 'a',
                   src='s' if loop.src else None)
         loop.graph(g)
         ops += g.ops
@@ -671,6 +672,23 @@ def columns_function(name):
               '        : ' + CLOBBERS + ', "cc");', '}']
     return lines
 
+
+# Width 1 (issue #149 round 2, lc-opt's *_even_columns): the even columns, j and j + 2 per iteration.
+def even_columns_function(name):
+    loop = next(l for l in LOOPS if l.name == name)
+    asm = loop_asm(loop)
+    asm = asm[:asm.index('.p2align 5')] + ['.p2align 5', '1:'] + loop_body(loop, 64) + ['add $128, %[a]', 'cmp %[end], %[a]', 'jne 1b']
+    lines = [f'// {name}() on the even columns j < h. h a multiple of 4.',
+             f'inline void {name}_even_columns(Vec* a, std::size_t h, const std::uint32_t* x, const std::uint32_t* y) {{',
+             '    alignas(32) Vec w[3];  // twiddle values x, y, z; their quotients stay in ymm11-13',
+             '    Vec* const end = a + h;', '    asm volatile(']
+    lines += asm_lines(asm)
+    lines += ['        : [a] "+r"(a)',
+              '        : [end] "r"(end), [h] "r"(32 * h), [h3] "r"(96 * h), [y] "r"(y), [x] "r"(x), [w] "r"(w),',
+              '          [P] "m"(kP), [P2] "m"(k2P)',
+              '        : ' + CLOBBERS + ', "cc");', '}']
+    return lines
+
 BOTTOM_DOC = {
     'first': 'Forward half of the bottom stage for the batch at a, b; fills buf.',
     'last': 'Leaf products from cur and the inverse butterfly; writes the batch at out.',
@@ -731,6 +749,8 @@ def generate():
         lines += loop_function(loop) + ['']
     for name in COLUMNS:
         lines += columns_function(name) + ['']
+    for name in COLUMNS:
+        lines += even_columns_function(name) + ['']
     lines += ['// Bottom stage: a batch of four vectors is a radix-4 group with h = 1; each output vector',
               '// v_t is a leaf, a polynomial mod x^8 - w_t. buf, cur: leaf buffers (384 bytes, 64-byte',
               '// aligned); w: the four leaf weights, then their quotients.', '']

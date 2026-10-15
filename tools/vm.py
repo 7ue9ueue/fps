@@ -31,16 +31,19 @@ def zone(vm: str) -> str:
     return ZONES.get(vm, 'europe-west2-b')
 
 
-def ssh(vm: str, command: str, stdin: bytes | None = None, capture: bool = False) -> subprocess.CompletedProcess:
-    """Run command on vm. A connection failure (exit 255, or gcloud itself crashing on a timeout
-    to the Compute API, seen in PR 134's gate) is retried twice: every command the tools send
-    (copy, test, bench) can safely run again."""
+def ssh(vm: str, command: str, stdin: bytes | None = None, capture: bool = False,
+        timeout: float | None = None) -> subprocess.CompletedProcess:
+    """Run command on vm. A connection failure (exit 255, a connection that went silent for two
+    minutes, or gcloud itself crashing on a timeout to the Compute API, seen in PR 134's gate) is
+    retried twice: every command the tools send (copy, test, bench) can safely run again.
+    `timeout` (seconds, per attempt) raises subprocess.TimeoutExpired."""
     cmd = ['gcloud', 'compute', 'ssh', vm, f'--zone={zone(vm)}', '--quiet', f'--command={command}',
-           '--', '-o', 'LogLevel=ERROR', '-o', 'ConnectTimeout=20']
+           '--', '-o', 'LogLevel=ERROR', '-o', 'ConnectTimeout=20',
+           '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=4']
     for attempt in range(3):
         # stderr always read, so a gcloud crash is seen on uncaptured calls too (ship: PR 156's gate)
         result = subprocess.run(cmd, input=stdin, stdout=subprocess.PIPE if capture else None,
-                                stderr=subprocess.PIPE)
+                                stderr=subprocess.PIPE, timeout=timeout)
         if not capture and result.stderr:
             sys.stderr.buffer.write(result.stderr)
             sys.stderr.flush()
@@ -79,7 +82,7 @@ def rev_tar(rev: str) -> bytes:
 def ship(vm: str, name: str, data: bytes) -> str:
     """Replace ~/hpc_library/<name> on vm with the tar stream; return its path from home."""
     path = f'{ROOT}/{slug(name)}'
-    result = ssh(vm, f'rm -rf {path} && mkdir -p {path} && tar -xzmf - -C {path}', stdin=data)
+    result = ssh(vm, f'rm -rf {path} && mkdir -p {path} && tar -xzmf - -C {path}', stdin=data, timeout=900)
     if result.returncode:
         sys.exit(f'copy to {vm}:{path} failed')
     return path

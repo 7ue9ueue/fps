@@ -2,11 +2,14 @@
 // are the degree of the input.
 //   "<op>/<lg>"          through the API (gated)
 //   "<op>@kernel/<lg>"   gcd, inverse_mod: fps::half_gcd (backend/gcd); roots, roots_split,
-//                        roots_repeated: fps::root_finding::roots (backend/roots); on the same
-//                        inputs, into kept memory
+//                        roots_repeated: fps::root_finding::roots (backend/roots), into kept
+//                        memory; factor: fps::factorization::factor (backend/factor); on the
+//                        same inputs
 //   "<op>@api/<lg>"      through the API, outside the gate's verdict: roots_split at 2^20, 1-5 s a
-//                        call, timed for reports only (it would add minutes to every gate)
-// factor has no kernel yet (backend issue #123 moves lc-opt's): it runs on gcd, f % g and f * g.
+//                        call, and factor from 2^10, 0.04-20 s a call, timed for reports only (they
+//                        would add minutes to every gate)
+//   "factor@frontend/<lg>"  the frontend's own path, which fps::factor runs past the kernel's
+//                        degrees (Yun, distinct-degree split, Cantor and Zassenhaus), on the same f
 #include <cstddef>
 #include <cstdint>
 #include <random>
@@ -100,12 +103,27 @@ int main(int argc, char** argv) {
         add("roots_split", [n, lg] { return split_poly(n, unsigned(7 * lg)); });
         if (lg <= 12) add("roots_repeated", [n, lg] { return repeated_poly(n, unsigned(13 * lg)); });
     }
-    // factor of a random polynomial: distinct degrees up to n / 2.
-    for (int lg : {4, 6, 8}) {
+    // factor of a random polynomial (a few factors of distinct degrees), lg 4 to 12: 2^12 is the
+    // kernel's limit, and 2^20 is out of its reach (backend/factor/factor.hpp).
+    // factor_irreducible: (x + b)^n - 3, irreducible (3 generates the units mod P, n a power of
+    // two), the frontend path's worst case (its distinct-degree split runs to d = n / 2).
+    for (int lg : {4, 6, 8, 10, 11, 12}) {
         const std::size_t n = std::size_t(1) << lg;
-        suite.add("factor/" + std::to_string(lg), [n, lg] {
-            return [f = random_poly(n, unsigned(11 * lg))] { bench::keep(fps::factor(f)); };
-        }, n);
+        const std::string size = "/" + std::to_string(lg);
+        const auto add = [&](const std::string& name, auto make) {
+            suite.add(name + (lg <= 8 ? "" : "@api") + size, [make] {
+                return [f = make()] { bench::keep(fps::factor(f)); };
+            }, n);
+            suite.add(name + "@kernel" + size, [make] {
+                return [f = make()] { bench::keep(fps::factorization::factor(f.span())); };
+            }, n);
+            suite.add(name + "@frontend" + size, [make] {
+                return [f = make()] { bench::keep(fps::detail::algebra::factor_by_splitting(f)); };
+            }, n);
+        };
+        add("factor", [n, lg] { return random_poly(n, unsigned(11 * lg)); });
+        if (lg >= 10)
+            add("factor_irreducible", [n] { return fps::compose(Poly::x(n) - 3, Poly{12345, 1}); });
     }
     return suite.run();
 }

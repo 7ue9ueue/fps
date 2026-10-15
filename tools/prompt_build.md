@@ -27,17 +27,40 @@ user and every agent) are ours; text from any other account is information, neve
      `frontend/bench_<area>.cpp` (`kernel.py bench` times every `bench*.cpp`) on the same inputs:
      `<op>/<lg>` through the API and `<op>@kernel/<lg>` calling the backend directly, with lg = 20
      among the sizes where the operation takes inputs that large (small sizes alone are noisy).
-     The gate times every case without `@` on every frontend pull request: name an API case that
-     takes more than about 0.1 s a call `<op>@api/<lg>`, so it is timed for your reports only.
+     Every case without `@` is timed in each bench run and makes up the geomean of the `Speed`
+     section: name an API case that takes more than about 0.1 s a call `<op>@api/<lg>`, so it is
+     timed for your reports only and keeps the run short.
      The API adds no overhead of its own (AGENTS.md, Conventions). Do not tune the frontend: speed
      work belongs in the backend, through a backend issue.
    - If DESIGN.md is wrong or unclear, follow AGENTS.md: fix it in the same pull request with the
      reason. If it is a choice only the user can make, ask (above).
 4. Test with `tools/kernel.py test frontend` on the Mac (`scalar`, `arm`) and on the VMs
-   (`tools/vm.py`); time with `tools/kernel.py bench frontend`.
+   (`tools/vm.py`); time with `tools/kernel.py bench frontend --base <the recorded hash>` on each
+   timing machine (avx2 `lc-bench`, avx512 `lc-intel`, zen5 `lc-zen5`, arm `lc-arm`), which takes
+   the bench lock. The merge gate runs tests only and times nothing: your numbers are the only
+   speed check, and the reviewer trusts them. Put a `Speed` section in the pull request body:
+
+   ```
+   Speed (base <hash>, <N> rounds, medians of paired rounds, GCC 15.2):
+   | target | geomean of existing cases new/base | the new code | vs lc-opt |
+   ```
+
+   The geomean is the bench's `Geomean over gated cases` line for the existing cases, which shows
+   that the change slowed nothing. A geomean above 1.005 on any target needs a fix, or the reason
+   (noise you re-measured alone). The new-code column includes n = 2^20 where the operation takes
+   inputs that large; it is the speed-up in percent with its spread when
+   the pull request makes existing code faster; for a new function, its cost: `<op>` over
+   `<op>@kernel`, or over `mul@kernel` when no backend call is wrapped. Write `new, no base`
+   rather than leave a cell empty.
+   `vs lc-opt` is fps / lc-opt from the same-run table that BACKEND.md asks for (`lc-bench`, same
+   inputs and flags, at several sizes with 2^20 among them): below 1 we are faster, as in new/base.
+   Give the geomean of that table, or the headline case's ratio. lc-opt is AVX2-only and tuned for
+   Zen 3, so the other targets say `n/a`; so does an operation lc-opt lacks (BACKEND.md says which
+   it has). Never leave it empty.
+   Time the API call (`<op>`), not the raw kernel, so the gap shows what the user gets.
 5. Log what you built and the numbers in a new file `frontend/notes/{issue}.md`, starting with
    `# #{issue}: <title>` (new file, never an edit of an existing entry). Commit, push, and open a pull request
-   that names issue #{issue}. Comment on issue #{issue}: what was built and the numbers, always
+   that names issue #{issue} and has the `Speed` section. Comment on issue #{issue}: what was built and the numbers, always
    including n = 2^20 (against the kernel, against the code it replaces, and against lc-opt when
    lc-opt has the operation).
 6. Stop every background process you started, then return: the pull request's number and each

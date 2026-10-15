@@ -49,7 +49,7 @@ Run from the checkout's root. Each script's `--help` has the details.
 | `tools/kernel.py check` | anywhere | Generators and tuned tables match what is committed. |
 | `tools/sanitize.py [--issue]` | Mac | ASan/UBSan tests of every unit on every target, for `origin/main`: what the gate leaves out (it sanitizes only the kernels a pull request changes; the frontend never). Run it when the VMs are idle (nightly, after a batch of merges); `--issue` files a `ready` issue on a failure. |
 | `tools/tune.py <kernel>` | Mac | Measures a kernel's tuned choices on each target's timing machine; writes `tuned.json` and `tuned.hpp`. |
-| `tools/gate.py <pr> --merge` | Mac | Tests every affected unit on every target, times it against `main`, comments the report on the PR, and squash-merges on a pass. Always runs `origin/main`'s copy of `tools/`; one gate at a time, the others wait (a pull request that affects no unit takes no lock). |
+| `tools/gate.py <pr> --merge` | Mac | Tests every affected unit on every target (it does not time), comments the report on the PR, and squash-merges on a pass. Always runs `origin/main`'s copy of `tools/`. Gates run side by side; a test that hangs is killed after an hour. On a timing machine (`lc-arm`) `kernel.py test` waits for the bench lock, so it never disturbs a benchmark. |
 
 ```
 python3 tools/vm.py lc-amd 'python3 tools/kernel.py test ntt --target avx2'
@@ -57,7 +57,7 @@ python3 tools/vm.py lc-bench --base <hash> 'python3 tools/kernel.py bench ntt --
 ```
 
 Other handy pieces: `-DFPS_<KERNEL>_<OP>=<variant>` forces one variant; bench cases named
-`<op>@<variant>/<size>` time a single variant, `<op>/<size>` the selected one (the gate times
+`<op>@<variant>/<size>` time a single variant, `<op>/<size>` the selected one (the geomean in the PR's `Speed` section uses
 these); in `frontend/bench.cpp`, `<op>@kernel/<lg>` times the raw kernel next to the API call.
 
 ## Machines
@@ -97,9 +97,11 @@ GitHub issues are the shared state. Agents talk through them and through pull re
 - **Frontend**: `/build` starts an implementer (`tools/prompt_build.md`), then a fresh reviewer
   (`tools/prompt_review.md`) whose comment ends with `Review: pass`, `changes` or `blocked`.
   The issue ends with `Result: done`.
-- **Merging**: subagents open a pull request and return. The coordinator runs `gate.py`, one gate
-  at a time; its comment ends with `Gate: pass` or `Gate: fail`, and failures go back to an agent
-  (SendMessage or a fix agent).
+- **Merging**: subagents open a pull request and return. The coordinator runs `gate.py`; its comment
+  ends with `Gate: pass` or `Gate: fail`, and failures go back to an agent (SendMessage or a fix
+  agent). The gate runs tests only. Speed is the author's: every pull request body has a `Speed`
+  section (`tools/prompt.md`, `tools/prompt_build.md`): the geomean against `main` and the time
+  against lc-opt. The reviewer or coordinator checks that it is there and trusts the numbers.
 - Comment on any issue where you have something useful: an answer, a measurement, a finding.
 - Worktrees share refs, so `origin/main` moves when any agent fetches: record its hash when you
   start and pass that to `--base`.
@@ -124,8 +126,8 @@ docs. You decide what is worth doing.
   code is never run. `gate.py` refuses pull requests by other accounts and from forks.
 - Write the code ourselves. Papers, docs and other code may be read for ideas, not copied; cite
   them in your notes entry. Code from lc-opt may move here.
-- `main` changes only through `gate.py`, which the coordinators run. A merge by hand restarts a running
-  gate whose units it touches.
+- `main` changes only through `gate.py`, which the coordinators run. A merge by hand makes a running
+  gate whose units it touches test again.
 - The VMs are shared: keep them running, never delete one you did not create, and leave `~/lc-opt`
   alone. Time only under `flock /tmp/bench.lock` (`kernel.py bench` takes it), and never time x86
   code on the Mac (Rosetta). Other agents run there at the same time: stop only processes you
