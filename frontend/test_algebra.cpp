@@ -431,13 +431,25 @@ void test_roots_long() {
     CHECK(std::ranges::all_of(ok, [](int v) { return v == 1; }));
 }
 
-// factor of the product of the given factors (to their multiplicities), times c.
-void check_factor(Factors parts, u32 c, std::size_t tag) {
+// The product of the given factors (to their multiplicities), times c.
+Vec product_of(const Factors& parts, u32 c) {
     Vec f{c};
     for (const auto& [g, e] : parts)
         for (int i = 0; i < e; ++i) f = naive_mul(f, g);
+    return f;
+}
+
+// factor of the product of the given factors, times c.
+void check_factor(Factors parts, u32 c, std::size_t tag) {
+    const Vec f = product_of(parts, c);
     sort_factors(parts);
     CHECK(to_vecs(fps::factor(poly(f))) == parts, tag, parts.size());
+}
+
+// fps::factor's two paths give the same list: the kernel (deg f <= 2048) and the frontend's own
+// split (past it).
+bool same_paths(const Vec& f) {
+    return to_vecs(fps::factor(poly(f))) == to_vecs(fps::detail::algebra::factor_by_splitting(poly(f)));
 }
 
 void test_factor() {
@@ -494,6 +506,62 @@ void test_factor() {
     for (int i = 0; i < 10; ++i) parts.push_back({irreducible_quadratic(random_value(), z), 1 + i % 2});
     for (int i = 0; i < 4; ++i) parts.push_back({random_irreducible(6), 1});
     check_factor(parts, nonzero(), 1);
+}
+
+// Both paths on the same inputs: random f of the sizes above and around the kernel's kept
+// factorizer (degree 256); then A^e B with A of degree 64 (multiplicity e) and B of 63 + {0, 1, 2}
+// (known irreducibles; small square-free parts keep the kernel's O(m^3) cheap): e = 31 gives
+// degrees 2047 .. 2049, around fps::factor's switch, and e = 63 gives 4095 .. 4097, around the
+// kernel's own limit (its direct call too, up to 4096).
+void test_factor_paths() {
+    static_assert(fps::detail::algebra::kFactorKernelMax == 2048 && fps::factorization::kMaxDegree == 4096);
+    for (const std::size_t n : kSizes)
+        for (int kind = 0; kind < 4; ++kind) {
+            Vec f = random_vec(n, kind);
+            if (kind == 1 && n <= 33) f = naive_mul(f, naive_mul(f, {1, 1}));  // f^2 (x + 1)
+            if (!trim(f).empty()) CHECK(same_paths(f), n, kind);
+        }
+    for (const std::size_t n : {255, 256, 257, 300}) CHECK(same_paths(random_degree(n)), n);
+    const u32 z = non_square();
+    std::vector<u32> used;  // the linear factors' constants, distinct
+    const auto linear = [&] {
+        u32 r;
+        do r = random_value();
+        while (std::ranges::find(used, r) != used.end());
+        used.push_back(r);
+        return Vec{r, 1};
+    };
+    Factors a;  // degree 32 + 16 + 12 + 4 = 64
+    for (int i = 0; i < 32; ++i) a.push_back({linear(), 0});
+    for (int i = 0; i < 8; ++i) a.push_back({irreducible_quadratic(random_value(), z), 0});
+    for (int i = 0; i < 4; ++i) a.push_back({random_irreducible(3), 0});
+    a.push_back({random_irreducible(4), 0});
+    Vec a1{1}, power{1};
+    for (const auto& part : a) a1 = naive_mul(a1, part.first);
+    for (int e = 1; e <= 63; ++e) {
+        power = naive_mul(power, a1);
+        if (e != 31 && e != 63) continue;
+        for (auto& part : a) part.second = e;
+        for (std::size_t extra = 0; extra < 3; ++extra) {
+            Factors b;  // 3 of degree 5, 48 + extra linear factors
+            for (int i = 0; i < 3; ++i) b.push_back({random_irreducible(5), 1});
+            for (std::size_t i = 0; i < 48 + extra; ++i) b.push_back({linear(), 1});
+            Vec f = naive_mul(power, product_of(b, nonzero()));
+            CHECK(f.size() == 64 * std::size_t(e) + 64 + extra, f.size());
+            if (extra == 1) f.resize(f.size() + 3);  // trailing zeros do not count
+            Factors parts = a;
+            parts.insert(parts.end(), b.begin(), b.end());
+            sort_factors(parts);
+            CHECK(to_vecs(fps::factor(poly(f))) == parts, e, extra);
+            CHECK(to_vecs(fps::detail::algebra::factor_by_splitting(poly(f))) == parts, e, extra);
+            if (trim(f).size() <= 4097) {
+                Factors direct;
+                for (const auto& g : fps::factorization::factor(f))
+                    direct.emplace_back(g.coefficients, int(g.multiplicity));
+                CHECK(direct == parts, e, extra);
+            }
+        }
+    }
 }
 
 void test_threads() {
@@ -580,6 +648,7 @@ int main() {
     test_roots();
     test_roots_long();
     test_factor();
+    test_factor_paths();
     test_threads();
     test_errors();
     if (failures) {
