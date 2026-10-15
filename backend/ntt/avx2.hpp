@@ -924,7 +924,12 @@ template <class Trees>
         return trees(f, nv / 4, 4);
     }
     if (radix8_lower(lg, n)) {
-        forward_radix8_lower_from(in, n, words, nv / 8, r);
+        if (in == words) {  // in place (forward(in, F) with in at F): one pass, lc-opt's forward_top8
+            std::fill(words + n, words + 4 * nv, 0u);
+            forward_radix8_sparse(f, nv / 8, r);
+        } else {
+            forward_radix8_lower_from(in, n, words, nv / 8, r);
+        }
         return trees(f, nv / 8, 8);
     }
     forward_radix2_from(in, n, words, nv / 2);
