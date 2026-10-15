@@ -17,9 +17,9 @@ from typing import Optional
 OUT = Path(__file__).resolve().parent / 'avx2_kernels.hpp'
 
 # Zen 3: multiplies on 2 of the 4 vector pipes, shifts on 2, everything else on any.
-LATENCY = {'vpmuludq': 3, 'vpmulld': 3, 'vpsrlq': 1, 'vpaddd': 1, 'vpsubd': 1,
+LATENCY = {'vpmuludq': 3, 'vpmulld': 3, 'vpsrlq': 1, 'vpsllq': 1, 'vpaddd': 1, 'vpsubd': 1,
            'vpminud': 1, 'vpblendd': 1, 'vpaddq': 1}
-PIPE = {'vpmuludq': 'mul', 'vpmulld': 'mul', 'vpsrlq': 'shift'}
+PIPE = {'vpmuludq': 'mul', 'vpmulld': 'mul', 'vpsrlq': 'shift', 'vpsllq': 'shift'}
 COMMUTATIVE = {'vpaddd', 'vpaddq', 'vpminud', 'vpmuludq', 'vpmulld'}
 LOADS = {'vmovdqa', 'vmovdqu', 'vbroadcastss'}
 # Bases in the caller's memory, any 4-byte alignment: unaligned loads and stores.
@@ -99,7 +99,7 @@ class Graph:
 
     def op(self, mnemonic, *srcs, imm=None):
         srcs = [self.materialize(s) if s.kind == 'scalar' else self.loaded.get(s, s) for s in srcs]
-        if mnemonic in ('vpsubd', 'vpblendd', 'vpsrlq'):  # first source in a register (VEX shifts take none from memory)
+        if mnemonic in ('vpsubd', 'vpblendd', 'vpsrlq', 'vpsllq'):  # first source in a register (VEX shifts take none from memory)
             srcs[0] = self.materialize(srcs[0])
             if srcs[0].kind == 'cmem':
                 raise ScheduleError('constant minuend in memory')
@@ -578,8 +578,8 @@ def emit(o, reg):
     dst = f'%%ymm{reg[o.dst]}'
     if o.mnemonic in LOADS:
         return f'{o.mnemonic} {operand(o.srcs[0], reg)}, {dst}'
-    if o.mnemonic == 'vpsrlq':
-        return f'vpsrlq ${o.imm}, {operand(o.srcs[0], reg)}, {dst}'
+    if o.mnemonic in ('vpsrlq', 'vpsllq'):
+        return f'{o.mnemonic} ${o.imm}, {operand(o.srcs[0], reg)}, {dst}'
     x, y = o.srcs  # AT&T: dst = x OP y is written "op y, x, dst"; only y may be in memory
     if o.mnemonic in COMMUTATIVE and x.in_memory:
         x, y = y, x

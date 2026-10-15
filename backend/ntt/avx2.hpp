@@ -1036,7 +1036,47 @@ struct SumBottom {
     }
 };
 
-// Sums with a term alone: the intrinsics' bottom on Avx2 (Bottom::inverse_terms).
+// A product of leaves a, b plus a leaf form alone at side (bottom_side_*; its first stage is
+// bottom_leaves_first): the leaves of a b + side, with 2^-32, through the inverse butterflies.
+struct SideBottom {
+    static void run(Vec* out, const u32* a, const u32* b, const u32* side, std::size_t nv, std::size_t first, const u32* r,
+                    const u32* ir) {
+        Leaves leaves[2][2];
+        product_kernels::bottom_leaves_first(a, leaves[0], r + slot(first), r + slot(2 * first));
+        for (std::size_t j = 0, k = first;; j += 8, k += 2) {
+            const std::size_t cur = j / 8 % 2, next = cur ^ 1;
+            const u32 *ix = ir + slot(k), *iy = ir + slot(2 * k);
+            if (j + 8 == nv) return product_kernels::bottom_side_last(out + j, leaves[cur], b + 8 * j, side + 8 * j, ix, iy);
+            product_kernels::bottom_side_both(a + 8 * (j + 8), leaves[next], r + slot(k + 2), r + slot(2 * k + 4), out + j,
+                                              leaves[cur], b + 8 * j, side + 8 * j, ix, iy);
+        }
+    }
+};
+
+// Transform::toeplitz_product's bottom (bottom_toeplitz_*): the rows of S, D1, D3 at leaves[.][0, 2,
+// 4]; m1 + m2 through the inverse butterflies, m1 + m3 over A3. The 'both' kernels take the current
+// batches' A2, B1, B0, A3 at the next batches' minus 256 bytes.
+struct ToeplitzBottom {
+    static void run(Vec* out, const Toeplitz& z, std::size_t at, std::size_t nv, std::size_t first, const u32* r,
+                    const u32* ir) {
+        Leaves leaves[2][6];
+        const u32 *a1 = z.a1 + at, *a2 = z.a2 + at, *b0 = z.b0 + at, *b1 = z.b1 + at;
+        u32* const a3 = z.a3 + at;
+        product_kernels::bottom_toeplitz_first(a1, a2, a3, b0, b1, leaves[0], r + slot(first), r + slot(2 * first));
+        for (std::size_t j = 0, k = first;; j += 8, k += 2) {
+            const std::size_t cur = j / 8 % 2, next = cur ^ 1, w = 8 * j;
+            const u32 *ix = ir + slot(k), *iy = ir + slot(2 * k);
+            if (j + 8 == nv)
+                return product_kernels::bottom_toeplitz_last(out + j, leaves[cur], a2 + w, b1 + w, b0 + w, a3 + w, ix, iy);
+            const std::size_t n8 = 8 * (j + 8);
+            product_kernels::bottom_toeplitz_both(a1 + n8, a2 + n8, a3 + n8, b0 + n8, b1 + n8, leaves[next], r + slot(k + 2),
+                                                  r + slot(2 * k + 4), out + j, leaves[cur], ix, iy);
+        }
+    }
+};
+
+// Sums with a term alone (but one product and one term alone, SideBottom): the intrinsics' bottom on
+// Avx2 (Bottom::inverse_terms).
 using TermsLeaf = intrinsics::Bottom<simd::Avx2>;
 
 // Upper halves of the inverse top levels (Transform's fused ops): count words of the upper half of
@@ -1107,19 +1147,11 @@ inline void cyclic_product(const u32* in, std::size_t n, const u32* b, u32* word
     scale_radix2_out(words, nv / 2, out, count, s);
 }
 
-inline void inverse_product(const LeafTerm* terms, int n, u32* words, u32* out, std::size_t count, int lg, const u32* r,
-                            const u32* ir, unsigned output) {
-    if (n == 1 && !terms[0].b && output == 0) return inverse(terms[0].a, words, out, count, lg, ir, nullptr);
-    // Products only, 1 to 3 of them: the asm bottoms; a term alone, or 4 terms: the intrinsics'.
-    const int products = std::all_of(terms, terms + n, [](const LeafTerm& t) { return t.b != nullptr; }) && n <= 3 ? n : 0;
-    const auto stage = [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
-        const std::size_t at = std::size_t(t - words);
-        auto* v = reinterpret_cast<Vec*>(t);
-        if (products == 1) LeavesBottom::run(v, terms[0].a + at, terms[0].b + at, leaves, at / 32, r, ir);
-        else if (products == 2) SumBottom<2>::run(v, terms, at, leaves, at / 32, r, ir);
-        else if (products == 3) SumBottom<3>::run(v, terms, at, leaves, at / 32, r, ir);
-        else TermsLeaf::inverse_terms(t, terms, n, leaves / 4, at / 32, r, ir);
-    };
+// The inverse levels above stage(t, leaves), which writes each run of leaves at t and runs its
+// inverse bottom level, and the top level writing count words of the half output picks to out.
+template <class Stage>
+[[gnu::always_inline]] inline void inverse_staged(u32* words, u32* out, std::size_t count, int lg, const u32* ir,
+                                                  unsigned output, Stage stage) {
     auto* f = reinterpret_cast<Vec*>(words);
     const std::size_t nv = (std::size_t(1) << lg) / 8;
     const u32 s = output_scale(lg, output);
@@ -1137,6 +1169,32 @@ inline void inverse_product(const LeafTerm* terms, int n, u32* words, u32* out, 
     inverse_trees_with(f, nv / 8, 8, 0, ir, stage);
     if (upper) return inverse_radix8_upper_out(words, nv / 8, out, count, ir, s);
     inverse_radix8_out(words, nv / 8, out, count, ir, s);
+}
+
+inline void inverse_product(const LeafTerm* terms, int n, u32* words, u32* out, std::size_t count, int lg, const u32* r,
+                            const u32* ir, unsigned output) {
+    if (n == 1 && !terms[0].b && output == 0) return inverse(terms[0].a, words, out, count, lg, ir, nullptr);
+    // Products only, 1 to 3 of them, or a product and a term alone: the asm bottoms; other terms
+    // alone, or 4 terms: the intrinsics'.
+    const int products = std::all_of(terms, terms + n, [](const LeafTerm& t) { return t.b != nullptr; }) && n <= 3 ? n : 0;
+    const int side = n == 2 && !products && (terms[0].b || terms[1].b) ? (terms[0].b ? 1 : 0) : -1;  // the term alone
+    inverse_staged(words, out, count, lg, ir, output, [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
+        const std::size_t at = std::size_t(t - words);
+        auto* v = reinterpret_cast<Vec*>(t);
+        if (products == 1) LeavesBottom::run(v, terms[0].a + at, terms[0].b + at, leaves, at / 32, r, ir);
+        else if (products == 2) SumBottom<2>::run(v, terms, at, leaves, at / 32, r, ir);
+        else if (products == 3) SumBottom<3>::run(v, terms, at, leaves, at / 32, r, ir);
+        else if (side >= 0) SideBottom::run(v, terms[1 - side].a + at, terms[1 - side].b + at, terms[side].a + at, leaves, at / 32, r, ir);
+        else TermsLeaf::inverse_terms(t, terms, n, leaves / 4, at / 32, r, ir);
+    });
+}
+
+inline void toeplitz_product(const Toeplitz& z, u32* words, u32* out, std::size_t count, int lg, const u32* r,
+                             const u32* ir, unsigned output) {
+    inverse_staged(words, out, count, lg, ir, output, [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
+        const std::size_t at = std::size_t(t - words);
+        ToeplitzBottom::run(reinterpret_cast<Vec*>(t), z, at, leaves, at / 32, r, ir);
+    });
 }
 
 // Hooked ops (Transform, issue #149): a forward from in whose runs of leaves go to a hook after
@@ -1540,6 +1598,11 @@ struct avx2 {
                                 std::size_t count, int lg, const std::uint32_t* roots, const std::uint32_t* inverse_roots,
                                 unsigned output) {
         detail::avx2::inverse_product(terms, n, f, out, count, lg, roots, inverse_roots, output);
+    }
+
+    static void toeplitz_product(const detail::Toeplitz& z, std::uint32_t* f, std::uint32_t* out, std::size_t count,
+                                 int lg, const std::uint32_t* roots, const std::uint32_t* inverse_roots, unsigned output) {
+        detail::avx2::toeplitz_product(z, f, out, count, lg, roots, inverse_roots, output);
     }
 
     // Hooked ops; width in words (Transform::forward(in, F, hook, ...)).

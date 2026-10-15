@@ -44,6 +44,8 @@
 //   t.cyclic_product(e, G, work, e, {.negate = true});   // e = -(e g mod (x^L - 1))[0, e.size())
 //   const fps::ntt::Term terms[] = {{A, B}, {C, D}};
 //   t.inverse_product(terms, work, out);       // out = coefficients of A B + C D
+//   t.toeplitz_product(A1, A2, A3, B0, B1, work, out);  // out = coefficients of A2 B0 + A1 B1;
+//                                              // A3 = A3 B0 + A2 B1: 3 leaf products, not 4
 //
 //   // Hooked ops: the caller's pass on each run of leaves in cache; pruned levels (issue #149).
 //   t.forward_hooked(in, F, hook, zero);       // F = leaf form of in; hook(F + 8 i, i, count) on runs
@@ -459,7 +461,8 @@ public:
     // Fused ops (Newton steps): sources in caller memory, products and inverses in one pass.
 
     // F = the leaf form of in (in.size() <= length() words, zero past them): the top level reads in,
-    // and skips the zero half of an in of at most length() / 2 words. F apart from in.
+    // and skips the zero half of an in of at most length() / 2 words. F apart from in, or in place:
+    // in at F, in.size() <= length() / 2 (F's upper half is not read).
     template <class Variant = SelectedForward>
     void forward(std::span<const std::uint32_t> in, std::uint32_t* F) const {
         Variant::forward_from(in.data(), checked_source(in, length()), F, lg_, roots());
@@ -506,6 +509,22 @@ public:
         if (out.empty()) return;
         Variant::inverse_product(terms.data(), int(terms.size()), work, out.data(), out.size(), lg_, roots(),
                                  inverse_roots(), output);
+    }
+
+    // out[i] = coefficient o.offset + i of the polynomial whose leaf form is A2 B0 + A1 B1, negated if
+    // o.negate, and A3 = A3 B0 + A2 B1 leaf by leaf, by three leaf products instead of four (lc-opt's
+    // Toeplitz sharing in log's blocked division): m1 = A2 (B0 + B1), m2 = (A1 - A2) B1, m3 = (A3 -
+    // A2) B0; A2 B0 + A1 B1 = m1 + m2 and A3 B0 + A2 B1 = m1 + m3. A1, A2, A3, B0, B1: leaf forms;
+    // work, o: as cyclic_product; out apart from the leaf forms. A3 then is a leaf form as any other
+    // (a term of inverse_product; avx2 runs a product and a term alone in one asm bottom). Zen 3,
+    // 2^18: 0.88 of the time of two inverse_products of 2 and 3 terms (notes/87-r2.md).
+    template <class Variant = SelectedInverse>
+    void toeplitz_product(const std::uint32_t* A1, const std::uint32_t* A2, std::uint32_t* A3, const std::uint32_t* B0,
+                          const std::uint32_t* B1, std::uint32_t* work, std::span<std::uint32_t> out, Output o = {}) const {
+        const unsigned output = checked_output(out, o);
+        if (out.empty()) return;
+        Variant::toeplitz_product(detail::Toeplitz{A1, A2, A3, B0, B1}, work, out.data(), out.size(), lg_, roots(),
+                                  inverse_roots(), output);
     }
 
     // Hooked ops (issue #149): the caller's pass over each run of leaves while it is in cache, and

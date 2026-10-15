@@ -1,10 +1,11 @@
 // Tests for issue #87 round 2 (notes/87-r2.md): the forward's lowest levels as loops (avx2:
-// forward_h4, forward_leaves_loop) and the radix-8 top level from a source in the lower half
-// (avx2: forward_radix8_lower_from, two passes; cyclic_product then ends with the radix-8 inverse
-// top). On the avx2 variant (where built) and the tuned one, against the scalar model: forward in
-// place at every length, and forward(in, F), forward_product and cyclic_product (both halves out,
-// negated or not) for sources around the blocks of the radix-8 level (L/8 words), at every length
-// to 2^kMaxTestLog. Words past each output untouched.
+// forward_h4, forward_leaves_loop), the radix-8 top level from a source in the lower half (avx2:
+// forward_radix8_lower_from, two passes; cyclic_product then ends with the radix-8 inverse top) and
+// forward(in, F) in place (in at F, at most L/2 words). On every variant this machine runs and the
+// tuned one, against the scalar model: forward in place at every length, and forward(in, F) apart
+// and in place, forward_product and cyclic_product (both halves out, negated or not) for sources
+// around the blocks of the radix-8 level (L/8 words), at every length to 2^kMaxTestLog. Words past
+// each output untouched.
 #include "backend/ntt/ntt.hpp"
 
 #include <algorithm>
@@ -28,6 +29,7 @@ constexpr int kMaxTestLog = 16;
 constexpr int kMaxTestLog = 20;
 #endif
 constexpr int kSourcesMaxLog = 14;  // past it, fewer source sizes
+constexpr int kScalarMaxLog = 14;
 constexpr u32 kSentinel = 0xdeadbeef;
 
 std::mt19937_64 rng(872);
@@ -119,6 +121,12 @@ void test_length(const std::string& name, int lg) {
         Words F(len), G(len);
         t.forward<V>(std::span<const u32>(in), F.data);
         expect(F.words() == A && F.padding_kept(), name + " forward(in, F)", n);
+        if (2 * n <= len) {  // in place: the source in F's lower half, garbage past it
+            Words H(len);
+            std::fill(std::copy(in.begin(), in.end(), H.data), H.data + len, P - 1);
+            t.forward<V>(std::span<const u32>(H.data, n), H.data);
+            expect(H.words() == A && H.padding_kept(), name + " forward(in, F) in place", n);
+        }
         t.forward_product<V>(std::span<const u32>(in), Bw.data, G.data);
         expect(G.words() == AB && G.padding_kept(), name + " forward_product", n);
         for (std::size_t offset : {std::size_t(0), len / 2}) {
@@ -137,15 +145,25 @@ void test_length(const std::string& name, int lg) {
 }
 
 template <class V>
-void test_variant(const std::string& name) {
-    for (int lg = kMinLog; lg <= kMaxTestLog; ++lg) test_length<V>(name + " lg " + std::to_string(lg), lg);
+void test_variant(const std::string& name, int max_lg = kMaxTestLog) {
+    for (int lg = kMinLog; lg <= max_lg; ++lg) test_length<V>(name + " lg " + std::to_string(lg), lg);
 }
 
 }  // namespace
 
 int main() {
+    test_variant<variant::scalar>("scalar", kScalarMaxLog);
+    fps::simd::for_each(fps::simd::All{}, []<class S> {
+        test_variant<variant::intrinsics<S>>(std::string("intrinsics ") + S::name, S::lanes == 1 ? kScalarMaxLog : kMaxTestLog);
+    });
 #ifdef __AVX2__
     test_variant<variant::avx2>("avx2");
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+    test_variant<variant::avx512>("avx512");
+#endif
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    test_variant<variant::neon>("neon");
 #endif
     test_variant<variant::tuned>("tuned");
     if (failures) {

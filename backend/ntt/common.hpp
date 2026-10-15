@@ -199,6 +199,12 @@ struct LeafTerm {
     const std::uint32_t* b;
 };
 inline constexpr int kMaxTerms = 4;
+// The leaf forms of Transform::toeplitz_product (issue #87): a3 is written.
+struct Toeplitz {
+    const std::uint32_t *a1, *a2;
+    std::uint32_t* a3;
+    const std::uint32_t *b0, *b1;
+};
 // The output of the fused ops: bits of `output`. kUpperHalf: coefficients from 2^lg / 2 on (the
 // count words written are those of the upper half); kNegated: their negatives.
 inline constexpr unsigned kUpperHalf = 1, kNegated = 2;
