@@ -20,6 +20,13 @@
 //   middle_product@multiply/<lg> what it replaces (fps::middle_product before issue #55):
 //                                multiply(f, g, out) into 2^lg words (a transform of 2^(lg + 1)),
 //                                then 2^lg / 2 + 1 words moved down.
+//   <op>/<N>                     ragged lengths (issue #155) for product, product_cut, square and
+//                                middle_product: N = 2^k + 1, 1.25 2^k, 1.5 2^k, 1.75 2^k and
+//                                2^(k + 1) - 1 for k = 8, 12, 16, 20, 22 (named k+1, k.25, k.5,
+//                                k.75, (k+1)-1), and 5e5, 1e6, 1.2e6. Items per call: N. product: f
+//                                of N / 2 + 1 words, g of the rest, out of N = n + m - 1;
+//                                product_cut: out of N / 2 + 1; square: f of (N + 1) / 2;
+//                                middle_product: f of N, g of N / 2, out of N - N / 2 + 1.
 // Tables past 2^16 are built by a thread's first call, then kept (ntt.hpp, Memory). Repeated calls
 // reuse the last output as input, and convolution cases write no factors: the timing does not
 // depend on the values.
@@ -170,8 +177,48 @@ void add_product_cases(bench::Suite& suite) {
     }
 }
 
+// The ragged lengths N and their names (issue #155).
+std::vector<std::pair<std::string, std::size_t>> ragged_lengths() {
+    std::vector<std::pair<std::string, std::size_t>> lengths;
+    for (const int k : {8, 12, 16, 20, 22}) {
+        const std::size_t len = std::size_t(1) << k;
+        const std::string lg = std::to_string(k);
+        lengths.insert(lengths.end(), {{lg + "+1", len + 1}, {lg + ".25", len + len / 4}, {lg + ".5", len + len / 2},
+                                       {lg + ".75", 2 * len - len / 4}, {std::to_string(k + 1) + "-1", 2 * len - 1}});
+    }
+    lengths.insert(lengths.end(), {{"5e5", 500000}, {"1e6", 1000000}, {"1.2e6", 1200000}});
+    return lengths;
+}
+
+void add_ragged_cases(bench::Suite& suite) {
+    for (const auto& [size, N] : ragged_lengths()) {
+        const std::size_t n = N / 2 + 1, m = N - n + 1;
+        for (const auto& [name, count] : {std::pair{"product/", N}, std::pair{"product_cut/", n}}) {
+            suite.add(name + size, [n, m, count] {
+                return [f = std::make_shared<Spans>(n, count), m] {
+                    multiply(f->fs(), f->gs().first(m), f->outs());
+                    bench::keep(f->out.begin()[0]);
+                };
+            }, N);
+        }
+        suite.add("square/" + size, [N] {
+            const std::size_t h = (N + 1) / 2;
+            return [s = std::make_shared<Spans>(h, 2 * h - 1)] {
+                square(s->fs(), s->outs());
+                bench::keep(s->out.begin()[0]);
+            };
+        }, N);
+        suite.add("middle_product/" + size, [N] {
+            return [s = std::make_shared<Spans>(N, N - N / 2 + 1), m = N / 2] {
+                middle_product(s->fs(), s->gs().first(m), s->outs());
+                bench::keep(s->out.begin()[0]);
+            };
+        }, N);
+    }
+}
+
 template <class V>
-constexpr bool only_candidate = std::is_same_v<Selected, Candidates<V>>;
+constexpr bool only_candidate =std::is_same_v<Selected, Candidates<V>>;
 
 template <class Forward, class Inverse, class Multiply>
 void add_cases(bench::Suite& suite, const std::string& suffix, int max_lg) {
@@ -229,5 +276,6 @@ int main(int argc, char** argv) {
 #endif
     add_convolution_cases(suite);
     add_product_cases(suite);
+    add_ragged_cases(suite);
     return suite.run();
 }
