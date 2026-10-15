@@ -1,11 +1,11 @@
 // Tests for issue #87 round 2 (notes/87-r2.md): the forward's lowest levels as loops (avx2:
 // forward_h4, forward_leaves_loop), the radix-8 top level from a source in the lower half (avx2:
-// forward_radix8_lower_from, two passes; cyclic_product then ends with the radix-8 inverse top) and
-// forward(in, F) in place (in at F, at most L/2 words). On every variant this machine runs and the
-// tuned one, against the scalar model: forward in place at every length, and forward(in, F) apart
-// and in place, forward_product and cyclic_product (both halves out, negated or not) for sources
-// around the blocks of the radix-8 level (L/8 words), at every length to 2^kMaxTestLog. Words past
-// each output untouched.
+// forward_radix8_lower_from, two passes; cyclic_product then ends with the radix-8 inverse top)
+// and forward(in, F) in place (in at F, at most L/2 words). On every variant this machine runs and
+// the tuned one, against the scalar model: forward in place at every length, and forward(in, F)
+// apart and in place, forward_upper(in, H), forward_product and cyclic_product (both halves out,
+// negated or not) for sources around the radix-8 level's blocks (L/8 words), at every length to
+// 2^kMaxTestLog. Words past each output untouched.
 #include "backend/ntt/ntt.hpp"
 
 #include <algorithm>
@@ -121,6 +121,12 @@ void test_length(const std::string& name, int lg) {
         Words F(len), G(len);
         t.forward<V>(std::span<const u32>(in), F.data);
         expect(F.words() == A && F.padding_kept(), name + " forward(in, F)", n);
+        if (2 * n <= len && lg > kMinLog) {  // forward_upper(in, H): the upper half of A
+            Words H(len / 2);
+            t.forward_upper<V>(std::span<const u32>(in), H.data);
+            expect(std::equal(A.begin() + std::ptrdiff_t(len / 2), A.end(), H.data) && H.padding_kept(),
+                   name + " forward_upper(in, H)", n);
+        }
         if (2 * n <= len) {  // in place: the source in F's lower half, garbage past it
             Words H(len);
             std::fill(std::copy(in.begin(), in.end(), H.data), H.data + len, P - 1);
