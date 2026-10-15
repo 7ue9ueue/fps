@@ -2,7 +2,7 @@
 
 Composition of power series modulo P = 998244353: `compose(f, g, out)`, `power_projection(g,
 out)`, `compositional_inverse(f, out)` (API: `composition.hpp`). Tests: `test.cpp`; bench:
-`bench.cpp`. Attempts: `notes/` (one file per issue round). From lc-opt's
+`bench.cpp`; round-2 paths: `test_doubling.cpp`. Attempts: `notes/` (one file per issue round). From lc-opt's
 `lib/poly/{composition,projection,compositional_inverse}.hpp` (its `lib/poly/notes.md`:
 Composition, Power projection, Compositional inverse), rewritten on `ntt::Transform`'s public
 leaf-form ops and `backend/simd`, so every target runs it. One variant per op: no `select.hpp`.
@@ -32,11 +32,22 @@ leaf-form ops and `backend/simd`, so every target runs it. One variant per op: n
     the adds folded into umlal (was a Montgomery product per term); Scalar: u64.
   - CRT: (A + B) / 2 + u^4 (A - B) / (2 s); the 1/2 and 1/s are in the constants (Montgomery
     products with 2^32 / 2 and 2^32 / (2 s), a table per pair), the sums' 2^-32 stays: the hooked
-    inverse (`inverse_hooked`) takes leaves times 2^-32.
+    inverse (`inverse_hooked`) takes leaves times 2^-32. A pass whose output the next level
+    doubles scales the constants by c = 2^32 8 / B (`Crt`, `scaled_crt`: a table of m/4 words per
+    level), so its leaves come out times 8 / B, which `truncate_blocks` undoes (issue #149 r2).
 - Pruned transforms (issue #149, `ntt::Transform`'s column bits): a row at stride 2L holds x < L,
   so bit L of the index is zero in Q_s's forward at 4m, and P^'s forward at 2m has bit L/2 zero;
   V's inverse at 2m uses x < L/2, R's at 4m x < L. The levels above the bit run on half the
-  columns (the top level included).
+  columns (the top level included), the group holding it on half its inputs or outputs (r2). From
+  32 words on the forwards do not use the masked words: no zero fills (`zero_columns` below 32).
+- Doubling (lc-opt's `Doubling`; issue #149 r2), generic levels 3 .. T - 4 from m = 512 on: level
+  s's leaf form at 4m from the previous level's V (W) at 2m, whose rows of 2L words are the blocks
+  of `ntt::Transform::truncate_blocks` (the lower half: Q_s mod (y^Y - 1) is V cut to x < L, block
+  by block, without the y levels), `join_blocks` (V's rows mod y^Y - 1) and
+  `forward_upper_hooked` (the upper half, mod y^Y + 1: the same rows, row 0 = 2 - row 0 for Q,
+  whose row Y wraps onto the true row 0 = 1 with the opposite sign there). The hook of level s - 1
+  writes V (and W) into the lower half of level s's array: compose's levels[s]; power projection's
+  FQ and FP in place, below the leaves read (ntt's hooked forward runs in increasing order).
 - One-dimensional levels (lc-opt's; issue #149):
   - Level 0: Q_1 = 1 - y (g(x) + g(-x)) + y^2 g(x) g(-x): the Graeffe of g at 2m (in the forward's
     hook) and one inverse at m. compose: h = p1(x^2) - p0(x^2) g(-x), the forward of p0 at m and
@@ -59,8 +70,12 @@ leaf-form ops and `backend/simd`, so every target runs it. One variant per op: n
   64-byte aligned arrays 80 words apart (`Arena`, which throws std::logic_error past its size);
   compose stores the leaf forms of Q_0 (at 2m), q1, q2 (at m) and Q_2 .. Q_(T-4) (4m words each).
 - Few coefficients: Horner (compose) and the powers of g (power projection) up to 16.
-- compositional_inverse: power projection, then Lagrange with `series::log` and `series::exp`
-  (lc-opt and the frontend: their `power`).
+- compositional_inverse: power projection, h by one batch division (`series::detail::
+  divide_by_index`) reversed, then g / x = (h / h[0])^(-1/N) / f[1] by `series::pow` (lc-opt's
+  `power`; issue #149 r2; was `series::log` then `series::exp`).
+- Coefficient loops at stride 2 (q1 = -2 g_even, level 1's rows, the up pass's adds into even
+  words): `Stride2`'s permutes and blends on simd::Native (r2: the scalar loops ran 4 ns a word,
+  0.25 ms of level 0 at 2^17).
 
 ## Measurements
 
@@ -133,13 +148,31 @@ n = 33, 1000, 1024, 4097, 2^17), n = 2^(lg-1), median of 3 rounds, us:
 compositional_inverse's tail (log and exp after the projection) is 6.4 ms of 36.8 at 2^17,
 lc-opt's (its `power`) 4.6 of 30.4: issue #107.
 
+### Issue #149, round 2
+
+Same run against lc-opt (`lc-bench`, as above; `issue149r2/compare.cpp`, outputs equal at n =
+33, 1000, 1024, 4097, 2^17, 2^20), n = 2^(lg-1), median of 3 rounds, fps / lc-opt (round 1):
+
+| op | lg 11 | 14 | 16 | 18 | 21 |
+|---|---:|---:|---:|---:|---:|
+| `compose` | 0.989 (1.02) | 0.969 (1.04) | 0.983 (1.06) | 0.997 (1.09) | 0.982 |
+| `power_projection` | 1.031 (1.11) | 1.001 (1.13) | 1.012 | 1.038 (1.17) | 1.063 |
+| `compositional_inverse` | 0.988 (1.12) | 0.986 (1.14) | 1.006 | 1.033 (1.21) | 1.058 |
+
+lg 6 and 8: 0.23-0.53. At 2^17, us: compose 29273 / 29365, power projection 26956 / 25958,
+compositional_inverse 31556 / 30539; at 2^20 316885 / 322750, 301666 / 283657, 344782 / 325849.
+`bench.cpp` against main (7 rounds), geomean new/base: Zen 3 0.910, Emerald Rapids 0.923, Zen 5
+0.921, Neoverse V2 0.939; every case below 1 but Emerald Rapids' n = 32 (1.035) and compose/8
+(1.003). Steps and per-phase numbers: notes/149-r2.md.
+
 ## Next
 
-- Doubling (lc-opt's `Doubling`, its power projection 23.2 -> 21.3 ms on the generic levels): the
-  next level's transform of 4m from V's (and W's) leaves at 2m: the lower half by the levels
-  within blocks of L words only (inverse, x < L/2 kept, forward; the y levels commute with the
-  truncation and cancel), the upper half by `forward_upper` of the rows mod y^2Y - 1 with row 0
-  turned into 2 - row 0. Saves the y levels and the top level of the lower half per array and
-  level. Needs ntt ops on blocks of a leaf form (levels below a column bit).
+- Power projection's hook with doubling costs 6.5% more than lc-opt's `ProjectionBottom` (its Q
+  doubling 13.46 against 12.87 ms at 2^17, P alone 6.80 against 6.62): per tile after the bottom
+  level, where lc-opt runs it per 16 vectors right after theirs.
+- The plain hooked forward at 4m (level 2) is 5-12% slower than lc-opt's `forward_pruned`: lc-opt's
+  h = 4 loop kernels (#210).
+- The scaled CRT table per doubled level: 66 us at 2^20 (1 MB written); the factor could go into
+  the hooks' A and B instead (8 products per leaf pair more), or a table per level kept.
 - Memory: compose keeps T - 3 leaf forms of 4m words (1.6 GiB at n = 2^22 with the rest);
   recomputing them from the coefficients (m + L words a level) costs one forward of 4m per level.
