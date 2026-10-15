@@ -74,6 +74,16 @@
 // the last level writes it to out. out may overlap f or g. Throws std::length_error, before
 // writing out, past 2^kMaxLog.
 //
+// Ragged lengths (issue #155, ragged.hpp): a product of N = n + m - 1 words with L < N <= 2L (a
+// middle product: of the m - 1 + out.size() words of f it reads) runs on about N words of
+// transforms, not 2L: c = A + (x^L - 1) q, A = c mod (x^L - 1) a cyclic product of length L, and q,
+// the top N - L words of c, from a cyclic product of length s mod (x^s - 3^s) (twisted to y^s - 1)
+// and a product of the top words of f and g; middle products run the transpose. The plan per
+// length and r / L is a tuned choice ("ntt.ragged"); the plain product at 2L stays one of its
+// options, and powers of two run it. Against the plain one, same binary: Zen 3 at N = 2^20 + 1
+// 0.48x the time, 1.25 2^20 0.65x, 1.5 2^20 0.79x (notes/155-r1.md). Convolution::length and
+// Transform stay powers of two: callers size memory and Newton steps by them.
+//
 // Memory of a product: each thread keeps the largest region a product of it used and hands it to
 // the next one. Constructing, multiplying and destroying a 32 x 32 Convolution takes 110 ns on Zen
 // 3, against 106 ns for multiply() alone and 56 us when each Convolution mapped fresh memory

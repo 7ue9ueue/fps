@@ -181,7 +181,9 @@ inline std::optional<Choices> parse(std::string_view s) {
 // The ragged plans ("ntt.ragged", ragged.hpp): for each main length 2^lg, kMinLog <= lg <=
 // budget.max_lg (and lg < kMaxLog), and each bucket b of r / L, every kind's plan at N = L + (2b - 1)
 // L / 32 (the bucket's middle), a product of factors of N / 2 + 1 and N - N / 2 words by multiply's
-// path (detail::product). The fastest kind wins unless start's is within the margin. Rows run from
+// path (detail::product). The fastest kind wins unless start's is within the margin; a row keeps the
+// least kind with the plan that won (a kind falls back to a lesser one where it is no split, and the
+// middle may fall back where other words of the bucket do not). Rows run from
 // short to long and each is set before the next, so a top product runs the measured rows. Past
 // max_lg each bucket keeps start's kind, unless its choice at max_lg changed: then the longer rows
 // take the new one.
@@ -218,9 +220,11 @@ inline detail::ragged::Kinds measure_ragged(const detail::ragged::Kinds& start, 
                 asm volatile("" : : "r"(out.data()) : "memory");
             });
             const int best = int(std::ranges::min_element(ns) - ns.begin());
+            // ids holds the least kind of each plan: stored rather than start's own kind, which may
+            // fall back to that plan at the bucket's middle and not elsewhere in it.
             const auto now = std::ranges::find_if(ids, [&](int k) { return detail::ragged::plan(N, k) == detail::ragged::plan(N, start[i]); });
             const bool keep = now != ids.end() && ns[now - ids.begin()] <= ns[best] * (1 + budget.margin);
-            kinds[i] = std::uint8_t(keep ? start[i] : ids[best]);
+            kinds[i] = std::uint8_t(keep ? *now : ids[best]);
             if (log) log->push_back({lg, b, ids, ns});
         }
 #ifndef FPS_NO_TUNER

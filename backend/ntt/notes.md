@@ -8,7 +8,8 @@ Number-theoretic transforms and products modulo P = 998244353. API: `ntt.hpp` (`
 `select.hpp`: the variant per op and length, a tuned choice ("ntt.variant", issue #78): per target
 a list of candidates and a table of one per op (forward, inverse, multiply, product) and lg, with
 compiled defaults in `tuned.hpp` (`tools/tune.py ntt`, `tune.cpp`); `tune.hpp` measures it at run
-time. `memory.hpp`: `Convolution`'s memory, kept per thread. Tests: `test.cpp`,
+time. `ragged.hpp`: products of ragged length (issue #155), their plan a tuned choice
+("ntt.ragged"). `memory.hpp`: `Convolution`'s memory, kept per thread. Tests: `test.cpp`,
 `test_no_tuner.cpp`; benches: `bench.cpp`.
 Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_product_kernels.hpp`
 (`gen_avx2_product_kernels.py`), `avx512_kernels.hpp` (`gen_avx512_kernels.py`).
@@ -82,6 +83,13 @@ Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_produc
   first level reads b in place; scalar skips its copy then). Costs a dense first level for b and
   the staging pass (one write of 2^lg words): middle_product/22 (f of 2^22 words, transform 2^22)
   took 1.03 of product/22 (factors of 2^21, sparse) on Zen 3.
+- Ragged lengths (issue #155, `ragged.hpp`; notes/155-r1.md): `multiply`, `square` and
+  `middle_product` of N words, L < N <= 2L, run a plan: the plain product at 2L, or c = A + (x^L -
+  1) q with A the cyclic product of length L (the variants' `multiply(const Product&)` with n + m
+  - 1 > L, unchanged) and q, the top N - L words, from a twisted piece (a cyclic product of length
+  s of f(3y), g(3y) mod (y^s - 1), so mod x^s - 3^s) and a product of the top words of f and g,
+  planned again. Middle products run the transpose. The plan per main length and sixteenth of r /
+  L is a tuned choice ("ntt.ragged", `tune.hpp`); `Convolution` and `Transform` stay powers of two.
 - `Transform`: tables built once; forward and inverse in place on caller arrays (32-byte aligned,
   16 words of padding: the AVX2 forward kernels read 4 bytes past their last vector).
 - `Transform`'s leaf-form ops (issue #49), for `fps::Values` and the product tree. Each variant

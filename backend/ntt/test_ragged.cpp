@@ -235,7 +235,8 @@ void overlap(const char* name) {
 
 // plan(): every kind for every N to 2^14 and around each power of two is a valid split or the
 // plain plan: s a power of two in [max(2^kMinLog, L / kMaxChunks), L / 2], t <= s or s = 0, s + 2t
-// <= L, L + s + t >= N (t = 0: s >= r); entry() inside the table.
+// <= L, L + s + t >= N (t = 0: s >= r); entry() inside the table; the compiled kinds the least of
+// their plans.
 void test_plans() {
     std::vector<std::size_t> lengths;
     for (std::size_t N = 1; N <= 16384; ++N) lengths.push_back(N);
@@ -260,6 +261,15 @@ void test_plans() {
             expect(e >= 0 && e < detail::ragged::kRows * detail::ragged::kBuckets, "plan: entry", N);
         }
     }
+    // The compiled table holds the least kind of each plan at the buckets' middles, as measured.
+    for (int i = 0; i < detail::ragged::kRows * detail::ragged::kBuckets; ++i) {
+        const int lg = kMinLog + i / detail::ragged::kBuckets, b = i % detail::ragged::kBuckets + 1;
+        const std::size_t L = std::size_t(1) << lg, N = L + std::max<std::size_t>(1, (2 * b - 1) * L / 32);
+        const int kind = detail::ragged::kKindDefaults[i];
+        bool least = true;
+        for (int k = 0; k < kind; ++k) least &= !(detail::ragged::plan(N, k) == detail::ragged::plan(N, kind));
+        expect(least, "plan: compiled kind not the least of its plan", i);
+    }
 }
 
 // measure_ragged at a small budget: valid kinds, the rows past max_lg start's or the new kind at
@@ -282,11 +292,12 @@ void test_tuning() {
     for (const RaggedTimes& t : log) expect(t.kinds.size() == t.ns.size() && t.ns[0] > 0, "ragged tuning: log");
     expect(!log.empty(), "ragged tuning: log", log.size());
     const Kinds kept = measure_ragged(mixed, {8, 1, 2e3, 1e9});
-    for (int i = 0; i < 3 * detail::ragged::kBuckets; ++i) {  // rows 2^6 to 2^8: start's, unless one plan only
+    for (int i = 0; i < 3 * detail::ragged::kBuckets; ++i) {  // rows 2^6 to 2^8: start's plan
         const int lg = kMinLog + i / detail::ragged::kBuckets, b = i % detail::ragged::kBuckets + 1;
         const std::size_t L = std::size_t(1) << lg, N = L + std::max<std::size_t>(1, (2 * b - 1) * L / 32);
-        std::array<detail::ragged::Plan, 4> plans;
-        expect(kept[i] == (detail::ragged::options(N, plans) > 1 ? mixed[i] : 0), "ragged tuning: margin keeps start", i);
+        int least = 0;  // the least kind with mixed[i]'s plan at N
+        while (!(detail::ragged::plan(N, least) == detail::ragged::plan(N, mixed[i]))) ++least;
+        expect(kept[i] == least, "ragged tuning: margin keeps start", i);
     }
     const std::string path = "fps-ntt-ragged-wisdom-" + std::to_string(std::random_device{}());
     detail::ragged::kinds.set(mixed);

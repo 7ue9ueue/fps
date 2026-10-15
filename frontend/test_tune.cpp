@@ -175,15 +175,19 @@ int check_results(const std::vector<Case>& products, const Vec& fact, const std:
     return wrong;
 }
 
+// The registered choices: one line each in the wisdom, after the format, CPU and target lines.
+constexpr const char* kChoices[] = {"ntt.variant ", "ntt.ragged ", "small.variant ", "small.ntt ", "factorials.variant "};
+constexpr std::size_t kLines = 3 + std::size(kChoices);
+
 // Every registered choice is in the wisdom, after the format, CPU and target lines.
 void test_format(const std::string& wisdom) {
     const std::vector<std::string> l = lines(wisdom);
-    CHECK(l.size() == 7, std::to_string(l.size()) + " lines");
+    CHECK(l.size() == kLines, std::to_string(l.size()) + " lines");
     if (l.size() < 3) return;
     CHECK(l[0] == "fps wisdom 1", l[0]);
     CHECK(l[1] == "cpu " + fps::tune::cpu_name(), l[1]);
     CHECK(l[2] == "target " + std::string(fps::tune::target_name()), l[2]);
-    for (const std::string name : {"ntt.variant ", "small.variant ", "small.ntt ", "factorials.variant "})
+    for (const std::string name : kChoices)
         CHECK(std::ranges::count_if(l, [&](const std::string& line) { return line.starts_with(name); }) == 1, name);
 }
 
@@ -247,6 +251,11 @@ void test_forced(const std::string& wisdom, const std::vector<Case>& products, c
         forced.push_back(
             {"factorials.variant " + std::to_string(v), with(wisdom, "factorials.variant", fps::factorials::text(choices))});
     }
+    for (int k = 0; k < fps::ntt::detail::ragged::kKinds; ++k) {  // every ragged plan kind everywhere
+        fps::ntt::detail::ragged::Kinds kinds;
+        kinds.fill(std::uint8_t(k));
+        forced.push_back({"ntt.ragged " + std::to_string(k), with(wisdom, "ntt.ragged", fps::tune::text(kinds))});
+    }
     for (const auto& [what, text] : forced) {
         CHECK(load(text), what);
         CHECK(active() == text, what + ": saved wisdom differs from the file loaded");
@@ -272,9 +281,10 @@ void test_tune(const std::string& wisdom, const std::vector<Case>& products, con
     const std::string tuned = active();
     const std::vector<std::string> l = lines(tuned), w = lines(wisdom);
     CHECK(l.size() == w.size() && std::equal(w.begin(), w.begin() + 3, l.begin()), "tuned wisdom header");
-    std::printf("choices changed by tune_all(): %d of 3\n",
+    std::printf("choices changed by tune_all(): %d of %zu\n",
                 int(std::ranges::count(std::views::iota(std::size_t(3), std::min(l.size(), w.size())), false,
-                                       [&](std::size_t i) { return l[i] == w[i]; })));
+                                       [&](std::size_t i) { return l[i] == w[i]; })),
+                std::size(kChoices));
     fps::tune_all();  // once per process: no second measurement
     CHECK(active() == tuned, "a second tune_all() changed the choices");
 
@@ -295,7 +305,7 @@ int main() {
     check_results(products, fact, "compiled defaults");
     const std::string wisdom = active();
     test_format(wisdom);
-    if (lines(wisdom).size() == 6) {
+    if (lines(wisdom).size() == kLines) {
         CHECK(load(wisdom), "its own wisdom");
         CHECK(active() == wisdom);
         test_refused(wisdom);

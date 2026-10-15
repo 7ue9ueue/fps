@@ -1,6 +1,12 @@
 // Products of ragged length (issue #155): N = n + m - 1 words with L < N <= 2L, L = 2^lg, at about
-// the cost of N words, not of the transform of 2L. ntt.hpp runs them (multiply, square); this
-// header has the plan and the passes around the power-of-two products.
+// the cost of N words, not of the transform of 2L. ntt.hpp runs them (multiply, square, and
+// middle_product as the transpose, below); this header has the plans and the passes around the
+// power-of-two products.
+//
+//   plan(N, kind), options(N, plans)   the plan of a kind; the distinct plans of N
+//   choose(N)                          the tuned plan: kinds.get()[entry(N)] ("ntt.ragged")
+//   twist_fold, fold, combine          the passes of a product
+//   split_transposed, stage_turned, unfold_add   those of a middle product
 //
 // c = f g, N = L + r, 0 < r <= L. With A = c mod (x^L - 1) (a cyclic product of length L) and q =
 // c div x^L (the top r words of c, deg q < r): c = A + (x^L - 1) q, so c[k] = A[k] - q[k] for k < r,
