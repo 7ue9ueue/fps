@@ -281,6 +281,11 @@ template <int K, class Run>
     run_blocks<K>(int(count >> std::countr_zero(block)), run, from, out, 0, block);
 }
 
+// Transform::forward_hooked does not use the words of its source with (i & zero) != 0 when
+// kUnreadWidth <= zero < length / 4: the pruned top level writes zeros for them (every step of a
+// first level is at most kUnreadWidth words). Issue #149 round 2.
+inline constexpr std::size_t kUnreadWidth = 32;
+
 // Pruned first and last levels (Transform's hooked ops, issue #149): a run for first_level or
 // last_level that runs only the columns c with (c & width) == 0 (width: words, a power of two,
 // at least the step and below the block). A first level writes zeros to the K blocks of the other

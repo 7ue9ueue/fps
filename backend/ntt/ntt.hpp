@@ -516,8 +516,10 @@ public:
     // bit) == 0 only. Not a power of two: std::invalid_argument.
 
     // F = the leaf form of in (as forward(in, F)); hook(F + 8 first, first, count) after the bottom
-    // level of each run, which may read and change those leaves (canonical). in[i] must be 0 where
-    // i & zero is not 0.
+    // level of each run, which may read and change those leaves (canonical); the runs come in
+    // increasing order of first, so a hook may write F's words below 8 first. in[i] counts as 0 where
+    // i & zero is not 0: it must be 0 there, except that with 32 <= zero < length() / 4 those words
+    // are not used (detail::kUnreadWidth) and may hold anything.
     template <class Variant = SelectedForward, class Hook>
     void forward_hooked(std::span<const std::uint32_t> in, std::uint32_t* F, Hook hook, std::size_t zero = 0) const {
         Variant::forward_hooked(in.data(), checked_source(in, length()), F, lg_, roots(), checked_bit(zero), hook);
@@ -536,7 +538,48 @@ public:
         Variant::inverse_hooked(hook, work, out.data(), out.size(), lg_, roots(), inverse_roots(), output, width);
     }
 
+    // Doubling for Kronecker layouts (issue #149 round 2, lc-opt's Doubling): block j of `block`
+    // words of a leaf form of f (block a power of two, 32 <= block <= length() / 8) is the leaf
+    // form of f mod (x^block - r(j)^2) by the levels within the block, the same in every length (the
+    // lower half of a leaf form of length 2L is the one of length L). A layout of rows of `block`
+    // words, x below block / 2, doubles: its lower half by truncate_blocks, its upper half by
+    // join_blocks and forward_upper_hooked, without the levels above the blocks of the lower half.
+
+    // For each block j of the leaf form F: c_j = (f mod (x^block - r(j)^2)) mod x^(block / 2), times
+    // block / 8; copy[j block + i] = c_j's coefficient i for i < block / 2 (canonical; copy's other
+    // words unspecified) and F's block becomes c_j's leaf form. hook(F + 8 first, first, count) on
+    // runs of the new leaves, as forward_hooked's. copy: length() words, apart from F.
+    template <class Variant = SelectedForward, class Hook>
+    void truncate_blocks(std::uint32_t* F, std::size_t block, std::uint32_t* copy, Hook hook) const {
+        Variant::truncate_blocks(F, checked_block(block), copy, lg_, roots(), inverse_roots(), hook);
+    }
+
+    // copy as truncate_blocks writes it (block j's first block / 2 words: a polynomial c_j) -> in
+    // place, the polynomial c of degree below length() with c mod (x^block - r(j)^2) = c_j for every
+    // j and coefficient i zero where (i mod block) >= block / 2, times scale: copy[i] for (i mod
+    // block) < block / 2, canonical; the other words unspecified.
+    template <class Variant = SelectedInverse>
+    void join_blocks(std::uint32_t* copy, std::size_t block, std::uint32_t scale) const {
+        Variant::join_blocks(copy, checked_block(block), scale, lg_, inverse_roots());
+    }
+
+    // forward_upper(H) with a hook and a column bit: H (length() / 2 words) = p mod (x^(L/2) + 1) ->
+    // the upper half of p's leaf form; hook(H + 8 i, length() / 16 + i, count) on runs of its
+    // leaves (their indices in the whole leaf form). H[i] counts as 0 where i & zero is not 0, and is
+    // not used there when 16 <= zero < length() / 8 (the first level skips those words, or zeroes
+    // them where a whole group would read them). lg > kMinLog.
+    template <class Variant = SelectedForward, class Hook>
+    void forward_upper_hooked(std::uint32_t* H, Hook hook, std::size_t zero = 0) const {
+        if (lg_ == kMinLog) throw std::length_error("fps::ntt::Transform::forward_upper_hooked: needs lg > kMinLog");
+        Variant::forward_upper_hooked(H, lg_ - 1, roots(), checked_bit(zero), hook);
+    }
+
 private:
+    std::size_t checked_block(std::size_t block) const {
+        if (block < 32 || block > length() / 8 || (block & (block - 1)))
+            throw std::invalid_argument("fps::ntt::Transform: block not a power of two in [32, length() / 8]");
+        return block;
+    }
     static std::size_t checked_bit(std::size_t bit) {
         if (bit & (bit - 1)) throw std::invalid_argument("fps::ntt::Transform: column bit not a power of two");
         return bit;

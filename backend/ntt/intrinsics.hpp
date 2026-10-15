@@ -409,12 +409,25 @@ struct Butterflies : Arith<S> {
     }
 
     // Pruned groups (Transform's hooked ops, issue #149): group k on the columns j < q with (j &
-    // width) == 0, chunks of width words. width a multiple of 2 S::lanes, q of 2 width.
+    // width) == 0, chunks of width words. width a multiple of S::lanes, q of 2 width. Chunks of one
+    // vector (issue #149 round 2) one column at a time.
     template <int kIn = 4>
     static void forward_group_columns(u32* f, std::size_t q, std::size_t width, std::size_t k, const u32* r) {
+        if (width < 2 * S::lanes) {
+            const F x = A::entry(r, k), y = A::entry(r, 2 * k), z = A::entry(r, 2 * k + 1);
+            for (std::size_t c = 0; c < q; c += 2 * width)
+                each(f + c, f + c, q, width, [&] [[gnu::always_inline]] (Column& v) { forward4<kIn>(v, x, y, z); });
+            return;
+        }
         for (std::size_t c = 0; c < q; c += 2 * width) forward_group_part<kIn, 4>(f + c, f + c, q, width, k, r);
     }
     static void inverse_group_columns(u32* f, std::size_t q, std::size_t width, std::size_t k, const u32* ir) {
+        if (width < 2 * S::lanes) {
+            const F x = A::entry(ir, k), y = A::entry(ir, 2 * k), z = A::entry(ir, 2 * k + 1);
+            for (std::size_t c = 0; c < q; c += 2 * width)
+                each(f + c, f + c, q, width, [&] [[gnu::always_inline]] (Column& v) { inverse4(v, x, y, z); });
+            return;
+        }
         if (k == 0) {
             const F z = A::entry(ir, 1);
             for (std::size_t c = 0; c < q; c += 2 * width)
@@ -427,6 +440,30 @@ struct Butterflies : Arith<S> {
         for (std::size_t c = 0; c < q; c += 2 * width)
             each2<kPipelined.groups>(f + c, f + c, q, width, [&] [[gnu::always_inline]] (Column& v) { inverse_first(v, y, z); },
                                      [&] [[gnu::always_inline]] (Column& v) { inverse_second(v, x); });
+    }
+
+    // The group whose quarter index holds the bit (issue #149 round 2, as avx2.hpp's): quarters 2
+    // and 3 (high) or 1 and 3 zero in the forward, not read; the inverse's outputs at quarters 0 and
+    // 1 (high) or 0 and 2 only. In and out as forward_group and inverse_group.
+    template <int kIn = 4>
+    static void forward_group_half(u32* f, std::size_t q, std::size_t k, const u32* r, bool high) {
+        if (high) return forward_group_part<kIn, 2>(f, f, q, q, k, r);
+        const F x = A::entry(r, k);
+        for (std::size_t j = 0; j < q; j += S::lanes) {  // A, A, C, C for A, C = f0 +- x f2
+            const V a = below2(S::load(f + j), kIn), c = mul(S::load(f + j + 2 * q), x), s = add(a, c), d = diff(a, c);
+            S::store(f + j, s), S::store(f + j + q, s), S::store(f + j + 2 * q, d), S::store(f + j + 3 * q, d);
+        }
+    }
+    static void inverse_group_half(u32* f, std::size_t q, std::size_t k, const u32* ir, bool high) {
+        const F x = A::entry(ir, k);
+        if (high) {
+            const F y = A::entry(ir, 2 * k), z = A::entry(ir, 2 * k + 1);
+            return each<4, 2>(f, f, q, q, [&] [[gnu::always_inline]] (Column& v) { inverse_first(v, y, z), inverse_second(v, x); });
+        }
+        for (std::size_t j = 0; j < q; j += S::lanes) {
+            const V ab = low(add(S::load(f + j), S::load(f + j + q))), cd = low(add(S::load(f + j + 2 * q), S::load(f + j + 3 * q)));
+            S::store(f + j, low(add(ab, cd))), S::store(f + j + 2 * q, mul(diff(ab, cd), x));
+        }
     }
 
     // Groups k, k + 1, ..., k + count - 1 of a level, group k + i at f + 4 q i, in one call: a call
@@ -2176,11 +2213,16 @@ struct Ntt : Butterflies<S> {
     static constexpr std::size_t kPruneForward = 32, kPruneInverse = 8;  // leaves per quarter
 
     static bool prunes(std::size_t q, std::size_t width, std::size_t least) {
-        return width >= 2 * S::lanes && q >= 2 * width && q >= 8 * least;
+        return width >= S::lanes && q >= 2 * width && q >= 8 * least;
+    }
+    // The group whose quarter index holds the bit: half its inputs (forward) or outputs (inverse).
+    static bool halves(std::size_t q, std::size_t width, std::size_t least) {
+        return (q == width || 2 * q == width) && q >= 8 * least;
     }
     template <int kIn>
     static void first_group_pruned(const u32* from, u32* f, std::size_t q, std::size_t k, const u32* r, std::size_t width) {
         if (from == f && prunes(q, width, kPruneForward)) return B::template forward_group_columns<kIn>(f, q, width, k, r);
+        if (from == f && halves(q, width, kPruneForward)) return B::template forward_group_half<kIn>(f, q, k, r, 2 * q == width);
         first_group<kIn>(from, f, q, k, r);
     }
     template <int kIn>
@@ -2189,6 +2231,7 @@ struct Ntt : Butterflies<S> {
     }
     static void inverse_group_pruned(u32* f, std::size_t q, std::size_t k, const u32* ir, std::size_t width) {
         if (prunes(q, width, kPruneInverse)) return B::inverse_group_columns(f, q, width, k, ir);
+        if (halves(q, width, kPruneInverse)) return B::inverse_group_half(f, q, k, ir, 2 * q == width);
         inverse_group(f, q, k, ir);
     }
 
@@ -2228,7 +2271,8 @@ struct Ntt : Butterflies<S> {
 
     // hook(leaves, first, count) on each subtree's leaves of the leaf form of in after its bottom level.
     // The top level pruned too (detail::PrunedLevel) when it reads in whole: not a source of at most
-    // half the length under a radix-2 level, which the subtrees' first groups read.
+    // half the length under a radix-2 level, which the subtrees' first groups read, unless width is
+    // at least kUnreadWidth (Transform::forward_hooked: the skipped words of in are not used then).
     template <class Hook>
     static void forward_hooked(const u32* in, std::size_t n, u32* f, int lg, const u32* r, std::size_t width, Hook hook) {
         if (lg < kHookWholeLog) {
@@ -2249,21 +2293,32 @@ struct Ntt : Butterflies<S> {
             for (std::size_t t = 0; t < 4; ++t) sub(std::integral_constant<int, 4>{}, f + t * q, f + t * q, nv / 4, t);
             return;
         }
+        // Runs in increasing order (Transform::forward_hooked): the lower subtree first, as in is
+        // apart from f (from_top runs the upper one first, for a source in place).
         const std::size_t half = len / 2;
-        if (n <= half && nv / 2 >= 16) return from_top(in, n, f, lg, r, sub);
+        if (n <= half && nv / 2 >= 16 && width < kUnreadWidth) {
+            sub(std::integral_constant<int, 2>{}, Source{in, n}, f, nv / 2, 0);
+            sub(std::integral_constant<int, 2>{}, Source{in, n}, f + half, nv / 2, 1);
+            return;
+        }
         first_level_pruned<2>(in, n, f, half, S::lanes, width,
                               [&] [[gnu::always_inline]] (auto blocks, const u32* s, u32* d, std::size_t words) {
                                   forward_radix2_part<decltype(blocks)::value>(s, d, half, words);
                               });
-        sub(std::integral_constant<int, 2>{}, f + half, f + half, nv / 2, 1);
         sub(std::integral_constant<int, 2>{}, f, f, nv / 2, 0);
+        sub(std::integral_constant<int, 2>{}, f + half, f + half, nv / 2, 1);
     }
 
     // product_top_out (no scale folded) with the columns (j & width) != 0 unwritten.
     static void product_top_out_pruned(u32* f, u32* out, std::size_t count, int lg, const u32* ir, unsigned output,
                                        std::size_t width) {
+        const u32 scale = product_scale(lg);
+        top_out_pruned(f, out, count, lg, ir, output & kNegated ? kP - scale : scale, output, width);
+    }
+    // The same times s (not 0).
+    static void top_out_pruned(u32* f, u32* out, std::size_t count, int lg, const u32* ir, u32 s, unsigned output,
+                               std::size_t width) {
         const std::size_t len = std::size_t(1) << lg, q = len / 4, half = len / 2;
-        const u32 scale = product_scale(lg), s = output & kNegated ? kP - scale : scale;
         if (!has_radix2(lg)) {
             if (output & kUpperHalf) {
                 return last_level_pruned<2>(f, q, out, count, kStep, width,
@@ -2313,6 +2368,146 @@ struct Ntt : Butterflies<S> {
             inverse_pruned_tree(f + len / 2, nv / 2, 1, ir, width, stage);
         }
         product_top_out_pruned(f, out, count, lg, ir, output, width);
+    }
+
+    // ---- Doubling (Transform::truncate_blocks, join_blocks, forward_upper_hooked; issue #149 round 2)
+    // A block of nb = block / 8 leaves (nb >= 4) is group j's subtree if nb is a power of 4
+    // (aligned), else the subtrees of groups 2j and 2j + 1 (nb / 2 leaves each) under the second
+    // stage of group j / 2 (a radix-2 level with r(j)). Blocks go in runs of a tile (kTile leaves).
+    static bool aligned_block(std::size_t nb) { return std::countr_zero(nb) % 2 == 0; }
+
+    // Subtrees [first, first + count) of nv leaves each (a power of 4) at f: forward (in < 4P) with
+    // tile on runs of leaves, inverse (in, out < 2P, unscaled); level by level up to kTile leaves.
+    template <class Tile>
+    static void forward_runs(u32* f, std::size_t nv, std::size_t count, std::size_t first, const u32* r, Tile tile) {
+        if (nv > kTile) {
+            for (std::size_t i = 0; i < count; ++i) forward_tiles<4>(f + 8 * nv * i, nv, first + i, r, tile);
+            return;
+        }
+        for (std::size_t h = nv / 4; h >= 4; h /= 4) B::forward_groups(f, 8 * h, first * (nv / (4 * h)), count * (nv / (4 * h)), r);
+        bottom_forward(f, count * nv / 4, first * nv / 4, r);
+        tile(f, count * nv);
+    }
+    static void inverse_runs(u32* f, std::size_t nv, std::size_t count, std::size_t first, const u32* ir) {
+        if (nv > kTile) {
+            for (std::size_t i = 0; i < count; ++i) inverse_tree(f + 8 * nv * i, nv, first + i, ir);
+            return;
+        }
+        bottom_inverse(f, count * nv / 4, first * nv / 4, ir);
+        for (std::size_t h = 4; h < nv; h *= 4) B::inverse_groups(f, 8 * h, first * (nv / (4 * h)), count * (nv / (4 * h)), ir);
+    }
+
+    template <class Hook>
+    static void truncate_blocks(u32* f, std::size_t block, u32* copy, int lg, const u32* r, const u32* ir, Hook hook) {
+        const std::size_t blocks = (std::size_t(1) << lg) / block, nb = block / 8, half = block / 2;
+        const std::size_t run = std::max<std::size_t>(1, kTile / nb);
+        const bool aligned = aligned_block(nb);
+        const auto tile = [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) { hook(t, std::size_t(t - f) / 8, leaves); };
+        for (std::size_t j0 = 0; j0 < blocks; j0 += run) {
+            const std::size_t n = std::min(run, blocks - j0);
+            u32* const g = f + j0 * block;
+            // The levels within the blocks undone: the lower halves, < 2P, times nb.
+            if (aligned && nb == 4) {
+                bottom_inverse(g, n, j0, ir);
+            } else if (aligned) {
+                inverse_runs(g, nb / 4, 4 * n, 4 * j0, ir);
+                for (std::size_t j = 0; j < n; ++j) B::inverse_group_half(g + j * block, block / 4, j0 + j, ir, true);
+            } else {  // the radix-2 level's lower output: u + v
+                inverse_runs(g, nb / 2, 2 * n, 2 * j0, ir);
+                for (std::size_t j = 0; j < n; ++j)
+                    for (u32 *b = g + j * block, *e = b + half; b < e; b += S::lanes)
+                        S::store(b, B::low(add(S::load(b), S::load(b + half))));
+            }
+            // The lower halves to copy (canonical); the upper halves zero (aligned) or a copy of the
+            // lower ones (a radix-2 level with a zero upper input), then the levels within the blocks.
+            for (std::size_t j = 0; j < n; ++j) {
+                u32 *b = g + j * block, *c = copy + (j0 + j) * block;
+                for (std::size_t i = 0; i < half; i += S::lanes) {
+                    const V x = S::load(b + i);
+                    S::store(c + i, canonical(x));
+                    if (!aligned) S::store(b + half + i, x);
+                }
+            }
+            if (aligned && nb == 4) {
+                for (std::size_t j = 0; j < n; ++j) std::fill_n(g + j * block + half, half, 0u);
+                bottom_forward(g, n, j0, r);
+                tile(g, 4 * n);
+            } else if (aligned) {
+                for (std::size_t j = 0; j < n; ++j) B::template forward_group_half<4>(g + j * block, block / 4, j0 + j, r, true);
+                forward_runs(g, nb / 4, 4 * n, 4 * j0, r, tile);
+            } else {
+                forward_runs(g, nb / 2, 2 * n, 2 * j0, r, tile);
+            }
+        }
+    }
+
+    // The first stage of inverse group k on quarters of q words, quarters 0 and 2 only: a + c,
+    // x (a - c) (blocks 2k and 2k + 1's lower halves to the rows' lower halves). In, out < 2P.
+    static void join_radix2(u32* f, std::size_t q, std::size_t k, const u32* ir) {
+        const F x = B::entry(ir, k);
+        for (std::size_t j = 0; j < q; j += S::lanes) {
+            const V a = S::load(f + j), c = S::load(f + j + 2 * q);
+            S::store(f + j, B::low(add(a, c))), S::store(f + j + 2 * q, B::mul(diff(a, c), x));
+        }
+    }
+    // The inverse levels of group k's subtree (nv leaves) above the blocks of nb leaves, on the
+    // columns with (j & width) == 0 from kTile leaves up, every column below.
+    static void join_tree(u32* f, std::size_t nv, std::size_t k, std::size_t nb, const u32* ir, std::size_t width) {
+        if (nv == nb) return;
+        if (nv == 2 * nb) return join_radix2(f, 2 * nv, k, ir);
+        if (nv > kTile) {
+            const std::size_t h = nv / 4;
+            for (std::size_t t = 0; t < 4; ++t) join_tree(f + 8 * h * t, h, 4 * k + t, nb, ir, width);
+            return inverse_group_pruned(f, 8 * h, k, ir, width);
+        }
+        std::size_t h = nb;  // leaves per quarter of the lowest level above the blocks
+        if (!aligned_block(nb)) {
+            for (std::size_t g = 0; g < nv / (2 * nb); ++g) join_radix2(f + 16 * nb * g, 4 * nb, k * (nv / (2 * nb)) + g, ir);
+            h = 2 * nb;
+        }
+        for (; h < nv; h *= 4) B::inverse_groups(f, 8 * h, k * (nv / (4 * h)), nv / (4 * h), ir);
+    }
+
+    static void join_blocks(u32* f, std::size_t block, u32 scale, int lg, const u32* ir) {
+        const std::size_t len = std::size_t(1) << lg, nv = len / 8, nb = block / 8, width = block / 2;
+        if (!has_radix2(lg)) {
+            for (std::size_t t = 0; t < 4; ++t) join_tree(f + t * len / 4, nv / 4, t, nb, ir, width);
+        } else {
+            join_tree(f, nv / 2, 0, nb, ir, width);
+            join_tree(f + len / 2, nv / 2, 1, nb, ir, width);
+        }
+        // The levels above the blocks multiply by nv / nb.
+        top_out_pruned(f, f, len, lg, ir, multiply_mod(scale, power(u32(nv / nb), kP - 2)), 0, width);
+    }
+
+    // forward_upper with pruned groups and a hook (leaf indices from 2^lg / 8, f being the upper
+    // half of a leaf form of 2^(lg + 1) words). Under a radix-2 top the first level is group 1's,
+    // which leaves the skipped columns as they are: below 512 words a whole group at the column bit
+    // reads them, so they are zeroed first. Under group 0 the radix-2 level with r(1) writes zeros.
+    template <class Hook>
+    static void forward_upper_hooked(u32* f, int lg, const u32* r, std::size_t width, Hook hook) {
+        const std::size_t len = std::size_t(1) << lg, nv = len / 8, half = len / 2;
+        const u32* const base = f - len;
+        const auto tile = [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) { hook(t, std::size_t(t - base) / 8, leaves); };
+        if (has_radix2(lg + 1)) {
+            if (width && width < 512)
+                for (std::size_t j = width; j < len; j += 2 * width) std::fill_n(f + j, width, 0u);
+            return forward_pruned_tree<1>(f, f, nv, 1, r, width, tile);
+        }
+        const F z = B::entry(r, 1);
+        const V zero = S::broadcast(0);
+        const bool pruned = width >= S::lanes && width < half;
+        for (std::size_t c = 0; c < half; c += pruned ? 2 * width : half) {
+            const std::size_t end = pruned ? c + width : half;
+            for (std::size_t i = c; i < end; i += S::lanes) {
+                const V x = S::load(f + i), y = B::mul(S::load(f + i + half), z);
+                S::store(f + i, add(x, y)), S::store(f + i + half, diff(x, y));
+            }
+            if (pruned)
+                for (std::size_t i = end; i < end + width; i += S::lanes) S::store(f + i, zero), S::store(f + i + half, zero);
+        }
+        forward_pruned_tree<4>(f, f, nv / 2, 2, r, width, tile);
+        forward_pruned_tree<4>(f + half, f + half, nv / 2, 3, r, width, tile);
     }
 };
 
@@ -2408,6 +2603,23 @@ struct intrinsics {
     static void inverse_hooked(Hook hook, std::uint32_t* f, std::uint32_t* out, std::size_t count, int lg,
                                const std::uint32_t*, const std::uint32_t* inverse_roots, unsigned output, std::size_t width) {
         Ntt::inverse_hooked(hook, f, out, count, lg, inverse_roots, output, width);
+    }
+
+    // Doubling ops (Transform::truncate_blocks, join_blocks, forward_upper_hooked).
+    template <class Hook>
+    static void truncate_blocks(std::uint32_t* f, std::size_t block, std::uint32_t* copy, int lg, const std::uint32_t* roots,
+                                const std::uint32_t* inverse_roots, Hook hook) {
+        Ntt::truncate_blocks(f, block, copy, lg, roots, inverse_roots, hook);
+    }
+
+    static void join_blocks(std::uint32_t* f, std::size_t block, std::uint32_t scale, int lg,
+                            const std::uint32_t* inverse_roots) {
+        Ntt::join_blocks(f, block, scale, lg, inverse_roots);
+    }
+
+    template <class Hook>
+    static void forward_upper_hooked(std::uint32_t* f, int lg, const std::uint32_t* roots, std::size_t width, Hook hook) {
+        Ntt::forward_upper_hooked(f, lg, roots, width, hook);
     }
 };
 

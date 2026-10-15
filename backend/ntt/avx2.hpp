@@ -1079,22 +1079,68 @@ inline void inverse_product(const LeafTerm* terms, int n, u32* words, u32* out, 
 
 // Hooked ops (Transform, issue #149): a forward from in whose runs of leaves go to a hook after
 // their bottom level, an inverse whose runs of leaves a hook writes before theirs; both pruned for
-// Kronecker layouts. width (vectors, a power of two; 0 or 1: none): vector bit log2(width) of the
+// Kronecker layouts. width (vectors, a power of two; 0: none): vector bit log2(width) of the
 // index is zero in the forward's input, or unused in the inverse's output, so the groups above it
-// run only on the columns j with (j & width) == 0 (kernels::*_columns). As in lc-opt, groups with
-// quarters below kPruneForward (kPruneInverse) vectors run whole: narrow columns gain little. The
-// top level runs whole (the skipped columns of a forward hold zeros mod P from there on).
+// run only on the columns j with (j & width) == 0 (kernels::*_columns, *_even_columns), and the
+// group holding it on half its inputs or outputs. As in lc-opt, groups with quarters below
+// kPruneForward (kPruneInverse) vectors run whole: narrow columns gain little. The top level is
+// pruned where its step allows (detail::PrunedLevel), and writes zeros to the skipped columns.
 inline constexpr std::size_t kPruneForward = 32, kPruneInverse = 8;
 
-inline bool prunes(std::size_t h, std::size_t width, std::size_t least) { return width >= 2 && h >= 2 * width && h >= least; }
+// The group whose quarter index holds the bit (issue #149 round 2; lc-opt's forward_half and
+// inverse_half): width = h (quarters 1 and 3 zero in the forward, unused in the inverse) or 2h
+// (quarters 2 and 3). The forward reads half its inputs, the inverse writes half its outputs.
+// With f2 = f3 = 0 the outputs are f0 + y f1, f0 - y f1, f0 + z f1, f0 - z f1; with f1 = f3 = 0
+// they are A, A, C, C for A, C = f0 +- x f2. In < 4P, out < 4P.
+inline void forward_group_half(Vec* f, std::size_t h, std::size_t k, const u32* r, bool high) {
+    const Factor x = entry(r, k), y = entry(r, 2 * k), z = entry(r, 2 * k + 1);
+    if (high) {
+        for (std::size_t j = 0; j < h; ++j) {
+            const Vec u = reduce(f[j], 2 * kP), b = f[j + h], yb = multiply(b, y), zb = multiply(b, z);
+            f[j] = add(u, yb), f[j + h] = diff(u, yb), f[j + 2 * h] = add(u, zb), f[j + 3 * h] = diff(u, zb);
+        }
+        return;
+    }
+    for (std::size_t j = 0; j < h; ++j) {
+        const Vec u = reduce(f[j], 2 * kP), xc = multiply(f[j + 2 * h], x), s = add(u, xc), d = diff(u, xc);
+        f[j] = s, f[j + h] = s, f[j + 2 * h] = d, f[j + 3 * h] = d;
+    }
+}
 
+// Inverse: outputs 0 and h (high) or 0 and 2h of group k, in and out < 2P.
+inline void inverse_group_half(Vec* f, std::size_t h, std::size_t k, const u32* ir, bool high) {
+    const Factor x = entry(ir, k), y = entry(ir, 2 * k), z = entry(ir, 2 * k + 1);
+    if (high) {
+        for (std::size_t j = 0; j < h; ++j) {
+            const Vec f0 = f[j], f1 = f[j + h], f2 = f[j + 2 * h], f3 = f[j + 3 * h];
+            const Vec ab = reduce(add(f0, f1), 2 * kP), cd = reduce(add(f2, f3), 2 * kP);
+            f[j] = reduce(add(ab, cd), 2 * kP);
+            f[j + h] = reduce(add(multiply(diff(f0, f1), y), multiply(diff(f2, f3), z)), 2 * kP);
+        }
+        return;
+    }
+    for (std::size_t j = 0; j < h; ++j) {
+        const Vec ab = reduce(add(f[j], f[j + h]), 2 * kP), cd = reduce(add(f[j + 2 * h], f[j + 3 * h]), 2 * kP);
+        f[j] = reduce(add(ab, cd), 2 * kP), f[j + 2 * h] = multiply(diff(ab, cd), x);
+    }
+}
+
+// Width 1 (vector bit 0, issue #149 round 2): the even columns (kernels::*_even_columns).
 inline void forward_group_pruned(Vec* f, std::size_t h, std::size_t k, const u32* r, std::size_t width) {
-    if (prunes(h, width, kPruneForward)) return kernels::forward_columns(f, h, width, r + slot(k), r + slot(2 * k));
+    if (width >= 1 && h >= kPruneForward) {
+        if (width == 1) return kernels::forward_even_columns(f, h, r + slot(k), r + slot(2 * k));
+        if (h >= 2 * width) return kernels::forward_columns(f, h, width, r + slot(k), r + slot(2 * k));
+        if (h == width || 2 * h == width) return forward_group_half(f, h, k, r, 2 * h == width);
+    }
     forward_group(f, h, k, r);
 }
 
 inline void inverse_group_pruned(Vec* f, std::size_t h, std::size_t k, const u32* ir, std::size_t width) {
-    if (prunes(h, width, kPruneInverse)) return kernels::inverse_columns(f, h, width, ir + slot(k), ir + slot(2 * k));
+    if (width >= 1 && h >= kPruneInverse) {
+        if (width == 1) return kernels::inverse_even_columns(f, h, ir + slot(k), ir + slot(2 * k));
+        if (h >= 2 * width) return kernels::inverse_columns(f, h, width, ir + slot(k), ir + slot(2 * k));
+        if (h == width || 2 * h == width) return inverse_group_half(f, h, k, ir, 2 * h == width);
+    }
     inverse_group(f, h, k, ir);
 }
 
@@ -1225,6 +1271,130 @@ inline void inverse_hooked(Hook hook, u32* words, u32* out, std::size_t count, i
     inverse_top_pruned(words, nv, lg, out, count, ir, output_scale(lg, output), output & kUpperHalf, width);
 }
 
+// Doubling (Transform::truncate_blocks, join_blocks, forward_upper_hooked; issue #149 round 2), as
+// intrinsics.hpp's: a block of nb = block / 8 vectors (nb >= 4) is group j's subtree if nb is a
+// power of 4, else those of groups 2j, 2j + 1 (nb / 2 vectors) under a radix-2 level with r(j).
+// Blocks go in runs of a tile.
+template <class Hook>
+inline void truncate_blocks(u32* words, std::size_t block, u32* copy, int lg, const u32* r, const u32* ir, Hook hook) {
+    auto* f = reinterpret_cast<Vec*>(words);
+    const std::size_t blocks = (std::size_t(1) << lg) / block, nb = block / 8, hv = nb / 2;
+    const std::size_t run = std::max<std::size_t>(1, kTile / nb);
+    const bool aligned = std::countr_zero(nb) % 2 == 0;
+    const auto tile = [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) { hook(t, std::size_t(t - words) / 8, leaves); };
+    for (std::size_t j0 = 0; j0 < blocks; j0 += run) {
+        const std::size_t n = std::min(run, blocks - j0);
+        Vec* const g = f + j0 * nb;
+        // The levels within the blocks undone: the lower halves, < 2P, times nb.
+        if (aligned && nb == 4) {
+            inverse_bottom(g, n, j0, ir);
+        } else if (aligned) {
+            inverse_trees(g, nb / 4, 4 * n, 4 * j0, ir);
+            for (std::size_t j = 0; j < n; ++j) inverse_group_half(g + j * nb, nb / 4, j0 + j, ir, true);
+        } else {  // the radix-2 level's lower output: u + v
+            inverse_trees(g, nb / 2, 2 * n, 2 * j0, ir);
+            for (Vec *b = g, *e = g + n * nb; b < e; b += nb)
+                for (std::size_t i = 0; i < hv; ++i) b[i] = reduce(add(b[i], b[i + hv]), 2 * kP);
+        }
+        // The lower halves to copy (canonical); the upper halves zero (aligned) or a copy of the
+        // lower ones (a radix-2 level with a zero upper input), then the levels within the blocks.
+        for (std::size_t j = 0; j < n; ++j) {
+            Vec* b = g + j * nb;
+            u32* c = copy + (j0 + j) * block;
+            for (std::size_t i = 0; i < hv; ++i) {
+                store(c + 8 * i, reduce(b[i], kP));
+                if (!aligned) b[i + hv] = b[i];
+            }
+        }
+        if (aligned && nb == 4) {
+            for (std::size_t j = 0; j < n; ++j) g[4 * j + 2] = g[4 * j + 3] = _mm256_setzero_si256();
+            forward_bottom(g, n, j0, r);
+            tile(reinterpret_cast<u32*>(g), 4 * n);
+        } else if (aligned) {
+            for (std::size_t j = 0; j < n; ++j) forward_group_half(g + j * nb, nb / 4, j0 + j, r, true);
+            forward_tiles(g, nb / 4, 4 * n, 4 * j0, r, tile);
+        } else {
+            forward_tiles(g, nb / 2, 2 * n, 2 * j0, r, tile);
+        }
+    }
+}
+
+// The first stage of inverse group k on quarters of h vectors, quarters 0 and 2 only: a + c, x (a - c).
+inline void join_radix2(Vec* f, std::size_t h, std::size_t k, const u32* ir) {
+    const Factor x = entry(ir, k);
+    for (std::size_t j = 0; j < h; ++j) {
+        const Vec a = f[j], c = f[j + 2 * h];
+        f[j] = reduce(add(a, c), 2 * kP), f[j + 2 * h] = multiply(diff(a, c), x);
+    }
+}
+
+// Subtrees [first, first + count) of nv vectors at f: their inverse levels above the blocks of nb
+// vectors, columns with (j & width) == 0 (inverse_group_pruned).
+inline void join_trees(Vec* f, std::size_t nv, std::size_t count, std::size_t first, std::size_t nb, const u32* ir,
+                       std::size_t width) {
+    if (nv == nb) return;
+    if (nv == 2 * nb) {
+        for (std::size_t k = first; k < first + count; ++k, f += nv) join_radix2(f, nv / 4, k, ir);
+        return;
+    }
+    if (nv > kTile) {
+        for (std::size_t k = first; k < first + count; ++k, f += nv) {
+            join_trees(f, nv / 4, 4, 4 * k, nb, ir, width);
+            inverse_group_pruned(f, nv / 4, k, ir, width);
+        }
+        return;
+    }
+    const std::size_t run = std::min(count, kTile / nv), total = run * nv;
+    const bool aligned = std::countr_zero(nb) % 2 == 0;
+    for (std::size_t k = first; k < first + count; k += run, f += total) {
+        std::size_t h = nb;  // vectors per quarter of the lowest level above the blocks
+        if (!aligned) {
+            for (std::size_t j = 0, g = k * (nv / (2 * nb)); j < total; j += 2 * nb, ++g) join_radix2(f + j, nb / 2, g, ir);
+            h = 2 * nb;
+        }
+        for (; h < nv; h *= 4)
+            for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) inverse_group_pruned(f + j, h, g, ir, width);
+    }
+}
+
+inline void join_blocks(u32* words, std::size_t block, u32 scale, int lg, const u32* ir) {
+    auto* f = reinterpret_cast<Vec*>(words);
+    const std::size_t len = std::size_t(1) << lg, nv = len / 8, nb = block / 8, width = nb / 2;
+    if (!has_radix2(lg)) join_trees(f, nv / 4, 4, 0, nb, ir, width);
+    else join_trees(f, nv / 8, 8, 0, nb, ir, width);  // the top level holds the radix-2 level and both halves' last
+    // The levels above the blocks multiply by nv / nb.
+    inverse_top_pruned(words, nv, lg, words, len, ir, multiply_mod(scale, power(u32(nv / nb), kP - 2)), false, width);
+}
+
+// forward_upper with pruned groups and a hook (leaf indices from 2^lg / 8; words is the upper half
+// of a leaf form of 2^(lg + 1) words). Under a radix-2 top the first level is group 1's, which
+// leaves the skipped columns as they are: below 64 vectors a whole group at the column bit reads
+// them, so they are zeroed first. Under group 0 the radix-2 level with r(1) writes zeros there.
+template <class Hook>
+inline void forward_upper_hooked(u32* words, int lg, const u32* r, std::size_t width, Hook hook) {
+    auto* f = reinterpret_cast<Vec*>(words);
+    const std::size_t nv = (std::size_t(1) << lg) / 8, h = nv / 2;
+    const u32* const base = words - (std::size_t(1) << lg);
+    const auto tile = [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) { hook(t, std::size_t(t - base) / 8, leaves); };
+    if (has_radix2(lg + 1)) {
+        if (width && width < 64)
+            for (std::size_t j = width; j < nv; j += 2 * width) std::fill_n(f + j, width, _mm256_setzero_si256());
+        return forward_pruned_tiles(f, nv, 1, 1, r, width, tile);
+    }
+    const Factor z = entry(r, 1);
+    const bool pruned = width >= 1 && width < h;
+    for (std::size_t c = 0; c < h; c += pruned ? 2 * width : h) {
+        const std::size_t end = pruned ? c + width : h;
+        for (std::size_t i = c; i < end; ++i) {
+            const Vec x = f[i], y = multiply(f[i + h], z);
+            f[i] = add(x, y), f[i + h] = diff(x, y);
+        }
+        if (pruned)
+            for (std::size_t i = end; i < end + width; ++i) f[i] = f[i + h] = _mm256_setzero_si256();
+    }
+    forward_pruned_tiles(f, h, 2, 2, r, width, tile);
+}
+
 }  // namespace fps::ntt::detail::avx2
 
 namespace fps::ntt::variant {
@@ -1321,6 +1491,23 @@ struct avx2 {
     static void inverse_hooked(Hook hook, std::uint32_t* f, std::uint32_t* out, std::size_t count, int lg,
                                const std::uint32_t*, const std::uint32_t* inverse_roots, unsigned output, std::size_t width) {
         detail::avx2::inverse_hooked(hook, f, out, count, lg, inverse_roots, output, width / 8);
+    }
+
+    // Doubling ops (Transform::truncate_blocks, join_blocks, forward_upper_hooked); width in words.
+    template <class Hook>
+    static void truncate_blocks(std::uint32_t* f, std::size_t block, std::uint32_t* copy, int lg, const std::uint32_t* roots,
+                                const std::uint32_t* inverse_roots, Hook hook) {
+        detail::avx2::truncate_blocks(f, block, copy, lg, roots, inverse_roots, hook);
+    }
+
+    static void join_blocks(std::uint32_t* f, std::size_t block, std::uint32_t scale, int lg,
+                            const std::uint32_t* inverse_roots) {
+        detail::avx2::join_blocks(f, block, scale, lg, inverse_roots);
+    }
+
+    template <class Hook>
+    static void forward_upper_hooked(std::uint32_t* f, int lg, const std::uint32_t* roots, std::size_t width, Hook hook) {
+        detail::avx2::forward_upper_hooked(f, lg, roots, width / 8, hook);
     }
 };
 
