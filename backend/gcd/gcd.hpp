@@ -27,10 +27,11 @@
 //   jump(k - progress) on the top of the result, combine R2 R1 by cyclic products of length
 //   bit_ceil(progress), keeping the products' transforms (the parent doubles them by
 //   forward_upper). Jumps of k <= kDirect: Euclid's algorithm with fraction-free steps on the top
-//   coefficients (3 products per word in 64-bit sums, one Montgomery reduction).
+//   coefficients (3 products per word in 64-bit sums, one Montgomery reduction), each step's
+//   factors from the last's in scalar code.
 // - Products in the values form (ntt.hpp): a pointwise product per word instead of an 8 x 8 leaf
-//   product, for a split per forward and a join per inverse. The matrices' transforms are kept
-//   times 2^32, so a product of two takes one Montgomery reduction and stays in that form.
+//   product, for a split per forward and a join per inverse. Each product takes one Montgomery
+//   reduction and leaves its factor 2^-32: matrices and remainders only matter up to constants.
 // - gcd: the spine of a full jump without its matrix: jump(k1) on the top, apply to the whole of
 //   (a, b), repeat; Euclid's fraction-free steps on whole remainders below kDirect.
 // - inverse_mod: b = f mod g, the full jump of deg g on (g, b) computing R[0][1] only (and every
@@ -83,7 +84,6 @@ constexpr u32 power(u32 a, u64 e) {
     return r;
 }
 constexpr u32 inverse(u32 a) { return power(a, kP - 2); }
-constexpr u32 kR = u32((u64(1) << 32) % kP);  // 2^32 mod P
 constexpr u32 kNegPinv = u32(0) - M::kPinv;  // -P^-1 mod 2^32
 
 inline constexpr std::ptrdiff_t kDirect = 64;  // jumps of at most this many degrees: Euclid
@@ -212,81 +212,34 @@ inline constexpr std::size_t kPad = std::max<std::size_t>(kLanes, 4);  // zero w
 
 // ---- Values-form passes ------------------------------------------------------------------------
 
-constexpr u32 kR2 = mul(kR, kR);  // 2^64 mod P
-
-// x[i] = x[i] 2^32 mod P for i < n (canonical).
-inline void to_montgomery(u32* x, std::size_t n) {
-    std::size_t i = 0;
-    const V r2 = S::broadcast(kR2);
-    for (; i + kLanes <= n; i += kLanes) S::store(x + i, M::template reduce<kP>(M::montgomery(S::load(x + i), r2)));
-    for (; i < n; ++i) x[i] = mul(x[i], kR);
-}
-
-// (x0 y0 + x1 y1) 2^-32 mod P, canonical, for canonical words; twice: then times 2^-32 again.
-// kWide: the two products in 64-bit sums (< 2 P^2 + 2^32 P < 2^64), one Montgomery reduction (and
-// a second of the result); else Montgomery products, added.
+// (x0 y0 + x1 y1) 2^-32 mod P, canonical, for canonical words. kWide: the two products in 64-bit
+// sums (< 2 P^2 + 2^32 P < 2^64), one Montgomery reduction; else Montgomery products, added.
 template <class T>
-[[gnu::always_inline]] inline typename T::V products_vector(typename T::V x0, typename T::V y0, typename T::V x1, typename T::V y1, bool twice) {
-    using W = typename T::V;
+[[gnu::always_inline]] inline typename T::V products_vector(typename T::V x0, typename T::V y0, typename T::V x1, typename T::V y1) {
     using Ops = modarith::Ops<T, kP>;
     if constexpr (requires { T::mul_even(x0, y0); }) {
-        const W ninv = T::broadcast(kNegPinv), p = T::broadcast(kP);
-        const auto reduce = [&](W s) { return T::add64(s, T::mul_even(T::mul_even(s, ninv), p)); };  // high words
-        W even = reduce(T::add64(T::mul_even(x0, y0), T::mul_even(x1, y1)));
-        W odd = reduce(T::add64(T::mul_even(T::template shr64<32>(x0), T::template shr64<32>(y0)),
-                                T::mul_even(T::template shr64<32>(x1), T::template shr64<32>(y1))));
-        if (twice) {  // (r + m P) / 2^32 again, r < 2P the high words
-            even = reduce(T::template shr64<32>(even));
-            odd = reduce(T::template shr64<32>(odd));
-        }
-        return Ops::template reduce<kP>(T::join_high(even, odd));
+        const auto odd = [](typename T::V v) { return T::template shr64<32>(v); };
+        return montgomery_join<T>(T::add64(T::mul_even(x0, y0), T::mul_even(x1, y1)),
+                                  T::add64(T::mul_even(odd(x0), odd(y0)), T::mul_even(odd(x1), odd(y1))));
     } else if constexpr (requires { T::mul_wide_lo(x0, y0); }) {
-        const W ninv = T::broadcast(kNegPinv), p = T::broadcast(kP);
-        auto low = T::mla_wide_lo(T::mul_wide_lo(x0, y0), x1, y1);
-        auto high = T::mla_wide_hi(T::mul_wide_hi(x0, y0), x1, y1);
-        W m = T::mul_lo(T::lo_halves(low, high), ninv);
-        W r = T::hi_halves(T::mla_wide_lo(low, m, p), T::mla_wide_hi(high, m, p));  // < 2P
-        if (twice) {  // r 2^-32: (r + m P) / 2^32 with m = -r P^-1, r + m P < 2^32 (2P + P)
-            m = T::mul_lo(r, ninv);
-            r = T::hi_halves(T::mla_wide_lo(T::mul_wide_lo(r, T::broadcast(1)), m, p),
-                             T::mla_wide_hi(T::mul_wide_hi(r, T::broadcast(1)), m, p));
-        }
-        return Ops::template reduce<kP>(r);
+        return montgomery_halves<T>(T::mla_wide_lo(T::mul_wide_lo(x0, y0), x1, y1), T::mla_wide_hi(T::mul_wide_hi(x0, y0), x1, y1));
     } else {
-        const W s = Ops::add(Ops::template reduce<kP>(Ops::montgomery(x0, y0)), Ops::template reduce<kP>(Ops::montgomery(x1, y1)));
-        return twice ? Ops::template reduce<kP>(Ops::montgomery(s, T::broadcast(1))) : s;
+        return Ops::add(Ops::template reduce<kP>(Ops::montgomery(x0, y0)), Ops::template reduce<kP>(Ops::montgomery(x1, y1)));
     }
 }
 
-// m 2^-32 mod P, canonical, for m < P: (m + q P) / 2^32 with q = -m P^-1 mod 2^32.
-template <class T>
-[[gnu::always_inline]] inline typename T::V from_montgomery(typename T::V m) {
-    using W = typename T::V;
-    using Ops = modarith::Ops<T, kP>;
-    if constexpr (requires { T::mul_even(m, m); }) {
-        const W ninv = T::broadcast(kNegPinv), p = T::broadcast(kP);
-        const auto reduce = [&](W s) { return T::add64(s, T::mul_even(T::mul_even(s, ninv), p)); };
-        const W even = reduce(T::template blend<0xaaaa>(m, T::broadcast(0))), odd = reduce(T::template shr64<32>(m));
-        return Ops::template reduce<kP>(T::join_high(even, odd));
-    } else {
-        return Ops::template reduce<kP>(Ops::montgomery(m, T::broadcast(1)));
-    }
-}
-
-// m = (x0 y0 + x1 y1) 2^-32 mod P word by word (canonical words, n a multiple of kLanes); kept[i] =
-// m if kept is not null; out[i] = m 2^-32 if twice, else m. A product of two forms times 2^32 is
-// then kept as such and goes to the inverse as the plain values (twice).
-inline void products(const u32* x0, const u32* y0, const u32* x1, const u32* y1, u32* kept, u32* out, std::size_t n,
-                     bool twice) {
+// out[i] = (x0 y0 + x1 y1) 2^-32 mod P word by word (canonical words, n a multiple of kLanes), and
+// kept[i] the same if kept is not null.
+inline void products(const u32* x0, const u32* y0, const u32* x1, const u32* y1, u32* kept, u32* out, std::size_t n) {
     if (!kept) {
         for (std::size_t i = 0; i < n; i += kLanes)
-            S::store(out + i, products_vector<S>(S::load(x0 + i), S::load(y0 + i), S::load(x1 + i), S::load(y1 + i), twice));
+            S::store(out + i, products_vector<S>(S::load(x0 + i), S::load(y0 + i), S::load(x1 + i), S::load(y1 + i)));
         return;
     }
     for (std::size_t i = 0; i < n; i += kLanes) {
-        const V m = products_vector<S>(S::load(x0 + i), S::load(y0 + i), S::load(x1 + i), S::load(y1 + i), false);
+        const V m = products_vector<S>(S::load(x0 + i), S::load(y0 + i), S::load(x1 + i), S::load(y1 + i));
         S::store(kept + i, m);
-        S::store(out + i, twice ? from_montgomery<S>(m) : m);
+        S::store(out + i, m);
     }
 }
 
@@ -653,16 +606,14 @@ private:
         r.progress = delta;
     }
 
-    // out (len words) = the values form of length len of c mod (x^len - 1), c of size coefficients,
-    // times 2^32 if montgomery (the matrices' form).
-    static void values_of(const u32* c, std::size_t size, u32* out, std::size_t len, bool montgomery) {
+    // out (len words) = the values form of length len of c mod (x^len - 1), c of size coefficients.
+    static void values_of(const u32* c, std::size_t size, u32* out, std::size_t len) {
         division::detail::fold(Span(c, size), Out(out, len));
-        if (montgomery) to_montgomery(out, std::min(size, len));
         transform(len).forward(out, ntt::Form::values);
     }
 
-    // r.transform[i] = the values form of length len of entry i, times 2^32 (room >= len): kept,
-    // doubled from the half held (the upper half from the entry mod x^(len/2) + 1), or computed.
+    // r.transform[i] = the values form of length len of entry i (room >= len): kept, doubled from
+    // the half held (the upper half from the entry mod x^(len/2) + 1), or computed.
     static void extend(Matrix& r, int i, std::size_t len) {
         if (r.length[i] == len) return;
         u32* const t = r.transform[i];
@@ -673,10 +624,9 @@ private:
             std::copy_n(e, std::min(size, half), upper);
             std::fill(upper + std::min(size, half), upper + half, 0u);
             if (size > half) upper[0] = sub1(upper[0], e[half]);
-            to_montgomery(upper, std::min(size, half));
             transform(len).forward_upper(upper, ntt::Form::values);
         } else {
-            values_of(r.entry[i], size, t, len, true);
+            values_of(r.entry[i], size, t, len);
         }
         r.length[i] = len;
     }
@@ -690,8 +640,8 @@ private:
         const std::size_t len = std::max(kMinLength, std::bit_ceil(std::size_t(n + 1) / 2));
         for (int i = 0; i < 4; ++i) extend(r1, i, len);
         u32 *const ta = take(len), *const tb = take(len);
-        values_of(a, std::size_t(n + 1), ta, len, false);
-        values_of(b, std::size_t(m + 1), tb, len, false);
+        values_of(a, std::size_t(n + 1), ta, len);
+        values_of(b, std::size_t(m + 1), tb, len);
         u32 *const pc = take(len), *const pd = take(len);
         apply_products(r1.transform, ta, tb, pc, pd, len);
         const std::ptrdiff_t l = std::ptrdiff_t(len), mixed = c_deg - l;  // c[j] + c[j + L] at j <= mixed
@@ -709,18 +659,18 @@ private:
             u32* rt[4];
             for (int i = 0; i < 4; ++i) {
                 rt[i] = take(short_len);
-                values_of(r1.entry[i], std::min(low, r1.size[i]), rt[i], short_len, true);
+                values_of(r1.entry[i], std::min(low, r1.size[i]), rt[i], short_len);
             }
-            values_of(a, low, ta, short_len, false);
-            values_of(b, mb, tb, short_len, false);
+            values_of(a, low, ta, short_len);
+            values_of(b, mb, tb, short_len);
             apply_products(rt, ta, tb, lc, ld, short_len);
         } else {
-            values_of(a, low, ta, len, false);
-            values_of(b, mb, tb, len, false);
+            values_of(a, low, ta, len);
+            values_of(b, mb, tb, len);
             apply_products(r1.transform, ta, tb, lc, ld, len);
-            // Coefficient L of the low products (if n = 2L) wraps onto 0.
-            lc[0] = u32((u64(r1.at0[0]) * a[0] + u64(r1.at0[1]) * b[0]) % kP);
-            ld[0] = u32((u64(r1.at0[2]) * a[0] + u64(r1.at0[3]) * b[0]) % kP);
+            // Coefficient L of the low products (if n = 2L) wraps onto 0; the products are 2^-32 r1 (a, b).
+            lc[0] = montgomery(u64(r1.at0[0]) * a[0] + u64(r1.at0[1]) * b[0]);
+            ld[0] = montgomery(u64(r1.at0[2]) * a[0] + u64(r1.at0[3]) * b[0]);
         }
         // [s2, mixed] from the low products, (mixed, L) as computed, [L, c_deg] unwrapped.
         const std::ptrdiff_t first = std::min(s2, mixed + 1);
@@ -734,19 +684,20 @@ private:
         stack_.release(mark);
     }
 
-    // c, d (len words each) = the coefficients of r (a, b) mod (x^len - 1) from the values forms of
-    // length len of r's entries (times 2^32) and of a, b.
+    // c, d (len words each) = the coefficients of 2^-32 r (a, b) mod (x^len - 1) from the values
+    // forms of length len of r's entries and of a, b.
     static void apply_products(u32* const (&r)[4], const u32* ta, const u32* tb, u32* c, u32* d, std::size_t len) {
         const ntt::Transform& t = transform(len);
-        products(r[0], ta, r[1], tb, nullptr, c, len, false);
-        products(r[2], ta, r[3], tb, nullptr, d, len, false);
+        products(r[0], ta, r[1], tb, nullptr, c, len);
+        products(r[2], ta, r[3], tb, nullptr, d, len);
         t.inverse(c, ntt::Form::values);
         t.inverse(d, ntt::Form::values);
     }
 
-    // out = r2 r1 (the entries in need), progress p = r2.progress + r1.progress: cyclic products
-    // of length L >= p (coefficient L, if p = L, wraps onto 0), whose values forms out keeps if its
-    // room allows.
+    // out = 2^-32 r2 r1 (the entries in need), progress p = r2.progress + r1.progress: cyclic
+    // products of length L >= p (coefficient L, if p = L, wraps onto 0), whose values forms out
+    // keeps if its room allows. Matrices only matter up to constants (one per matrix: the apply
+    // and the combine of r1 read the same entries).
     void combine(Matrix& r2, Matrix& r1, Matrix& out, unsigned need) {
         u32* const mark = stack_.mark();
         const std::size_t p = r2.progress + r1.progress, len = std::max(kMinLength, std::bit_ceil(p));
@@ -762,13 +713,13 @@ private:
             for (int j = 0; j < 2; ++j) {
                 const int ij = 2 * i + j;
                 out.length[ij] = 0;
-                const u32 x0 = u32((u64(r2.at0[2 * i]) * r1.at0[j] + u64(r2.at0[2 * i + 1]) * r1.at0[2 + j]) % kP);
+                const u32 x0 = montgomery(u64(r2.at0[2 * i]) * r1.at0[j] + u64(r2.at0[2 * i + 1]) * r1.at0[2 + j]);
                 out.at0[ij] = x0;
                 if (!(need >> ij & 1)) continue;
-                // out[ij] = r2[2i] r1[j] + r2[2i + 1] r1[2 + j]: kept times 2^32, its coefficients
-                // from the plain values in work.
+                // out[ij] = (r2[2i] r1[j] + r2[2i + 1] r1[2 + j]) 2^-32: its values kept, its
+                // coefficients by the inverse of a copy in work.
                 products(r2.transform[2 * i], r1.transform[j], r2.transform[2 * i + 1], r1.transform[2 + j],
-                         keep ? out.transform[ij] : nullptr, work, len, true);
+                         keep ? out.transform[ij] : nullptr, work, len);
                 if (keep) out.length[ij] = len;
                 t.inverse(work, ntt::Form::values);
                 u32* const e = out.entry[ij];
