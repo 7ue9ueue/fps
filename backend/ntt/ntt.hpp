@@ -80,9 +80,11 @@
 // the top N - L words of c, from a cyclic product of length s mod (x^s - 3^s) (twisted to y^s - 1)
 // and a product of the top words of f and g; middle products run the transpose. The plan per
 // length and r / L is a tuned choice ("ntt.ragged"); the plain product at 2L stays one of its
-// options, and powers of two run it. Against the plain one, same binary: Zen 3 at N = 2^20 + 1
-// 0.48x the time, 1.25 2^20 0.65x, 1.5 2^20 0.79x (notes/155-r1.md). Convolution::length and
-// Transform stay powers of two: callers size memory and Newton steps by them.
+// options, and powers of two run it. Against the plain products, same run, on Zen 3, Emerald
+// Rapids, Zen 5 and Neoverse V2 (notes/155-r1.md): N = 2^20 + 1 0.49-0.51x the time, 1.25 2^20
+// 0.66-0.69x, 1.5 2^20 0.80-0.82x, 1.75 2^20 1.00 (plain); ns per word of N 1.00-1.05, 1.10-1.13,
+// 1.12-1.15 and 1.17-1.22 of a product of 2^20. Convolution::length and Transform stay powers of
+// two: callers size memory and Newton steps by them.
 //
 // Memory of a product: each thread keeps the largest region a product of it used and hands it to
 // the next one. Constructing, multiplying and destroying a 32 x 32 Convolution takes 110 ns on Zen

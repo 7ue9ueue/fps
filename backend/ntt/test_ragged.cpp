@@ -308,6 +308,24 @@ void test_tuning() {
     detail::ragged::kinds.set(detail::ragged::kKindDefaults);
 }
 
+// Long ragged lengths, the selected variant at -O2 only (the main product 2^23 and 2^24): every plan
+// against the plain one, products and middle products.
+void huge() {
+#if !__has_feature(address_sanitizer)
+    for (const std::size_t N : {(std::size_t(1) << 23) + (std::size_t(1) << 21) + 3, (std::size_t(1) << 24) + 7}) {
+        const std::size_t n = N / 2 + 1, m = N + 1 - n;
+        const auto f = random_poly(n, 0), g = random_poly(m, 1);
+        std::array<detail::ragged::Plan, 4> plans;
+        detail::ragged::options(N, plans);
+        const auto plain = run<SelectedMultiply, false>(f, g, N, plans[0]);
+        check_plans<SelectedMultiply, false>("selected, long", f, g, N, plain);
+        const auto v = random_poly(N, 0), w = random_poly(N / 2, 0);
+        const auto middle = run_middle<SelectedMultiply>(v, w, N - N / 2 + 1, plans[0]);
+        check_middle<SelectedMultiply>("selected, long middle", v, w, N - N / 2 + 1, middle);
+    }
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -318,5 +336,6 @@ int main() {
         long_lengths<V>(name, max_lg);
         overlap<V>(name);
     });
+    huge();
     return finish();
 }
