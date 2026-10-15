@@ -52,6 +52,7 @@
 #include <vector>
 
 #include "backend/division/division.hpp"
+#include "backend/gcd/select.hpp"
 #include "backend/modarith/modarith.hpp"
 #include "backend/ntt/ntt.hpp"
 #include "backend/series/series.hpp"
@@ -86,7 +87,6 @@ constexpr u32 power(u32 a, u64 e) {
 constexpr u32 inverse(u32 a) { return power(a, kP - 2); }
 constexpr u32 kNegPinv = u32(0) - M::kPinv;  // -P^-1 mod 2^32
 
-inline constexpr std::ptrdiff_t kDirect = 64;  // jumps of at most this many degrees: Euclid
 inline constexpr std::size_t kMinLength = std::size_t(1) << ntt::kMinLog;
 
 inline const ntt::Transform& transform(std::size_t len) { return series::detail::transform(std::countr_zero(len)); }
@@ -300,8 +300,10 @@ struct Matrix {
 // Jumps of (a, b) on a Stack.
 class HalfGcd {
 public:
-    // direct: jumps of at most this many degrees run Euclid's algorithm (tests force others).
-    explicit HalfGcd(Stack& stack, std::ptrdiff_t direct = kDirect) : stack_(stack), direct_(direct) {}
+    // direct: jumps of at most this many degrees run Euclid's algorithm (tests force others), and
+    // jumps of k on fewer than 2k + 1 words up to whole (at least direct), as the spine's tail.
+    HalfGcd(Stack& stack, std::ptrdiff_t direct, std::ptrdiff_t whole = 0)
+        : stack_(stack), direct_(direct), whole_(std::max(direct, whole)) {}
 
     // Room for a matrix of progress up to k, with transforms of length up to room.
     Matrix matrix(std::size_t k, std::size_t room) {
@@ -326,7 +328,7 @@ public:
             const std::ptrdiff_t s = n - 2 * k;
             return jump(a + s, n - s, b + s, m - s, k, out, need);
         }
-        if (k <= direct_) return euclid(a, n, b, m, k, out, need);
+        if (k <= direct_ || (n < 2 * k && k <= whole_)) return euclid(a, n, b, m, k, out, need);
         u32* const mark = stack_.mark();
         const std::size_t room = std::max(kMinLength, std::bit_ceil(std::size_t(k)));
         const std::ptrdiff_t k1 = first_jump(k), s1 = std::max<std::ptrdiff_t>(0, n - 2 * k1);
@@ -365,7 +367,7 @@ public:
         u32* const top = stack_.mark();
         u32* c = take(std::size_t(n + 1));
         u32* d = take(std::size_t(n + 1));
-        while (m >= 0 && n > direct_) {
+        while (m >= 0 && n > whole_) {
             u32* const mark = stack_.mark();
             const std::ptrdiff_t k1 = first_jump(n), s1 = std::max<std::ptrdiff_t>(0, n - 2 * k1);
             const std::size_t room = std::max({kMinLength, std::bit_ceil(std::size_t(k1)), std::bit_ceil(std::size_t(n + 1) / 2)});
@@ -734,7 +736,7 @@ private:
     }
 
     Stack& stack_;
-    std::ptrdiff_t direct_;
+    std::ptrdiff_t direct_, whole_;
 };
 
 // ---- Sizes --------------------------------------------------------------------------------------
@@ -783,7 +785,7 @@ inline void check_length(std::size_t n) {
 }
 
 // gcd of a (na) and b (nb) words, trimmed, na >= nb >= 1, in the stack: out[0, t) monic.
-inline std::size_t gcd_run(Stack& stack, Span a, Span b, Out out, std::ptrdiff_t direct) {
+inline std::size_t gcd_run(Stack& stack, Span a, Span b, Out out, std::ptrdiff_t direct, std::ptrdiff_t whole) {
     const std::size_t na = a.size(), nb = b.size();
     // (a, b) <- (b, a mod b), then the spine.
     u32* const x = stack.take(na);
@@ -791,7 +793,7 @@ inline std::size_t gcd_run(Stack& stack, Span a, Span b, Out out, std::ptrdiff_t
     std::copy(b.begin(), b.end(), x);
     std::fill(x + nb, x + na, 0u);
     std::fill(y, y + na, 0u);
-    HalfGcd h(stack, direct);
+    HalfGcd h(stack, direct, whole);
     divide_in(stack, a, b, Out(), Out(y, nb - 1));
     std::ptrdiff_t n = std::ptrdiff_t(nb) - 1, m = n - 1;
     while (m >= 0 && y[m] == 0) --m;
@@ -799,14 +801,14 @@ inline std::size_t gcd_run(Stack& stack, Span a, Span b, Out out, std::ptrdiff_t
 }
 
 // inverse_mod of f by g (m >= 2 words, g[m - 1] != 0) in the stack.
-inline std::ptrdiff_t inverse_mod_run(Stack& stack, Span f, Span g, Out h, std::ptrdiff_t direct) {
+inline std::ptrdiff_t inverse_mod_run(Stack& stack, Span f, Span g, Out h, std::ptrdiff_t direct, std::ptrdiff_t whole) {
     const std::ptrdiff_t d = std::ptrdiff_t(g.size()) - 1;
     u32* const b = stack.take(std::size_t(d));
     divide_in(stack, f, g, Out(), Out(b, std::size_t(d)));
     std::ptrdiff_t m = d - 1;
     while (m >= 0 && b[m] == 0) --m;
     if (m < 0) return -1;
-    HalfGcd gcd(stack, direct);
+    HalfGcd gcd(stack, direct, whole);
     Matrix r = gcd.matrix(std::size_t(d), 0);
     gcd.jump(g.data(), d, b, m, d, r, 0x2);
     if (std::ptrdiff_t(r.progress) != d) return -1;  // deg gcd = d - progress
@@ -820,8 +822,8 @@ inline std::ptrdiff_t inverse_mod_run(Stack& stack, Span f, Span g, Out h, std::
     return std::ptrdiff_t(t);
 }
 
-// The gcd with Euclid below `direct` (tests force small values).
-inline std::size_t gcd(Span f, Span g, Out out, std::span<u32> scratch, std::ptrdiff_t direct) {
+// The gcd with Euclid below `direct` (tests force small values; whole: HalfGcd's).
+inline std::size_t gcd(Span f, Span g, Out out, std::span<u32> scratch, std::ptrdiff_t direct, std::ptrdiff_t whole = 0) {
     std::size_t nf = trimmed(f), ng = trimmed(g);
     if (nf < ng) std::swap(f, g), std::swap(nf, ng);
     const std::size_t need = ng ? ng : nf;
@@ -838,10 +840,11 @@ inline std::size_t gcd(Span f, Span g, Out out, std::span<u32> scratch, std::ptr
         return 1;
     }
     return with_stack(gcd_words(nf, ng), scratch,
-                      [&](Stack& stack) { return gcd_run(stack, f.first(nf), g.first(ng), out, direct); });
+                      [&](Stack& stack) { return gcd_run(stack, f.first(nf), g.first(ng), out, direct, whole); });
 }
 
-inline std::ptrdiff_t inverse_mod(Span f, Span g, Out h, std::span<u32> scratch, std::ptrdiff_t direct) {
+inline std::ptrdiff_t inverse_mod(Span f, Span g, Out h, std::span<u32> scratch, std::ptrdiff_t direct,
+                                  std::ptrdiff_t whole = 0) {
     const std::size_t m = g.size();
     if (m == 0 || g[m - 1] == 0 || h.size() != m - 1)
         throw std::invalid_argument("fps::half_gcd::inverse_mod: g empty or g[m - 1] = 0, or h not m - 1 words");
@@ -849,7 +852,7 @@ inline std::ptrdiff_t inverse_mod(Span f, Span g, Out h, std::span<u32> scratch,
     check_length(std::max(f.size(), m));
     f = f.first(trimmed(f));
     return with_stack(inverse_mod_words(f.size(), m), scratch,
-                      [&](Stack& stack) { return inverse_mod_run(stack, f, g, h, direct); });
+                      [&](Stack& stack) { return inverse_mod_run(stack, f, g, h, direct, whole); });
 }
 
 }  // namespace detail
@@ -869,13 +872,13 @@ inline std::size_t inverse_mod_scratch(std::size_t n, std::size_t m) {
 
 // out[0, t) = the monic gcd of f and g, t returned (above).
 inline std::size_t gcd(std::span<const u32> f, std::span<const u32> g, std::span<u32> out, std::span<u32> scratch = {}) {
-    return detail::gcd(f, g, out, scratch, detail::kDirect);
+    return detail::gcd(f, g, out, scratch, detail::kDirect, detail::kDirectWhole);
 }
 
 // h = 1 / f mod g; the number of coefficients of h, or -1 if gcd(f, g) != 1 (above).
 inline std::ptrdiff_t inverse_mod(std::span<const u32> f, std::span<const u32> g, std::span<u32> h,
                                   std::span<u32> scratch = {}) {
-    return detail::inverse_mod(f, g, h, scratch, detail::kDirect);
+    return detail::inverse_mod(f, g, h, scratch, detail::kDirect, detail::kDirectWhole);
 }
 
 }  // namespace fps::half_gcd
