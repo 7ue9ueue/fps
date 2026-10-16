@@ -23,10 +23,12 @@
 #include <cstdint>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 #include "backend/chirp/select.hpp"
 #include "backend/modarith/modarith.hpp"
+#include "backend/simd/align.hpp"
 
 namespace fps::chirp {
 
@@ -126,6 +128,12 @@ private:
 
 namespace detail {
 
+// arm: the nops after the 32-byte alignment before pass's main loop (simd/align.hpp), measured per
+// loop (notes/230-r1.md). chirp's loop then starts at 12 mod 32: GCC 15.2 and 16.2 put 10 setup
+// instructions (constants) in between; 5.5% slower at any other start, 11% at main's. multiply_chirp's
+// starts right after the padding, at 0 mod 32 (4% slower at 4 mod 32).
+inline constexpr int kChirpLoopNops = 1, kMultiplyLoopNops = 0;
+
 // out[k] = put(x_k, in[k]) for k < n, a vector at a time; with kRead false in is not read (put
 // gets zeros). in may be out. put returns canonical words.
 template <bool kRead, class S, int K, u32 P, class Put>
@@ -136,13 +144,42 @@ template <bool kRead, class S, int K, u32 P, class Put>
     constexpr std::size_t W = T::kWidth;
     auto t = terms.state();
     std::size_t k = 0;
-    for (; k + W <= n; k += W) {
-        unrolled<K>([&](auto v) {
-            V a{};
-            if constexpr (kRead) a = S::load(in + k + v * L);
-            S::store(out + k + v * L, put(t.x[v], a));
-        });
-        t.next();
+#if defined(__aarch64__)
+    constexpr bool kPinned = std::is_same_v<S, simd::Neon>;
+#else
+    constexpr bool kPinned = false;
+#endif
+    if constexpr (kPinned) {
+        // A loop on pointers, at a measured address (kChirpLoopNops). The empty asm statements
+        // put the state in registers before the padding.
+        if (n >= W) {
+            const u32* src = in;
+            u32 *dst = out, *end = out + n / W * W;
+            unrolled<K>([&t](auto v) { asm volatile("" : "+w"(t.x[v]), "+w"(t.g[v])); });
+            asm volatile("" : "+w"(t.step), "+w"(t.step_quotient));
+            if constexpr (kRead) simd::align_loop<kMultiplyLoopNops>(src, dst, end);
+            else simd::align_loop<kChirpLoopNops>(dst, end);
+            do {
+                unrolled<K>([&](auto v) {
+                    V a{};
+                    if constexpr (kRead) a = S::load(src + v * L);
+                    S::store(dst + v * L, put(t.x[v], a));
+                });
+                t.next();
+                if constexpr (kRead) src += W;
+                dst += W;
+            } while (dst != end);
+            k = n / W * W;
+        }
+    } else {
+        for (; k + W <= n; k += W) {
+            unrolled<K>([&](auto v) {
+                V a{};
+                if constexpr (kRead) a = S::load(in + k + v * L);
+                S::store(out + k + v * L, put(t.x[v], a));
+            });
+            t.next();
+        }
     }
     for (int v = 0; v < K && k < n; ++v, k += L) {
         const int count = int(std::min<std::size_t>(L, n - k));
