@@ -14,20 +14,21 @@ inline constexpr std::size_t kMinSlots = 17;
 
 // evaluate(): Horner's rule costs about kHorner ns per coefficient and point; the tree about
 // kFixed + kPerPoint m8 lg(m8) + kPerCoefficient K lg(K) ns (m8 points with padding, K = max(n,
-// m8)), fitted to n or m = 4096 against 8 (notes.md). Horner runs when it is the cheaper.
+// m8)), fitted (relative least squares) to a grid of n, m in 8 .. 16384 where the two are within
+// 4x of each other (notes/136-r1.md). Horner runs when it is the cheaper.
 struct EvaluateCosts {
     double horner, fixed, point, coefficient;
 };
 #if defined(__znver5__)
-inline constexpr EvaluateCosts kEvaluateCosts{0.063, 7000, 2.4, 0.59};  // lc-zen5
+inline constexpr EvaluateCosts kEvaluateCosts{0.064, 3739, 1.59, 0.391};  // lc-zen5
 #elif defined(__AVX512F__)
 inline constexpr EvaluateCosts kEvaluateCosts{0.105, 9400, 3.5, 0.9};  // lc-intel
 #elif defined(__AVX2__)
-inline constexpr EvaluateCosts kEvaluateCosts{0.21, 11000, 4.5, 1.08};  // lc-bench
+inline constexpr EvaluateCosts kEvaluateCosts{0.21, 4840, 2.90, 0.860};  // lc-bench
 #elif defined(__ARM_NEON) && defined(__aarch64__)
 inline constexpr EvaluateCosts kEvaluateCosts{0.227, 15000, 6.9, 1.66};  // lc-arm
 #elif defined(__SSE4_1__)
-inline constexpr EvaluateCosts kEvaluateCosts{0.42, 15000, 6.0, 1.5};  // a guess: AVX2's, Horner at half the width
+inline constexpr EvaluateCosts kEvaluateCosts{0.42, 6450, 3.87, 1.15};  // a guess: AVX2's tree costs times 4/3, Horner at half the width
 #else
 inline constexpr EvaluateCosts kEvaluateCosts{1.5, 40000, 20.0, 5.0};  // a guess
 #endif
