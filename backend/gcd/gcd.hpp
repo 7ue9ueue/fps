@@ -394,7 +394,7 @@ public:
         std::copy_n(b, m + 1, p[1]);
         a = p[0], b = p[1];
         u32* e = p[2];
-        steps<false>(a, n, b, m, e, 0, kWhole, nullptr);
+        steps<false>(a, n, b, m, e, 0, kNoFloor, nullptr);
         const u32 scale = inverse(a[n]);
         for (std::ptrdiff_t i = 0; i < n; ++i) out[std::size_t(i)] = mul(a[i], scale);
         out[std::size_t(n)] = 1;
@@ -468,10 +468,10 @@ private:
         bool last_d_row;
     };
 
-    static constexpr std::ptrdiff_t kWhole = std::numeric_limits<std::ptrdiff_t>::min() / 2;  // steps()' floor: all words
+    static constexpr std::ptrdiff_t kNoFloor = std::numeric_limits<std::ptrdiff_t>::min() / 2;  // steps()' floor: all words
 
     // Euclid's fraction-free steps on (c, d), deg c = n > deg d = m, while m >= target, on the
-    // coefficients from floor + (progress so far) (all of them for kWhole), which are all the
+    // coefficients from floor + (progress so far) (all of them for kNoFloor), which are all the
     // remaining quotients read: (c, d) end as (r_h, r_(h+1)) up to constants, m < target (m = -1:
     // d = 0). c, d, e: take_padded arrays of n + 1 words. The rows (kRows) take the same steps.
     // A run of degree-1 steps keeps the top two words of c and d in scalars and computes the next
