@@ -72,10 +72,10 @@ using Selected = Candidates<Variant<simd::Avx2, 4, 2, false>, Variant<simd::Avx2
                             Variant<simd::Avx2, 4, 2, true, 4>, Variant<simd::Sse, 4, 1, true, 4>,
                             Variant<simd::Avx2, 4, 2, false, 4>>;
 #elif defined(__ARM_NEON) && defined(__aarch64__)
-using Selected = Candidates<Variant<simd::Neon, 6, 4, false>, Variant<simd::Neon, 6, 4, true>,
-                            Variant<simd::Neon, 4, 1, false>, Variant<simd::Neon, 8, 4, false>,
-                            Variant<simd::Neon, 8, 1, false>, Variant<simd::Neon, 6, 4, true, 4>,
-                            Variant<simd::Neon, 8, 1, false, 4>>;
+using Selected = Candidates<Variant<simd::Neon, 8, 1, false>, Variant<simd::Neon, 6, 1, true>,
+                            Variant<simd::Neon, 4, 1, false>, Variant<simd::Neon, 6, 1, false>,
+                            Variant<simd::Neon, 6, 1, true, 4>, Variant<simd::Neon, 8, 1, false, 4>,
+                            Variant<simd::Neon, 4, 1, false, 4>>;
 #elif defined(__SSE4_1__)
 using Selected = Candidates<Variant<simd::Sse, 4, 1, false>, Variant<simd::Sse, 4, 2, false>,
                             Variant<simd::Sse, 4, 1, true>, Variant<simd::Sse, 4, 1, true, 4>>;

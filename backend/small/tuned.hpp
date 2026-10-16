@@ -5,12 +5,12 @@
 //   avx2: lc-bench (AMD EPYC 7B13), 2026-10-13, commit a1c4a07
 //   avx512: lc-intel (INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz), 2026-10-13, commit a1c4a07
 //   zen5: lc-zen5 (AMD EPYC 9B45), 2026-10-13, commit a1c4a07
-//   arm: lc-arm (implementer 0x41 variant 0x0 part 0xd4f revision 1), 2026-10-13, commit a1c4a07
+//   arm: lc-arm (implementer 0x41 variant 0x0 part 0xd4f revision 1), 2026-10-16, commit 275baa0
 #pragma once
 
 namespace fps::small::tuned {
 
-inline constexpr int signature[] = {1704353439, 366953214, 1226725547, 1442862803, 1812215027, 1790837844};
+inline constexpr int signature[] = {1704353439, 366953214, 1226725547, 1442862803, 1812215027, 49714551};
 
 inline constexpr int variant[][44] = {
     {  // scalar
@@ -34,18 +34,18 @@ inline constexpr int variant[][44] = {
         0, 2, 2, 2, 2, 2, 2, 2, 0, 2, 2, 0, 0,
     },
     {  // arm
-        5, 1, 0, 5, 6, 6, 5, 1, 6, 5, 6, 6, 5, 5, 1, 2, 1, 6, 2, 2, 4, 6, 2, 6, 4, 2, 6, 6, 4, 4, 6,
-        6, 3, 4, 6, 6, 3, 6, 6, 6, 3, 6, 6, 4,
+        4, 1, 0, 4, 5, 5, 4, 1, 5, 4, 5, 5, 4, 4, 1, 2, 3, 5, 3, 2, 2, 6, 3, 5, 0, 2, 5, 5, 0, 0, 5,
+        5, 0, 0, 5, 5, 0, 5, 5, 5, 0, 5, 5, 0,
     },
 };
 
-inline constexpr double term[] = {0.3175, 0.1041, 0.04979, 0.03981, 0.01852, 0.08985};
+inline constexpr double term[] = {0.3175, 0.1041, 0.04979, 0.03981, 0.01852, 0.09051};
 
-inline constexpr double word[] = {1.543, 0.4924, 0.2264, 0.1534, 0.1001, 0.4246};
+inline constexpr double word[] = {1.543, 0.4924, 0.2264, 0.1534, 0.1001, 0.4041};
 
-inline constexpr double call[] = {168.1, 60.96, 37.67, 42.13, 23.51, 33.85};
+inline constexpr double call[] = {168.1, 60.96, 37.67, 42.13, 23.51, 33.75};
 
-inline constexpr double square[] = {0.1008, 0.03738, 0.02176, 0.009135, 0.003864, 0.03832};
+inline constexpr double square[] = {0.1008, 0.03738, 0.02176, 0.009135, 0.003864, 0.02581};
 
 inline constexpr double ntt[][20] = {
     {  // scalar
@@ -74,9 +74,9 @@ inline constexpr double ntt[][20] = {
         9.324e+07,
     },
     {  // arm
-        159.4, 295.3, 678.3, 1541, 3335, 7224, 1.588e+04, 3.406e+04, 7.358e+04, 1.563e+05,
-        3.374e+05, 7.198e+05, 1.532e+06, 3.239e+06, 6.949e+06, 1.452e+07, 3.074e+07, 6.469e+07,
-        1.354e+08, 2.816e+08,
+        161.9, 301.3, 695.6, 1539, 3328, 7249, 1.595e+04, 3.428e+04, 7.377e+04, 1.562e+05,
+        3.379e+05, 7.174e+05, 1.526e+06, 3.223e+06, 6.883e+06, 1.447e+07, 3.045e+07, 6.439e+07,
+        1.341e+08, 2.787e+08,
     },
 };
 

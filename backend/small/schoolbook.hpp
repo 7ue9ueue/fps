@@ -20,7 +20,8 @@
 //   x86 (mul_even): two 64-bit-lane sums per vector, even and odd words. The odd words of the
 //     window at k0 + r W - j are the even words of the window one word on, which the step before
 //     loaded: 2 mul_even, 2 add64 and 1 load per vector and j.
-//   Neon: two 64-bit-lane sums per vector, words 0-1 and 2-3 (umlal, umlal2).
+//   Neon: two 64-bit-lane sums per vector, words 0-1 and 2-3 (umlal, umlal2). The loop with all R
+//     vectors starts at a multiple of 32 bytes (neon_terms).
 //   Scalar: one 64-bit sum per word.
 // Sums: products < (P - 1)^2; every Sums<P>::kFold products a fold keeps them below 2^64; the
 // last step needs them below 3P 2^32 (Sums). Blocks whose loads of a would leave [0, n) read a
@@ -228,12 +229,16 @@ private:
         for (int r = 0; r < C; ++r) L::start(acc[r], src + r * kWidth);
         for (std::size_t j = 0;;) {
             const std::size_t stop = std::min(m, j + Sums<P>::kFold);
-            for (; j < stop; ++j) {
-                const V bj = S::broadcast(b[j]);
-                const u32* base = src - j;
-                if constexpr (detail::HasMulWide<S>) asm("" : "+r"(base));  // as in step()
+            if constexpr (detail::HasMulWide<S>) {
+                neon_terms<0, C, 1, false>(acc, src - j, b + j, b + stop);
+                j = stop;
+            } else {
+                for (; j < stop; ++j) {
+                    const V bj = S::broadcast(b[j]);
+                    const u32* base = src - j;
 #pragma GCC unroll 4
-                for (int r = 0; r < C; ++r) L::step(acc[r], base + r * kWidth, bj);
+                    for (int r = 0; r < C; ++r) L::step(acc[r], base + r * kWidth, bj);
+                }
             }
             if (j == m) break;
             fold(acc, C);
@@ -382,7 +387,12 @@ private:
         L::start(acc[0], w - lo);
         for (std::size_t j = lo;;) {
             const std::size_t stop = std::min(hi, j + Sums<P>::kFold);
-            for (; j < stop; ++j) L::step(acc[0], w - j, S::broadcast(b[j]));
+            if constexpr (detail::HasMulWide<S>) {
+                neon_terms<0, 1, 1, false>(acc, w - j, b + j, b + stop);
+                j = stop;
+            } else {
+                for (; j < stop; ++j) L::step(acc[0], w - j, S::broadcast(b[j]));
+            }
             if (j == hi) break;
             L::fold(acc[0]);
         }
@@ -452,7 +462,10 @@ private:
     template <int First, int Last>
     [[gnu::always_inline]] static void terms(Acc (&acc)[R], const u32* src, std::size_t k, const u32* b,
                                              std::size_t j, std::size_t stop) {
-        if constexpr (First == 0 && Last == R && U > 1) {
+        constexpr bool kAll = First == 0 && Last == R;
+        if constexpr (detail::HasMulWide<S>) {
+            neon_terms<First, Last, kAll ? U : 1, kAll>(acc, src + k - j, b + j, b + stop);
+        } else if constexpr (kAll && U > 1) {
 #pragma GCC unroll U
             for (; j < stop; ++j) step<First, Last>(acc, src, k, b, j);
         } else {
@@ -464,11 +477,39 @@ private:
     [[gnu::always_inline]] static void step(Acc (&acc)[R], const u32* src, std::size_t k, const u32* b, std::size_t j) {
         const V bj = S::broadcast(b[j]);
         const u32* base = src + k - j;
-        // Neon: GCC keeps windows in registers from one j to the next (vector r's window at step j is
-        // vector r + 1's at step j + W) and pays a move for each; an opaque base stops it (notes.md).
-        if constexpr (detail::HasMulWide<S>) asm("" : "+r"(base));
 #pragma GCC unroll 16
         for (int r = First; r < Last; ++r) L::step(acc[r], base + r * kWidth, bj);
+    }
+
+    // Neon: the terms of vectors [First, Last) for the words of b' at p .. end - 1 (p < end), vector
+    // r's window at base + r W for the first and one word lower for each next: a loop on pointers,
+    // unrolled Unroll times. With Align it starts at a multiple of 32 bytes: Neoverse V2 runs the
+    // loop with all R vectors 9% slower at any other address, and GCC aligns a loop only when that
+    // skips at most 15 bytes (-falign-loops=32:16), so where it landed changed with the code before it
+    // and the compiler (issue #197, notes.md). The .p2align has the loop's pointers as operands, so
+    // they are ready before it and nothing comes between it and the loop.
+    template <int First, int Last, int Unroll, bool Align, int N>
+    [[gnu::always_inline]] static void neon_terms(Acc (&acc)[N], const u32* base, const u32* p, const u32* end) {
+        if constexpr (Unroll > 1) {
+            for (std::size_t rest = std::size_t(end - p) % Unroll; rest > 0; --rest) neon_term<First, Last>(acc, base, p);
+            if (p == end) return;
+        }
+        if constexpr (Align) asm volatile(".p2align 5" : "+r"(p), "+r"(base) : "r"(end));
+        do {
+#pragma GCC unroll 16
+            for (int u = 0; u < Unroll; ++u) neon_term<First, Last>(acc, base, p);
+        } while (p != end);
+    }
+
+    // One step of neon_terms. GCC keeps windows in registers from one step to the next (vector r's
+    // window is vector r + 1's W steps later) and pays a move for each; an opaque base stops it.
+    template <int First, int Last, int N>
+    [[gnu::always_inline]] static void neon_term(Acc (&acc)[N], const u32*& base, const u32*& p) {
+        asm("" : "+r"(base));
+        const V bj = S::broadcast(*p++);
+#pragma GCC unroll 16
+        for (int r = First; r < Last; ++r) L::step(acc[r], base + r * kWidth, bj);
+        --base;
     }
 
     // terms<first, last> for runtime first < last <= R: one jump through a table (a chain of compares
