@@ -5,8 +5,8 @@
    "machine": "lc-bench",
    "cpu": "AMD EPYC 7B13",
    "flags": "",
-   "date": "2026-10-12",
-   "commit": "1e867c9",
+   "date": "2026-10-13",
+   "commit": "79dfe49",
    "fields": [
     [
      "signature",
@@ -125,8 +125,8 @@
    "machine": "lc-bench",
    "cpu": "AMD EPYC 7B13",
    "flags": "-march=x86-64-v2",
-   "date": "2026-10-12",
-   "commit": "1e867c9",
+   "date": "2026-10-13",
+   "commit": "79dfe49",
    "fields": [
     [
      "signature",
@@ -245,8 +245,8 @@
    "machine": "lc-bench",
    "cpu": "AMD EPYC 7B13",
    "flags": "-march=x86-64-v3",
-   "date": "2026-10-12",
-   "commit": "6658dfc",
+   "date": "2026-10-13",
+   "commit": "79dfe49",
    "fields": [
     [
      "signature",
@@ -365,8 +365,8 @@
    "machine": "lc-intel",
    "cpu": "INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz",
    "flags": "-march=x86-64-v4 -mavx512ifma -mavx512vbmi",
-   "date": "2026-10-12",
-   "commit": "877a450+changes",
+   "date": "2026-10-13",
+   "commit": "79dfe49",
    "fields": [
     [
      "signature",
@@ -380,10 +380,10 @@
      "int",
      [
       "0",
+      "3",
       "2",
       "2",
-      "2",
-      "2",
+      "3",
       "2",
       "2",
       "2",
@@ -407,7 +407,7 @@
      [
       "1",
       "0",
-      "2",
+      "3",
       "3",
       "2",
       "2",
@@ -418,7 +418,7 @@
       "3",
       "2",
       "2",
-      "2",
+      "3",
       "2",
       "2",
       "2",
@@ -434,8 +434,8 @@
       "1",
       "0",
       "3",
-      "2",
-      "2",
+      "3",
+      "3",
       "3",
       "3",
       "3",
@@ -465,7 +465,7 @@
       "2",
       "3",
       "3",
-      "2",
+      "3",
       "3",
       "3",
       "3",
@@ -486,7 +486,7 @@
    "cpu": "AMD EPYC 9B45",
    "flags": "-march=znver5",
    "date": "2026-10-13",
-   "commit": "808adfc+changes",
+   "commit": "79dfe49",
    "fields": [
     [
      "signature",
@@ -544,7 +544,7 @@
       "3",
       "3",
       "2",
-      "3"
+      "2"
      ]
     ],
     [
@@ -554,7 +554,7 @@
       "0",
       "0",
       "3",
-      "2",
+      "3",
       "3",
       "3",
       "3",
@@ -606,7 +606,7 @@
    "cpu": "implementer 0x41 variant 0x0 part 0xd4f revision 1",
    "flags": "-mcpu=neoverse-v2",
    "date": "2026-10-13",
-   "commit": "877a450+changes",
+   "commit": "79dfe49",
    "fields": [
     [
      "signature",

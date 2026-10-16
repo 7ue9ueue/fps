@@ -5,8 +5,9 @@
   gate.py REV [--base REV]      a local revision, merged into --base (default origin/main)
 
 For every target in tools/kernel.py, all at once, on the target's test machines ('mac' is this
-Mac, with clang): kernel.py test of every affected unit; kernel.py check once, on the first
-target's first test machine. A test whose preprocessed text for the target is identical to the
+Mac, with clang): kernel.py test of every affected unit, and again with each older compiler in
+kernel.py's COMPAT on its machine (GCC 15.2 for avx2 on lc-amd: users may still build with it);
+kernel.py check once, on the first target's first test machine. A test whose preprocessed text for the target is identical to the
 base's is skipped (kernel.py --base): the base passed it already, and the same text, compiler and
 flags give the same binary. ASan/UBSan builds only for the kernels whose own folder changed (all,
 if a shared file did); tools/sanitize.py runs them for every unit on every target, apart from the
@@ -63,7 +64,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from kernel import TARGETS
+from kernel import COMPAT, TARGETS
 from vm import ROOT as ROOT_ON_VM, rev_tar, ship, slug, ssh
 
 TEST_TIMEOUT = 2 * 60 * 60  # seconds for one machine's tests: a shared-file change rebuilds every
@@ -164,11 +165,12 @@ def run_here(command: str, cwd: str) -> subprocess.CompletedProcess:
 
 
 def run_tests(machine: str, name: str, new_tar: bytes, base_tar: bytes | None, target: str, units: list[str],
-              check: bool, sanitized: list[str] | None = None) -> subprocess.CompletedProcess:
+              check: bool, sanitized: list[str] | None = None, image: str | None = None) -> subprocess.CompletedProcess:
     """Tests that build to the same preprocessed text as in base_tar are skipped (kernel.py --base);
-    only the units in `sanitized` are built with ASan/UBSan (None: all). Exit code 124: timed out."""
+    only the units in `sanitized` are built with ASan/UBSan (None: all). image: a COMPAT compiler
+    instead of the pinned one. Exit code 124: timed out."""
     command = ('python3 tools/kernel.py check && ' if check else '') + \
-        f'python3 tools/kernel.py test {" ".join(units)} --target {target}'
+        f'python3 tools/kernel.py{f" --image {image}" if image else ""} test {" ".join(units)} --target {target}'
     if sanitized is not None:
         command += f' --sanitize {" ".join(sanitized)}'
     if machine == 'mac':
@@ -181,7 +183,7 @@ def run_tests(machine: str, name: str, new_tar: bytes, base_tar: bytes | None, t
     # the test runs on this machine share its cores: this gate's targets here, or, counted when the
     # run starts, every live gate run on it if more (gates run side by side: two gates' 6 runs on
     # lc-amd's 4 cores each took a quarter of them, and neither finished in 80 min on 2026-10-16)
-    share = sum(machine in spec['test'] for spec in TARGETS.values())
+    share = sum(machine in spec['test'] for spec in TARGETS.values()) + sum(m == machine for _, m, _ in COMPAT)
     live = ('$(for d in $HOME/' + ROOT_ON_VM + '/gate-*.run-*; do [ -e "$d/exit" ] || '
             '! kill -0 "$(cat "$d/pid" 2>/dev/null)" 2>/dev/null || echo; done | wc -l)')
     command += f' -j $(( s = {live}, s = s > {share} ? s : {share}, ($(nproc) + s - 1) / s ))'
@@ -247,18 +249,22 @@ def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, units: 
     spec = TARGETS[target]
     out = [f'### {target}: `{spec["flags"] or "no flags"}`', '']
 
-    def test_on(machine: str) -> tuple[subprocess.CompletedProcess, float]:
-        log(f'[{target}] testing on {machine}')
+    def test_on(machine: str, image: str | None = None) -> tuple[subprocess.CompletedProcess, float]:
+        log(f'[{target}] testing on {machine}' + (f' with {image}' if image else ''))
         start = time.monotonic()
         try:
-            result = run_tests(machine, f'gate-{label}-{target}-test', new_tar, base_tar, target, units,
-                               check and machine == spec['test'][0], sanitized)
+            result = run_tests(machine, f'gate-{label}-{target}-test' + ('-compat' if image else ''), new_tar,
+                               base_tar, target, units, check and machine == spec['test'][0] and not image,
+                               sanitized, image)
         except (Exception, SystemExit) as error:  # a copy that failed or hung: this machine fails, the others finish
             result = subprocess.CompletedProcess('', 1, b'', f'{type(error).__name__}: {error}'.encode())
         return result, minutes(start)
 
     with ThreadPoolExecutor() as executor:
+        # keys: the machine, or "machine with image" for a compatibility compiler (COMPAT, tests only)
         futures = {m: executor.submit(test_on, m) for m in spec['test']}
+        futures |= {f'{m} with {i.split("@")[0].rsplit("/", 1)[-1]}': executor.submit(test_on, m, i)
+                    for t, m, i in COMPAT if t == target}
         results = {m: future.result() for m, future in futures.items()}
     passed = True
     for machine, (result, took) in results.items():
