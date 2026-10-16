@@ -298,6 +298,12 @@ issue #152, below). A candidate on both targets; on zen5 also `Native` (the leaf
   alone moves single ops by up to 10% between builds (forward/11, product/10): compare in one
   binary (run-time switches) or over several builds. Loads 4 bytes past a column (odd words) in the
   two-column groups ran 1.36x slower (loads across two recent stores do not forward).
+- Issue #176 (notes/176-r1.md): at 2^6 and 2^7 the subtrees' bottoms run in one call
+  (`kJoinBottoms`, #151's hook), so the pair kernels take them: multiply/6-7 0.58-0.66 of the
+  variant's time before. The transforms' bottom level in statements of 2 and 4 pairs on Emerald
+  Rapids too (forward 0.85-0.87 of WideBottom's time on L1 data, inverse 4 pairs 0.95-0.97); on
+  Zen 5 the 4-pair statements scheduled with a window of 128 (forward 0.75, inverse 0.81; 0.80 and
+  0.86 before) and the 2-pair forward on the Emerald Rapids model (0.86; 0.89).
 
 ### neon (issue #151)
 
