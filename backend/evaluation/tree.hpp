@@ -122,6 +122,9 @@ private:
     bool left_ = true;
 };
 
+// Words between the rows of the lane products (C + 1 coefficients each) for the top tree's leaves.
+inline std::size_t row_stride(std::size_t slots) { return (slots + 16) / 16 * 16; }
+
 // Words of the lane tree's rooms for C slots (its split and base for slots of degree 1: the
 // middle, and at most kLaneBase slots), for sizing memory before the tree exists.
 inline std::size_t lane_kept_words(std::size_t slots, bool left) {
@@ -221,9 +224,16 @@ public:
           lanes_(slots_, stack, Store::Keeper{&lane_store_}) {
         const auto lane_words = [](u32 d) { return 8 * lane_length(d); };
         lane_store_.reset(stack, count_, Store::words(lanes_, 0, count_, lane_words, left), left);
-        const auto root = lanes_.root();
-        lane_root_ = root.coefficients;
-        for (std::size_t l = 0; l < 8; ++l) leaves_[l] = {lane_root_ + l, u32(count_), true, 8};
+        // The top tree's leaves: the lane products as rows (lane l's count_ + 1 coefficients at l
+        // stride), by vector transposes rather than strided loads.
+        const u32* const lanes = lanes_.root().coefficients;
+        const std::size_t stride = row_stride(slots), whole = (count_ + 1) / 8 * 8;
+        u32* const rows = stack.take(8 * stride);
+        lanes_to_rows<Lanes>(lanes, whole, rows, stride);
+        for (std::size_t l = 0; l < 8; ++l) {
+            for (std::size_t j = whole; j <= count_; ++j) rows[l * stride + j] = lanes[8 * j + l];
+            leaves_[l] = {rows + l * stride, u32(count_), true};
+        }
         top_.emplace(std::span<const Leaf>(leaves_), stack, Store::Keeper{&top_store_});
         const auto top_words = [](u32 d) { return top_length(d); };
         top_store_.reset(stack, 8, Store::words(*top_, 0, 8, top_words, left), left);
@@ -541,7 +551,6 @@ private:
     std::size_t count_, m8_, lane_length_, top_length_;
     Store lane_store_, top_store_;
     LaneTree<PointSlots, Store::Keeper> lanes_;
-    const u32* lane_root_ = nullptr;
     Leaf leaves_[8];
     std::optional<StandardTree<Store::Keeper>> top_;
     const u32* q_ = nullptr;

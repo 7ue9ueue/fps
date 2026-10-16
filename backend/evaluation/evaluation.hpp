@@ -63,6 +63,7 @@ inline std::size_t tree_words(std::size_t m8, bool left) {
     const std::size_t top_kept = (left ? 2 : 1) * (Stack::footprint(top_length(m8)) + 2 * Stack::footprint(top_length(m8 / 2)) +
                                                   4 * Stack::footprint(top_length(m8 / 4)));
     return Stack::footprint(slots + 1) + Stack::footprint(2 * slots + 2) + lane_kept_words(slots, left) + 6 * Stack::footprint(lanes) +
+           Stack::footprint(8 * row_stride(slots)) +
            Stack::footprint(16) + Stack::footprint(32) + top_kept + 4 * Stack::footprint(top) + 1024;
 }
 
