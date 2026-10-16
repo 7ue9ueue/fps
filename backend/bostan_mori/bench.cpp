@@ -54,7 +54,7 @@ int main(int argc, char** argv) {
     const auto schoolbook = [](const Vec& p, const Vec& q, std::uint64_t k) { return bm::variant::schoolbook(p, q, k); };
     const auto values = [](const Vec& p, const Vec& q, std::uint64_t k) { return bm::variant::values(p, q, k, 0); };
     const auto products = [](const Vec& p, const Vec& q, std::uint64_t k) { return bm::variant::products(p, q, k); };
-    for (std::size_t d : {2, 16, 64, 1024, 16384, 100000}) add(suite, "coefficient", d, selected);
+    for (std::size_t d : {2, 6, 16, 64, 1024, 16384, 100000}) add(suite, "coefficient", d, selected);
     for (std::size_t d : {16, 32, 48, 64, 96, 128}) {
         add(suite, "coefficient@schoolbook", d, schoolbook);
         add(suite, "coefficient@values", d, values);

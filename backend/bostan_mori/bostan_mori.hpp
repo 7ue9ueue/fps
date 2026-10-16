@@ -31,7 +31,9 @@
 // schoolbook: per step U_0 = qe pe - x qo po, U_1 = qe po - qo pe, V = qe qe - x qo qo, with
 // pe, po, qe, qo the even and odd halves (p = pe(x^2) + x po(x^2)): vectors of U's and V's words,
 // 64-bit sums of products (backend/small's lanes), one Montgomery reduction per word. At most
-// kTinyMax (4) words: scalar sums by the definition.
+// kTinyMax (8) words: scalar sums by the definition on a fixed shape per size (a template), with
+// no loop of variable length and no branch on k's bits. With q[0] = 1 (linear recurrences) both
+// skip the inverse at the end.
 //
 // Design and measurements: notes.md.
 #pragma once
@@ -75,6 +77,13 @@ inline constexpr auto kHalves = [] {
     std::array<u32, 65> t{};
     t[0] = 1;
     for (int h = 1; h <= 64; ++h) t[h] = mul(t[h - 1], (kP + 1) / 2);
+    return t;
+}();
+// 2^(32 (2^h - 1)) mod P for h <= 64: after h schoolbook steps from q[0] = 1, the inverse of q[0].
+inline constexpr auto kUnscale = [] {
+    std::array<u32, 65> t{};
+    t[0] = 1;
+    for (int h = 1; h <= 64; ++h) t[h] = mul(mul(t[h - 1], t[h - 1]), kR);
     return t;
 }();
 
@@ -345,17 +354,24 @@ struct Schoolbook {
         alignas(64) u32 out[2][kMax + 4 * W + 16];
         u32 *const e = pe + kFront, *const o = po + kFront, *const f = qe + kFront, *const g = qo + kFront,
                    *const ng = nqo + kFront;
-        std::fill_n(pe, kSpan, 0u), std::fill_n(po, kSpan, 0u), std::fill_n(qe, kSpan, 0u);
-        std::fill_n(qo, kSpan, 0u), std::fill_n(nqo, kSpan, 0u);
         std::size_t np = p0.size(), nq = q0.size();
-        for (std::size_t i = 0; i < np; ++i) (i % 2 ? o : e)[i / 2] = p0[i];
-        for (std::size_t i = 0; i < nq; ++i) (i % 2 ? g : f)[i / 2] = q0[i];
-        for (std::size_t i = 0; i < nq / 2; ++i) ng[i] = g[i] ? kP - g[i] : 0;
         const std::size_t width = std::max(np, nq);  // sizes stay at most this
         const auto halves = [](std::size_t n) { return ((n + 1) / 2 + W - 1) / W * W; };  // words of a half, rounded
         std::size_t written = halves(width);  // the halves may be nonzero below this
         const V zero = S::broadcast(0);
-        for (; k > 0; k /= 2) {
+        // Zeros where windows reach, [-W - 1, written + W + 1) of each half, by vector stores. The
+        // asm keeps these loops (and the ones below) from becoming calls of memset: GCC 16 makes
+        // the per-step ones calls, with vector spills around them (notes/198-r1.md).
+        for (std::size_t i = 0; i < kFront + written + 2 * W + 16; i += W) {
+            asm("" : "+r"(i));
+            S::store(pe + i, zero), S::store(po + i, zero), S::store(qe + i, zero), S::store(qo + i, zero);
+            S::store(nqo + i, zero);
+        }
+        for (std::size_t i = 0; i < np; ++i) (i % 2 ? o : e)[i / 2] = p0[i];
+        for (std::size_t i = 0; i < nq; ++i) (i % 2 ? g : f)[i / 2] = q0[i];
+        for (std::size_t i = 0; i < nq / 2; ++i) ng[i] = g[i] ? kP - g[i] : 0;
+        int steps = 0;
+        for (; k > 0; k /= 2, ++steps) {
             const std::size_t r = k % 2, top = std::size_t(std::min<u64>(k / 2 + 1, width));
             const std::ptrdiff_t ne = std::ptrdiff_t(np + 1) / 2, no = std::ptrdiff_t(np / 2);
             const std::ptrdiff_t me = std::ptrdiff_t(nq + 1) / 2, mo = std::ptrdiff_t(nq / 2);
@@ -377,54 +393,104 @@ struct Schoolbook {
             }
             // the halves of U and V, zeros from nu and nv on (the blocks wrote garbage past them)
             const std::size_t extent = halves(std::max(nu, nv));
-            for (std::size_t j = nu; j < 2 * extent; j += W) S::store(out[0] + j, zero);
-            for (std::size_t j = nv; j < 2 * extent; j += W) S::store(out[1] + j, zero);
+            for (std::size_t j = nu; j < 2 * extent; j += W) {
+                asm("" : "+r"(j));
+                S::store(out[0] + j, zero);
+            }
+            for (std::size_t j = nv; j < 2 * extent; j += W) {
+                asm("" : "+r"(j));
+                S::store(out[1] + j, zero);
+            }
             for (std::size_t i = 0; i < extent; i += W) {
                 const auto [ue, uo] = unzip<S>(S::load(out[0] + 2 * i), S::load(out[0] + 2 * i + W));
                 const auto [ve, vo] = unzip<S>(S::load(out[1] + 2 * i), S::load(out[1] + 2 * i + W));
                 S::store(e + i, ue), S::store(o + i, uo), S::store(f + i, ve), S::store(g + i, vo);
                 S::store(ng + i, M::sub(zero, vo));
             }
-            for (std::size_t i = extent; i < written; i += W)  // shorter than before: zeros
-                S::store(e + i, zero), S::store(o + i, zero), S::store(f + i, zero), S::store(g + i, zero),
-                    S::store(ng + i, zero);
+            for (std::size_t i = extent; i < written; i += W) {  // shorter than before: zeros
+                asm("" : "+r"(i));
+                S::store(e + i, zero), S::store(o + i, zero), S::store(f + i, zero), S::store(g + i, zero);
+                S::store(ng + i, zero);
+            }
             written = extent, np = nu, nq = nv;
         }
-        return mul(e[0], inverse(f[0]));
+        // f[0] is q0[0]^(2^steps) 2^(-32 (2^steps - 1)) (each step squares it, times 2^-32)
+        return q0[0] == 1 ? mul(e[0], kUnscale[steps]) : mul(e[0], inverse(f[0]));
     }
 };
 
-// Steps for p and q of at most kTinyMax words, in scalar code by the definition: with s = q(-x),
-// U[j] = sum over i of s_i p_(2j + r - i), V[j] = sum over i of s_i q_(2j - i), each a 64-bit sum
-// of at most kTinyMax products (below 2^64) reduced once. Exact. Faster than Schoolbook's vectors
-// for 3 words (Fibonacci), slower from 5 (notes.md).
-inline constexpr std::size_t kTinyMax = 4;
-inline u32 tiny(std::span<const u32> p0, std::span<const u32> q0, u64 k) {
-    u32 buffers[4][kTinyMax], s[kTinyMax];
-    u32 *p = buffers[0], *q = buffers[1], *u = buffers[2], *v = buffers[3];
-    std::size_t np = p0.size(), nq = q0.size();
-    std::copy(p0.begin(), p0.end(), p), std::copy(q0.begin(), q0.end(), q);
-    const std::size_t width = std::max(np, nq);
+// ---- Tiny steps ---------------------------------------------------------------------------------
+
+// f(integral_constant<int, i>) for i in [0, N), unrolled at compile time.
+template <int N, class F>
+[[gnu::always_inline]] inline void unroll(F&& f) {
+    [&]<int... I>(std::integer_sequence<int, I...>) { (f(std::integral_constant<int, I>{}), ...); }(
+        std::make_integer_sequence<int, N>{});
+}
+
+// Steps for p and q of at most kTinyMax words, in scalar code on a fixed shape: p of NP and q of NQ
+// words, NP = NQ - 1 or NP = NQ (zero words padded), which a step keeps for either r. With
+// s = q(-x): U[j] = sum over i of s_i p_(2j + r - i), V[j] = s_j q_j + 2 sum over i < j of
+// s_i q_(2j - i), each a 64-bit sum of at most NQ + 1 products below P^2, reduced once: exact.
+// p_(b + r) is picked by a mask of r: no loop of variable length, no branch on k's bits (GCC 16's
+// exit tests on the loops of the old version cost Zen 3 1.5-2.8x, notes/198-r1.md). Faster than
+// Schoolbook's vectors up to 8 words on every timed target.
+inline constexpr std::size_t kTinyMax = 8;
+
+template <int NP, int NQ>
+[[gnu::noinline]] u32 tiny_steps(const u32* p0, const u32* q0, u64 k) {
+    static_assert(NP == NQ || NP == NQ - 1);
+    static_assert(NQ <= 16);  // sums of at most 17 products < P^2 stay below 2^64
+    u32 p[NP], q[NQ];
+    unroll<NP>([&](auto i) { p[i] = p0[i]; });
+    unroll<NQ>([&](auto i) { q[i] = q0[i]; });
     for (; k > 0; k /= 2) {
-        const std::size_t r = k % 2, top = std::size_t(std::min<u64>(k / 2 + 1, width));
-        const std::size_t nu = std::min(np + nq >= 2 + r ? (np + nq - 2 - r) / 2 + 1 : 0, top);
-        const std::size_t nv = std::min(nq, top);
-        if (nu == 0) return 0;
-        for (std::size_t i = 0; i < nq; ++i) s[i] = i % 2 && q[i] ? kP - q[i] : q[i];
-        for (std::size_t j = 0; j < nu; ++j) {
-            const std::size_t t = 2 * j + r;
+        u32 s[NQ], ps[NP + 1], v[NQ];  // s = q(-x), odd words P - q_i; ps[b + 1] = p_(b + r)
+        unroll<NQ>([&](auto i) { s[i] = i % 2 ? kP - q[i] : q[i]; });
+        const u32 mask = 0u - u32(k % 2);
+        unroll<NP + 1>([&](auto c) {
+            constexpr int b = int(c) - 1;
+            u32 lo = 0, hi = 0;
+            if constexpr (b >= 0) lo = p[b];
+            if constexpr (b + 1 < NP) hi = p[b + 1];
+            ps[c] = lo ^ ((lo ^ hi) & mask);
+        });
+        unroll<NP>([&](auto j) {
             u64 sum = 0;
-            for (std::size_t i = t + 1 > np ? t + 1 - np : 0; i < nq && i <= t; ++i) sum += u64(s[i]) * p[t - i];
-            u[j] = u32(sum % kP);
-        }
-        for (std::size_t j = 0; j < nv; ++j) {
-            u64 sum = 0;
-            for (std::size_t i = 2 * j + 1 > nq ? 2 * j + 1 - nq : 0; i < nq && i <= 2 * j; ++i) sum += u64(s[i]) * q[2 * j - i];
+            unroll<NQ>([&](auto i) {
+                constexpr int b = 2 * int(j) - int(i);
+                if constexpr (b >= -1 && b < NP) sum += u64(s[i]) * ps[b + 1];
+            });
+            p[j] = u32(sum % kP);
+        });
+        unroll<NQ>([&](auto j) {
+            u64 sum = u64(s[j]) * q[j];
+            unroll<int(j)>([&](auto i) {
+                constexpr int m = 2 * int(j) - int(i);
+                if constexpr (m < NQ) sum += 2 * (u64(s[i]) * q[m]);
+            });
             v[j] = u32(sum % kP);
-        }
-        std::swap(p, u), std::swap(q, v), np = nu, nq = nv;
+        });
+        unroll<NQ>([&](auto i) { q[i] = v[i]; });
     }
-    return mul(p[0], inverse(q[0]));
+    // q[0] is q0[0]^(2^steps): 1 stays 1 (every linear recurrence)
+    return q[0] == 1 ? p[0] : mul(p[0], inverse(q[0]));
+}
+
+inline u32 tiny(std::span<const u32> p, std::span<const u32> q, u64 k) {
+    u32 a[kTinyMax] = {}, b[kTinyMax] = {};
+    for (std::size_t i = 0; i < p.size(); ++i) a[i] = p[i];
+    for (std::size_t i = 0; i < q.size(); ++i) b[i] = q[i];
+    u32 result = 0;
+    if (p.size() < q.size())
+        unroll<int(kTinyMax) - 1>([&](auto i) {
+            if (q.size() == i + 2) result = tiny_steps<i + 1, i + 2>(a, b, k);
+        });
+    else
+        unroll<int(kTinyMax)>([&](auto i) {
+            if (p.size() == i + 1) result = tiny_steps<i + 1, i + 1>(a, b, k);
+        });
+    return result;
 }
 
 // [x^k] p / q times kept scale for p, q of at most kSchoolbookCapacity words, k >= 1.
