@@ -27,6 +27,8 @@ Passes if every test passes. For a pull request it posts the report as a comment
 commit status `gate` on its head, which `main` requires; with --merge it squash-merges that head
 on a pass (GitHub refuses if the head moved). The last line of the report is "Gate: pass" or
 "Gate: fail". A test or a copy that takes longer than TEST_TIMEOUT fails, killed on the machine.
+On a VM the tests run detached from ssh and the gate polls them, so a dropped connection does not
+restart them.
 
 The only lock is the merge lock, held for seconds: from the last look at main to the merge. If
 main moved while the tests ran, the tests run again only when the new commits touch a unit this
@@ -48,7 +50,9 @@ import fcntl
 import io
 import json
 import os
+import random
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -64,6 +68,7 @@ from kernel import COMPAT, TARGETS
 from vm import ROOT as ROOT_ON_VM, rev_tar, ship, slug, ssh
 
 TEST_TIMEOUT = 60 * 60  # seconds for one machine's tests, a wait for the bench lock on lc-arm included
+POLL = 30  # seconds between looks at a VM's detached tests
 MERGE_LOCK_WAIT = 30 * 60  # seconds to wait for the merge lock
 NETWORK_TIMEOUT = 300  # seconds for one git or gh call
 SHARED = re.compile(r'^(backend/[^/]+|tools/kernel\.py)$')  # files outside a kernel folder
@@ -74,8 +79,18 @@ ROOT = Path(os.environ.get('FPS_GATE_ROOT') or Path(__file__).resolve().parent.p
 
 
 def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(['git', *args], check=check, capture_output=True, text=True, cwd=ROOT,
-                          timeout=NETWORK_TIMEOUT)
+    """A fetch is retried: gates run side by side in one checkout, and two fetches at once can fail
+    on a ref lock (#220: PR 203's and PR 217's gates, started in the same second)."""
+    for attempt in range(5 if args[0] == 'fetch' else 1):
+        if attempt:
+            log(f'git {args[0]} failed, retrying: {result.stderr.strip()[-200:]}')
+            time.sleep(1 + 4 * random.random())
+        result = subprocess.run(['git', *args], capture_output=True, text=True, cwd=ROOT, timeout=NETWORK_TIMEOUT)
+        if result.returncode == 0:
+            break
+    if check and result.returncode:
+        raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
+    return result
 
 
 def log(message: str) -> None:
@@ -164,23 +179,68 @@ def run_tests(machine: str, name: str, new_tar: bytes, base_tar: bytes | None, t
                 tarfile.open(fileobj=io.BytesIO(base_tar), mode='r:gz').extractall(base)
                 command += f' --base {base}'
             return run_here(command, tree)
-    # the test runs on this machine (targets, compatibility compilers) share its cores
+    # the test runs on this machine share its cores: this gate's targets here, or, counted when the
+    # run starts, every live gate run on it if more (gates run side by side: two gates' 6 runs on
+    # lc-amd's 4 cores each took a quarter of them, and neither finished in 80 min on 2026-10-16)
     share = sum(machine in spec['test'] for spec in TARGETS.values()) + sum(m == machine for _, m, _ in COMPAT)
-    command += f' -j $(( ($(nproc) + {share - 1}) / {share} ))'
+    live = ('$(for d in $HOME/' + ROOT_ON_VM + '/gate-*.run-*; do [ -e "$d/exit" ] || '
+            '! kill -0 "$(cat "$d/pid" 2>/dev/null)" 2>/dev/null || echo; done | wc -l)')
+    command += f' -j $(( s = {live}, s = s > {share} ? s : {share}, ($(nproc) + s - 1) / s ))'
     path, base_path = f'{ROOT_ON_VM}/{slug(name)}', f'{ROOT_ON_VM}/{slug(name + "-base")}' if base_tar else ''
+    run = f'{path}.run-{secrets.token_hex(4)}'  # the detached run's pid, out, err and exit; new per call
     try:
         ship(machine, name, new_tar)
         if base_tar:
             ship(machine, f'{name}-base', base_tar)
         command = f'cd {path} && {command}' + (f' --base $HOME/{base_path}' if base_path else '')
-        # `timeout` on the machine ends the tests and releases the bench lock; the local limit is a backstop
-        return ssh(machine, f'timeout -k 30 {TEST_TIMEOUT} bash -c {shlex.quote(command)}', capture=True,
-                   timeout=TEST_TIMEOUT + 300)
-    except subprocess.TimeoutExpired:
-        return timed_out(command)
+        return run_detached(machine, run, command)
     finally:
+        # kill the run if it is still going (the gate stopped waiting, or was interrupted)
+        stop = (f'sid=$(cat {run}/pid 2>/dev/null) && [ ! -e {run}/exit ] && '
+                f'{{ pkill -TERM -s $sid; sleep 5; pkill -KILL -s $sid; }}; ')
         with contextlib.suppress(subprocess.TimeoutExpired):
-            ssh(machine, f'rm -rf {path} {base_path}', timeout=120)
+            ssh(machine, stop + f'rm -rf {path} {base_path} {run}', timeout=120)
+
+
+def run_detached(machine: str, run: str, command: str) -> subprocess.CompletedProcess:
+    """Run a shell command on a VM, detached from ssh: one short ssh starts it in its own session,
+    writing pid, out, err and exit into the folder `run`; short ssh calls every POLL seconds look
+    for exit. A dropped connection costs a poll, not a rerun (on 2026-10-16 every ssh from this
+    Mac to two VMs dropped at once, 50 min into PR 203's and PR 217's gates, and both restarted
+    their tests). `timeout` on the machine ends the tests after TEST_TIMEOUT and releases the bench
+    lock; the gate stops waiting 5 min later, and the caller kills what is left."""
+    at = f'$HOME/{run}'
+    job = (f'echo $$ > {at}/pid; timeout -k 30 {TEST_TIMEOUT} bash -c {shlex.quote(command)} > {at}/out 2> {at}/err; '
+           f'echo $? > {at}/exit.tmp && mv {at}/exit.tmp {at}/exit')
+    # mkdir is the guard: a start whose ssh dropped after it ran is retried by ssh() and starts nothing
+    detach = f'setsid nohup bash -c {shlex.quote(job)} </dev/null >/dev/null 2>&1 &'
+    start = ssh(machine, f'if mkdir {run}; then {detach} fi', capture=True, timeout=120)
+    if start.returncode:
+        return subprocess.CompletedProcess(command, 1, b'', f'could not start the tests on {machine}: '.encode()
+                                           + start.stderr)
+    # exit code, or "gone" if the run ended without writing one (the VM restarted, or it was killed)
+    look = f'cat {run}/exit || kill -0 $(cat {run}/pid) || cat {run}/exit || echo gone'
+    deadline = time.monotonic() + TEST_TIMEOUT + 300
+    while time.monotonic() < deadline:
+        time.sleep(POLL)
+        try:
+            status = ssh(machine, look, capture=True, timeout=120)
+            if status.returncode:  # `look` itself exits 0: the connection failed
+                log(f'no answer from {machine} (exit {status.returncode}); the tests run on, polling again in {POLL} s')
+                continue
+            code = status.stdout.decode().strip()
+            if code == 'gone':
+                return subprocess.CompletedProcess(command, 1, b'', f'the tests on {machine} stopped without '
+                                                   'an exit code (killed, or the machine restarted)'.encode())
+            if not code.isdigit():
+                continue
+            out = ssh(machine, f'cat {run}/out', capture=True, timeout=300)
+            err = ssh(machine, f'cat {run}/err', capture=True, timeout=300)
+            if out.returncode == 0 and err.returncode == 0:
+                return subprocess.CompletedProcess(command, int(code), out.stdout, err.stdout)
+        except subprocess.TimeoutExpired:
+            log(f'no answer from {machine}; the tests run on, polling again in {POLL} s')
+    return timed_out(command)
 
 
 def run_target(target: str, label: str, new_tar: bytes, base_tar: bytes, units: list[str], sanitized: list[str],
@@ -305,7 +365,8 @@ def set_status(head: str, passed: bool, url: str) -> None:
 def merge_lock(label: str):
     """Held from the last look at main to the merge, seconds. The file is the one the gates that
     held it for a whole run used, so a gate still running that code makes this wait. It names the
-    holder, for those waiting."""
+    holder, for those waiting, and is emptied on release; a name left in it is from a gate that
+    died holding the lock, which the kernel released with it: only flock says who holds it."""
     path = Path.home() / '.cache' / 'fps' / 'gate-merge.lock'
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, 'a+') as lock:  # not 'w': that would erase the holder's name before the wait
@@ -324,7 +385,11 @@ def merge_lock(label: str):
         lock.truncate()
         lock.write(f'{label}, pid {os.getpid()}, since {time.strftime("%H:%M:%S")}\n')
         lock.flush()
-        yield
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            lock.truncate()
 
 
 def stale(base: str, tip: str, merged: str, units: list[str]) -> bool:
