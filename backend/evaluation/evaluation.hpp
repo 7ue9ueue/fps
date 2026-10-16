@@ -137,26 +137,13 @@ inline void divide_linear(u32* f, std::size_t n, u32 p) {
 }
 
 // interpolate() for m <= kDirectInterpolate, in O(m^2): M = prod (x - a_i), w_i = y_i / M'(a_i), f =
-// sum w_i M / (x - a_i).
+// sum w_i M / (x - a_i), in vectors of points (interpolate_small).
 inline void interpolate_direct(std::span<const u32> a, std::span<const u32> y, std::span<u32> f) {
     const std::size_t m = a.size();
-    std::vector<u32> big(m + 1, 0), q(m + 1);  // big = M
-    big[0] = 1;
-    for (std::size_t i = 0; i < m; ++i) {  // M *= x - a_i
-        for (std::size_t j = i + 1; j > 0; --j) big[j] = sub_mod(big[j - 1], multiply_mod(a[i], big[j]));
-        big[0] = sub_mod(0, multiply_mod(a[i], big[0]));
-    }
-    std::fill(f.begin(), f.end(), 0u);
-    for (std::size_t i = 0; i < m; ++i) {
-        // q = M / (x - a_i): q[m - 1] = M[m], q[j - 1] = M[j] + a q[j]; M'(a_i) = q(a_i).
-        u32 carry = 0;
-        for (std::size_t j = m; j > 0; --j) q[j - 1] = carry = add_mod(big[j], multiply_mod(a[i], carry));
-        u32 value = 0;
-        for (std::size_t j = m; j-- > 0;) value = add_mod(multiply_mod(value, a[i]), q[j]);
-        if (value == 0) throw std::domain_error("fps::evaluation::interpolate: repeated points");
-        const u32 w = multiply_mod(y[i], inverse_mod(value));
-        for (std::size_t j = 0; j < m; ++j) f[j] = add_mod(f[j], multiply_mod(w, q[j]));
-    }
+    std::vector<u32> big(m + 1 + 16), scratch((Wide::lanes + 2) * m + 16);
+    product_of_linear<Wide>(a.data(), m, big.data());
+    if (!interpolate_small<Wide>(big.data(), m, a.data(), y.data(), f.data(), scratch.data()))
+        throw std::domain_error("fps::evaluation::interpolate: repeated points");
 }
 
 // interpolate() by the tree, m >= 1.
@@ -237,7 +224,8 @@ inline void to_newton_basis(std::span<const std::uint32_t> f, std::span<const st
     if (n == 0) return;
     if (n <= kDirectNewton) {
         std::copy(f.begin(), f.end(), c.begin());
-        for (std::size_t k = 0; k + 1 < n; ++k) detail::divide_linear(c.data() + k, n - k, points[k]);
+        std::vector<std::uint32_t> scratch(n + 8 * detail::Wide::lanes);
+        detail::newton_small<detail::Wide, 4>(c.data(), n, points.data(), scratch.data());
         return;
     }
     detail::newton_tree(f, points, c);

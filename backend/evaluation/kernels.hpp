@@ -5,6 +5,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -224,7 +225,7 @@ template <class L>
     }
 }
 
-// multiply_units_inline, unrolled for m = k = 1, 2, 4.
+// multiply_units_inline, unrolled for m = k = 1, 2, 4, 8.
 template <class L>
 void multiply_units(const u32* a, std::size_t m, const u32* b, std::size_t k, u32* c) {
     if (m == k) {
@@ -232,6 +233,7 @@ void multiply_units(const u32* a, std::size_t m, const u32* b, std::size_t k, u3
             case 1: return multiply_units_inline<L>(a, 1, b, 1, c);
             case 2: return multiply_units_inline<L>(a, 2, b, 2, c);
             case 4: return multiply_units_inline<L>(a, 4, b, 4, c);
+            case 8: return multiply_units_inline<L>(a, 8, b, 8, c);
         }
     }
     multiply_units_inline<L>(a, m, b, k, c);
@@ -365,6 +367,124 @@ void horner(const u32* f, std::size_t n, const u32* x, std::size_t m, u32* value
         }
         std::copy_n(out, here, values + i0);
     }
+}
+
+// M = prod (x - a_i) over m points: m + 1 words, canonical (M[m] = 1). In vectors over the
+// coefficients, M = M x - a_i M from the top down.
+template <class S>
+void product_of_linear(const u32* a, std::size_t m, u32* M) {
+    using O = Ops<S>;
+    constexpr std::size_t W = S::lanes;
+    const typename S::V r2 = S::broadcast(kR2);
+    std::fill(M, M + m + 1, 0u);
+    M[0] = 1;
+    for (std::size_t i = 0; i < m; ++i) {  // degree i -> i + 1: M[j] = M[j - 1] - a M[j], j = i + 1 down to 0
+        const u32 am = montgomery(a[i], kR2);
+        const typename S::V av = O::template reduce<kP>(O::montgomery(S::broadcast(a[i]), r2));
+        std::size_t j = i + 1;
+        for (; j >= W; j -= W) {  // words [j - W + 1, j]
+            const typename S::V high = S::load(M + j - W + 1), low = S::load(M + j - W);
+            S::store(M + j - W + 1, O::sub(low, montgomery_canonical<S>(av, high)));
+        }
+        for (; j > 0; --j) M[j] = sub_mod(M[j - 1], montgomery(am, M[j]));
+        M[0] = sub_mod(0, montgomery(am, M[0]));
+    }
+}
+
+// The direct interpolation: M'(a_i) by Horner's rule (horner()), w_i = y_i / M'(a_i), then f[j] =
+// sum over the points of w q[j] for q = M / (x - a) by synthetic division (q[j - 1] = M[j] + a
+// q[j], from the top), on blocks of S::lanes points, kChains blocks at a time (a vector of sums
+// per coefficient, its lanes summed at the end). M: m + 1 words (prod (x - a_i), M[m] = 1), a and
+// y: m words, all canonical; f: m words; scratch: (S::lanes + 2) m words. Steps lazy (< 2P), as
+// horner_step. Returns false, f unspecified, if some M'(a_i) is 0.
+template <class S, std::size_t kChains = 4>
+bool interpolate_small(const u32* M, std::size_t m, const u32* a, const u32* y, u32* f, u32* scratch) {
+    using V = typename S::V;
+    using O = Ops<S>;
+    constexpr std::size_t W = S::lanes, B = kChains * W;
+    u32* const acc = scratch;
+    u32* const derivative = acc + W * m;
+    u32* const values = derivative + m;
+    for (std::size_t j = 0; j < m; ++j) derivative[j] = multiply_mod(u32(j + 1), M[j + 1]);
+    horner<S>(derivative, m, a, m, values);
+    const V r2 = S::broadcast(kR2);
+    std::fill(acc, acc + W * m, 0u);
+    for (std::size_t i0 = 0; i0 < m; i0 += B) {
+        const std::size_t here = std::min(B, m - i0);
+        alignas(64) u32 points[B] = {}, ys[B] = {}, check[B];
+        std::copy_n(a + i0, here, points);
+        std::copy_n(y + i0, here, ys);
+        std::copy_n(values + i0, here, check);
+        for (std::size_t l = 0; l < B; ++l) {
+            if (l >= here) check[l] = 1;  // padding: no point
+            else if (check[l] == 0) return false;
+        }
+        V am[kChains], q[kChains], w[kChains];
+        for (std::size_t c = 0; c < kChains; ++c) {
+            am[c] = montgomery_canonical<S>(S::load(points + W * c), r2);
+            // 1 / M'(a) times 2^32, times y: w 2^32 (Montgomery form, for the products below)
+            const V inverse = power_montgomery<S>(montgomery_canonical<S>(S::load(check + W * c), r2), kP - 2);
+            w[c] = montgomery_canonical<S>(montgomery_canonical<S>(S::load(ys + W * c), inverse), r2);
+            q[c] = S::broadcast(0);
+        }
+        for (std::size_t j = m; j > 0; --j) {  // acc[j - 1] += sum of w q[j - 1]
+            const V c = S::broadcast(M[j]);
+            V sum = S::load(acc + W * (j - 1));
+#pragma GCC unroll 8
+            for (std::size_t t = 0; t < kChains; ++t) {
+                q[t] = horner_step<S>(q[t], am[t], c);
+                sum = O::add(sum, O::template reduce<kP>(O::montgomery(w[t], O::template reduce<kP>(q[t]))));
+            }
+            S::store(acc + W * (j - 1), sum);
+        }
+    }
+    for (std::size_t j = 0; j < m; ++j) {
+        u32 s = 0;
+        for (std::size_t l = 0; l < W; ++l) s = add_mod(s, acc[W * j + l]);
+        f[j] = s;
+    }
+    return true;
+}
+
+// The Newton basis by synthetic divisions, B = K S::lanes of them at once in a systolic array of K
+// vectors: c (n words of f in, f's Newton coefficients out) and points p (n - 1 words), all
+// canonical; e: n + 2 B words of scratch. Division k by x - p_k (c[k..n) = c[k] + (x - p_k)
+// c[k+1..n), from the top: c[j] += p_k c[j + 1]) runs in lane k - k0 of a block of B divisions;
+// lane l works on coefficient j + l while lane 0 works on j, taking lane l - 1's last result (a
+// lane shift), so a block is one pass over the coefficients, from the top: one step's latency
+// per coefficient, for B divisions. Above f, zeros (lanes not started compute zeros there; lanes
+// past the last division divide by x, which keeps c). Each step stores every lane at its own
+// coefficient: lane B - 1's values (the block's last division) are the last stored at each
+// coefficient, and the next block reads them.
+template <class S, std::size_t K = 4>
+void newton_small(u32* c, std::size_t n, const u32* p, u32* e) {
+    using V = typename S::V;
+    constexpr std::size_t W = S::lanes, B = K * W;
+    if (n < 2) return;
+    std::array<int, W> from{}, last{};
+    for (std::size_t l = 0; l < W; ++l) from[l] = int(l ? l - 1 : 0), last[l] = int(W - 1);
+    const typename S::Index up = S::index(from), top = S::index(last);
+    const V r2 = S::broadcast(kR2);
+    std::copy_n(c, n, e);
+    std::fill(e + n, e + n + 2 * B, 0u);
+    for (std::size_t k0 = 0; k0 + 1 < n; k0 += B) {
+        alignas(64) u32 points[B] = {};
+        for (std::size_t l = 0; l < B && k0 + l + 1 < n; ++l) points[l] = p[k0 + l];
+        V pm[K], r[K];
+        for (std::size_t v = 0; v < K; ++v) pm[v] = montgomery_canonical<S>(S::load(points + W * v), r2), r[v] = S::broadcast(0);
+        for (std::size_t j = n; j-- > k0;) {  // lane 0 on coefficient j
+            V x[K];
+#pragma GCC unroll 4
+            for (std::size_t v = 0; v < K; ++v)
+                x[v] = S::template blend<1>(S::permute(r[v], up), v ? S::permute(r[v - 1], top) : S::broadcast(e[j]));
+#pragma GCC unroll 4
+            for (std::size_t v = 0; v < K; ++v) {
+                r[v] = Ops<S>::add(x[v], montgomery_canonical<S>(pm[v], r[v]));
+                S::store(e + j + W * v, r[v]);
+            }
+        }
+    }
+    std::copy_n(e, n, c);
 }
 
 // v[i] = y[i] / v[i] for i < count (a multiple of L::lanes, at most 8 kLaneBase), but 0 where

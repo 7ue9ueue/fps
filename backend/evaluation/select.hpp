@@ -39,10 +39,22 @@ inline bool evaluate_directly(std::size_t n, std::size_t m) {
     return c.horner * double(n) * double(m) <= c.fixed + c.point * double(m8) * lg(m8) + c.coefficient * double(big) * lg(big);
 }
 
-// interpolate() and to_newton_basis(): their O(m^2) loops up to this many points (crossovers about
-// 36 and 70 points on the four timing machines).
-inline constexpr std::size_t kDirectInterpolate = 32;
-inline constexpr std::size_t kDirectNewton = 64;
+// interpolate() and to_newton_basis(): their O(m^2) paths in vectors (interpolate_small,
+// newton_small) up to this many points, about where the trees take over on each timing machine
+// (notes/136-r1.md; the scalar loops before crossed at about 36 and 70).
+#if defined(__znver5__)
+inline constexpr std::size_t kDirectInterpolate = 104, kDirectNewton = 240;  // lc-zen5
+#elif defined(__AVX512F__)
+inline constexpr std::size_t kDirectInterpolate = 104, kDirectNewton = 240;  // lc-intel
+#elif defined(__AVX2__)
+inline constexpr std::size_t kDirectInterpolate = 104, kDirectNewton = 240;  // lc-bench
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+inline constexpr std::size_t kDirectInterpolate = 104, kDirectNewton = 184;  // lc-arm
+#elif defined(__SSE4_1__)
+inline constexpr std::size_t kDirectInterpolate = 80, kDirectNewton = 160;  // a guess: AVX2's at half the width
+#else
+inline constexpr std::size_t kDirectInterpolate = 32, kDirectNewton = 64;  // a guess: the scalar loops' crossovers
+#endif
 
 // to_newton_basis(): slots per lane C are padded to the power of two above when C is past this
 // fraction of it (lc-opt's choice; newton_slots).
