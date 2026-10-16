@@ -27,6 +27,7 @@
 
 #include "backend/evaluation/kernels.hpp"
 #include "backend/product_tree/tree.hpp"
+#include "backend/series/series.hpp"
 
 namespace fps::evaluation::detail {
 
@@ -546,92 +547,53 @@ private:
     const u32* q_ = nullptr;
 };
 
-// h = 1 / q mod x^k (k words), q of n words (zero past them), q[0] != 0; canonical. Newton's
-// iteration i -> 2i with transforms of 2i words (at least 64): G = T(h mod x^i), E = T(-q mod
-// x^2i), (E G inverse)[i, 2i) = -(q h)[i, 2i); then h[i, 2i) = (T(x^i that) G inverse)[i, 2i).
-// 5 transforms of 2i per step. Below 32 coefficients, the recurrence.
-inline void series_inverse(const u32* q, std::size_t n, std::size_t k, u32* h, Stack& stack) {
-    const u32 q0 = inverse_mod(q[0]);
-    const std::size_t base = std::min<std::size_t>(k, 32);
-    h[0] = q0;
-    for (std::size_t i = 1; i < base; ++i) {
-        u64 s = 0;
-        for (std::size_t j = 1; j <= std::min(i, n - 1); ++j) s = (s + u64(q[j]) * h[i - j]) % kP;
-        h[i] = multiply_mod(s ? kP - u32(s) : 0, q0);
-    }
-    if (base == k) return;
-    const Stack::Mark mark = stack.mark();
-    const std::size_t top = std::max<std::size_t>(64, 2 * std::bit_ceil(k));
-    u32* const g = stack.take(top);
-    u32* const e = stack.take(top);
-    for (std::size_t i = base; i < k; i *= 2) {
-        const std::size_t len = std::max<std::size_t>(64, 2 * i), next = std::min(k, 2 * i);
-        const ntt::Transform& t = transform(len);
-        std::fill(std::copy_n(h, i, g), g + len, 0u);
-        t.forward(g);
-        const std::size_t terms = std::min(n, 2 * i);
-        for (std::size_t j = 0; j < terms; ++j) e[j] = q[j] ? kP - q[j] : 0;
-        std::fill(e + terms, e + len, 0u);
-        t.forward(e);
-        t.multiply(e, g, e);
-        t.inverse(e);
-        std::fill(e, e + i, 0u);
-        std::fill(e + 2 * i, e + len, 0u);
-        t.forward(e);
-        t.multiply(e, g, e);
-        t.inverse(e);
-        std::copy(e + i, e + next, h + i);
-    }
-    stack.release(mark);
-}
-
 // d = G / q mod x^K for G = rev_K(f) (G[K - 1 - j] = f[j], f of n <= K words) and q of qn words
 // (q[0] = 1, qn <= K + 1), by Karp and Markstein's division with k = ceil(K / 2): h = 1 / q mod
-// x^k, q0 = G h mod x^k, r = (G - q q0)[k, K), q1 = h r mod x^(K - k), d = q0 + x^k q1; each
-// product cyclic of length L = bit_ceil(K) >= max(2k - 1, K). All canonical. qt: q's transform
-// of length qt_length times 2^32 (PointTree::product_transform), used if that is L.
+// x^k (fps::series::inverse), q0 = G h mod x^k, r = (G - q q0)[k, K), q1 = h r mod x^(K - k), d =
+// q0 + x^k q1; each product one ntt::Transform::cyclic_product of length L = bit_ceil(K) >=
+// max(2k - 1, K) (sources of at most L / 2 words: the forwards skip the zero half), in d itself
+// (G, then q0 and r, then q1). All canonical. qt: the transform of q mod (x^L - 1) of length
+// qt_length times 2^32 (PointTree::product_transform), used if that is L; r's pass takes the
+// 2^32 out.
 inline void root_window(const u32* f, std::size_t n, const u32* q, std::size_t qn, std::size_t big, u32* d, Stack& stack,
                         const u32* qt = nullptr, std::size_t qt_length = 0) {
     const std::size_t k = (big + 1) / 2, rest = big - k, len = std::max<std::size_t>(64, std::bit_ceil(big));
-    const auto g = [&](std::size_t i) { return i + n >= big ? f[big - 1 - i] : 0u; };  // G[i]
     const Stack::Mark mark = stack.mark();
-    u32* const h = stack.take(len);
-    series_inverse(q, std::min(qn, k), k, h, stack);
+    std::fill(d, d + big - n, 0u);
+    std::reverse_copy(f, f + n, d + big - n);  // G
+    u32* const h = stack.take(k);
+    {
+        const Stack::Mark inverse = stack.mark();
+        const std::size_t words = series::inverse_scratch(k);
+        series::inverse({q, std::min(qn, k)}, {h, k}, {stack.take(words), words});
+        stack.release(inverse);
+    }
     const ntt::Transform& t = transform(len);
-    std::fill(h + k, h + len, 0u);
-    t.forward(h);
-    u32* const a = stack.take(len);
-    u32* const b = stack.take(len);
-    for (std::size_t i = 0; i < k; ++i) a[i] = g(i);
-    std::fill(a + k, a + len, 0u);
-    t.forward(a);
-    t.multiply(a, h, a);
-    t.inverse(a);
-    std::copy_n(a, k, d);  // q0
-    std::fill(a + k, a + len, 0u);
-    t.forward(a);
-    if (qt && qt_length == len) {
-        leaf_products<Lanes>(qt, a, b, len / 8, leaf_weights(len / 8));  // (q 2^32) q0 2^-32
-    } else {
-        const std::size_t terms = std::min(qn, len);  // q mod (x^L - 1): deg q <= K <= L
+    u32* const H = stack.take(len);
+    u32* const work = stack.take(len);
+    t.forward({h, k}, H);
+    t.cyclic_product({d, k}, H, work, {d, k});  // q0
+    const bool montgomery = qt && qt_length == len;
+    if (!montgomery) {  // q mod (x^L - 1): deg q <= K <= L
+        u32* const b = stack.take(len);
+        const std::size_t terms = std::min(qn, len);
         std::fill(std::copy_n(q, terms, b), b + len, 0u);
         if (qn > len) b[0] = add_mod(b[0], q[len]);
         t.forward(b);
-        t.multiply(b, a, b);
+        qt = b;
     }
-    t.inverse(b);  // (q q0)[k, K) exact
-    for (std::size_t i = 0; i < rest; ++i) a[i] = sub_mod(g(k + i), b[k + i]);
-    std::fill(a + rest, a + len, 0u);
-    t.forward(a);
-    t.multiply(a, h, a);
-    t.inverse(a);
-    std::copy_n(a, rest, d + k);  // q1
+    // c = (q q0)[k, K), times 2^32 with the tree's qt: the upper half if k = L / 2, else the first K.
+    u32* const c = stack.take(len);
+    const std::size_t from = 2 * k == len ? k : 0;
+    t.cyclic_product({d, k}, qt, work, {c, big - from}, {.offset = from});
+    subtract_scaled<Wide>(d + k, c + k - from, montgomery ? 1 : kR, d + k, rest);  // r
+    t.cyclic_product({d + k, rest}, H, work, {d + k, rest});  // q1
     stack.release(mark);
 }
 
 inline std::size_t division_words(std::size_t big) {
-    const std::size_t len = std::max<std::size_t>(64, std::bit_ceil(big));
-    return 3 * Stack::footprint(len) + 2 * Stack::footprint(std::max<std::size_t>(64, 2 * std::bit_ceil((big + 1) / 2))) + 1024;
+    const std::size_t k = (big + 1) / 2, len = std::max<std::size_t>(64, std::bit_ceil(big));
+    return Stack::footprint(k) + std::max(Stack::footprint(series::inverse_scratch(k)), 4 * Stack::footprint(len)) + 1024;
 }
 
 }  // namespace fps::evaluation::detail

@@ -176,6 +176,16 @@ void add_words(const u32* a, const u32* b, u32* out, std::size_t n) {
     for (std::size_t i = 0; i < n; i += S::lanes) S::store(out + i, M::add(S::load(a + i), S::load(b + i)));
 }
 
+// out[i] = a[i] - b[i] y 2^-32 mod P, canonical; a, b, y < P. out may be a.
+template <class S>
+void subtract_scaled(const u32* a, const u32* b, u32 y, u32* out, std::size_t n) {
+    using M = Ops<S>;
+    const typename S::V v = S::broadcast(y);
+    product_tree::detail::each<S>(
+        n, [&](std::size_t i) { S::store(out + i, M::sub(S::load(a + i), montgomery_canonical<S>(S::load(b + i), v))); },
+        [&](std::size_t i) { out[i] = sub_mod(a[i], montgomery(b[i], y)); });
+}
+
 // x^e 2^32 for x in Montgomery form (x 2^32), e >= 0, lane by lane.
 template <class S>
 typename S::V power_montgomery(typename S::V x, std::size_t e) {
