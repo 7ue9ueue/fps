@@ -101,18 +101,21 @@ inline std::size_t copy_static_table(std::uint32_t* t, std::size_t count, bool i
 }
 
 // nv^-1 mod P for nv = 2^lg / 8 leaves, the gain of a forward and an inverse transform; and
-// nv^-1 2^32 mod P, which also undoes the Montgomery factor 2^-32 of the AVX2 leaf products.
-// Tables: a modular power costs about 100 ns per call.
+// nv^-1 2^32 mod P, which also undoes the Montgomery factor 2^-32 of the AVX2 leaf products; and
+// 2^-lg mod P, the inverse's scale from the values form (its join leaves the 8-point transform's
+// gain 8 in). Tables: a modular power costs about 100 ns per call.
 inline constexpr auto kLeafScales = [] {
-    std::array<std::array<std::uint32_t, kMaxLog + 1>, 2> t{};
+    std::array<std::array<std::uint32_t, kMaxLog + 1>, 3> t{};
     for (int lg = kMinLog; lg <= kMaxLog; ++lg) {
         t[0][lg] = power(std::uint32_t(1) << (lg - 3), kP - 2);
         t[1][lg] = multiply_mod(t[0][lg], kR);
+        t[2][lg] = multiply_mod(t[0][lg], power(8, kP - 2));
     }
     return t;
 }();
 constexpr std::uint32_t leaf_scale(int lg) { return kLeafScales[0][lg]; }
 constexpr std::uint32_t product_scale(int lg) { return kLeafScales[1][lg]; }
+constexpr std::uint32_t values_scale(int lg) { return kLeafScales[2][lg]; }
 
 // Radix-4 levels run on groups of 4 quarters. nv = 4^j leaves start with one group; nv = 2 * 4^j
 // start with a radix-2 level and two groups.
@@ -128,24 +131,24 @@ constexpr bool has_radix2(int lg) { return (lg - 3) % 2 == 1; }
 // The table index of z^k, k < 4: z = r(2), z^2 = r(1) = sqrt(-1), z^3 = r(3).
 constexpr std::size_t eighth_root(int k) { return std::size_t((k & 1) << 1 | (k >> 1 & 1)); }
 
-// Rows of 16 words: 8 values w, then their Shoup quotients. forward[l][k]: B(l, t)^k for lanes
-// t < 8 (k = 0 unused); inverse[l][k]: B(l, t)^-k / 8 (1/8: the 8-point transform's gain).
+// Rows of 16 words: the Shoup quotients of 8 values w, then the values (quotients first: on x86 the
+// odd lanes' quotients are a load 4 bytes on, inside the row's line). forward[l][k]: B(l, t)^k for
+// lanes t < 8; inverse[l][k]: B(l, t)^-k (k = 0 unused in both).
 struct alignas(64) ValueLanes {
     std::uint32_t forward[8][8][16];
     std::uint32_t inverse[8][8][16];
 };
 inline constexpr ValueLanes kValueLanes = [] {
     ValueLanes v{};
-    const std::uint32_t eighth = power(8, kP - 2);
     for (int l = 0; l < 8; ++l) {
         for (int t = 0; t < 8; ++t) {
             std::uint32_t b = 1, bi = 1;  // B(l, t) and its inverse: bits j of 32 l + 4 t
             for (int j = 0; j < 8; ++j)
                 if ((32 * l + 4 * t) >> j & 1) b = multiply_mod(b, kRoots[0][j]), bi = multiply_mod(bi, kRoots[1][j]);
-            std::uint32_t x = 1, y = eighth;
+            std::uint32_t x = 1, y = 1;
             for (int k = 0; k < 8; ++k, x = multiply_mod(x, b), y = multiply_mod(y, bi)) {
-                v.forward[l][k][t] = x, v.forward[l][k][8 + t] = quotient(x);
-                v.inverse[l][k][t] = y, v.inverse[l][k][8 + t] = quotient(y);
+                v.forward[l][k][t] = quotient(x), v.forward[l][k][8 + t] = x;
+                v.inverse[l][k][t] = quotient(y), v.inverse[l][k][8 + t] = y;
             }
         }
     }

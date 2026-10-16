@@ -152,10 +152,12 @@ constexpr ScaledBlock scaled_block(u32 s) {
     }
     return b;
 }
-// Per length: [0] for leaf_scale (inverse), [1] for product_scale (products).
+// Per length: [0] for leaf_scale (inverse), [1] for product_scale (products), [2] for values_scale
+// (inverse from the values form).
 inline constexpr auto kScaledRoots = [] {
-    std::array<std::array<ScaledBlock, kMaxLog + 1>, 2> t{};
-    for (int lg = kMinLog; lg <= kMaxLog; ++lg) t[0][lg] = scaled_block(leaf_scale(lg)), t[1][lg] = scaled_block(product_scale(lg));
+    std::array<std::array<ScaledBlock, kMaxLog + 1>, 3> t{};
+    for (int lg = kMinLog; lg <= kMaxLog; ++lg)
+        t[0][lg] = scaled_block(leaf_scale(lg)), t[1][lg] = scaled_block(product_scale(lg)), t[2][lg] = scaled_block(values_scale(lg));
     return t;
 }();
 
@@ -1111,6 +1113,71 @@ struct WideBottom : Butterflies<S> {
         }
     }
 
+    // The rows of Np pairs of groups k + 2j, k + 2j + 1 for Bottom::products, from the canonical
+    // leaves of a (load_halves).
+    template <int Np>
+    [[gnu::always_inline]] static void fill_pairs(const u32* a, std::size_t k, const u32* r, Leaves (&out)[2]) {
+        #pragma GCC unroll 2
+        for (int j = 0; j < Np; ++j) {
+            const V p = S::broadcast(kP), ones = S::broadcast(~u32(0));
+            const Pair w = twiddles(r, k + 2 * j);
+            const F minus_y = {S::sub(p, w.y.w), S::sub(ones, w.y.q)}, minus_z = {S::sub(p, w.z.w), S::sub(ones, w.z.q)};
+            const F* weight[4] = {&w.y, &minus_y, &w.z, &minus_z};
+            const u32* aj = a + 64 * j;
+            #pragma GCC unroll 4
+            for (int t = 0; t < 4; ++t) {
+                const V at = S::load_halves(aj + 8 * t, aj + 32 + 8 * t), wat = canonical(B::mul(at, *weight[t]));
+                S::template store_half<0>(out[j].rows[t][0], wat), S::template store_half<0>(out[j].rows[t][0] + 8, at);
+                S::template store_half<1>(out[j].rows[t][1], wat), S::template store_half<1>(out[j].rows[t][1] + 8, at);
+                S::store(out[j].a[t], at);
+            }
+        }
+    }
+
+    // The leaf products of those Np pairs, the pairs through each step together: times 2^-32
+    // (leaf_products_at), then 2^32 by a Shoup product; out = them, or out += them (kAdd).
+    template <bool kAdd, int Np>
+    [[gnu::always_inline]] static void products_pairs(const Leaves (&in)[2], const u32* b, u32* out, const F& to_r) {
+        V c[Np][4];
+        #pragma GCC unroll 4
+        for (int t = 0; t < 4; ++t) {
+            #pragma GCC unroll 2
+            for (int j = 0; j < Np; ++j) c[j][t] = leaf_products_at(in[j], t, b + 64 * j + 8 * t, b + 64 * j + 32 + 8 * t);
+        }
+        #pragma GCC unroll 4
+        for (int t = 0; t < 4; ++t) {
+            #pragma GCC unroll 2
+            for (int j = 0; j < Np; ++j) {
+                u32* o = out + 64 * j + 8 * t;
+                V v = B::mul(c[j][t], to_r);
+                v = kAdd ? canonical(low(B::add(S::load_halves(o, o + 32), v))) : canonical(v);
+                S::template store_half<0>(o, v), S::template store_half<1>(o + 32, v);
+            }
+        }
+    }
+
+    // Bottom::products on S (Transform::multiply, multiply_add), count and first even: two pairs
+    // of groups per step (one at an odd end), the next step's rows filled before this step's
+    // products, as Bottom's (filled right before, their loads waited behind the stores of out
+    // past the caches: Zen 5 at 2^23 2.5x the time of Bottom<Avx512Vl>). On L1 data, against
+    // Bottom<Avx512Vl>::products: Zen 5 0.68 of its time (one pair per step 0.85), Emerald
+    // Rapids 0.97-1.00 (not used there). out may be a or b.
+    template <bool kAdd>
+    static void products(const u32* a, const u32* b, u32* out, std::size_t count, std::size_t first, const u32* r) {
+        const F to_r = B::factor(kR);
+        const std::size_t steps = count / 4, last = count % 4;  // last: 0 or 2 groups
+        Leaves leaves[2][2];
+        if (steps) fill_pairs<2>(a, first, r, leaves[0]);
+        else if (last) fill_pairs<1>(a, first, r, leaves[0]);
+        for (std::size_t s = 0; s < steps; ++s) {
+            const std::size_t g = 4 * s;
+            if (s + 1 < steps) fill_pairs<2>(a + 32 * (g + 4), first + g + 4, r, leaves[(s + 1) % 2]);
+            else if (last) fill_pairs<1>(a + 32 * (g + 4), first + g + 4, r, leaves[(s + 1) % 2]);
+            products_pairs<kAdd, 2>(leaves[s % 2], b + 32 * g, out + 32 * g, to_r);
+        }
+        if (last) products_pairs<kAdd, 1>(leaves[steps % 2], b + 128 * steps, out + 128 * steps, to_r);
+    }
+
     // Bottom::multiply_stored; count and first even. b: the stored leaves of group first.
     static void multiply_stored(u32* a, const u32* b, std::size_t count, std::size_t first, const u32* r, const u32* ir) {
         const Indices n;
@@ -1199,7 +1266,8 @@ struct WideBottom : Butterflies<S> {
 
 // The values form (common.hpp) on L (1, 4 or 8 lanes), one block of 64 words (8 leaves) at a
 // time: lane t of a vector is leaf t of a set of L::lanes leaves, so the twist and the 8-point
-// transform are lane-wise; transposes move between leaves and lanes.
+// transform are lane-wise; transposes move between leaves and lanes. Shoup products per set: the
+// split 19, the join 19 (its 1/8 is in the inverse's scale), 7 fewer each for blocks g < 8.
 template <class L>
 struct Values : Arith<L> {
     using A = Arith<L>;
@@ -1297,54 +1365,91 @@ struct Values : Arith<L> {
         static_assert(W == 8 || W == 4, "Values: no transpose for this struct");
     }
 
-    // x w per lane, w and its quotient from a table row (any x -> [0, 2P)).
-    [[gnu::always_inline]] static V mul_lanes(V x, const u32* row) {
-        return A::whole(M::shoup(x, L::load(row), L::load(row + 8)));
+    // x w per lane (any x -> [0, 2P)): q and w the quotients and values of a lane table row, qo
+    // (x86) the odd lanes' quotients in the even lanes, so q needs no shift.
+    [[gnu::always_inline]] static V mul_lanes(V x, V q, V qo, V w) {
+        if constexpr (requires { L::mul_even(x, x); }) {
+            const V even = L::mul_even(x, q), odd = L::mul_even(L::template shr64<32>(x), qo);
+            V qx;  // floor(x q / 2^32), joined as simd's mulhi joins
+            if constexpr (simd::detail::kMulhiPermute) qx = L::join_high(even, odd);
+            else qx = L::template blend<0xaaaa>(L::template shr64<32>(even), odd);
+            return A::whole(L::mul_sub(L::mul_lo(x, w), qx, L::broadcast(kP)));
+        } else {
+            return A::whole(M::shoup(x, w, q));
+        }
+    }
+    // From a row of ValueLanes (quotients, then values): qo is the load 4 bytes on.
+    [[gnu::always_inline]] static V mul_row(V x, const u32* row) {
+        return mul_lanes(x, L::load(row), L::load(row + 1), L::load(row + 8));
     }
 
-    // Twist and 8-point transform of a set: x[0] < P, x[k] < 2P in; canonical values out, in
-    // bit-reversed order. z[k]: z^k.
-    [[gnu::always_inline]] static void forward8(Set& x, const F (&z)[4]) {
+    // The 8-point transform of N twisted sets, step by step across the sets: x[k] < 2P in;
+    // canonical values out, in bit-reversed order. z[k]: z^k. 84 adds, subtracts and mins per set
+    // (100 before, with x[0] < P).
+    template <int N = 1>
+    [[gnu::always_inline]] static void forward8(Set* x, const F (&z)[4]) {
         #pragma GCC unroll 4
-        for (int k = 0; k < 4; ++k) {  // < 4P out
-            const V u = x[k], v = x[k + 4];
-            x[k] = add(u, v), x[k + 4] = k == 0 ? diff(u, v) : mul(diff(u, v), z[k]);
-        }
-        #pragma GCC unroll 8
-        for (int b = 0; b < 8; b += 4) {
+        for (int k = 0; k < 4; ++k) {  // sums and x[4] < 4P, products < 2P
             #pragma GCC unroll 2
-            for (int k = 0; k < 2; ++k) {
-                const V u = low(x[b + k]), v = low(x[b + k + 2]);
-                x[b + k] = add(u, v), x[b + k + 2] = k == 0 ? diff(u, v) : mul(diff(u, v), z[2]);
+            for (int s = 0; s < N; ++s) {
+                const V u = x[s][k], v = x[s][k + 4];
+                x[s][k] = add(u, v), x[s][k + 4] = k == 0 ? diff(u, v) : mul(diff(u, v), z[k]);
             }
         }
-        #pragma GCC unroll 8
+        #pragma GCC unroll 5
+        for (int k = 0; k < 5; ++k) {
+            #pragma GCC unroll 2
+            for (int s = 0; s < N; ++s) x[s][k] = low(x[s][k]);
+        }
+        #pragma GCC unroll 2
+        for (int b = 0; b < 8; b += 4) {  // < 2P out
+            #pragma GCC unroll 2
+            for (int s = 0; s < N; ++s) {
+                const V u = x[s][b], v = x[s][b + 2], c = x[s][b + 1], d = x[s][b + 3];
+                x[s][b] = low(add(u, v)), x[s][b + 2] = A::low_diff(u, v);
+                x[s][b + 1] = low(add(c, d)), x[s][b + 3] = mul(diff(c, d), z[2]);
+            }
+        }
+        #pragma GCC unroll 4
         for (int b = 0; b < 8; b += 2) {
-            const V u = low(x[b]), v = low(x[b + 1]);
-            x[b] = canonical(low(add(u, v))), x[b + 1] = canonical(low(diff(u, v)));
+            #pragma GCC unroll 2
+            for (int s = 0; s < N; ++s) {
+                const V u = x[s][b], v = x[s][b + 1];
+                x[s][b] = canonical(low(add(u, v))), x[s][b + 1] = canonical(A::low_diff(u, v));
+            }
         }
     }
 
     // forward8 undone, times 8: canonical in, < 4P out. z[k]: z^-k.
-    [[gnu::always_inline]] static void inverse8(Set& x, const F (&z)[4]) {
+    template <int N = 1>
+    [[gnu::always_inline]] static void inverse8(Set* x, const F (&z)[4]) {
         const V p = L::broadcast(kP);
         #pragma GCC unroll 8
         for (int b = 0; b < 8; b += 2) {  // < 2P out
-            const V u = x[b], v = x[b + 1];
-            x[b] = add(u, v), x[b + 1] = L::sub(L::add(u, p), v);
+            #pragma GCC unroll 2
+            for (int s = 0; s < N; ++s) {
+                const V u = x[s][b], v = x[s][b + 1];
+                x[s][b] = add(u, v), x[s][b + 1] = L::sub(L::add(u, p), v);
+            }
         }
         #pragma GCC unroll 8
         for (int b = 0; b < 8; b += 4) {
             #pragma GCC unroll 2
             for (int k = 0; k < 2; ++k) {  // < 4P out
-                const V u = x[b + k], v = k == 0 ? x[b + k + 2] : mul(x[b + k + 2], z[2]);
-                x[b + k] = add(u, v), x[b + k + 2] = diff(u, v);
+                #pragma GCC unroll 2
+                for (int s = 0; s < N; ++s) {
+                    const V u = x[s][b + k], v = k == 0 ? x[s][b + k + 2] : mul(x[s][b + k + 2], z[2]);
+                    x[s][b + k] = add(u, v), x[s][b + k + 2] = diff(u, v);
+                }
             }
         }
         #pragma GCC unroll 4
         for (int k = 0; k < 4; ++k) {
-            const V u = low(x[k]), v = k == 0 ? low(x[k + 4]) : mul(x[k + 4], z[k]);
-            x[k] = add(u, v), x[k + 4] = diff(u, v);
+            #pragma GCC unroll 2
+            for (int s = 0; s < N; ++s) {
+                const V u = low(x[s][k]), v = k == 0 ? low(x[s][k + 4]) : mul(x[s][k + 4], z[k]);
+                x[s][k] = add(u, v), x[s][k + 4] = diff(u, v);
+            }
         }
     }
 
@@ -1353,49 +1458,109 @@ struct Values : Arith<L> {
         for (int k = 0; k < 4; ++k) z[k] = A::entry(kStaticTables.words[inverse], eighth_root(k));
     }
 
-    // Blocks [first, first + count) of the leaf form at `from` -> the values form at `to` (may be
-    // from); canonical in and out. rows: build_value_rows.
-    static void split(const u32* from, u32* to, std::size_t count, std::size_t first, const u32* rows) {
-        F z[4];
-        factors(z, 0);
-        for (std::size_t g = first; g < first + count; ++g, from += 64, to += 64) {
-            const auto& b = kValueLanes.forward[g % 8];
-            const u32* a = rows + 32 * (g / 8);
-            Set x[kSets];
-            #pragma GCC unroll 8
-            for (int s = 0; s < kSets; ++s) load_leaves(from, s, x[s]);
-            #pragma GCC unroll 8
-            for (int s = 0; s < kSets; ++s) {
-                #pragma GCC unroll 8
-                for (int k = 1; k < 8; ++k) x[s][k] = mul(mul_lanes(x[s][k], b[k] + s * W), A::factor(a[k], a[8 + k]));
-                forward8(x[s], z);
+    // The twist of x[1..7] of N sets by rho^k (forward) or rho^-k (inverse): lane(j, k, v) = v
+    // times set j's lane factors B(g % 8, t)^k, then (kA) the broadcast A(g / 8)^k of row a (the
+    // same for every set); A(0) = 1. < 2P out.
+    template <bool kA, int N, class Lane>
+    [[gnu::always_inline]] static void twist(Set* x, Lane lane, const u32* a) {
+        #pragma GCC unroll 8
+        for (int k = 1; k < 8; ++k) {
+            #pragma GCC unroll 4
+            for (int j = 0; j < N; ++j) {
+                x[j][k] = lane(j, k, x[j][k]);
+                if constexpr (kA) x[j][k] = mul(x[j][k], A::factor(a[k], a[8 + k]));
             }
-            #pragma GCC unroll 8
-            for (int s = 0; s < kSets; ++s) store_values(to, s, x[s]);
         }
     }
 
-    // split undone: the values form at `from` -> the leaf form at `to` (may be from), canonical.
+    // Blocks g .. g + Nb - 1 (one A row: g a multiple of Nb), their sets through each step
+    // together (Neon: both sets of a block, 0.80 of the time of one after the other on Neoverse
+    // V2). Every set is loaded before a store: to may be from.
+    template <bool kA, int Nb>
+    [[gnu::always_inline]] static void split_blocks(const u32* from, u32* to, std::size_t g, const u32* rows,
+                                                    const F (&z)[4]) {
+        constexpr int N = Nb * kSets;
+        Set x[N];
+        #pragma GCC unroll 8
+        for (int j = 0; j < N; ++j) load_leaves(from + 64 * (j / kSets), j % kSets, x[j]);
+        twist<kA, N>(x, [g] [[gnu::always_inline]] (int j, int k, V v) {
+            return mul_row(v, kValueLanes.forward[(g + j / kSets) % 8][k] + j % kSets * W);
+        }, rows + 32 * (g / 8));
+        forward8<N>(x, z);
+        #pragma GCC unroll 8
+        for (int j = 0; j < N; ++j) store_values(to + 64 * (j / kSets), j % kSets, x[j]);
+    }
+
+    template <bool kA, int Nb, bool kCanonical>
+    [[gnu::always_inline]] static void join_blocks(const u32* from, u32* to, std::size_t g, const u32* rows,
+                                                   const F (&z)[4]) {
+        constexpr int N = Nb * kSets;
+        Set x[N];
+        #pragma GCC unroll 8
+        for (int j = 0; j < N; ++j) load_values(from + 64 * (j / kSets), j % kSets, x[j]);
+        inverse8<N>(x, z);
+        #pragma GCC unroll 8
+        for (int j = 0; j < N; ++j) x[j][0] = low(x[j][0]);
+        twist<kA, N>(x, [g] [[gnu::always_inline]] (int j, int k, V v) {
+            return mul_row(v, kValueLanes.inverse[(g + j / kSets) % 8][k] + j % kSets * W);
+        }, rows + 32 * (g / 8) + 16);
+        #pragma GCC unroll 8
+        for (int j = 0; j < N; ++j) {
+            if constexpr (kCanonical) {
+                #pragma GCC unroll 8
+                for (int k = 0; k < 8; ++k) x[j][k] = canonical(x[j][k]);
+            }
+            store_leaves(to + 64 * (j / kSets), j % kSets, x[j]);
+        }
+    }
+
+    // Blocks per step (split_blocks' Nb): 2 on 8 lanes with 32 registers, else 1. Avx2: 2 ran the
+    // split alone 0.93 of the time of 1 on Zen 3 (L1 data), but in the transforms 0.97-1.06
+    // (bigger code); 4 spilled. Neon (2 sets per block): 2 blocks spilled, 1.19 the time of 1 on
+    // Neoverse V2 (notes/98-r1.md).
+#if defined(FPS_NTT_VALUES_STEP)
+    static constexpr int kStep = FPS_NTT_VALUES_STEP;
+#else
+    static constexpr int kStep = W == 8 && L::registers >= 32 ? 2 : 1;
+#endif
+
+    // run(std::bool_constant<kA>{}, std::integral_constant<int, n>{}, g) over the blocks
+    // [first, first + count): n = kStep blocks from g, a multiple of kStep, else n = 1; kA = g >= 8
+    // (A(0) = 1: 7 products fewer per set).
+    template <class Run>
+    [[gnu::always_inline]] static void each_block(std::size_t count, std::size_t first, Run run) {
+        using One = std::integral_constant<int, 1>;
+        using Step = std::integral_constant<int, kStep>;
+        std::size_t g = first;
+        const std::size_t end = first + count;
+        if constexpr (kStep > 1)
+            for (; g < end && g % kStep; ++g) g < 8 ? run(std::false_type{}, One{}, g) : run(std::true_type{}, One{}, g);
+        for (; g + kStep <= end && g < 8; g += kStep) run(std::false_type{}, Step{}, g);
+        for (; g + kStep <= end; g += kStep) run(std::true_type{}, Step{}, g);
+        if constexpr (kStep > 1)
+            for (; g < end; ++g) g < 8 ? run(std::false_type{}, One{}, g) : run(std::true_type{}, One{}, g);
+    }
+
+    // Blocks [first, first + count) of the leaf form at `from` -> the values form at `to` (may be
+    // from). Leaves < 2P in (the transforms': canonical); canonical out. rows: build_value_rows.
+    static void split(const u32* from, u32* to, std::size_t count, std::size_t first, const u32* rows) {
+        F z[4];
+        factors(z, 0);
+        each_block(count, first, [&]<class On, class Nb> [[gnu::always_inline]] (On, Nb, std::size_t g) {
+            split_blocks<On::value, Nb::value>(from + 64 * (g - first), to + 64 * (g - first), g, rows, z);
+        });
+    }
+
+    // split undone but for the 8-point transform's gain: the values form at `from` (canonical) ->
+    // 8 times the leaf form at `to` (may be from), < 2P, or canonical (kCanonical). The inverses
+    // after it scale by values_scale(lg), 1/8 of leaf_scale(lg) (common.hpp).
+    template <bool kCanonical = true>
     static void join(const u32* from, u32* to, std::size_t count, std::size_t first, const u32* rows) {
         F z[4];
         factors(z, 1);
-        for (std::size_t g = first; g < first + count; ++g, from += 64, to += 64) {
-            const auto& b = kValueLanes.inverse[g % 8];
-            const u32* a = rows + 32 * (g / 8) + 16;
-            Set x[kSets];
-            #pragma GCC unroll 8
-            for (int s = 0; s < kSets; ++s) load_values(from, s, x[s]);
-            #pragma GCC unroll 8
-            for (int s = 0; s < kSets; ++s) {
-                inverse8(x[s], z);
-                x[s][0] = canonical(mul_lanes(x[s][0], b[0] + s * W));
-                #pragma GCC unroll 8
-                for (int k = 1; k < 8; ++k)
-                    x[s][k] = canonical(mul(mul_lanes(x[s][k], b[k] + s * W), A::factor(a[k], a[8 + k])));
-            }
-            #pragma GCC unroll 8
-            for (int s = 0; s < kSets; ++s) store_leaves(to, s, x[s]);
-        }
+        each_block(count, first, [&]<class On, class Nb> [[gnu::always_inline]] (On, Nb, std::size_t g) {
+            join_blocks<On::value, Nb::value, kCanonical>(from + 64 * (g - first), to + 64 * (g - first), g, rows, z);
+        });
     }
 };
 
@@ -1434,39 +1599,107 @@ struct WideValues : Values<S> {
         }
     }
 
-    // x w per lane, w and its quotient from the rows of blocks g and g + 1 (any x -> [0, 2P)).
-    [[gnu::always_inline]] static V mul_lanes(V x, const u32* row0, const u32* row1) {
-        return Base::whole(M::shoup(x, S::load_halves(row0, row1), S::load_halves(row0 + 8, row1 + 8)));
+    // The lane rows of blocks g, g + 1 (g even) as one 16-lane row: per pair p = g % 8 / 2 and
+    // k, 48 words: the quotients, the odd lanes' quotients in the even lanes, the values. One zmm
+    // load each (load_halves of ValueLanes' rows: a vinserti64x4 more per load).
+    struct alignas(64) Pairs {
+        u32 forward[4][8][48];
+        u32 inverse[4][8][48];
+    };
+    static constexpr Pairs kPairs = [] {
+        Pairs v{};
+        for (int p = 0; p < 4; ++p)
+            for (int k = 0; k < 8; ++k)
+                for (int i = 0; i < 16; ++i) {
+                    const int l = 2 * p + i / 8, t = i % 8, o = i % 2 ? i : i + 1;  // o: the odd lane
+                    v.forward[p][k][i] = kValueLanes.forward[l][k][t], v.forward[p][k][32 + i] = kValueLanes.forward[l][k][8 + t];
+                    v.inverse[p][k][i] = kValueLanes.inverse[l][k][t], v.inverse[p][k][32 + i] = kValueLanes.inverse[l][k][8 + t];
+                    v.forward[p][k][16 + i] = kValueLanes.forward[2 * p + o / 8][k][o % 8];
+                    v.inverse[p][k][16 + i] = kValueLanes.inverse[2 * p + o / 8][k][o % 8];
+                }
+        return v;
+    }();
+
+    // v times the lane factors of row k of pair p (kPairs.forward or inverse).
+    [[gnu::always_inline]] static V mul_pair(V v, const u32 (&b)[8][48], int k) {
+        return Base::mul_lanes(v, S::load(b[k]), S::load(b[k] + 16), S::load(b[k] + 32));
     }
 
-    // Blocks g, g + 1 (g even) at from -> to; z: factors(z, 0).
-    [[gnu::always_inline]] static void split2(const u32* from, u32* to, std::size_t g, const u32* rows, const F (&z)[4]) {
-        const auto &b0 = kValueLanes.forward[g % 8], &b1 = kValueLanes.forward[(g + 1) % 8];
-        const u32* a = rows + 32 * (g / 8);  // g / 8 = (g + 1) / 8
-        Set x;
-        #pragma GCC unroll 8
-        for (int u = 0; u < 8; ++u) x[u] = S::load_halves(from + 8 * u, from + 64 + 8 * u);
-        transpose(x);
-        #pragma GCC unroll 8
-        for (int k = 1; k < 8; ++k) x[k] = mul(mul_lanes(x[k], b0[k], b1[k]), Base::A::factor(a[k], a[8 + k]));
-        forward8(x, z);
-        #pragma GCC unroll 8
-        for (int i = 0; i < 8; ++i) S::template store_half<0>(to + 8 * i, x[i]), S::template store_half<1>(to + 64 + 8 * i, x[i]);
+    // The pairs g + 2j, g + 2j + 1 for j < Np (g a multiple of 2 Np: one A row) at from -> to,
+    // through each step together; z: factors(z, 0).
+    template <bool kA, int Np>
+    [[gnu::always_inline]] static void split_pairs(const u32* from, u32* to, std::size_t g, const u32* rows,
+                                                   const F (&z)[4]) {
+        Set x[Np];
+        #pragma GCC unroll 4
+        for (int j = 0; j < Np; ++j) {
+            #pragma GCC unroll 8
+            for (int u = 0; u < 8; ++u) x[j][u] = S::load_halves(from + 128 * j + 8 * u, from + 128 * j + 64 + 8 * u);
+            transpose(x[j]);
+        }
+        Base::template twist<kA, Np>(x, [g] [[gnu::always_inline]] (int j, int k, V v) {
+            return mul_pair(v, kPairs.forward[(g + 2 * j) % 8 / 2], k);
+        }, rows + 32 * (g / 8));
+        Base::template forward8<Np>(x, z);
+        #pragma GCC unroll 4
+        for (int j = 0; j < Np; ++j) {
+            #pragma GCC unroll 8
+            for (int i = 0; i < 8; ++i)
+                S::template store_half<0>(to + 128 * j + 8 * i, x[j][i]), S::template store_half<1>(to + 128 * j + 64 + 8 * i, x[j][i]);
+        }
     }
 
-    [[gnu::always_inline]] static void join2(const u32* from, u32* to, std::size_t g, const u32* rows, const F (&z)[4]) {
-        const auto &b0 = kValueLanes.inverse[g % 8], &b1 = kValueLanes.inverse[(g + 1) % 8];
-        const u32* a = rows + 32 * (g / 8) + 16;
-        Set x;
-        #pragma GCC unroll 8
-        for (int i = 0; i < 8; ++i) x[i] = S::load_halves(from + 8 * i, from + 64 + 8 * i);
-        inverse8(x, z);
-        x[0] = canonical(mul_lanes(x[0], b0[0], b1[0]));
-        #pragma GCC unroll 8
-        for (int k = 1; k < 8; ++k) x[k] = canonical(mul(mul_lanes(x[k], b0[k], b1[k]), Base::A::factor(a[k], a[8 + k])));
-        transpose(x);
-        #pragma GCC unroll 8
-        for (int u = 0; u < 8; ++u) S::template store_half<0>(to + 8 * u, x[u]), S::template store_half<1>(to + 64 + 8 * u, x[u]);
+    template <bool kA, int Np, bool kCanonical>
+    [[gnu::always_inline]] static void join_pairs(const u32* from, u32* to, std::size_t g, const u32* rows,
+                                                  const F (&z)[4]) {
+        Set x[Np];
+        #pragma GCC unroll 4
+        for (int j = 0; j < Np; ++j) {
+            #pragma GCC unroll 8
+            for (int i = 0; i < 8; ++i) x[j][i] = S::load_halves(from + 128 * j + 8 * i, from + 128 * j + 64 + 8 * i);
+        }
+        Base::template inverse8<Np>(x, z);
+        #pragma GCC unroll 4
+        for (int j = 0; j < Np; ++j) x[j][0] = Base::low(x[j][0]);
+        Base::template twist<kA, Np>(x, [g] [[gnu::always_inline]] (int j, int k, V v) {
+            return mul_pair(v, kPairs.inverse[(g + 2 * j) % 8 / 2], k);
+        }, rows + 32 * (g / 8) + 16);
+        #pragma GCC unroll 4
+        for (int j = 0; j < Np; ++j) {
+            if constexpr (kCanonical) {
+                #pragma GCC unroll 8
+                for (int k = 0; k < 8; ++k) x[j][k] = canonical(x[j][k]);
+            }
+            transpose(x[j]);
+            #pragma GCC unroll 8
+            for (int u = 0; u < 8; ++u)
+                S::template store_half<0>(to + 128 * j + 8 * u, x[j][u]), S::template store_half<1>(to + 128 * j + 64 + 8 * u, x[j][u]);
+        }
+    }
+
+    // Pairs per step (split_pairs' Np). 2 against 1, in the transforms (2^10-2^18): Emerald Rapids
+    // split 0.91-0.96, join 0.90-0.95; Zen 5 0.82-0.98, 0.87-0.93; 4 spilled (notes/98-r1.md).
+#if defined(FPS_NTT_VALUES_PAIRS)
+    static constexpr int kStep = FPS_NTT_VALUES_PAIRS;
+#else
+    static constexpr int kStep = 2;
+#endif
+
+    // run(std::bool_constant<kA>{}, std::integral_constant<int, n>{}, g) over the pairs in
+    // [first, first + count), first and count even: n = kStep pairs from g, a multiple of 2 kStep,
+    // else n = 1; kA = g >= 8.
+    template <class Run>
+    [[gnu::always_inline]] static void each_pair(std::size_t count, std::size_t first, Run run) {
+        using One = std::integral_constant<int, 1>;
+        using Step = std::integral_constant<int, kStep>;
+        std::size_t g = first;
+        const std::size_t end = first + count;
+        if constexpr (kStep > 1)
+            for (; g < end && g % (2 * kStep); g += 2) g < 8 ? run(std::false_type{}, One{}, g) : run(std::true_type{}, One{}, g);
+        for (; g + 2 * kStep <= end && g < 8; g += 2 * kStep) run(std::false_type{}, Step{}, g);
+        for (; g + 2 * kStep <= end; g += 2 * kStep) run(std::true_type{}, Step{}, g);
+        if constexpr (kStep > 1)
+            for (; g < end; g += 2) g < 8 ? run(std::false_type{}, One{}, g) : run(std::true_type{}, One{}, g);
     }
 
     // As Values::split and join.
@@ -1474,15 +1707,22 @@ struct WideValues : Values<S> {
         if (count && first % 2) Lone::split(from, to, 1, first, rows), from += 64, to += 64, ++first, --count;
         F z[4];
         factors(z, 0);
-        for (; count >= 2; count -= 2, first += 2, from += 128, to += 128) split2(from, to, first, rows, z);
-        if (count) Lone::split(from, to, 1, first, rows);
+        const std::size_t pairs = count / 2 * 2;
+        each_pair(pairs, first, [&]<class On, class Np> [[gnu::always_inline]] (On, Np, std::size_t g) {
+            split_pairs<On::value, Np::value>(from + 64 * (g - first), to + 64 * (g - first), g, rows, z);
+        });
+        if (count % 2) Lone::split(from + 64 * pairs, to + 64 * pairs, 1, first + pairs, rows);
     }
+    template <bool kCanonical = true>
     static void join(const u32* from, u32* to, std::size_t count, std::size_t first, const u32* rows) {
-        if (count && first % 2) Lone::join(from, to, 1, first, rows), from += 64, to += 64, ++first, --count;
+        if (count && first % 2) Lone::template join<kCanonical>(from, to, 1, first, rows), from += 64, to += 64, ++first, --count;
         F z[4];
         factors(z, 1);
-        for (; count >= 2; count -= 2, first += 2, from += 128, to += 128) join2(from, to, first, rows, z);
-        if (count) Lone::join(from, to, 1, first, rows);
+        const std::size_t pairs = count / 2 * 2;
+        each_pair(pairs, first, [&]<class On, class Np> [[gnu::always_inline]] (On, Np, std::size_t g) {
+            join_pairs<On::value, Np::value, kCanonical>(from + 64 * (g - first), to + 64 * (g - first), g, rows, z);
+        });
+        if (count % 2) Lone::template join<kCanonical>(from + 64 * pairs, to + 64 * pairs, 1, first + pairs, rows);
     }
 };
 #endif
@@ -1961,9 +2201,10 @@ struct Ntt : Butterflies<S> {
     // The scale goes into the top groups of the subtrees below the top level when those have one
     // (nv >= 16 leaves) and lg <= kFoldMaxLog: their scaled twiddles, else null (the top level
     // scales). Per vector: 0.5 products fewer and 1.25 other ops more under a radix-2 top, 0.375
-    // products fewer under a radix-4 top (notes.md).
-    static const u32* fold_scale(std::size_t nv, int lg, bool product) {
-        return nv >= 16 && lg <= kFoldMaxLog ? kScaledRoots[product][lg].words : nullptr;
+    // products fewer under a radix-4 top (notes.md). kind: kScaledRoots' (0 inverse, 1 products,
+    // 2 inverse from the values form).
+    static const u32* fold_scale(std::size_t nv, int lg, int kind) {
+        return nv >= 16 && lg <= kFoldMaxLog ? kScaledRoots[kind][lg].words : nullptr;
     }
 
     // Top levels by lg: nv = 4^j leaves start with group 0; nv = 2 * 4^j with the radix-2 level.
@@ -2064,9 +2305,25 @@ struct Ntt : Butterflies<S> {
         inverse_radix2(a, half, fold ? 0 : s);
     }
 
-    // Leaf-form operations (ntt.hpp, Transform). Leaf products: on N, a group of 4 leaves at a time.
+    // Leaf-form operations (ntt.hpp, Transform). Leaf products: on N, a group of 4 leaves at a
+    // time; on 16 lanes on Zen 4 and 5 WideBottom's, two pairs of groups at a time (groups: even,
+    // 2^(lg - 5)), up to 2^kWideProductsMaxLog. Against N's on Zen 5: 0.65 of its time to 2^14,
+    // 0.84 at 2^20, 1.9x at 2^22 (memory; not understood); Emerald Rapids 0.97-1.00 on L1 data
+    // (notes/98-r1.md).
+#if defined(__znver4__) || defined(__znver5__)
+    static constexpr bool kWideProducts = kWideBottom;
+#else
+    static constexpr bool kWideProducts = false;
+#endif
+    static constexpr int kWideProductsMaxLog = 20;
     static void leaf_products(const u32* a, const u32* b, u32* out, int lg, const u32* r, bool accumulate) {
         const std::size_t groups = (std::size_t(1) << lg) / 32;
+        if constexpr (kWideProducts) {
+            if (lg <= kWideProductsMaxLog) {
+                if (accumulate) return WideBottom<S>::template products<true>(a, b, out, groups, 0, r);
+                return WideBottom<S>::template products<false>(a, b, out, groups, 0, r);
+            }
+        }
         if (accumulate) return Leaf::template products<true>(a, b, out, groups, 0, r);
         Leaf::template products<false>(a, b, out, groups, 0, r);
     }
@@ -2091,25 +2348,29 @@ struct Ntt : Butterflies<S> {
     // The leaf form (rows null) or values form at `from` -> coefficients [0, count) to out, through
     // f (aligned, may be from; out may be f, then count = 2^lg). The subtrees read their leaves from
     // `from` (copied, or joined, into f before their bottom level), and the top level writes out.
+    // s: leaf_scale(lg), or values_scale(lg) from the values form (fold_scale's tables are those).
     static void inverse(const u32* from, u32* f, u32* out, std::size_t count, int lg, const u32* ir, u32 s,
                         const u32* rows) {
         const std::size_t len = std::size_t(1) << lg;
+        // The join's leaves are < 2P, as every bottom level here takes them.
         if (rows && lg < 8) {
-            ValuesFor<S>::join(from, f, len / 64, 0, rows);
-            return inverse_into(f, out, count, lg, ir, s, NoTile{});
+            ValuesFor<S>::template join<false>(from, f, len / 64, 0, rows);
+            return inverse_into(f, out, count, lg, ir, s, 2, NoTile{});
         }
         if (rows) {
-            return inverse_into(f, out, count, lg, ir, s, [from, f, rows] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
+            const auto join = [from, f, rows] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
                 const std::size_t at = std::size_t(t - f);
-                ValuesFor<S>::join(from + at, t, leaves / 8, at / 64, rows);
-            });
+                ValuesFor<S>::template join<false>(from + at, t, leaves / 8, at / 64, rows);
+            };
+            return inverse_into(f, out, count, lg, ir, s, 2, join);
         }
         if (from != f) {
-            return inverse_into(f, out, count, lg, ir, s, [from, f] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
+            const auto copy = [from, f] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
                 std::memcpy(t, from + (t - f), 8 * leaves * sizeof(u32));
-            });
+            };
+            return inverse_into(f, out, count, lg, ir, s, 0, copy);
         }
-        inverse_into(f, out, count, lg, ir, s, NoTile{});
+        inverse_into(f, out, count, lg, ir, s, 0, NoTile{});
     }
 
     // inverse_into at 2^6 and 2^7 with kJoin (the subtrees' bottoms in one call), in a function of
@@ -2117,30 +2378,31 @@ struct Ntt : Butterflies<S> {
     // zmm variant's inverse of the values form at 2^9 ran 11% slower on Zen 5 (notes/176-r1.md).
     template <class Tile>
     [[gnu::noinline]] static void inverse_into_joined(u32* f, u32* out, std::size_t count, int lg, const u32* ir, u32 s,
-                                                      Tile tile) {
+                                                      int kind, Tile tile) {
         const std::size_t len = std::size_t(1) << lg, nv = len / 8;
         tile(f, nv), bottom_inverse(f, nv / 4, 0, ir);
         if (!has_radix2(lg)) {
-            const u32* fold = fold_scale(nv / 4, lg, false);
+            const u32* fold = fold_scale(nv / 4, lg, kind);
             if (out == f) return inverse_radix4(f, len / 4, ir, fold ? 0 : s);
             return inverse_radix4_out(f, len / 4, out, count, ir, fold ? 0 : s);
         }
-        const u32* fold = fold_scale(nv / 2, lg, false);
+        const u32* fold = fold_scale(nv / 2, lg, kind);
         if (out == f) return inverse_radix2(f, len / 2, fold ? 0 : s);
         inverse_radix2_out(f, len / 2, out, count, fold ? 0 : s);
     }
+    // kind: fold_scale's, for s.
     template <class Tile>
-    static void inverse_into(u32* f, u32* out, std::size_t count, int lg, const u32* ir, u32 s, Tile tile) {
+    static void inverse_into(u32* f, u32* out, std::size_t count, int lg, const u32* ir, u32 s, int kind, Tile tile) {
         if constexpr (kJoin)
-            if (lg <= 7) return inverse_into_joined(f, out, count, lg, ir, s, tile);
+            if (lg <= 7) return inverse_into_joined(f, out, count, lg, ir, s, kind, tile);
         const std::size_t len = std::size_t(1) << lg, nv = len / 8;
         if (!has_radix2(lg)) {
-            const u32* fold = fold_scale(nv / 4, lg, false);
+            const u32* fold = fold_scale(nv / 4, lg, kind);
             for (std::size_t t = 0; t < 4; ++t) inverse_tiles(f + t * len / 4, nv / 4, t, ir, fold, tile);
             if (out == f) return inverse_radix4(f, len / 4, ir, fold ? 0 : s);
             return inverse_radix4_out(f, len / 4, out, count, ir, fold ? 0 : s);
         }
-        const u32* fold = fold_scale(nv / 2, lg, false);
+        const u32* fold = fold_scale(nv / 2, lg, kind);
         inverse_tiles(f, nv / 2, 0, ir, fold, tile);
         inverse_tiles(f + len / 2, nv / 2, 1, ir, fold, tile);
         if (out == f) return inverse_radix2(f, len / 2, fold ? 0 : s);
@@ -2771,7 +3033,7 @@ struct intrinsics {
 
     static void inverse(const std::uint32_t* from, std::uint32_t* f, std::uint32_t* out, std::size_t count, int lg,
                         const std::uint32_t* inverse_roots, const std::uint32_t* rows) {
-        Ntt::inverse(from, f, out, count, lg, inverse_roots, detail::leaf_scale(lg), rows);
+        Ntt::inverse(from, f, out, count, lg, inverse_roots, rows ? detail::values_scale(lg) : detail::leaf_scale(lg), rows);
     }
 
     // Fused leaf-form ops (ntt.hpp, Transform): forward from caller memory, forward and leaf
