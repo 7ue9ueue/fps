@@ -36,8 +36,13 @@ target's candidates (struct, R, U, Solo, T), the variant per shape class and bea
   (a load that spans several of the copy's stores waits until they reach the cache). With Solo
   the edge vectors run one at a time (`one`), without phases. The last vector's words past the
   product are not stored (`store_first`: a masked store on AVX-512, pieces elsewhere).
-- The loop with all R vectors is unrolled U times. Neon: an empty `asm` makes each step's base
-  pointer opaque, so GCC loads each window instead of keeping windows in registers across j.
+- The loop with all R vectors is unrolled U times. Neon: every term loop is a loop on pointers
+  (`neon_terms`), and an empty `asm` makes each step's base pointer opaque, so GCC loads each
+  window instead of keeping windows in registers across j. The loop with all R vectors starts at a
+  multiple of 32 bytes (a `.p2align 5` in an `asm` whose operands are the loop's pointers):
+  Neoverse V2 runs it 9% slower at any other address, and GCC's `-falign-loops=32:16` aligns it
+  only when that skips at most 15 bytes, so its place was luck (#197, `notes/197-r1.md`). The
+  arm candidates are all U = 1 since.
 - b in panels of at most 1024 words, so the stack scratch is fixed (about 9 KiB: b' and the copy);
   panels after the first add into out (`panels`, out of line). Any n, m work.
 - Tiny path (issue #37 round 3): a product of at most T vectors (n + m - 1 <= T W, T = 2 to 4,
