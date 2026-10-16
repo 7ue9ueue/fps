@@ -11,8 +11,9 @@
 //   or others (runs of 4 from a multiple of 4 in asm, the rest intrinsics);
 //   the bottom level forward and inverse, 2 to 64 groups (statements of 4 and 2 pairs, a last
 //   pair by the intrinsics) from even first groups.
-// On other targets (avx512) the hooks without asm run the intrinsics, and the checks hold
-// trivially. The whole ops of the variant run in test.cpp and the other test files.
+// On the avx512 target (avx512_kernels.hpp) only the bottom level has asm behind these hooks (issue
+// #176); the other hooks run the intrinsics, and their checks hold trivially. The whole ops of the
+// variant run in test.cpp and the other test files.
 #include "backend/ntt/test_util.hpp"
 
 #include <cstring>
