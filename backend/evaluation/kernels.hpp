@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <type_traits>
 
 #include "backend/product_tree/kernels.hpp"
 
@@ -63,15 +64,53 @@ template <class L, bool kUnit = false>
     }
 }
 
-// middle_lanes_inline, unrolled for k = count = 1, 2, 4, 8.
+// middle_lanes_inline for k = count = K, in blocks of B outputs: per term, w's and q's vectors
+// loaded (their odd words by shifts), the sums in registers. x86 (Sums EvenOdd): 0.89 of the time
+// of middle_lanes_inline in a base of 16 slots on Zen 3 (notes/136-r1.md); 8 lanes per vector.
+template <class L, std::size_t K, std::size_t B, bool kUnit>
+[[gnu::always_inline]] inline void middle_blocks(const u32* w, const u32* q, u32* out) {
+    using S = Sums<L>;
+    constexpr std::size_t j0 = kUnit ? 1 : 0;
+#pragma GCC unroll 8
+    for (std::size_t t0 = 0; t0 < K; t0 += B) {
+        typename S::Acc s[B];
+#pragma GCC unroll 9
+        for (std::size_t j = j0; j <= K; ++j) {
+            const typename S::Op y = S::of(L::load(q + 8 * j));
+#pragma GCC unroll 8
+            for (std::size_t i = 0; i < B; ++i) {
+                const typename S::Op x = S::of(L::load(w + 8 * (K + t0 + i - j)));
+                if (j == j0) s[i] = S::mul(x, y);
+                else S::mac(s[i], x, y);
+            }
+        }
+#pragma GCC unroll 8
+        for (std::size_t i = 0; i < B; ++i) {
+            typename L::V r = S::reduce(s[i]);
+            if constexpr (kUnit) r = Ops<L>::add(r, L::load(w + 8 * (K + t0 + i)));
+            L::store(out + 8 * (t0 + i), r);
+        }
+    }
+}
+
+// middle_lanes_inline, unrolled for k = count = 1, 2, 4, 8 (x86: middle_blocks).
 template <class L, bool kUnit = false>
 void middle_lanes(const u32* w, std::size_t k, const u32* q, std::size_t count, u32* out) {
     if (k == count) {
-        switch (k) {
-            case 1: return middle_lanes_inline<L, kUnit>(w, 1, q, 1, out);
-            case 2: return middle_lanes_inline<L, kUnit>(w, 2, q, 2, out);
-            case 4: return middle_lanes_inline<L, kUnit>(w, 4, q, 4, out);
-            case 8: return middle_lanes_inline<L, kUnit>(w, 8, q, 8, out);
+        if constexpr (std::is_same_v<Sums<L>, product_tree::detail::EvenOdd<L>> && L::lanes == 8) {
+            switch (k) {
+                case 1: return middle_blocks<L, 1, 1, kUnit>(w, q, out);
+                case 2: return middle_blocks<L, 2, 2, kUnit>(w, q, out);
+                case 4: return middle_blocks<L, 4, 2, kUnit>(w, q, out);
+                case 8: return middle_blocks<L, 8, 2, kUnit>(w, q, out);
+            }
+        } else {
+            switch (k) {
+                case 1: return middle_lanes_inline<L, kUnit>(w, 1, q, 1, out);
+                case 2: return middle_lanes_inline<L, kUnit>(w, 2, q, 2, out);
+                case 4: return middle_lanes_inline<L, kUnit>(w, 4, q, 4, out);
+                case 8: return middle_lanes_inline<L, kUnit>(w, 8, q, 8, out);
+            }
         }
     }
     middle_lanes_inline<L, kUnit>(w, k, q, count, out);
