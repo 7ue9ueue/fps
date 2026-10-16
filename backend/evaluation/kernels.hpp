@@ -65,8 +65,9 @@ template <class L, bool kUnit = false>
 }
 
 // middle_lanes_inline for k = count = K, in blocks of B outputs: per term, w's and q's vectors
-// loaded (their odd words by shifts), the sums in registers. x86 (Sums EvenOdd): 0.89 of the time
-// of middle_lanes_inline in a base of 16 slots on Zen 3 (notes/136-r1.md); 8 lanes per vector.
+// loaded (their odd words by shifts), the sums in registers, no arrays of operands to spill. x86
+// (Sums EvenOdd, 8 lanes per vector): a base's descent of 16 slots in 0.84 of the time on Zen 3
+// (notes/136-r1.md).
 template <class L, std::size_t K, std::size_t B, bool kUnit>
 [[gnu::always_inline]] inline void middle_blocks(const u32* w, const u32* q, u32* out) {
     using S = Sums<L>;

@@ -43,11 +43,11 @@ inline bool evaluate_directly(std::size_t n, std::size_t m) {
 // newton_small) up to this many points, about where the trees take over on each timing machine
 // (notes/136-r1.md; the scalar loops before crossed at about 36 and 70).
 #if defined(__znver5__)
-inline constexpr std::size_t kDirectInterpolate = 104, kDirectNewton = 240;  // lc-zen5
+inline constexpr std::size_t kDirectInterpolate = 128, kDirectNewton = 400;  // lc-zen5
 #elif defined(__AVX512F__)
 inline constexpr std::size_t kDirectInterpolate = 104, kDirectNewton = 240;  // lc-intel
 #elif defined(__AVX2__)
-inline constexpr std::size_t kDirectInterpolate = 104, kDirectNewton = 240;  // lc-bench
+inline constexpr std::size_t kDirectInterpolate = 96, kDirectNewton = 352;  // lc-bench
 #elif defined(__ARM_NEON) && defined(__aarch64__)
 inline constexpr std::size_t kDirectInterpolate = 104, kDirectNewton = 184;  // lc-arm
 #elif defined(__SSE4_1__)
