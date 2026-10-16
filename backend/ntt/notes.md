@@ -300,10 +300,14 @@ issue #152, below). A candidate on both targets; on zen5 also `Native` (the leaf
   two-column groups ran 1.36x slower (loads across two recent stores do not forward).
 - Issue #176 (notes/176-r1.md): at 2^6 and 2^7 the subtrees' bottoms run in one call
   (`kJoinBottoms`, #151's hook), so the pair kernels take them: multiply/6-7 0.58-0.66 of the
-  variant's time before. The transforms' bottom level in statements of 2 and 4 pairs on Emerald
-  Rapids too (forward 0.85-0.87 of WideBottom's time on L1 data, inverse 4 pairs 0.95-0.97); on
-  Zen 5 the 4-pair statements scheduled with a window of 128 (forward 0.75, inverse 0.81; 0.80 and
-  0.86 before) and the 2-pair forward on the Emerald Rapids model (0.86; 0.89).
+  variant's time before, and the tuned table moved the 2^6-2^7 products to it (Zen 5 multiply/7
+  0.64 of main's time, Emerald Rapids 0.80). The transforms' bottom level in statements of 2 and 4
+  pairs on Emerald Rapids too (forward 0.85-0.87 of WideBottom's time on L1 data, inverse 4 pairs
+  0.95-0.97); on Zen 5 the 4-pair statements scheduled with a window of 128 (forward 0.75, inverse
+  0.81; 0.80 and 0.86 before) and the 2-pair forward on the Emerald Rapids model (0.86; 0.89).
+  `inverse_into` dispatches its joined lengths to a function of its own: inlined, the join changed
+  its code for 2^9 (the values form 11% slower on Zen 5). Zen 5 code layout again: a function that
+  roots/6 never runs moved roots/6 by 15%, and squares at 2^14-2^22 moved 1-2% between builds.
 
 ### neon (issue #151)
 
