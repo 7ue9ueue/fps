@@ -174,6 +174,55 @@ void multiply_lanes(const u32* a, std::size_t m, const u32* b, std::size_t k, u3
     multiply_lanes_inline<L>(a, m, b, k, c);
 }
 
+// multiply_lanes for a[0] = b[0] = kR (1 in Montgomery form; products of factors 1 + a x, such as
+// backend/evaluation's): the terms a[0] b[t] and a[t] b[0] are b[t] and a[t] themselves, added
+// after the Montgomery step; c[0] = kR. Montgomery form in and out (canonical); 1 <= m, k <= 8.
+template <class L>
+[[gnu::always_inline]] inline void multiply_units_inline(const u32* a, std::size_t m, const u32* b, std::size_t k, u32* c) {
+    using S = Sums<L>;
+    using M = Ops<L>;
+    using V = typename L::V;
+    constexpr int kVectors = 8 / L::lanes;
+#pragma GCC unroll 8
+    for (int u = 0; u < kVectors; ++u) {
+        typename S::Op x[9], y[9];
+#pragma GCC unroll 9
+        for (std::size_t i = 1; i <= m; ++i) x[i] = S::of(L::load(a + 8 * i + u * L::lanes));
+#pragma GCC unroll 9
+        for (std::size_t j = 1; j <= k; ++j) y[j] = S::of(L::load(b + 8 * j + u * L::lanes));
+        L::store(c + u * L::lanes, L::broadcast(kR));
+#pragma GCC unroll 17
+        for (std::size_t t = 1; t <= m + k; ++t) {
+            V r = L::broadcast(0);
+            if (t <= m) r = L::load(a + 8 * t + u * L::lanes);
+            if (t <= k) r = M::add(r, L::load(b + 8 * t + u * L::lanes));
+            // a[i] b[t - i] for i in [max(1, t - k), min(t - 1, m)]
+            const std::size_t first = t > k ? t - k : 1, last = std::min(t - 1, m);
+            if (first <= last) {
+                typename S::Acc s = S::mul(x[first], y[t - first]);
+#pragma GCC unroll 8
+                for (std::size_t i = first + 1; i <= last; ++i) S::mac(s, x[i], y[t - i]);
+                r = M::add(r, S::reduce(s));
+            }
+            L::store(c + 8 * t + u * L::lanes, r);
+        }
+    }
+}
+
+// multiply_units_inline, unrolled for m = k = 1, 2, 4, 8.
+template <class L>
+void multiply_units(const u32* a, std::size_t m, const u32* b, std::size_t k, u32* c) {
+    if (m == k) {
+        switch (m) {
+            case 1: return multiply_units_inline<L>(a, 1, b, 1, c);
+            case 2: return multiply_units_inline<L>(a, 2, b, 2, c);
+            case 4: return multiply_units_inline<L>(a, 4, b, 4, c);
+            case 8: return multiply_units_inline<L>(a, 8, b, 8, c);
+        }
+    }
+    multiply_units_inline<L>(a, m, b, k, c);
+}
+
 // out[i] = f(in[i]) for i < n, f on vectors of S and on single words.
 template <class S, class F, class G>
 [[gnu::always_inline]] inline void each(std::size_t n, F f, G g) {

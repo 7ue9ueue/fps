@@ -55,6 +55,7 @@ inline std::size_t top_length(std::size_t degree) { return StandardTree<>::lengt
 
 // Slot k of lane l: the factor 1 - x[8 k + l] x, in Montgomery form.
 struct PointSlots {
+    static constexpr bool kUnitTerms = true;  // factors 1 - a x
     const u32* x;
     std::size_t slots;
 
