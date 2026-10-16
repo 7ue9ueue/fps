@@ -155,9 +155,22 @@ private:
         build(2 * v, lo, mid);
         build(2 * v + 1, mid, hi);
         if (v == 1) return;
-        multiply_lanes<Lanes>(product_[2 * v], mid - lo, product_[2 * v + 1], hi - mid, free_);
+        if (hi - lo == 2) linear_pair(product_[2 * v], product_[2 * v + 1], free_);
+        else multiply_lanes<Lanes>(product_[2 * v], mid - lo, product_[2 * v + 1], hi - mid, free_);
         product_[v] = free_;
         free_ += 8 * (hi - lo + 1);
+    }
+
+    // (1 + a x)(1 + b x) = 1 + (a + b) x + a b x^2 from two slots' factors (Montgomery forms: 1 is
+    // kR): one product, not multiply_lanes' four sums.
+    static void linear_pair(const u32* x, const u32* y, u32* c) {
+        using L = Lanes;
+        for (int l = 0; l < 8; l += L::lanes) {
+            const typename L::V a = L::load(x + 8 + l), b = L::load(y + 8 + l);
+            L::store(c + l, L::broadcast(kR));
+            L::store(c + 8 + l, Ops<L>::add(a, b));
+            L::store(c + 16 + l, montgomery_canonical<L>(a, b));
+        }
     }
 
     // 16 slots: 2 coefficients per slot and s + 1 per node of s slots below the top: 32 + 24 +
