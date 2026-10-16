@@ -19,16 +19,19 @@
 //   C points, C >= kMinSlots. The lane tree multiplies Q_v = prod (1 - a_i x) of the 8 lanes side by
 //   side, a top tree the 8 lane products; each node's children's transforms are kept (tree.hpp).
 // - evaluate: the root's window (rev_K(f) / Q mod x^K)[K - m8, K), K = max(n, m8), by Karp and
-//   Markstein's division; then the transposed descent (Bostan, Lecerf and Schost): one product with
+//   Markstein's division (fps::series::inverse, fused cyclic products); then the transposed descent (Bostan, Lecerf and Schost): one product with
 //   the sibling's kept transform per child, then halving (inverse_upper and forward of half the
 //   length), schoolbook middle products below kLaneBase slots. Horner's rule where a cost model
 //   per target says it is cheaper (select.hpp: up to n = m = 256-512, or a short side).
 // - interpolate: M'(a_i) by evaluate's descent (M = prod (x - a_i), from Q), the weights w_i = y_i
 //   / M'(a_i) (one inversion per base), then the transpose of the descent, in the same pass: R_v =
-//   R_l Q_r + R_r Q_l up the tree in the kept transforms; f = rev_m(R).
+//   R_l Q_r + R_r Q_l up the tree in the kept transforms; f = rev_m(R). Up to kDirectInterpolate
+//   points (about 100), O(m^2) in vectors of points instead.
 // - to_newton_basis: with F = rev(f), c_k = [x^(N-1-k)] F / Q_(k+1); a node's right child's window
 //   is the low part of its own, its left child's a middle product with the right sibling's Q (one
-//   product per node). Points in blocks per lane (lane l holds points [l C, (l + 1) C)).
+//   product per node); the top tree's rightmost windows are prefixes of the root's. Points in
+//   blocks per lane (lane l holds points [l C, (l + 1) C)). Up to kDirectNewton points (about
+//   200), the synthetic divisions in a systolic array of vector lanes instead.
 // Memory: one region of this thread (ntt's, kept across calls): the kept transforms, about 2 m8
 // words per level of the lane tree (14.7 MB at m = 2^17), and scratch. Design and measurements:
 // notes.md.
@@ -129,11 +132,6 @@ inline void evaluate_chunks(std::span<const u32> f, std::span<const u32> points,
         return;
     }
     evaluate_tree(f, points, values);
-}
-
-// f = c0 + (x - p) g: g = f quo (x - p) in place of f[1, n), c0 = f(p) in f[0].
-inline void divide_linear(u32* f, std::size_t n, u32 p) {
-    for (std::size_t j = n - 1; j-- > 0;) f[j] = add_mod(f[j], multiply_mod(f[j + 1], p));
 }
 
 // interpolate() for m <= kDirectInterpolate, in O(m^2): M = prod (x - a_i), w_i = y_i / M'(a_i), f =
