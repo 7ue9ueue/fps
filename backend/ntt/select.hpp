@@ -240,6 +240,13 @@ template <class... V>
     int i = 0;
     (void)((i++ == v && (V::inverse_product(terms, n, f, out, count, lg, r, ir, output), true)) || ...);
 }
+template <class... V>
+[[gnu::always_inline]] inline void run_toeplitz_product(Candidates<V...>, int v, const Toeplitz& z, std::uint32_t* f,
+                                                        std::uint32_t* out, std::size_t count, int lg, const std::uint32_t* r,
+                                                        const std::uint32_t* ir, unsigned output) {
+    int i = 0;
+    (void)((i++ == v && (V::toeplitz_product(z, f, out, count, lg, r, ir, output), true)) || ...);
+}
 
 // Transform's hooked ops: by the forward's and the inverse's choice.
 template <class Hook, class... V>
@@ -362,6 +369,11 @@ struct tuned {
                                 unsigned output) {
         detail::run_inverse_product(Selected{}, choice(kInverse, lg), terms, n, f, out, count, lg, roots, inverse_roots,
                                     output);
+    }
+
+    static void toeplitz_product(const detail::Toeplitz& z, std::uint32_t* f, std::uint32_t* out, std::size_t count,
+                                 int lg, const std::uint32_t* roots, const std::uint32_t* inverse_roots, unsigned output) {
+        detail::run_toeplitz_product(Selected{}, choice(kInverse, lg), z, f, out, count, lg, roots, inverse_roots, output);
     }
 
     // Transform's hooked ops.

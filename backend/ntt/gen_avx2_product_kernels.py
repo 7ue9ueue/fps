@@ -25,6 +25,15 @@ bottom_leaves_*: the same with a given as leaves too: the windows are filled fro
 leaves, no forward butterflies (the inverse of a leaf product, Transform::inverse_product).
 bottom_leaves2_*, bottom_leaves3_*: the sum of 2 or 3 such products (a, a1, a2 times bs, bs1,
 bs2), each reduced, then added; the leaf buffers of term k from 2 k LEAVES bytes on.
+bottom_toeplitz_*: Transform::toeplitz_product (issue #87, lc-opt's ToeplitzBottom): windows of
+S = B0 + B1, D1 = A1 - A2 and D3 = A3 - A2 (canonical, from the leaves at b0, b1, a1, a2, a3), the
+products m1 = S A2, m2 = D1 B1, m3 = D3 B0 (b_j from a2, b1, b0); m1 + m2 (each reduced, then
+added) through the inverse butterflies, m1 + m3 exact (its 64-bit sums added, < 16 P^2, as
+hi (2^32 mod P) + lo; canonical) over A3's leaves. In 'both', the current batches' a2, b1, b0, a3
+are the next ones' minus 256 bytes (13 pointers fit; 17 would not).
+bottom_side_*: a product of leaves (as bottom_leaves_*; 'first' is bottom_leaves_first) plus a
+leaf form alone at side, added to the product's 64-bit sums before the reduction, so it carries
+2^-32 as the product does (Transform::inverse_product of a product and a term alone).
 
 Usage: gen_avx2_product_kernels.py [--check]   (--check: exit 1 if avx2_product_kernels.hpp differs)
 """
@@ -58,6 +67,16 @@ SQUARE_ARGS = {part: [a for a in args if a != 'b'] for part, args in ARGS.items(
 STORED_ARGS = {'first': SQUARE_ARGS['first'], 'last': ['out', 'cur', 'bs', 'ix', 'iy'],
                'both': SQUARE_ARGS['first'] + ['out', 'cur', 'bs', 'ix', 'iy']}
 TERMS = {'leaves2': 2, 'leaves3': 3}  # sums of leaf products
+# Toeplitz and side: as the sums of 3 products and the product of leaves.
+# Toeplitz 'both': windows 5 and more deadlock at every shift tried; 4 with shift 0.05 does not.
+TOEPLITZ_KNOBS = dict(TERMS_KNOBS['leaves3'], both=gk.Knobs(window=4))
+TOEPLITZ_SHIFT = 0.05
+SIDE_KNOBS = LEAVES_KNOBS
+TOEPLITZ_ARGS = {'first': ['a1', 'a2', 'a3', 'b0', 'b1', 'buf', 'x', 'y'],
+                 'last': ['out', 'cur', 'a2', 'b1', 'b0', 'a3', 'ix', 'iy', 'kr'],
+                 'both': ['a1', 'a2', 'a3', 'b0', 'b1', 'buf', 'x', 'y', 'out', 'cur', 'ix', 'iy', 'kr']}
+SIDE_ARGS = {'last': ['out', 'cur', 'bs', 'side', 'ix', 'iy'],
+             'both': ['a', 'buf', 'x', 'y', 'out', 'cur', 'bs', 'side', 'ix', 'iy']}
 
 
 def term_args(terms):
@@ -70,6 +89,17 @@ def term_args(terms):
 
 def term_name(base, k):
     return base if k == 0 else f'{base}{k}'
+SPECIAL_DOC = {
+    'toeplitz': {
+        'first': 'Toeplitz: the rows of S, D1, D3 (header) for the two batches at a1, a2, a3, b0, b1; fills buf.',
+        'last': 'Toeplitz: m1 + m2 from cur and a2, b1, b0, the inverse butterflies to out; m1 + m3 over a3.',
+        'both': 'bottom_toeplitz_last() for the current two batches (at the next ones minus 256 bytes) interleaved\n'
+                '// with bottom_toeplitz_first() for the next two.'},
+    'side': {
+        'last': 'Side: the products of cur and bs plus the leaf form at side, the inverse butterflies to out.',
+        'both': 'bottom_side_last() for the current two batches interleaved with bottom_leaves_first() for the\n'
+                '// next two at a.'},
+}
 DOC = {
     'first': 'Forward half of the bottom stage for the two batches at a, b; fills buf.',
     'last': 'Leaf products from cur and the inverse butterflies; writes the two batches at out.',
@@ -101,7 +131,15 @@ def first(g, square=False):
         for k in range(TERMS[square]):
             first_rows(g, [g.materialize(g.at(term_name('a', k), 32 * t)) for t in range(4)], 2 * LEAVES * k)
         return
-    leaves = square == 'leaves'
+    if square == 'toeplitz':  # leaf by leaf: rows of S, D1, D3
+        for t in range(4):
+            a2 = g.materialize(g.at('a2', 32 * t))
+            values = [canonical_sum(g, g.at('b0', 32 * t), g.at('b1', 32 * t)), canonical_diff(g, g.at('a1', 32 * t), a2),
+                      canonical_diff(g, g.at('a3', 32 * t), a2)]
+            for k, a in enumerate(values):
+                first_row(g, t, a, 2 * LEAVES * k)
+        return
+    leaves = square in ('leaves', 'side')
     values = [g.materialize(g.at('a', 32 * t)) for t in range(4)] if leaves else gk.forward_h1(g, 'a', 'x', 'y')
     for t, v in enumerate(values):
         a = v if leaves else g.canonical(v)
@@ -118,6 +156,17 @@ def first(g, square=False):
         g.store(g.canonical(v), 'buf', None, 256 + 32 * t)
 
 
+def first_row(g, t, a, at):
+    """Row t [w_t A_t, A_t] of a canonical leaf A_t into buf from byte at (first_rows' body)."""
+    g.store(a, 'buf', None, at + 64 * t + 32)
+    w, q = (0, 32) if t < 2 else (4, 36)
+    wa = g.shoup(a, g.scalar('y', w), g.scalar('y', q))
+    wa = g.op('vpminud', wa, g.op('vpsubd', wa, g.c['P']))
+    if t % 2:
+        wa = g.op('vpsubd', g.c['P'], wa)
+    g.store(wa, 'buf', None, at + 64 * t)
+
+
 def first_rows(g, values, at):
     """Rows [w_t A_t, A_t] of canonical leaves A_t into buf from byte at (first() for leaves)."""
     for t, a in enumerate(values):
@@ -130,9 +179,19 @@ def first_rows(g, values, at):
         g.store(wa, 'buf', None, at + 64 * t)
 
 
-def leaf_sum(g, t, bs, at):
-    """Leaf t's product from the windows at cur + at and b_j from bs: reduced, < 2P."""
-    c = g.c
+def canonical_sum(g, x, y):  # x, y < P -> x + y mod P
+    t = g.add(x, y)
+    return g.op('vpminud', t, g.op('vpsubd', t, g.c['P']))
+
+
+def canonical_diff(g, x, y):  # x, y < P -> x - y mod P
+    t = g.op('vpsubd', g.op('vpaddd', x, g.c['P']), y)
+    return g.op('vpminud', t, g.op('vpsubd', t, g.c['P']))
+
+
+def leaf_sums(g, t, bs, at):
+    """Leaf t's product from the windows at cur + at and b_j from bs: its 64-bit sums, lanes 2i
+    (e) and 2i + 1 (o), each < 8 P^2."""
     e = o = None
     for j in range(8):
         b = g.materialize(g.scalar(bs, 32 * t + 4 * j))
@@ -140,9 +199,29 @@ def leaf_sum(g, t, bs, at):
         po = g.op('vpmuludq', g.at('cur', at + 64 * t + 4 * (9 - j)), b)
         e = pe if e is None else g.op('vpaddq', e, pe)
         o = po if o is None else g.op('vpaddq', o, po)
+    return e, o
+
+
+def montgomery(g, e, o):
+    """The sums times 2^-32 mod P (Montgomery), < 2P."""
+    c = g.c
     e = g.op('vpaddq', e, g.op('vpmuludq', g.op('vpmuludq', e, c['NI']), c['P']))
     o = g.op('vpaddq', o, g.op('vpmuludq', g.op('vpmuludq', o, c['NI']), c['P']))
     return g.low(g.op('vpblendd', g.op('vpsrlq', e, imm=32), o, imm=0xAA))
+
+
+def exact(g, e, o):
+    """The sums (< 2^64) mod P, canonical: hi (2^32 mod P) + lo, hi by a Shoup product (R and its
+    quotient at kr), lo - 2P if no less, then the sum (< 2^32) reduced."""
+    hi = g.op('vpblendd', g.op('vpsrlq', e, imm=32), o, imm=0xAA)
+    lo = g.op('vpblendd', e, g.op('vpsllq', o, imm=32), imm=0xAA)
+    x = g.add(g.low(lo), g.shoup(hi, g.scalar('kr', 0), g.scalar('kr', 4)))
+    return g.canonical(g.low(x))
+
+
+def leaf_sum(g, t, bs, at):
+    """Leaf t's product from the windows at cur + at and b_j from bs: reduced, < 2P."""
+    return montgomery(g, *leaf_sums(g, t, bs, at))
 
 
 def last(g, square=False):  # square: True, or 'stored' (b_j from bs)
@@ -151,7 +230,7 @@ def last(g, square=False):  # square: True, or 'stored' (b_j from bs)
     square: b_j from A_t, words 8 + j of window t."""
     c = g.c
     leaves = []
-    for t in range(4 if square not in TERMS else 0):
+    for t in range(4 if square not in TERMS and square not in ('toeplitz', 'side') else 0):
         e = o = None
         for j in range(8):
             if square in ('stored', 'leaves'):
@@ -172,6 +251,20 @@ def last(g, square=False):  # square: True, or 'stored' (b_j from bs)
                 x = leaf_sum(g, t, term_name('bs', k), 2 * LEAVES * k)
                 leaf = x if leaf is None else g.low(g.add(leaf, x))
             leaves.append(leaf)
+    if square == 'toeplitz':  # m3's sums, m1's, m1 + m3 out, m1 reduced, then m2: at most 4 sums live
+        for t in range(4):
+            e3, o3 = leaf_sums(g, t, 'b0', 4 * LEAVES)
+            e1, o1 = leaf_sums(g, t, 'a2', 0)
+            g.store(exact(g, g.op('vpaddq', e1, e3), g.op('vpaddq', o1, o3)), 'a3', None, 32 * t)
+            m1 = montgomery(g, e1, o1)
+            leaves.append(g.low(g.add(m1, montgomery(g, *leaf_sums(g, t, 'b1', 2 * LEAVES)))))
+    if square == 'side':
+        for t in range(4):
+            e, o = leaf_sums(g, t, 'bs', 0)
+            s = g.materialize(g.at('side', 32 * t))
+            odd = g.op('vpsrlq', s, imm=32)  # lanes 2i + 1, zero-extended
+            even = g.op('vpblendd', s, odd, imm=0xAA)  # lanes 2i: odd's high words are zero
+            leaves.append(montgomery(g, g.op('vpaddq', e, even), g.op('vpaddq', o, odd)))
     tw = {'WX': g.scalar('ix', 0), 'QX': g.scalar('ix', 32), 'WY': g.scalar('iy', 0), 'QY': g.scalar('iy', 32),
           'WZ': g.scalar('iy', 4), 'QZ': g.scalar('iy', 36)}
     r = leaves
@@ -189,22 +282,26 @@ def body(part, square=False):
     if part in ('last', 'both'):
         for m in range(BATCHES):
             g.offset = {'cur': LEAVES * m, 'out': 128 * m, 'bs': 128 * m, 'bs1': 128 * m, 'bs2': 128 * m,
-                        'ix': 4 * m, 'iy': 8 * m}
+                        'ix': 4 * m, 'iy': 8 * m, 'side': 128 * m}
+            if square == 'toeplitz':  # the current batches' leaves, 256 bytes before the next ones in 'both'
+                for base in ('a2', 'b1', 'b0', 'a3'):
+                    g.offset[base] = 128 * m - (256 if part == 'both' else 0)
             last(g, square)
     split = len(g.ops)
     if part in ('first', 'both'):
         for m in range(BATCHES):
             g.offset = {'a': 128 * m, 'a1': 128 * m, 'a2': 128 * m, 'b': 128 * m, 'buf': LEAVES * m, 'x': 4 * m,
-                        'y': 8 * m}
+                        'y': 8 * m, 'a3': 128 * m, 'b0': 128 * m, 'b1': 128 * m}
             first(g, square)
     ops = g.ops
     if part == 'both':  # interleave the two stages' source orders proportionally
         older, newer = ops[:split], ops[split:]
         keyed = [(i / len(older), 0, i, o) for i, o in enumerate(older)]
-        shift = TERMS_SHIFT if square in TERMS else SQUARE_SHIFT if square else SHIFT
+        shift = TERMS_SHIFT if square in TERMS else TOEPLITZ_SHIFT if square == 'toeplitz' else SQUARE_SHIFT if square else SHIFT
         keyed += [(j / len(newer) + shift, 1, j, o) for j, o in enumerate(newer)]
         ops = [o for *_, o in sorted(keyed, key=lambda t: t[:3])]
-    knobs = TERMS_KNOBS[square] if square in TERMS else LEAVES_KNOBS if square == 'leaves' else SQUARE_KNOBS if square else KNOBS
+    knobs = (TERMS_KNOBS[square] if square in TERMS else TOEPLITZ_KNOBS if square == 'toeplitz' else SIDE_KNOBS if square == 'side'
+             else LEAVES_KNOBS if square == 'leaves' else SQUARE_KNOBS if square else KNOBS)
     seq = gk.schedule(ops, 13, knobs[part])
     reg = gk.allocate(seq, {13, 14, 15})
     head = ['vpbroadcastd %[P], %%ymm15', 'vpbroadcastd %[P2], %%ymm14', 'vpbroadcastd %[NI], %%ymm13']
@@ -212,17 +309,21 @@ def body(part, square=False):
 
 
 def function(part, square=False):
-    stored = square in ('stored', 'leaves') or square in TERMS
-    args = (term_args(TERMS[square])[part] if square in TERMS else STORED_ARGS[part] if stored
+    stored = square in ('stored', 'leaves', 'toeplitz', 'side') or square in TERMS
+    args = (term_args(TERMS[square])[part] if square in TERMS else TOEPLITZ_ARGS[part] if square == 'toeplitz'
+            else SIDE_ARGS[part] if square == 'side' else STORED_ARGS[part] if stored
             else SQUARE_ARGS[part] if square else ARGS[part])
-    params = ', '.join(f'{"void*" if a in ("buf", "out") else "const void*"} {a}' for a in args)
-    doc = DOC[part] + (f' Leaves: the sum of {TERMS[square]} products of leaves (a.. times bs..).' if square in TERMS else
+    written = ('buf', 'out') + (('a3',) if square == 'toeplitz' else ())
+    params = ', '.join(f'{"void*" if a in written else "const void*"} {a}' for a in args if a != 'kr')
+    doc = (SPECIAL_DOC[square][part] if square in SPECIAL_DOC else
+           DOC[part] + (f' Leaves: the sum of {TERMS[square]} products of leaves (a.. times bs..).' if square in TERMS else
                        ' Leaves: a and b as leaves (a at a, b at bs).' if square == 'leaves' else
-                       ' Stored: b as leaves at bs.' if stored else ' Square: a times a.' if square else '')
+                       ' Stored: b as leaves at bs.' if stored else ' Square: a times a.' if square else ''))
     name = f'bottom_{square}_{part}' if stored else f'bottom_square_{part}' if square else f'bottom_{part}'
     lines = [f'// {doc}', f'[[gnu::always_inline]] inline void {name}({params}) {{', '    asm volatile(']
     lines += gk.asm_lines(body(part, square))
-    lines += ['        :', '        : ' + ', '.join(f'[{a}] "r"({a})' for a in args) + ',',
+    inputs = [f'[{a}] "r"({a})' if a != 'kr' else '[kr] "r"(kExactR)' for a in args]
+    lines += ['        :', '        : ' + ', '.join(inputs) + ',',
               '          [P] "m"(kP), [P2] "m"(k2P), [NI] "m"(kNI)',
               '        : ' + gk.CLOBBERS + ');', '}']
     return lines
@@ -399,6 +500,8 @@ def top4_to_function(blocks, upper=False):
 
 
 TOP4_KNOBS = gk.Knobs()
+P = 998244353
+R = (1 << 32) % P
 
 TOP_UPPER_TO_DOC = '''\
 // inverse_top_to() for the upper half of the result (Transform's fused ops): columns j < columns of
@@ -443,6 +546,12 @@ def generate():
     for square in (False, True, 'stored', 'leaves', 'leaves2', 'leaves3'):
         for part in ('first', 'last', 'both'):
             lines += function(part, square) + ['']
+    lines += ['// 2^32 mod P and its Shoup quotient: bottom_toeplitz_*\'s exact sums (kr).',
+              f'alignas(8) inline constexpr std::uint32_t kExactR[2] = {{{R}, {(R << 32) // P}}};', '']
+    for part in ('first', 'last', 'both'):
+        lines += function(part, 'toeplitz') + ['']
+    for part in ('last', 'both'):
+        lines += function(part, 'side') + ['']
     lines += top_function() + [''] + top4_function() + ['']
     lines += TOP_TO_DOC.split('\n')
     for blocks in range(1, 9):

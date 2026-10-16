@@ -278,7 +278,8 @@ struct scalar {
 
     // Fused leaf-form ops (ntt.hpp, Transform), step by step: in copied into f, zero past n.
     static void forward_from(const std::uint32_t* in, std::size_t n, std::uint32_t* f, int lg, const std::uint32_t* roots) {
-        std::fill(std::copy_n(in, n, f), f + (std::size_t(1) << lg), 0u);
+        if (in != f) std::copy_n(in, n, f);  // in place: in at f
+        std::fill(f + n, f + (std::size_t(1) << lg), 0u);
         forward(f, lg, roots);
     }
 
@@ -309,6 +310,15 @@ struct scalar {
         inverse(f, lg, inverse_roots);
         const std::uint32_t* from = f + (output & detail::kUpperHalf ? (std::size_t(1) << lg) / 2 : 0);
         for (std::size_t i = 0; i < count; ++i) out[i] = output & detail::kNegated ? detail::scalar::sub(0, from[i]) : from[i];
+    }
+
+    // The model: A2 B0 + A1 B1 as inverse_product's four products, then A3 = A3 B0 + A2 B1 in f.
+    static void toeplitz_product(const detail::Toeplitz& z, std::uint32_t* f, std::uint32_t* out, std::size_t count,
+                                 int lg, const std::uint32_t* roots, const std::uint32_t* inverse_roots, unsigned output) {
+        const detail::LeafTerm sum[] = {{z.a2, z.b0}, {z.a1, z.b1}}, side[] = {{z.a3, z.b0}, {z.a2, z.b1}};
+        inverse_product(sum, 2, f, out, count, lg, roots, inverse_roots, output);
+        detail::scalar::leaf_terms(side, 2, f, lg, roots);
+        std::copy_n(f, std::size_t(1) << lg, z.a3);
     }
 
     // Hooked ops (Transform::forward(in, F, hook, ...)): one run of all the leaves; no pruning. The

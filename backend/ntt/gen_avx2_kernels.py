@@ -17,9 +17,9 @@ from typing import Optional
 OUT = Path(__file__).resolve().parent / 'avx2_kernels.hpp'
 
 # Zen 3: multiplies on 2 of the 4 vector pipes, shifts on 2, everything else on any.
-LATENCY = {'vpmuludq': 3, 'vpmulld': 3, 'vpsrlq': 1, 'vpaddd': 1, 'vpsubd': 1,
+LATENCY = {'vpmuludq': 3, 'vpmulld': 3, 'vpsrlq': 1, 'vpsllq': 1, 'vpaddd': 1, 'vpsubd': 1,
            'vpminud': 1, 'vpblendd': 1, 'vpaddq': 1}
-PIPE = {'vpmuludq': 'mul', 'vpmulld': 'mul', 'vpsrlq': 'shift'}
+PIPE = {'vpmuludq': 'mul', 'vpmulld': 'mul', 'vpsrlq': 'shift', 'vpsllq': 'shift'}
 COMMUTATIVE = {'vpaddd', 'vpaddq', 'vpminud', 'vpmuludq', 'vpmulld'}
 LOADS = {'vmovdqa', 'vmovdqu', 'vbroadcastss'}
 # Bases in the caller's memory, any 4-byte alignment: unaligned loads and stores.
@@ -99,7 +99,7 @@ class Graph:
 
     def op(self, mnemonic, *srcs, imm=None):
         srcs = [self.materialize(s) if s.kind == 'scalar' else self.loaded.get(s, s) for s in srcs]
-        if mnemonic in ('vpsubd', 'vpblendd', 'vpsrlq'):  # first source in a register (VEX shifts take none from memory)
+        if mnemonic in ('vpsubd', 'vpblendd', 'vpsrlq', 'vpsllq'):  # first source in a register (VEX shifts take none from memory)
             srcs[0] = self.materialize(srcs[0])
             if srcs[0].kind == 'cmem':
                 raise ScheduleError('constant minuend in memory')
@@ -353,6 +353,82 @@ def inverse_leaves(g, groups=2):
 LEAVES = {'forward_leaves': forward_leaves, 'inverse_leaves': inverse_leaves}
 
 
+# The two lowest forward levels as loops over a run of groups (Transform's forward, issue #87; lc-opt's
+# lib/poly/gen_kernels.py): h = 4 one group per iteration, its twiddle addresses from the group
+# index (slot(k) = k + (k & ~7)); h = 1 eight groups per iteration, their twiddles one table block
+# of x and two of y, z. Against a call per group at h = 4 and forward_leaves at h = 1: a forward of
+# 2^17-2^21 in 0.96-0.97 of the time on Zen 3 (notes/87-r2.md). Knobs (H4_KNOBS, LEAVES_LOOP_KNOBS):
+# lc-opt's, timed on EPYC 7B13.
+
+
+def group_twiddles(g, x, y, i=0):
+    """Group i of a table block: x entry i at x; y, z entries 2i, 2i + 1 of the blocks at y."""
+    yd = 64 * (i // 4) + 8 * (i % 4)
+    return {'WX': g.scalar(x, 4 * i), 'QX': g.scalar(x, 32 + 4 * i), 'WY': g.scalar(y, yd), 'QY': g.scalar(y, yd + 32),
+            'WZ': g.scalar(y, yd + 4), 'QZ': g.scalar(y, yd + 36)}
+
+
+def forward_quarters(g, tw, quarters, canonical):
+    """forward_butterfly on the vectors at byte offsets quarters of a, in place; canonical out or < 4P."""
+    f = [g.at('a', q) for q in quarters]
+    a, b = g.low(f[0]), g.low(f[1])
+    cc = g.shoup(f[2], tw['WX'], tw['QX'], odd=g.at('a', quarters[2] + 4))
+    dd = g.shoup(f[3], tw['WX'], tw['QX'], odd=g.at('a', quarters[3] + 4))
+    ac = g.low(g.add(a, cc))
+    amc = g.low_signed(g.op('vpsubd', a, cc))
+    bd, bmd = g.add(b, dd), g.diff(b, dd)
+    y = g.shoup(bd, tw['WY'], tw['QY'])
+    z = g.shoup(bmd, tw['WZ'], tw['QZ'])
+    for q, v in zip(quarters, [g.add(ac, y), g.diff(ac, y), g.add(amc, z), g.diff(amc, z)]):
+        g.store(g.canonical(v) if canonical else v, 'a', None, q)
+
+
+def group_loop_body(build, knobs):
+    g = Graph({'P': Value('creg', reg=15), '2P': Value('creg', reg=14)})
+    build(g)
+    seq = schedule(g.ops, 14, knobs)
+    reg = allocate(seq, {14, 15})
+    return [emit(o, reg) for o in seq]
+
+
+def forward_h4_function():
+    def build(g):
+        tw = group_twiddles(g, 'tx', 'ty')
+        for j in range(4):
+            forward_quarters(g, tw, [32 * (j + 4 * s) for s in range(4)], canonical=False)
+    # tx = table + 4 slot(k), ty = table + 4 slot(2k)
+    slots = ['mov %[k], %[tx]', 'and $-8, %[tx]', 'add %[k], %[tx]', 'lea (%[table],%[tx],4), %[tx]',
+             'lea (%[k],%[k]), %[ty]', 'and $-8, %[ty]', 'lea (%[ty],%[k],2), %[ty]', 'lea (%[table],%[ty],4), %[ty]']
+    head = ['vpbroadcastd %[P], %%ymm15', 'vpbroadcastd %[P2], %%ymm14', '.p2align 5', '1:']
+    tail = ['add $512, %[a]', 'inc %[k]', 'cmp %[end], %[a]', 'jne 1b']
+    lines = ['// Forward radix-4 butterflies at h = 4 of count >= 1 groups from group k (16 vectors each),',
+             '// values < 4P; table: the twiddle table. Reads 4 bytes past the last vector.',
+             '[[gnu::noinline]] inline void forward_h4(Vec* a, std::size_t count, const std::uint32_t* table, std::size_t k) {',
+             '    Vec* const end = a + 16 * count;', '    const std::uint32_t *tx, *ty;', '    asm volatile(']
+    lines += asm_lines(head + slots + group_loop_body(build, H4_KNOBS) + tail)
+    lines += ['        : [a] "+r"(a), [k] "+r"(k), [tx] "=&r"(tx), [ty] "=&r"(ty)',
+              '        : [end] "r"(end), [table] "r"(table), [P] "m"(kP), [P2] "m"(k2P)',
+              '        : ' + CLOBBERS + ', "cc");', '}']
+    return lines
+
+
+def forward_leaves_loop_function():
+    def build(g):
+        for i in range(8):
+            forward_quarters(g, group_twiddles(g, 'x', 'y', i), [128 * i + 32 * t for t in range(4)], canonical=True)
+    head = ['vpbroadcastd %[P], %%ymm15', 'vpbroadcastd %[P2], %%ymm14', '.p2align 5', '1:']
+    tail = ['add $1024, %[a]', 'add $64, %[x]', 'add $128, %[y]', 'cmp %[end], %[a]', 'jne 1b']
+    lines = ['// Forward radix-4 butterflies at h = 1 of count groups from group k (4 vectors each), canonical',
+             '// outputs: the leaves. count and k multiples of 8; x, y: slots k and 2k of the table. Reads 4',
+             '// bytes past the last vector.',
+             '[[gnu::noinline]] inline void forward_leaves_loop(Vec* a, std::size_t count, const std::uint32_t* x, const std::uint32_t* y) {',
+             '    Vec* const end = a + 4 * count;', '    asm volatile(']
+    lines += asm_lines(head + group_loop_body(build, LEAVES_LOOP_KNOBS) + tail)
+    lines += ['        : [a] "+r"(a), [x] "+r"(x), [y] "+r"(y)', '        : [end] "r"(end), [P] "m"(kP), [P2] "m"(k2P)',
+              '        : ' + CLOBBERS + ', "cc");', '}']
+    return lines
+
+
 # ------------------------------------------------------------------------------- scheduling
 
 @dataclass
@@ -502,8 +578,8 @@ def emit(o, reg):
     dst = f'%%ymm{reg[o.dst]}'
     if o.mnemonic in LOADS:
         return f'{o.mnemonic} {operand(o.srcs[0], reg)}, {dst}'
-    if o.mnemonic == 'vpsrlq':
-        return f'vpsrlq ${o.imm}, {operand(o.srcs[0], reg)}, {dst}'
+    if o.mnemonic in ('vpsrlq', 'vpsllq'):
+        return f'{o.mnemonic} ${o.imm}, {operand(o.srcs[0], reg)}, {dst}'
     x, y = o.srcs  # AT&T: dst = x OP y is written "op y, x, dst"; only y may be in memory
     if o.mnemonic in COMMUTATIVE and x.in_memory:
         x, y = y, x
@@ -558,6 +634,8 @@ BOTTOM_KNOBS = {'first': Knobs(window=12),
                 'both': Knobs(seed=540, jitter=3.0, window=12)}
 BOTTOM_SHIFT = -0.05  # 'both': the first stage's ops start this fraction earlier in source order
 LEAVES_KNOBS = {'forward_leaves': Knobs(window=20), 'inverse_leaves': Knobs(window=20)}
+H4_KNOBS = Knobs(window=16)
+LEAVES_LOOP_KNOBS = Knobs(window=40, margin=1)
 
 
 def loop_body(loop, spacing=32):
@@ -759,6 +837,8 @@ def generate():
     lines += ['// Bottom level of a transform alone: leaves out (forward), leaves in (inverse).', '']
     for name in LEAVES:
         lines += leaves_function(name) + ['']
+    lines += ['// The lowest forward levels of a run of groups as loops (Transform\'s forward).', '']
+    lines += forward_h4_function() + [''] + forward_leaves_loop_function() + ['']
     lines += ['}  // namespace fps::ntt::avx2_kernels']
     return '\n'.join(lines) + '\n'
 

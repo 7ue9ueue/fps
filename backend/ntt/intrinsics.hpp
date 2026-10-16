@@ -797,6 +797,43 @@ struct Bottom : Butterflies<L> {
         }
     }
 
+    // Transform::toeplitz_product's bottom on groups [first, first + count) (out: group g at out + 32
+    // (g - first); the leaf forms of z at + 32 g): rows of S = B0 + B1, D1 = A1 - A2 and D3 = A3 - A2,
+    // m1 = S A2, m2 = D1 B1, m3 = D3 B0; m1 + m2 through the inverse butterflies (out < 2P, with the
+    // factor 2^-32), m1 + m3 times 2^32 over A3, canonical.
+    static void inverse_toeplitz(u32* out, const Toeplitz& z, std::size_t count, std::size_t first, const u32* r,
+                                 const u32* ir) {
+        using M = typename B::M;
+        const F to_r = B::factor(kR);
+        alignas(64) u32 sum[3][32];
+        Rows rows[3];
+        for (std::size_t g = 0; g < count; ++g) {
+            const std::size_t k = first + g, at = 32 * k;
+            #pragma GCC unroll 8
+            for (std::size_t i = 0; i < 32; i += L::lanes) {
+                const V a2 = L::load(z.a2 + at + i);
+                L::store(sum[0] + i, M::add(L::load(z.b0 + at + i), L::load(z.b1 + at + i)));
+                L::store(sum[1] + i, M::sub(L::load(z.a1 + at + i), a2));
+                L::store(sum[2] + i, M::sub(L::load(z.a3 + at + i), a2));
+            }
+            for (int i = 0; i < 3; ++i) fill_rows(sum[i], rows[i], k, r);
+            V m1[kWords][4], m2[kWords][4], m3[kWords][4];
+            leaf_products(rows[0].window, z.a2 + at, 8, m1);
+            leaf_products(rows[1].window, z.b1 + at, 8, m2);
+            leaf_products(rows[2].window, z.b0 + at, 8, m3);
+            const F x = B::entry(ir, k), y = B::entry(ir, 2 * k), w = B::entry(ir, 2 * k + 1);
+            #pragma GCC unroll 8
+            for (int u = 0; u < kWords; ++u) {
+                #pragma GCC unroll 8
+                for (int t = 0; t < 4; ++t) {
+                    L::store(z.a3 + at + 8 * t + u * L::lanes, canonical(B::mul(B::add(m1[u][t], m3[u][t]), to_r)));
+                    m1[u][t] = low(B::add(m1[u][t], m2[u][t]));
+                }
+                B::inverse4(m1[u], x, y, w), B::store(out + 32 * g + u * L::lanes, 8, m1[u]);
+            }
+        }
+    }
+
     // Leaf products of leaf forms (Transform::multiply): rows [w_t A_t, A_t] of group k from
     // canonical a, as forward_leaves; the products read 1 word past the last row.
     struct alignas(64) Rows {
@@ -1118,6 +1155,41 @@ struct WideBottom : Butterflies<S> {
                 #pragma GCC unroll 4
                 for (int t = 0; t < 4; ++t) f[t] = i == 0 ? d[t] : low(B::add(f[t], d[t]));
             }
+            const Pair iw = twiddles(ir, k);
+            B::inverse4(f, iw.x, iw.y, iw.z);
+            store(out, f, n);
+        }
+    }
+
+    // Bottom::inverse_toeplitz; count and first even. S, D1, D3 word by word (any layout), their rows
+    // from memory as fill_rows'.
+    static void inverse_toeplitz(u32* out, const Toeplitz& z, std::size_t count, std::size_t first, const u32* r,
+                                 const u32* ir) {
+        using M = typename B::M;
+        const F to_r = B::factor(kR);
+        const Indices n;
+        alignas(64) u32 sum[3][64];
+        Leaves leaves[3];
+        for (std::size_t k = first; k < first + count; k += 2, out += 64) {
+            const std::size_t at = 32 * k;
+            #pragma GCC unroll 4
+            for (std::size_t i = 0; i < 64; i += 16) {
+                const V a2 = S::load(z.a2 + at + i);
+                S::store(sum[0] + i, M::add(S::load(z.b0 + at + i), S::load(z.b1 + at + i)));
+                S::store(sum[1] + i, M::sub(S::load(z.a1 + at + i), a2));
+                S::store(sum[2] + i, M::sub(S::load(z.a3 + at + i), a2));
+            }
+            for (int i = 0; i < 3; ++i) fill_rows(sum[i], k, r, n, leaves[i]);
+            const u32 *a2 = z.a2 + at, *b1 = z.b1 + at, *b0 = z.b0 + at;
+            V f[4], side[4];
+            #pragma GCC unroll 4
+            for (int t = 0; t < 4; ++t) {
+                const V m1 = leaf_products_at(leaves[0], t, a2 + 8 * t, a2 + 32 + 8 * t);
+                const V m2 = leaf_products_at(leaves[1], t, b1 + 8 * t, b1 + 32 + 8 * t);
+                const V m3 = leaf_products_at(leaves[2], t, b0 + 8 * t, b0 + 32 + 8 * t);
+                f[t] = low(B::add(m1, m2)), side[t] = canonical(B::mul(B::add(m1, m3), to_r));
+            }
+            store(z.a3 + at, side, n);
             const Pair iw = twiddles(ir, k);
             B::inverse4(f, iw.x, iw.y, iw.z);
             store(out, f, n);
@@ -1493,6 +1565,12 @@ struct Ntt : Butterflies<S> {
         if constexpr (kWideBottom)
             if (count % 2 == 0) return WideBottom<S>::inverse_terms(out, terms, n, count, first, r, ir);
         Leaf::inverse_terms(out, terms, n, count, first, r, ir);
+    }
+    static void bottom_toeplitz(u32* out, const Toeplitz& z, std::size_t count, std::size_t first, const u32* r,
+                                const u32* ir) {
+        if constexpr (kWideBottom)
+            if (count % 2 == 0) return WideBottom<S>::inverse_toeplitz(out, z, count, first, r, ir);
+        Leaf::inverse_toeplitz(out, z, count, first, r, ir);
     }
     template <bool kSquare>
     static void bottom_multiply(u32* a, const u32* b, std::size_t count, std::size_t first, const u32* r,
@@ -2289,10 +2367,25 @@ struct Ntt : Butterflies<S> {
     static void inverse_product(const LeafTerm* terms, int n, u32* f, u32* out, std::size_t count, int lg, const u32* r,
                                 const u32* ir, unsigned output) {
         if (n == 1 && !terms[0].b && output == 0) return inverse(terms[0].a, f, out, count, lg, ir, leaf_scale(lg), nullptr);
-        const std::size_t len = std::size_t(1) << lg, nv = len / 8;
-        const auto stage = [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
+        inverse_staged(f, out, count, lg, ir, output, [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
             bottom_inverse_terms(t, terms, n, leaves / 4, std::size_t(t - f) / 32, r, ir);
-        };
+        });
+    }
+
+    // Transform::toeplitz_product: inverse_product's levels with bottom_toeplitz.
+    static void toeplitz_product(const Toeplitz& z, u32* f, u32* out, std::size_t count, int lg, const u32* r,
+                                 const u32* ir, unsigned output) {
+        inverse_staged(f, out, count, lg, ir, output, [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
+            bottom_toeplitz(t, z, leaves / 4, std::size_t(t - f) / 32, r, ir);
+        });
+    }
+
+    // The inverse levels above stage(t, leaves), which writes each run of leaves at t and runs its
+    // inverse bottom level, and the top level writing count words of the half output picks to out.
+    template <class Stage>
+    [[gnu::always_inline]] static void inverse_staged(u32* f, u32* out, std::size_t count, int lg, const u32* ir,
+                                                      unsigned output, Stage stage) {
+        const std::size_t len = std::size_t(1) << lg, nv = len / 8;
         const auto fold = [&](std::size_t leaves) { return output & kNegated ? nullptr : fold_scale(leaves, lg, true); };
         if (!has_radix2(lg)) {
             if (kJoin && nv == 16) stage(f, 16);
@@ -2693,6 +2786,11 @@ struct intrinsics {
                                 std::size_t count, int lg, const std::uint32_t* roots, const std::uint32_t* inverse_roots,
                                 unsigned output) {
         Ntt::inverse_product(terms, n, f, out, count, lg, roots, inverse_roots, output);
+    }
+
+    static void toeplitz_product(const detail::Toeplitz& z, std::uint32_t* f, std::uint32_t* out, std::size_t count,
+                                 int lg, const std::uint32_t* roots, const std::uint32_t* inverse_roots, unsigned output) {
+        Ntt::toeplitz_product(z, f, out, count, lg, roots, inverse_roots, output);
     }
 
     // Hooked ops; width in words (Transform::forward(in, F, hook, ...)).

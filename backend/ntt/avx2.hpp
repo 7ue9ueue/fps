@@ -505,6 +505,53 @@ inline void forward_radix8_from(const u32* f, std::size_t n, u32* to, std::size_
     });
 }
 
+// forward_radix8_part<kLoad> for kLoad <= 4 (a source in the lower half), one group per pass:
+// group 0's outputs (blocks 0-3) or group 1's (blocks 4-7), each from the same source blocks.
+template <int kLoad, int kGroup>
+[[gnu::noinline]] void forward_radix8_half_part(const u32* s, Vec* f, std::size_t columns, std::size_t q,
+                                                const u32* roots) {
+    static_assert(kLoad <= 4);
+    const Factor i = entry(roots, 1), y = entry(roots, 2), z = entry(roots, 3);
+    const Vec zero = _mm256_setzero_si256();
+    for (std::size_t j = 0; j < columns; ++j) {
+        const auto in = [&] [[gnu::always_inline]] (std::size_t t) { return t < kLoad ? loadu(s + 8 * (j + t * q)) : zero; };
+        const Vec f0 = in(0), f1 = in(1), f2 = in(2), f3 = in(3);
+        if constexpr (kGroup == 0) {  // twiddles 1, 1, i: every term < 2P
+            const Vec g0 = add(f0, f2), g1 = add(f1, f3);
+            const Vec h0 = diff_canonical(f0, f2), ih1 = kLoad > 1 ? multiply(diff_canonical(f1, f3), i) : zero;
+            f[j] = add(g0, g1), f[j + q] = diff(g0, g1);
+            f[j + 2 * q] = add(h0, ih1), f[j + 3 * q] = diff(h0, ih1);
+        } else {  // twiddles i, y, z
+            const Vec if2 = kLoad > 2 ? multiply(f2, i) : zero, if3 = kLoad > 3 ? multiply(f3, i) : zero;
+            const Vec u0 = reduce(add(f0, if2), 2 * kP), v0 = reduce(diff(f0, if2), 2 * kP);
+            const Vec yu1 = kLoad > 1 ? multiply(add(f1, if3), y) : zero, zv1 = kLoad > 1 ? multiply(diff(f1, if3), z) : zero;
+            f[j + 4 * q] = add(u0, yu1), f[j + 5 * q] = diff(u0, yu1);
+            f[j + 6 * q] = add(v0, zv1), f[j + 7 * q] = diff(v0, zv1);
+        }
+    }
+}
+
+// The radix-8 top level from a source of n <= 2^lg / 2 words, as forward_radix8_from, in two passes
+// (group 1, then group 0) of 4 input and 4 output streams each: in one pass, 12 streams 2^lg / 8
+// words apart; through a radix-2 copy, one pass more over the transform (forwards of 2^18, 2^20
+// in 0.94-0.96 of the time on Zen 3, notes/87-r2.md). Group 1 first: first_level stages a
+// boundary column in the lower half, which group 0's pass stages again.
+inline void forward_radix8_lower_from(const u32* f, std::size_t n, u32* to, std::size_t q, const u32* roots) {
+    first_level<4>(f, n, to, 8 * q, 8, [&] [[gnu::always_inline]] (auto blocks, const u32* s, u32* d, std::size_t words) {
+        forward_radix8_half_part<decltype(blocks)::value, 1>(s, reinterpret_cast<Vec*>(d), words / 8, q, roots);
+    });
+    first_level<4>(f, n, to, 8 * q, 8, [&] [[gnu::always_inline]] (auto blocks, const u32* s, u32* d, std::size_t words) {
+        forward_radix8_half_part<decltype(blocks)::value, 0>(s, reinterpret_cast<Vec*>(d), words / 8, q, roots);
+    });
+}
+
+// Whether a fused op's forward from a source of n words starts with forward_radix8_lower_from: a
+// radix-2 length of at least 2^kRadix8LowerMinLog and the source in the lower half.
+inline constexpr int kRadix8LowerMinLog = 8;
+inline bool radix8_lower(int lg, std::size_t n) {
+    return has_radix2(lg) && lg >= kRadix8LowerMinLog && 2 * n <= (std::size_t(1) << lg);
+}
+
 // The last inverse level of each half, the radix-2 level and the scale in one pass over the 8q
 // vectors after the subtrees: canonical output, count words of it to out. w: as
 // product_kernels::inverse_top's.
@@ -584,9 +631,19 @@ inline void square(const Product& p, const u32* r, const u32* ir) {
 // Transforms alone. The bottom level (h = 1) has a group per 4 vectors, each with its own twiddles.
 
 // Forward groups [first, first + count) with h = 1, values < 4P in; canonical leaves out. first
-// and count even.
+// and count even; multiples of 8: one loop of 8 groups per step (forward_leaves_loop, lc-opt's;
+// with forward_h4 below, forwards of 2^17-2^21 in 0.96-0.97 of the time on Zen 3, notes/87-r2.md).
 inline void forward_bottom(Vec* f, std::size_t count, std::size_t first, const u32* r) {
+    if (count % 8 == 0 && first % 8 == 0) return kernels::forward_leaves_loop(f, count, r + slot(first), r + slot(2 * first));
     for (std::size_t k = first; k < first + count; k += 2, f += 8) kernels::forward_leaves(f, r + slot(k), r + slot(2 * k));
+}
+
+// The forward levels h = nv / 4 .. 4 of a run of total vectors at f, subtrees of nv vectors from
+// group k: a call per group down to h = 16, then h = 4 as one loop over the run (forward_h4).
+inline void forward_levels(Vec* f, std::size_t nv, std::size_t total, std::size_t k, const u32* r) {
+    for (std::size_t h = nv / 4; h >= 16; h /= 4)
+        for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) forward_group(f + j, h, g, r);
+    if (nv >= 16) kernels::forward_h4(f, total / 16, r, k * (nv / 16));
 }
 
 // Inverse groups [first, first + count) with h = 1; canonical in, < 2P out. first and count even.
@@ -606,8 +663,7 @@ inline void forward_trees(Vec* f, std::size_t nv, std::size_t count, std::size_t
     }
     const std::size_t run = std::min(count, kTile / nv), total = run * nv;
     for (std::size_t k = first; k < first + count; k += run, f += total) {
-        for (std::size_t h = nv / 4; h >= 4; h /= 4)
-            for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) forward_group(f + j, h, g, r);
+        forward_levels(f, nv, total, k, r);
         forward_bottom(f, total / 4, k * (nv / 4), r);
     }
 }
@@ -649,8 +705,7 @@ inline void forward_tiles(Vec* f, std::size_t nv, std::size_t count, std::size_t
     }
     const std::size_t run = std::min(count, kTile / nv), total = run * nv;
     for (std::size_t k = first; k < first + count; k += run, f += total) {
-        for (std::size_t h = nv / 4; h >= 4; h /= 4)
-            for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) forward_group(f + j, h, g, r);
+        forward_levels(f, nv, total, k, r);
         forward_bottom(f, total / 4, k * (nv / 4), r);
         tile(reinterpret_cast<u32*>(f), total);
     }
@@ -831,8 +886,7 @@ inline void cycle_trees(Vec* f, std::size_t nv, std::size_t count, std::size_t f
     }
     const std::size_t run = std::min(count, kTile / nv), total = run * nv;
     for (std::size_t k = first; k < first + count; k += run, f += total) {
-        for (std::size_t h = nv / 4; h >= 4; h /= 4)
-            for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) forward_group(f + j, h, g, r);
+        forward_levels(f, nv, total, k, r);
         stage(reinterpret_cast<u32*>(f), total);
         for (std::size_t h = 4; h < nv; h *= 4)
             for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) inverse_group(f + j, h, g, ir);
@@ -862,6 +916,8 @@ inline void inverse_trees_with(Vec* f, std::size_t nv, std::size_t count, std::s
 // A radix-2 level, not product()'s radix 8: from a source apart from words, its 16 streams 2^lg / 8
 // words apart ran forward(in, F) 1.48x slower than in place at 2^18 on Zen 3 (a guess: 16 streams
 // on the same sets of its 8-way L2); with the radix-2 level 1.04x, within 1% elsewhere (notes).
+// A source in the lower half (radix8_lower): radix 8 in two passes of 8 streams, the radix-2 level
+// a copy no longer.
 template <class Trees>
 [[gnu::always_inline]] inline void from_top(const u32* in, std::size_t n, u32* words, int lg, const u32* r, Trees trees) {
     auto* f = reinterpret_cast<Vec*>(words);
@@ -869,6 +925,15 @@ template <class Trees>
     if (!has_radix2(lg)) {
         forward_radix4_from(in, n, words, nv / 4, r);
         return trees(f, nv / 4, 4);
+    }
+    if (radix8_lower(lg, n)) {
+        if (in == words) {  // in place (forward(in, F) with in at F): one pass, lc-opt's forward_top8
+            std::fill(words + n, words + 4 * nv, 0u);
+            forward_radix8_sparse(f, nv / 8, r);
+        } else {
+            forward_radix8_lower_from(in, n, words, nv / 8, r);
+        }
+        return trees(f, nv / 8, 8);
     }
     forward_radix2_from(in, n, words, nv / 2);
     trees(f, nv / 2, 2);
@@ -979,7 +1044,47 @@ struct SumBottom {
     }
 };
 
-// Sums with a term alone: the intrinsics' bottom on Avx2 (Bottom::inverse_terms).
+// A product of leaves a, b plus a leaf form alone at side (bottom_side_*; its first stage is
+// bottom_leaves_first): the leaves of a b + side, with 2^-32, through the inverse butterflies.
+struct SideBottom {
+    static void run(Vec* out, const u32* a, const u32* b, const u32* side, std::size_t nv, std::size_t first, const u32* r,
+                    const u32* ir) {
+        Leaves leaves[2][2];
+        product_kernels::bottom_leaves_first(a, leaves[0], r + slot(first), r + slot(2 * first));
+        for (std::size_t j = 0, k = first;; j += 8, k += 2) {
+            const std::size_t cur = j / 8 % 2, next = cur ^ 1;
+            const u32 *ix = ir + slot(k), *iy = ir + slot(2 * k);
+            if (j + 8 == nv) return product_kernels::bottom_side_last(out + j, leaves[cur], b + 8 * j, side + 8 * j, ix, iy);
+            product_kernels::bottom_side_both(a + 8 * (j + 8), leaves[next], r + slot(k + 2), r + slot(2 * k + 4), out + j,
+                                              leaves[cur], b + 8 * j, side + 8 * j, ix, iy);
+        }
+    }
+};
+
+// Transform::toeplitz_product's bottom (bottom_toeplitz_*): the rows of S, D1, D3 at leaves[.][0, 2,
+// 4]; m1 + m2 through the inverse butterflies, m1 + m3 over A3. The 'both' kernels take the current
+// batches' A2, B1, B0, A3 at the next batches' minus 256 bytes.
+struct ToeplitzBottom {
+    static void run(Vec* out, const Toeplitz& z, std::size_t at, std::size_t nv, std::size_t first, const u32* r,
+                    const u32* ir) {
+        Leaves leaves[2][6];
+        const u32 *a1 = z.a1 + at, *a2 = z.a2 + at, *b0 = z.b0 + at, *b1 = z.b1 + at;
+        u32* const a3 = z.a3 + at;
+        product_kernels::bottom_toeplitz_first(a1, a2, a3, b0, b1, leaves[0], r + slot(first), r + slot(2 * first));
+        for (std::size_t j = 0, k = first;; j += 8, k += 2) {
+            const std::size_t cur = j / 8 % 2, next = cur ^ 1, w = 8 * j;
+            const u32 *ix = ir + slot(k), *iy = ir + slot(2 * k);
+            if (j + 8 == nv)
+                return product_kernels::bottom_toeplitz_last(out + j, leaves[cur], a2 + w, b1 + w, b0 + w, a3 + w, ix, iy);
+            const std::size_t n8 = 8 * (j + 8);
+            product_kernels::bottom_toeplitz_both(a1 + n8, a2 + n8, a3 + n8, b0 + n8, b1 + n8, leaves[next], r + slot(k + 2),
+                                                  r + slot(2 * k + 4), out + j, leaves[cur], ix, iy);
+        }
+    }
+};
+
+// Sums with a term alone (but one product and one term alone, SideBottom): the intrinsics' bottom on
+// Avx2 (Bottom::inverse_terms).
 using TermsLeaf = intrinsics::Bottom<simd::Avx2>;
 
 // Upper halves of the inverse top levels (Transform's fused ops): count words of the upper half of
@@ -1042,23 +1147,19 @@ inline void cyclic_product(const u32* in, std::size_t n, const u32* b, u32* word
         if (upper) return inverse_radix4_upper_out(words, nv / 4, out, count, ir, s);
         return inverse_radix4_out(words, nv / 4, out, count, ir, s);
     }
+    if (radix8_lower(lg, n)) {
+        if (upper) return inverse_radix8_upper_out(words, nv / 8, out, count, ir, s);
+        return inverse_radix8_out(words, nv / 8, out, count, ir, s);
+    }
     if (upper) return scale_radix2_upper_out(words, nv / 2, out, count, s);
     scale_radix2_out(words, nv / 2, out, count, s);
 }
 
-inline void inverse_product(const LeafTerm* terms, int n, u32* words, u32* out, std::size_t count, int lg, const u32* r,
-                            const u32* ir, unsigned output) {
-    if (n == 1 && !terms[0].b && output == 0) return inverse(terms[0].a, words, out, count, lg, ir, nullptr);
-    // Products only, 1 to 3 of them: the asm bottoms; a term alone, or 4 terms: the intrinsics'.
-    const int products = std::all_of(terms, terms + n, [](const LeafTerm& t) { return t.b != nullptr; }) && n <= 3 ? n : 0;
-    const auto stage = [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
-        const std::size_t at = std::size_t(t - words);
-        auto* v = reinterpret_cast<Vec*>(t);
-        if (products == 1) LeavesBottom::run(v, terms[0].a + at, terms[0].b + at, leaves, at / 32, r, ir);
-        else if (products == 2) SumBottom<2>::run(v, terms, at, leaves, at / 32, r, ir);
-        else if (products == 3) SumBottom<3>::run(v, terms, at, leaves, at / 32, r, ir);
-        else TermsLeaf::inverse_terms(t, terms, n, leaves / 4, at / 32, r, ir);
-    };
+// The inverse levels above stage(t, leaves), which writes each run of leaves at t and runs its
+// inverse bottom level, and the top level writing count words of the half output picks to out.
+template <class Stage>
+[[gnu::always_inline]] inline void inverse_staged(u32* words, u32* out, std::size_t count, int lg, const u32* ir,
+                                                  unsigned output, Stage stage) {
     auto* f = reinterpret_cast<Vec*>(words);
     const std::size_t nv = (std::size_t(1) << lg) / 8;
     const u32 s = output_scale(lg, output);
@@ -1076,6 +1177,33 @@ inline void inverse_product(const LeafTerm* terms, int n, u32* words, u32* out, 
     inverse_trees_with(f, nv / 8, 8, 0, ir, stage);
     if (upper) return inverse_radix8_upper_out(words, nv / 8, out, count, ir, s);
     inverse_radix8_out(words, nv / 8, out, count, ir, s);
+}
+
+inline void inverse_product(const LeafTerm* terms, int n, u32* words, u32* out, std::size_t count, int lg, const u32* r,
+                            const u32* ir, unsigned output) {
+    if (n == 1 && !terms[0].b && output == 0) return inverse(terms[0].a, words, out, count, lg, ir, nullptr);
+    // Products only, 1 to 3 of them, or a product and a term alone: the asm bottoms; other terms
+    // alone, or 4 terms: the intrinsics'.
+    const int products = std::all_of(terms, terms + n, [](const LeafTerm& t) { return t.b != nullptr; }) && n <= 3 ? n : 0;
+    const int side = n == 2 && !products && (terms[0].b || terms[1].b) ? (terms[0].b ? 1 : 0) : -1;  // the term alone
+    inverse_staged(words, out, count, lg, ir, output, [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
+        const std::size_t at = std::size_t(t - words);
+        auto* v = reinterpret_cast<Vec*>(t);
+        if (products == 1) LeavesBottom::run(v, terms[0].a + at, terms[0].b + at, leaves, at / 32, r, ir);
+        else if (products == 2) SumBottom<2>::run(v, terms, at, leaves, at / 32, r, ir);
+        else if (products == 3) SumBottom<3>::run(v, terms, at, leaves, at / 32, r, ir);
+        else if (side >= 0)
+            SideBottom::run(v, terms[1 - side].a + at, terms[1 - side].b + at, terms[side].a + at, leaves, at / 32, r, ir);
+        else TermsLeaf::inverse_terms(t, terms, n, leaves / 4, at / 32, r, ir);
+    });
+}
+
+inline void toeplitz_product(const Toeplitz& z, u32* words, u32* out, std::size_t count, int lg, const u32* r,
+                             const u32* ir, unsigned output) {
+    inverse_staged(words, out, count, lg, ir, output, [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
+        const std::size_t at = std::size_t(t - words);
+        ToeplitzBottom::run(reinterpret_cast<Vec*>(t), z, at, leaves, at / 32, r, ir);
+    });
 }
 
 // Hooked ops (Transform, issue #149): a forward from in whose runs of leaves go to a hook after
@@ -1479,6 +1607,11 @@ struct avx2 {
                                 std::size_t count, int lg, const std::uint32_t* roots, const std::uint32_t* inverse_roots,
                                 unsigned output) {
         detail::avx2::inverse_product(terms, n, f, out, count, lg, roots, inverse_roots, output);
+    }
+
+    static void toeplitz_product(const detail::Toeplitz& z, std::uint32_t* f, std::uint32_t* out, std::size_t count,
+                                 int lg, const std::uint32_t* roots, const std::uint32_t* inverse_roots, unsigned output) {
+        detail::avx2::toeplitz_product(z, f, out, count, lg, roots, inverse_roots, output);
     }
 
     // Hooked ops; width in words (Transform::forward(in, F, hook, ...)).

@@ -31,8 +31,9 @@
 // - log f = integral of f' / f mod x^(n-1) in B <= 4 blocks of k coefficients (lc-opt's blocked
 //   division, divide()): h = 1 / f mod x^k, then q_j = h (f' - f Q)[jk, (j+1)k) mod x^k, Q = q mod
 //   x^(jk), (f Q)[jk, (j+1)k) = sum over i < j of (W_(j-i) q_i)[k, 2k), W_t = f[(t-1)k, (t+1)k),
-//   as one inverse of a sum of leaf products of kept transforms of length 2k. About 11.5 T(n) + 6
-//   LP(n).
+//   as one inverse of a sum of leaf products of kept transforms of length 2k; for 4 blocks, blocks
+//   2 and 3 share lc-opt's Toeplitz product (ntt::Transform::toeplitz_product: 4 leaf products, not
+//   5). About 11.5 T(n) + 5.5 LP(n). h and log's q_j are transformed in place.
 // - exp: m -> 2m keeping h = 1 / g mod x^(m/2) and H = T_m(h), q = x f' (lc-opt's step, notes.md);
 //   8 transforms and 3.5 leaf products of 2m a step. The last step, to n <= 2m, runs at length m
 //   in two blocks of m/2 (lc-opt's exp_last_step): 14 transforms and 7 leaf products of m.
@@ -427,7 +428,7 @@ struct DivisionShape {
 };
 
 // The division's arrays: H = T(h), W_1 .. W_(blocks-1), the blocks' transforms Q_0 .. Q_(blocks-2)
-// (2k words each), R (k words: h, and log's blocks), work (2k).
+// (2k words each), R (k words: log's last block), work (2k).
 struct DivisionArrays {
     u32* H;
     std::array<u32*, kLogBlocks> W, Q;
@@ -445,16 +446,19 @@ inline std::size_t division_words(const DivisionShape& s) {
 //   (f Q)[jk, (j+1)k) = sum over i < j of (W_(j-i) q_i)[k, 2k),  W_t = f[(t-1)k, (t+1)k),
 // the sum as one inverse of leaf products of kept transforms (its upper half is exact).
 // numerator(first, c, s, out): out[i] = N[first + i] - s[i] (s null: N alone), i < c, out may
-// be s. place(j): where block j's residual and q_j go (k words). done(j, first, c): q_j is at
-// place(j), and its transform at a.Q[j] if j + 1 < blocks. (3 + 5B) transforms and 2 + B + B(B -
-// 1)/2 leaf products of 2k for B blocks.
+// be s. place(j): where block j's residual and q_j go (k words; a.Q[j]: its transform then runs in
+// place). done(j, first, c): q_j is at place(j); after it returns, its transform goes to a.Q[j] if
+// j + 1 < blocks. h and its transform in H (in place). For 4 blocks, lc-opt's Toeplitz sharing:
+// block 2's residual and W_3 = W_3 Q_0 + W_2 Q_1 by one toeplitz_product (3 leaf products), block
+// 3's from W_3 and W_1 Q_2. (3 + 5B) transforms and 2 + B + B(B - 1)/2 leaf products of 2k for B
+// blocks, one fewer for B = 4.
 template <class Numerator, class Place, class Done>
 void divide(Span f, std::size_t count, const DivisionShape& shape, const DivisionArrays& a, const Numerator& numerator,
             const Place& place, const Done& done) {
     const std::size_t k = shape.k, len = 2 * k, blocks = shape.blocks;
     const ntt::Transform& t = transform(std::countr_zero(len));
-    inverse_newton(f.first(std::min(f.size(), k)), Out(a.R, k), a.W[1], a.Q[0]);  // h = 1 / f mod x^k
-    t.forward(Span(a.R, k), a.H);
+    inverse_newton(f.first(std::min(f.size(), k)), Out(a.H, k), a.W[1], a.Q[0]);  // h = 1 / f mod x^k
+    t.forward(Span(a.H, k), a.H);
     for (std::size_t j = 1; j < blocks; ++j) {  // W_j = T(f[(j-1)k, (j+1)k))
         const std::size_t lo = std::min(f.size(), (j - 1) * k), hi = std::min(f.size(), (j + 1) * k);
         t.forward(f.subspan(lo, hi - lo), a.W[j]);
@@ -466,14 +470,20 @@ void divide(Span f, std::size_t count, const DivisionShape& shape, const Divisio
         if (j == 0) {
             numerator(0, c, nullptr, p);
         } else {  // N[jk, jk + c) - sum_(i<j) (W_(j-i) q_i)[k, 2k)
-            std::array<ntt::Term, kLogBlocks> terms{};
-            for (std::size_t i = 0; i < j; ++i) terms[i] = {a.W[j - i], a.Q[i]};
-            t.inverse_product(std::span<const ntt::Term>(terms.data(), j), a.work, r, {.offset = k});
+            if (blocks == 4 && j >= 2) {  // lc-opt's Toeplitz sharing: W_3 = W_3 Q_0 + W_2 Q_1 in block 2
+                const ntt::Term terms[] = {{a.W[1], a.Q[2]}, {a.W[3], nullptr}};
+                if (j == 2) t.toeplitz_product(a.W[1], a.W[2], a.W[3], a.Q[0], a.Q[1], a.work, r, {.offset = k});
+                else t.inverse_product(terms, a.work, r, {.offset = k});
+            } else {
+                std::array<ntt::Term, kLogBlocks> terms{};
+                for (std::size_t i = 0; i < j; ++i) terms[i] = {a.W[j - i], a.Q[i]};
+                t.inverse_product(std::span<const ntt::Term>(terms.data(), j), a.work, r, {.offset = k});
+            }
             numerator(first, c, p, p);
         }
         t.cyclic_product(r, a.H, a.work, r);  // q_j = h (residual) mod x^k
-        if (j + 1 < blocks) t.forward(Span(p, k), a.Q[j]);
         done(j, first, c);
+        if (j + 1 < blocks) t.forward(Span(p, k), a.Q[j]);
     }
 }
 
@@ -508,9 +518,10 @@ inline void log_newton(Span f, Out g, Arena arena) {
     divide(
         f, n - 1, shape, a,
         [f](std::size_t first, std::size_t c, const u32* s, u32* out) { index_block(f, first + 1, 1, c, s, out); },
-        [&a](std::size_t) { return a.R; },
-        [&](std::size_t, std::size_t first, std::size_t c) {
-            divide_by_index(first + 1, g.data() + first + 1, c, [&](std::size_t i) { return load_part(a.R, i, c); });
+        [&a, blocks](std::size_t j) { return j + 1 < blocks ? a.Q[j] : a.R; },
+        [&](std::size_t j, std::size_t first, std::size_t c) {
+            const u32* q = j + 1 < blocks ? a.Q[j] : a.R;
+            divide_by_index(first + 1, g.data() + first + 1, c, [&](std::size_t i) { return load_part(q, i, c); });
         });
     g[0] = 0;
 }
