@@ -35,40 +35,44 @@ constexpr u32 half(u32 x) { return multiply_mod(x, (kP + 1) / 2); }
 
 // Lanes: out[t] = sum_(j <= k) w[k + t - j] q[j] 2^-32 for t < count, the middle product of w (k +
 // count coefficients) and q (k + 1); canonical in and out, q in Montgomery form for w's form out.
-// k < kMaxTerms, k + count <= 32.
-template <class L>
+// k < kMaxTerms, k + count <= 32. kUnit: q[0] = kR (1 in Montgomery form, as in the products of
+// factors 1 + a x), so the term j = 0 is w[k + t] itself, added after the Montgomery step.
+template <class L, bool kUnit = false>
 [[gnu::always_inline]] inline void middle_lanes_inline(const u32* w, std::size_t k, const u32* q, std::size_t count, u32* out) {
     using S = Sums<L>;
     constexpr int kVectors = 8 / L::lanes;
+    constexpr std::size_t j0 = kUnit ? 1 : 0;
 #pragma GCC unroll 8
     for (int u = 0; u < kVectors; ++u) {
         typename S::Op x[32], y[kMaxTerms];
 #pragma GCC unroll 32
         for (std::size_t i = 0; i < k + count; ++i) x[i] = S::of(L::load(w + 8 * i + u * L::lanes));
 #pragma GCC unroll 9
-        for (std::size_t j = 0; j <= k; ++j) y[j] = S::of(L::load(q + 8 * j + u * L::lanes));
+        for (std::size_t j = j0; j <= k; ++j) y[j] = S::of(L::load(q + 8 * j + u * L::lanes));
 #pragma GCC unroll 16
         for (std::size_t t = 0; t < count; ++t) {
-            typename S::Acc s = S::mul(x[k + t], y[0]);
+            typename S::Acc s = S::mul(x[k + t - j0], y[j0]);
 #pragma GCC unroll 9
-            for (std::size_t j = 1; j <= k; ++j) S::mac(s, x[k + t - j], y[j]);
-            L::store(out + 8 * t + u * L::lanes, S::reduce(s));
+            for (std::size_t j = j0 + 1; j <= k; ++j) S::mac(s, x[k + t - j], y[j]);
+            typename L::V r = S::reduce(s);
+            if constexpr (kUnit) r = Ops<L>::add(r, L::load(w + 8 * (k + t) + u * L::lanes));
+            L::store(out + 8 * t + u * L::lanes, r);
         }
     }
 }
 
 // middle_lanes_inline, unrolled for k = count = 1, 2, 4, 8.
-template <class L>
+template <class L, bool kUnit = false>
 void middle_lanes(const u32* w, std::size_t k, const u32* q, std::size_t count, u32* out) {
     if (k == count) {
         switch (k) {
-            case 1: return middle_lanes_inline<L>(w, 1, q, 1, out);
-            case 2: return middle_lanes_inline<L>(w, 2, q, 2, out);
-            case 4: return middle_lanes_inline<L>(w, 4, q, 4, out);
-            case 8: return middle_lanes_inline<L>(w, 8, q, 8, out);
+            case 1: return middle_lanes_inline<L, kUnit>(w, 1, q, 1, out);
+            case 2: return middle_lanes_inline<L, kUnit>(w, 2, q, 2, out);
+            case 4: return middle_lanes_inline<L, kUnit>(w, 4, q, 4, out);
+            case 8: return middle_lanes_inline<L, kUnit>(w, 8, q, 8, out);
         }
     }
-    middle_lanes_inline<L>(w, k, q, count, out);
+    middle_lanes_inline<L, kUnit>(w, k, q, count, out);
 }
 
 // Lanes: out[t] = (sum_i a[i] d[t - i] + sum_i b[i] c[t - i]) 2^-32 for t < n + k, a of n
@@ -118,6 +122,119 @@ void cross_lanes(const u32* a, std::size_t n, const u32* b, std::size_t k, const
         }
     }
     cross_lanes_inline<L>(a, n, b, k, c, d, out);
+}
+
+// cross_lanes for c[0] = d[0] = kR (the products of factors 1 + a x): the terms a[t] d[0] and b[t]
+// c[0] are a[t] and b[t] themselves, added after the Montgomery step, and the two sums share one
+// step when they have at most kMaxTerms products together. Same arguments.
+template <class L>
+[[gnu::always_inline]] inline void cross_units_inline(const u32* a, std::size_t n, const u32* b, std::size_t k, const u32* c,
+                                                      const u32* d, u32* out) {
+    using S = Sums<L>;
+    using M = Ops<L>;
+    using V = typename L::V;
+    constexpr int kVectors = 8 / L::lanes;
+#pragma GCC unroll 8
+    for (int u = 0; u < kVectors; ++u) {
+        typename S::Op xa[kMaxTerms], xb[kMaxTerms], yc[kMaxTerms + 1], yd[kMaxTerms + 1];
+#pragma GCC unroll 9
+        for (std::size_t i = 0; i < n; ++i) xa[i] = S::of(L::load(a + 8 * i + u * L::lanes));
+#pragma GCC unroll 9
+        for (std::size_t i = 0; i < k; ++i) xb[i] = S::of(L::load(b + 8 * i + u * L::lanes));
+#pragma GCC unroll 10
+        for (std::size_t j = 1; j <= n; ++j) yc[j] = S::of(L::load(c + 8 * j + u * L::lanes));
+#pragma GCC unroll 10
+        for (std::size_t j = 1; j <= k; ++j) yd[j] = S::of(L::load(d + 8 * j + u * L::lanes));
+#pragma GCC unroll 16
+        for (std::size_t t = 0; t < n + k; ++t) {
+            // Products a[i] d[t - i] for i in [first, end), b[i] c[t - i] for i in [first2, end2).
+            const std::size_t first = t > k ? t - k : 0, end = std::min(t, n);
+            const std::size_t first2 = t > n ? t - n : 0, end2 = std::min(t, k);
+            const std::size_t terms = (end > first ? end - first : 0) + (end2 > first2 ? end2 - first2 : 0);
+            V r = t < n ? L::load(a + 8 * t + u * L::lanes) : L::broadcast(0);
+            if (t < k) r = M::add(r, L::load(b + 8 * t + u * L::lanes));
+            typename S::Acc s{}, s2{};
+            bool started = false, started2 = false;
+            const bool merged = terms <= std::size_t(kMaxTerms);
+#pragma GCC unroll 9
+            for (std::size_t i = first; i < end; ++i) {
+                if (started) S::mac(s, xa[i], yd[t - i]);
+                else s = S::mul(xa[i], yd[t - i]), started = true;
+            }
+#pragma GCC unroll 9
+            for (std::size_t i = first2; i < end2; ++i) {
+                if (merged && started) S::mac(s, xb[i], yc[t - i]);
+                else if (merged) s = S::mul(xb[i], yc[t - i]), started = true;
+                else if (started2) S::mac(s2, xb[i], yc[t - i]);
+                else s2 = S::mul(xb[i], yc[t - i]), started2 = true;
+            }
+            if (started) r = M::add(r, S::reduce(s));
+            if (started2) r = M::add(r, S::reduce(s2));
+            L::store(out + 8 * t + u * L::lanes, r);
+        }
+    }
+}
+
+// cross_units_inline, unrolled for n = k = 1, 2, 4, 8.
+template <class L>
+void cross_units(const u32* a, std::size_t n, const u32* b, std::size_t k, const u32* c, const u32* d, u32* out) {
+    if (n == k) {
+        switch (n) {
+            case 1: return cross_units_inline<L>(a, 1, b, 1, c, d, out);
+            case 2: return cross_units_inline<L>(a, 2, b, 2, c, d, out);
+            case 4: return cross_units_inline<L>(a, 4, b, 4, c, d, out);
+            case 8: return cross_units_inline<L>(a, 8, b, 8, c, d, out);
+        }
+    }
+    cross_units_inline<L>(a, n, b, k, c, d, out);
+}
+
+// c = a b, lane by lane, for a of degree m and b of degree k with a[0] = b[0] = kR (the products
+// of factors 1 + a x): the terms a[0] b[t] and a[t] b[0] are b[t] and a[t] themselves, added
+// after the Montgomery step; c[0] = kR. Montgomery form in and out (canonical); 1 <= m, k <= 8.
+template <class L>
+[[gnu::always_inline]] inline void multiply_units_inline(const u32* a, std::size_t m, const u32* b, std::size_t k, u32* c) {
+    using S = Sums<L>;
+    using M = Ops<L>;
+    using V = typename L::V;
+    constexpr int kVectors = 8 / L::lanes;
+#pragma GCC unroll 8
+    for (int u = 0; u < kVectors; ++u) {
+        typename S::Op x[9], y[9];
+#pragma GCC unroll 9
+        for (std::size_t i = 1; i <= m; ++i) x[i] = S::of(L::load(a + 8 * i + u * L::lanes));
+#pragma GCC unroll 9
+        for (std::size_t j = 1; j <= k; ++j) y[j] = S::of(L::load(b + 8 * j + u * L::lanes));
+        L::store(c + u * L::lanes, L::broadcast(kR));
+#pragma GCC unroll 17
+        for (std::size_t t = 1; t <= m + k; ++t) {
+            V r = L::broadcast(0);
+            if (t <= m) r = L::load(a + 8 * t + u * L::lanes);
+            if (t <= k) r = M::add(r, L::load(b + 8 * t + u * L::lanes));
+            // a[i] b[t - i] for i in [max(1, t - k), min(t - 1, m)]
+            const std::size_t first = t > k ? t - k : 1, last = std::min(t - 1, m);
+            if (first <= last) {
+                typename S::Acc s = S::mul(x[first], y[t - first]);
+#pragma GCC unroll 8
+                for (std::size_t i = first + 1; i <= last; ++i) S::mac(s, x[i], y[t - i]);
+                r = M::add(r, S::reduce(s));
+            }
+            L::store(c + 8 * t + u * L::lanes, r);
+        }
+    }
+}
+
+// multiply_units_inline, unrolled for m = k = 1, 2, 4.
+template <class L>
+void multiply_units(const u32* a, std::size_t m, const u32* b, std::size_t k, u32* c) {
+    if (m == k) {
+        switch (m) {
+            case 1: return multiply_units_inline<L>(a, 1, b, 1, c);
+            case 2: return multiply_units_inline<L>(a, 2, b, 2, c);
+            case 4: return multiply_units_inline<L>(a, 4, b, 4, c);
+        }
+    }
+    multiply_units_inline<L>(a, m, b, k, c);
 }
 
 // lanes[8 j + l] = rows[l stride + j] for l < 8, j < count (a multiple of 8): 8 rows to lanes, by

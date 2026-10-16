@@ -37,7 +37,6 @@ using product_tree::detail::LaneTree;
 using product_tree::detail::Leaf;
 using product_tree::detail::leaf_products;
 using product_tree::detail::leaf_weights;
-using product_tree::detail::multiply_lanes;
 using product_tree::detail::pointwise;
 using product_tree::detail::Rooms;
 using product_tree::detail::scale;
@@ -155,22 +154,9 @@ private:
         build(2 * v, lo, mid);
         build(2 * v + 1, mid, hi);
         if (v == 1) return;
-        if (hi - lo == 2) linear_pair(product_[2 * v], product_[2 * v + 1], free_);
-        else multiply_lanes<Lanes>(product_[2 * v], mid - lo, product_[2 * v + 1], hi - mid, free_);
+        multiply_units<Lanes>(product_[2 * v], mid - lo, product_[2 * v + 1], hi - mid, free_);
         product_[v] = free_;
         free_ += 8 * (hi - lo + 1);
-    }
-
-    // (1 + a x)(1 + b x) = 1 + (a + b) x + a b x^2 from two slots' factors (Montgomery forms: 1 is
-    // kR): one product, not multiply_lanes' four sums.
-    static void linear_pair(const u32* x, const u32* y, u32* c) {
-        using L = Lanes;
-        for (int l = 0; l < 8; l += L::lanes) {
-            const typename L::V a = L::load(x + 8 + l), b = L::load(y + 8 + l);
-            L::store(c + l, L::broadcast(kR));
-            L::store(c + 8 + l, Ops<L>::add(a, b));
-            L::store(c + 16 + l, montgomery_canonical<L>(a, b));
-        }
     }
 
     // 16 slots: 2 coefficients per slot and s + 1 per node of s slots below the top: 32 + 24 +
@@ -400,8 +386,8 @@ private:
         if (hi - lo == 1) return void(std::copy_n(w, 8, out));
         const std::size_t mid = lo + (hi - lo) / 2;
         alignas(64) u32 left[8 * kLaneBase], right[8 * kLaneBase];
-        middle_lanes<Lanes>(w, hi - mid, products[2 * v + 1], mid - lo, left);
-        middle_lanes<Lanes>(w, mid - lo, products[2 * v], hi - mid, right);
+        middle_lanes<Lanes, true>(w, hi - mid, products[2 * v + 1], mid - lo, left);
+        middle_lanes<Lanes, true>(w, mid - lo, products[2 * v], hi - mid, right);
         base_descend(products, 2 * v, lo, mid, left, out);
         base_descend(products, 2 * v + 1, mid, hi, right, out + 8 * (mid - lo));
     }
@@ -479,7 +465,7 @@ private:
         if (hi - lo == 1) return void(std::copy_n(w, 8, values + 8 * lo));
         const std::size_t mid = lo + (hi - lo) / 2;
         alignas(64) u32 left[8 * kLaneBase];
-        middle_lanes<Lanes>(w, hi - mid, products[2 * v + 1], mid - lo, left);
+        middle_lanes<Lanes, true>(w, hi - mid, products[2 * v + 1], mid - lo, left);
         newton_base(products, 2 * v, lo, mid, left, values);
         newton_base(products, 2 * v + 1, mid, hi, w, values);
     }
@@ -560,7 +546,7 @@ private:
         alignas(64) u32 left[8 * kLaneBase], right[8 * kLaneBase];
         base_ascend(products, 2 * v, lo, mid, w, left);
         base_ascend(products, 2 * v + 1, mid, hi, w + 8 * (mid - lo), right);
-        cross_lanes<Lanes>(left, mid - lo, right, hi - mid, products[2 * v], products[2 * v + 1], out);
+        cross_units<Lanes>(left, mid - lo, right, hi - mid, products[2 * v], products[2 * v + 1], out);
     }
 
     // Base node [lo, hi) of the interpolation from its window w: the descent to its slots' values
