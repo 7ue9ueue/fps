@@ -35,13 +35,15 @@
 //   of P^ (L/2), inverse of R (L).
 // - Doubling (lc-opt's; issue #149 round 2), levels 3 .. T - 4 from m = 512: Q_s's (P_s's) leaf
 //   form at 4m from V's (W's) at 2m, whose rows are the blocks of ntt's truncate_blocks (the lower
-//   half, without its y levels), join_blocks and forward_upper_hooked (the upper half).
+//   half, without its y levels), join_blocks and forward_upper_hooked (the upper half). The hooks
+//   before it skip the CRT's 1/2 (round 3, lc-opt's), so its leaf forms carry a factor, tracked.
 // - One-dimensional levels (lc-opt's): level 0 (Q_0 = 1 - y g: a Graeffe of g at 2m, compose's
 //   step a product of 2m), level 1 (Q_1 = 1 + y q1 + y^2 q2: transforms of q1, q2 at m, products
 //   G(q1), G(q2), E(q1, q2) in one hook, inverses at m/2), and from m = 256 levels T - 3, T - 2
 //   as polynomials in y per column (transforms of m/4, m/2), and T - 1 (Q = 1 + x q(y)).
-// Zen 3, n = 2^17: compose 29.3 ms against lc-opt's 29.4 (31.7 in round 1), power projection
-// 27.0 against 26.0 (30.3), compositional_inverse 31.6 against 30.5 (36.8) (notes.md).
+// Zen 3, n = 2^17 / 2^20, ms: compose 28.0 / 305 against lc-opt's 29.3 / 323, power projection
+// 24.9 / 279 against 25.9 / 283, compositional_inverse 29.2 / 321 against 30.5 / 325 (round 3,
+// notes.md).
 //
 // compositional_inverse: Lagrange, (n-1) [x^(n-1)] f^k = k [x^(n-1-k)] (x / g)^(n-1), so with
 // a = power_projection(f), h[j] = a[N-j] / (N-j) = [x^j] (x / g)^N / N for N = n - 1, and
@@ -72,6 +74,7 @@
 #include "backend/ntt/ntt.hpp"
 #include "backend/series/series.hpp"
 #include "backend/simd/select.hpp"
+#include "backend/tune/tune.hpp"
 
 namespace fps::composition {
 
@@ -149,20 +152,30 @@ inline const ntt::Transform& transform(int lg) {
 }
 
 // Per leaf pair p of a transform of 4m words (moduli z^8 -+ s, s = r(p)), for p < m / 4: s 2^32
-// (Montgomery's form of s) and 2^32 / (2 s) (the CRT's factor: its Montgomery product keeps the
-// sums' 2^-32 for the hooked inverse). r(p) does not depend on the length: one table per thread, grown to the longest.
+// (Montgomery's form of s; test.cpp reads it) and 2^32 / (2 s) (the CRT's factor: its Montgomery
+// product keeps the sums' 2^-32 for the hooked inverse). r(p) does not depend on the length: one
+// table per thread, grown to the longest.
 //
 // The CRT's constants of a pass (Crt): 2^32 c / (2 s) per pair and 2^32 c / 2, so its leaves come
-// out times c 2^-32: c = 1 for the hooked inverse (plain), c = 2^32 8 / B for a doubling with
-// blocks of B words (issue #149 round 2: truncate_blocks multiplies by B / 8).
+// out times c 2^-32: c = 1 for the hooked inverse (plain), c = 1 / c_s^2 for the last doubled
+// level (scaled_crt; doubled_factor).
 struct Crt {
     const u32* c;
     u32 half;
 };
+// w, wq: s and its Shoup quotient (issue #149 round 3: a Shoup product costs 4 multiplies on x86,
+// a Montgomery product 6); P - s has the quotient ~wq. iw, iq: 1 / s and its quotient, for the
+// CRT without the 1/2 (Crt::twice()).
+//
+// Crt::twice() (c null; issue #149 round 3, lc-opt's): (A + B) + u^4 (A - B) / s, twice the CRT, so
+// the leaves come out times 2^-31; 4 Shoup products per output leaf where the Crt above takes 8
+// Montgomery products. The doubled levels carry the factor (doubled_factor).
 struct PairTables {
-    std::vector<u32> s, crt;
+    std::vector<u32> s, crt, w, wq, iw, iq;
     Crt plain() const { return {crt.data(), mul(kHalf, kR)}; }
+    static Crt twice() { return {nullptr, 0}; }
 };
+constexpr u32 shoup_quotient(u32 w) { return u32((u64(w) << 32) / kP); }
 inline const PairTables& pair_tables(std::size_t pairs) {
     thread_local PairTables t;
     if (t.s.size() < pairs) {
@@ -174,8 +187,12 @@ inline const PairTables& pair_tables(std::size_t pairs) {
             r[p] = mul(r[p & (p - 1)], ntt::detail::kRoots[0][j]);
             ri[p] = mul(ri[p & (p - 1)], ntt::detail::kRoots[1][j]);
         }
-        t.s.resize(size), t.crt.resize(size);
-        for (std::size_t p = 0; p < size; ++p) t.s[p] = mul(r[p], kR), t.crt[p] = mul(mul(ri[p], kHalf), kR);
+        for (auto* v : {&t.s, &t.crt, &t.w, &t.wq, &t.iw, &t.iq}) v->resize(size);
+        for (std::size_t p = 0; p < size; ++p) {
+            t.s[p] = mul(r[p], kR), t.crt[p] = mul(mul(ri[p], kHalf), kR);
+            t.w[p] = r[p], t.wq[p] = shoup_quotient(r[p]);
+            t.iw[p] = ri[p], t.iq[p] = shoup_quotient(ri[p]);
+        }
     }
     return t;
 }
@@ -193,6 +210,11 @@ struct Pairs {
     using M = modarith::Ops<L, kP>;
     static constexpr int W = L::lanes;
     using Set = V[8];
+    // The projection's and level 1's leaves one call per leaf (below), but inline on the avx512
+    // target (issue #149 round 3, power projection at n = 2^20 in its real call sequence: Emerald
+    // Rapids 282-286 ms inline against 286-287 out of line; Zen 5 151 against 149, Zen 3 284 against
+    // 280, Neoverse V2 the same).
+    static constexpr bool kInlineLeaves = W == 1 || tune::kTarget == tune::Target::avx512;
 
     // x[k] lane l = p[stride l + k] for k < 8, and back.
     [[gnu::always_inline]] static void load(const u32* p, std::size_t stride, Set& x) {
@@ -229,7 +251,6 @@ struct Pairs {
     }
     [[gnu::always_inline]] static V red(V x) { return M::template reduce<kP>(x); }           // [0, 2P) -> [0, P)
     [[gnu::always_inline]] static V red4(V x) { return red(M::template reduce<2 * kP>(x)); }  // [0, 4P) -> [0, P)
-    [[gnu::always_inline]] static V mont(V a, V b) { return red(M::montgomery(a, b)); }      // a b 2^-32, [0, P)
 
     // ---- Leaf sums in 64 bits (lc-opt's): x86 per 64-bit lane (mul_even, the even words, then the
     // odd words shifted down), Neon per lane (umull and umull2 into two 64-bit halves; the adds
@@ -279,22 +300,25 @@ struct Pairs {
         else return L::broadcast64(kOffset);
     }
     // x 2^-32 mod P in [0, x / 2^32 + P) per 64-bit sum (Montgomery), from the sums of the even
-    // words and of the odd words (x86; Neon and Scalar: even only); canonical.
+    // words and of the odd words (x86; Neon and Scalar: even only); canonical, or below 2P if kLazy
+    // (the sums stay below 8 P^2, so x / 2^32 + P < 4P).
+    template <bool kLazy = false>
     [[gnu::always_inline]] static V reduce_sums(U even, U odd) {
+        const auto out = [](V x) { return kLazy ? M::template reduce<2 * kP>(x) : red4(x); };
         if constexpr (W == 1) {
-            return red4(V((even + u64(u32(even) * kNegInverse) * kP) >> 32));
+            return out(V((even + u64(u32(even) * kNegInverse) * kP) >> 32));
         }
 #if defined(__ARM_NEON)
         else if constexpr (kNeon) {
             const V q = L::mul_lo(L::lo_halves(even.lo, even.hi), L::broadcast(kNegInverse)), p = L::broadcast(kP);
-            return red4(L::hi_halves(L::mla_wide_lo(even.lo, q, p), L::mla_wide_hi(even.hi, q, p)));
+            return out(L::hi_halves(L::mla_wide_lo(even.lo, q, p), L::mla_wide_hi(even.hi, q, p)));
         }
 #endif
         else {
             const V ninv = L::broadcast(kNegInverse), p = L::broadcast(kP);
             even = L::add64(even, L::mul_even(L::mul_even(even, ninv), p));
             odd = L::add64(odd, L::mul_even(L::mul_even(odd, ninv), p));
-            return red4(L::join_high(even, odd));
+            return out(L::join_high(even, odd));
         }
     }
     // The odd words of each lane pair moved to the even ones (x86).
@@ -302,11 +326,24 @@ struct Pairs {
 #pragma GCC unroll 8
         for (int i = 0; i < 8; ++i) out[i] = L::template shr64<32>(x[i]);
     }
-    // tc[j] = t c[j] for j >= first (canonical), tR = t 2^32; the rest unset.
-    [[gnu::always_inline]] static void scaled(const Set& c, V tR, int first, Set& tc) {
+    // tc[j] = t c[j] for j >= first (canonical), tq: t's Shoup quotient; the rest zero.
+    [[gnu::always_inline]] static void scaled(const Set& c, V t, V tq, int first, Set& tc) {
 #pragma GCC unroll 8
-        for (int j = 0; j < 8; ++j) tc[j] = j < first ? L::broadcast(0) : mont(c[j], tR);
+        for (int j = 0; j < 8; ++j) tc[j] = j < first ? L::broadcast(0) : wmul(c[j], t, tq);
     }
+    // x w for a weight w and its Shoup quotient q, canonical.
+    [[gnu::always_inline]] static V wmul(V x, V w, V q) { return red(M::shoup(x, w, q)); }
+    // The pair's t = s, -s with their quotients (P - s: ~q).
+    [[gnu::always_inline]] static void weights(const u32* tw, const u32* tq, V (&w)[2], V (&q)[2]) {
+        w[0] = L::load(tw), q[0] = L::load(tq);
+        w[1] = L::sub(L::broadcast(kP), w[0]), q[1] = L::sub(L::broadcast(~u32(0)), q[0]);
+    }
+    // The tables from pair p0 (pointers loaded once per run, not after each out-of-line call).
+    struct Rows {
+        const u32 *w, *wq, *iw, *iq, *c;
+        Rows(const PairTables& t, const Crt& k, std::size_t p0)
+            : w(t.w.data() + p0), wq(t.wq.data() + p0), iw(t.iw.data() + p0), iq(t.iq.data() + p0), c(k.c ? k.c + p0 : nullptr) {}
+    };
     // Coefficient 2k of c(z) c(-z) mod (z^8 - t): sum over i + j = 2k of (-1)^j c_i c_j, and over
     // i + j = 2k + 8 of (-1)^j c_i tc_j (tc for j >= 4). 20 products.
     [[gnu::always_inline]] static void graeffe_sums(const Set& c, const Set& tc, U (&sum)[4]) {
@@ -347,6 +384,10 @@ struct Pairs {
             sum[k] = s;
         }
     }
+    // From c's leaves and tc = t c (scaled, from j = 1, 4, 2 on), times 2^-32 as series in u = z^2
+    // mod (u^4 - t), canonical (below 2P if kLazy): even_wide the even part of a(z) c(-z), ae ce - u
+    // ao co; graeffe_wide A = c(z) c(-z) = e^2 - u o^2 for c = e(u) + z o(u); odd_wide the odd part
+    // of a(z) c(-z) divided by z, ao ce - ae co.
     [[gnu::always_inline]] static void even_wide(const Set& a, const Set& c, const Set& tc, V (&B)[4]) {
         U even[4], odd[4] = {};
         even_sums(a, c, tc, even);
@@ -358,6 +399,7 @@ struct Pairs {
 #pragma GCC unroll 4
         for (int k = 0; k < 4; ++k) B[k] = reduce_sums(even[k], odd[k]);
     }
+    template <bool kLazy = false>
     [[gnu::always_inline]] static void graeffe_wide(const Set& c, const Set& tc, V (&A)[4]) {
         U even[4], odd[4] = {};
         graeffe_sums(c, tc, even);
@@ -367,8 +409,9 @@ struct Pairs {
             graeffe_sums(c2, tc2, odd);
         }
 #pragma GCC unroll 4
-        for (int k = 0; k < 4; ++k) A[k] = reduce_sums(even[k], odd[k]);
+        for (int k = 0; k < 4; ++k) A[k] = reduce_sums<kLazy>(even[k], odd[k]);
     }
+    template <bool kLazy = false>
     [[gnu::always_inline]] static void odd_wide(const Set& a, const Set& c, const Set& tc, V (&B)[4]) {
         U even[4], odd[4] = {};
         odd_sums(a, c, tc, even);
@@ -378,29 +421,13 @@ struct Pairs {
             odd_sums(a2, c2, tc2, odd);
         }
 #pragma GCC unroll 4
-        for (int k = 0; k < 4; ++k) B[k] = reduce_sums(even[k], odd[k]);
+        for (int k = 0; k < 4; ++k) B[k] = reduce_sums<kLazy>(even[k], odd[k]);
     }
 
-    // A = c(z) c(-z) mod (z^8 - t) as a series in u = z^2 mod (u^4 - t), times 2^-32, canonical:
-    // e^2 - u o^2 for c = e(u) + z o(u); tR = t 2^32 per lane.
-    [[gnu::always_inline]] static void graeffe(const Set& c, V tR, V (&A)[4]) {
-        Set tc;
-        scaled(c, tR, 4, tc);
-        graeffe_wide(c, tc, A);
-    }
-
-    // The odd part of a(z) c(-z) mod (z^8 - t), divided by z, as a series in u mod (u^4 - t), times
-    // 2^-32, canonical: po ce - pe co for a = pe(u) + z po(u), c = ce(u) + z co(u).
-    [[gnu::always_inline]] static void odd_product(const Set& a, const Set& c, V tR, V (&B)[4]) {
-        Set tc;
-        scaled(c, tR, 2, tc);
-        odd_wide(a, c, tc, B);
-    }
-
-    // graeffe(c, tR, A) and odd_product(a, c, tR, B) with c's t c_j and odd words shared.
-    [[gnu::always_inline]] static void graeffe_odd(const Set& c, const Set& a, V tR, V (&A)[4], V (&B)[4]) {
-        Set tc;
-        scaled(c, tR, 2, tc);
+    // The sums of graeffe_wide (A) and of odd_wide (B), the even words' of both before the odd
+    // words', c's t c_j and odd words shared.
+    template <bool kLazy = false>
+    [[gnu::always_inline]] static void graeffe_odd(const Set& c, const Set& a, const Set& tc, V (&A)[4], V (&B)[4]) {
         U ge[4], go[4] = {}, oe[4], oo[4] = {};
         graeffe_sums(c, tc, ge);
         odd_sums(a, c, tc, oe);
@@ -411,15 +438,7 @@ struct Pairs {
             odd_sums(a2, c2, tc2, oo);
         }
 #pragma GCC unroll 4
-        for (int k = 0; k < 4; ++k) A[k] = reduce_sums(ge[k], go[k]), B[k] = reduce_sums(oe[k], oo[k]);
-    }
-
-    // The even part of a(z) c(-z) mod (z^8 - t) as a series in u mod (u^4 - t), times 2^-32,
-    // canonical: ae ce - u ao co.
-    [[gnu::always_inline]] static void even_product(const Set& a, const Set& c, V tR, V (&B)[4]) {
-        Set tc;
-        scaled(c, tR, 1, tc);
-        even_wide(a, c, tc, B);
+        for (int k = 0; k < 4; ++k) A[k] = reduce_sums<kLazy>(ge[k], go[k]), B[k] = reduce_sums<kLazy>(oe[k], oo[k]);
     }
 
     // Leaf p of the transform of length 2m from A mod (u^4 - s) and B mod (u^4 + s), both times
@@ -433,6 +452,29 @@ struct Pairs {
             out[k + 4] = red(M::montgomery(L::add(L::sub(A[k], B[k]), p), c));
         }
     }
+    // Twice that without the Crt's factors, (A + B) + u^4 (A - B) / s (Crt::twice()), from A and B
+    // below 2P (reduce_sums<true>): iw, iq = 1/s and its quotient; canonical.
+    [[gnu::always_inline]] static void crt_twice(const V (&A)[4], const V (&B)[4], V iw, V iq, Set& out) {
+        const V p2 = L::broadcast(2 * kP);
+#pragma GCC unroll 4
+        for (int k = 0; k < 4; ++k) {
+            out[k] = red4(L::add(A[k], B[k]));
+            out[k + 4] = red(M::shoup(L::add(L::sub(A[k], B[k]), p2), iw, iq));
+        }
+    }
+    // The CRT of the pairs from p by k (kTwice: Crt::twice()).
+    template <bool kTwice>
+    [[gnu::always_inline]] static void combine(const V (&A)[4], const V (&B)[4], const Rows& r, const Crt& k, std::size_t q,
+                                               Set& out) {
+        if constexpr (kTwice) crt_twice(A, B, L::load(r.iw + q), L::load(r.iq + q), out);
+        else crt(A, B, L::broadcast(k.half), L::load(r.c + q), out);
+    }
+    // run.template operator()<kTwice>() for k.
+    template <class Run>
+    [[gnu::always_inline]] static void dispatch(const Crt& k, Run run) {
+        if (k.c) run.template operator()<false>();
+        else run.template operator()<true>();
+    }
 
     // The runs below take the leaf pairs [p0, p0 + pairs) (pairs a multiple of W); their pointers
     // are at those pairs: leaf 2 p0 of a leaf form of 4m words, leaf p0 of one of 2m, entry p0 of
@@ -443,17 +485,51 @@ struct Pairs {
         graeffe_run(F, G, p0, pairs, t, t.plain());
     }
     static void graeffe_run(const u32* F, u32* G, std::size_t p0, std::size_t pairs, const PairTables& t, const Crt& k) {
-        const V p = L::broadcast(kP), half = L::broadcast(k.half);
-        for (std::size_t q = 0; q < pairs; q += W) {
-            Set a, b, out;
-            load(F + 16 * q, 16, a), load(F + 16 * q + 8, 16, b);
-            const V s = L::load(t.s.data() + p0 + q);
-            V A[4], B[4];
-            graeffe(a, s, A);
-            graeffe(b, L::sub(p, s), B);
-            crt(A, B, half, L::load(k.c + p0 + q), out);
-            store(G + 8 * q, 8, out);
+        const Rows r(t, k, p0);
+        dispatch(k, [&]<bool kTwice> [[gnu::always_inline]] () {
+            for (std::size_t q = 0; q < pairs; q += W) {
+                Set out;
+                V w[2], wq[2], A[2][4];
+                weights(r.w + q, r.wq + q, w, wq);
+#pragma GCC unroll 2
+                for (int e = 0; e < 2; ++e) leaves<Pass::graeffe, kTwice>(F + 16 * q + 8 * e, nullptr, w[e], wq[e], A[e], A[e]);
+                combine<kTwice>(A[0], A[1], r, k, q, out);
+                store(G + 8 * q, 8, out);
+            }
+        });
+    }
+    // One leaf of each pair (modulus z^8 - t, tq: t's quotient), c = Q's leaf at FQ (stride 16
+    // words): A = the Graeffe of c; for Pass::projection also B = the odd part of a(z) c(-z) for P's
+    // leaf a at FP.
+    enum class Pass { graeffe, projection };
+    // kLazy: A and B below 2P (for crt_twice), else canonical. The projection's sums interleaved
+    // (graeffe_odd): 0.3-1.3% of power projection at 2^20 on every timing machine against the
+    // Graeffe's sums and then the odd product's.
+    template <Pass kPass, bool kLazy>
+    [[gnu::always_inline]] static void leaf(const u32* FQ, const u32* FP, V t, V tq, V (&A)[4], V (&B)[4]) {
+        Set c, tc;
+        load(FQ, 16, c);
+        scaled(c, t, tq, kPass == Pass::graeffe ? 4 : 2, tc);
+        if constexpr (kPass == Pass::graeffe) {
+            graeffe_wide<kLazy>(c, tc, A);
+        } else {
+            Set a;
+            load(FP, 16, a);
+            graeffe_odd<kLazy>(c, a, tc, A, B);
         }
+    }
+    // The projection's out of line (but kInlineLeaves), as lc-opt's ProjectionBottom::leaves: with
+    // both leaves of a pair in one body GCC spilled the sums (issue #149 round 3: 141 against
+    // lc-opt's 114 ns per 8 pairs on Zen 3, 128 out of line). The Graeffe's inline (out of line: 66
+    // against 60).
+    template <Pass kPass, bool kLazy>
+    [[gnu::noinline]] static void leaf_out_of_line(const u32* FQ, const u32* FP, V t, V tq, V (&A)[4], V (&B)[4]) {
+        leaf<kPass, kLazy>(FQ, FP, t, tq, A, B);
+    }
+    template <Pass kPass, bool kLazy>
+    [[gnu::always_inline]] static void leaves(const u32* FQ, const u32* FP, V t, V tq, V (&A)[4], V (&B)[4]) {
+        if constexpr (kPass == Pass::graeffe || kInlineLeaves) leaf<kPass, kLazy>(FQ, FP, t, tq, A, B);
+        else leaf_out_of_line<kPass, kLazy>(FQ, FP, t, tq, A, B);
     }
 
     // Power projection: from FQ and FP (4m, the leaf forms of Q and P) to GV and GW (2m, the leaf
@@ -465,57 +541,90 @@ struct Pairs {
     }
     static void projection_run(const u32* FQ, const u32* FP, u32* GV, u32* GW, std::size_t p0, std::size_t pairs,
                                const PairTables& t, const Crt& k) {
-        const V p = L::broadcast(kP), half = L::broadcast(k.half);
-        for (std::size_t q = 0; q < pairs; q += W) {
-            Set ca, cb, pa, pb, out;
-            load(FQ + 16 * q, 16, ca), load(FQ + 16 * q + 8, 16, cb);
-            load(FP + 16 * q, 16, pa), load(FP + 16 * q + 8, 16, pb);
-            const V s = L::load(t.s.data() + p0 + q), ns = L::sub(p, s), c = L::load(k.c + p0 + q);
-            V A[4], B[4], OA[4], OB[4];
-            graeffe_odd(ca, pa, s, A, OA);
-            graeffe_odd(cb, pb, ns, B, OB);
-            crt(A, B, half, c, out);
-            store(GV + 8 * q, 8, out);
-            crt(OA, OB, half, c, out);
-            store(GW + 8 * q, 8, out);
-        }
+        const Rows r(t, k, p0);
+        dispatch(k, [&]<bool kTwice> [[gnu::always_inline]] () {
+            for (std::size_t q = 0; q < pairs; q += W) {
+                Set out;
+                V w[2], wq[2], A[2][4], B[2][4];
+                weights(r.w + q, r.wq + q, w, wq);
+#pragma GCC unroll 2
+                for (int e = 0; e < 2; ++e)
+                    leaves<Pass::projection, kTwice>(FQ + 16 * q + 8 * e, FP + 16 * q + 8 * e, w[e], wq[e], A[e], B[e]);
+                combine<kTwice>(A[0], A[1], r, k, q, out);
+                store(GV + 8 * q, 8, out);
+                combine<kTwice>(B[0], B[1], r, k, q, out);
+                store(GW + 8 * q, 8, out);
+            }
+        });
     }
-
     // Level 1, one-dimensional: from the leaf forms at m of q1 (F1), q2 (F2) and (power projection;
     // else null) p1 (FP), per leaf pair the leaf forms at m/2, times 2^-32, of G(q1), G(q2), E(q1,
     // q2) and O(p1, q1), O(p1, q2) into out[0 .. 4]: G(a) = a(x) a(-x), E and O the even and the odd
     // part (over x) of a(x) b(-x).
     static void level1_run(const u32* F1, const u32* F2, const u32* FP, u32* const* out, std::size_t p0, std::size_t pairs,
                            const PairTables& t) {
-        const V p = L::broadcast(kP), half = L::broadcast(t.plain().half);
-        for (std::size_t q = 0; q < pairs; q += W) {
-            Set ca, cb, da, db, r;
-            load(F1 + 16 * q, 16, ca), load(F1 + 16 * q + 8, 16, cb);
-            load(F2 + 16 * q, 16, da), load(F2 + 16 * q + 8, 16, db);
-            const V s = L::load(t.s.data() + p0 + q), ns = L::sub(p, s), c = L::load(t.crt.data() + p0 + q);
-            V A[4], B[4];
-            graeffe(ca, s, A), graeffe(cb, ns, B), crt(A, B, half, c, r), store(out[0] + 8 * q, 8, r);
-            graeffe(da, s, A), graeffe(db, ns, B), crt(A, B, half, c, r), store(out[1] + 8 * q, 8, r);
-            even_product(ca, da, s, A), even_product(cb, db, ns, B), crt(A, B, half, c, r), store(out[2] + 8 * q, 8, r);
-            if (!FP) continue;
-            Set pa, pb;
-            load(FP + 16 * q, 16, pa), load(FP + 16 * q + 8, 16, pb);
-            odd_product(pa, ca, s, A), odd_product(pb, cb, ns, B), crt(A, B, half, c, r), store(out[3] + 8 * q, 8, r);
-            odd_product(pa, da, s, A), odd_product(pb, db, ns, B), crt(A, B, half, c, r), store(out[4] + 8 * q, 8, r);
+        const Crt k = t.plain();
+        const Rows r(t, k, p0);
+        const auto run = [&]<bool kNumerator> [[gnu::always_inline]] () {
+            constexpr int kOutputs = kNumerator ? 5 : 3;
+            const V half = L::broadcast(k.half);
+            for (std::size_t q = 0; q < pairs; q += W) {
+                V w[2], wq[2], R[2][5][4];
+                weights(r.w + q, r.wq + q, w, wq);
+#pragma GCC unroll 2
+                for (int e = 0; e < 2; ++e) {
+                    const std::size_t at = 16 * q + 8 * e;
+                    const u32* const fp = kNumerator ? FP + at : nullptr;
+                    if constexpr (kInlineLeaves) level1_leaf<kNumerator>(F1 + at, F2 + at, fp, w[e], wq[e], R[e]);
+                    else level1_out_of_line<kNumerator>(F1 + at, F2 + at, fp, w[e], wq[e], R[e]);
+                }
+                const V c = L::load(r.c + q);
+#pragma GCC unroll 5
+                for (int i = 0; i < kOutputs; ++i) {
+                    Set o;
+                    crt(R[0][i], R[1][i], half, c, o);
+                    store(out[i] + 8 * q, 8, o);
+                }
+            }
+        };
+        if (FP) run.template operator()<true>();
+        else run.template operator()<false>();
+    }
+    // One leaf of each pair (modulus z^8 - t): G(q1), G(q2), E(q1, q2) and (kNumerator) O(p1, q1),
+    // O(p1, q2) from the leaves at F1, F2, FP (stride 16), canonical. Out of line on vector lanes, as
+    // lc-opt's FirstLevelProducts::leaves (issue #149 round 3).
+    template <bool kNumerator>
+    [[gnu::always_inline]] static void level1_leaf(const u32* F1, const u32* F2, const u32* FP, V t, V tq, V (&R)[5][4]) {
+        Set c1, c2, t1, t2;
+        load(F1, 16, c1), load(F2, 16, c2);
+        scaled(c1, t, tq, kNumerator ? 2 : 4, t1);
+        scaled(c2, t, tq, 1, t2);
+        graeffe_wide(c1, t1, R[0]);
+        graeffe_wide(c2, t2, R[1]);
+        even_wide(c1, c2, t2, R[2]);
+        if constexpr (kNumerator) {
+            Set a;
+            load(FP, 16, a);
+            odd_wide(a, c1, t1, R[3]);
+            odd_wide(a, c2, t2, R[4]);
         }
+    }
+    template <bool kNumerator>
+    [[gnu::noinline]] static void level1_out_of_line(const u32* F1, const u32* F2, const u32* FP, V t, V tq, V (&R)[5][4]) {
+        level1_leaf<kNumerator>(F1, F2, FP, t, tq, R);
     }
 
     // out = sum over K terms of a(z^2) c(-z) mod (z^8 - t), times 2^-32, canonical, for a of 4
     // coefficients (in u = z^2): coefficient k is (-1)^k (a(z^2) c(z))_k, a sum of 4 products (t a_i
     // where 2i > k) per term.
     template <int K>
-    [[gnu::always_inline]] static void spread_product(const V (&a)[K][4], const Set* const (&c)[K], V tR, Set& out) {
+    [[gnu::always_inline]] static void spread_product(const V (&a)[K][4], const Set* const (&c)[K], V t, V tq, Set& out) {
         V ta[K][4];
 #pragma GCC unroll 2
         for (int e = 0; e < K; ++e) {
             ta[e][0] = a[e][0];
 #pragma GCC unroll 3
-            for (int i = 1; i < 4; ++i) ta[e][i] = mont(a[e][i], tR);
+            for (int i = 1; i < 4; ++i) ta[e][i] = wmul(a[e][i], t, tq);
         }
         {
             const auto sums = [](const V (&x)[K][4], const V (&tx)[K][4], const Set* const (&y)[K], U (&sum)[8]) {
@@ -567,31 +676,39 @@ struct Pairs {
     template <int K>
     static void product_run(const u32* const (&FP)[K], const u32* const (&FQ)[K], u32* R, std::size_t p0, std::size_t pairs,
                             const PairTables& t) {
-        const V p = L::broadcast(kP);
+        const Rows r(t, PairTables::twice(), p0);
         for (std::size_t q = 0; q < pairs; q += W) {
-            Set ca[K], cb[K], out;
-            V a[K][4], b[K][4];
-            const V s = L::load(t.s.data() + p0 + q);
+            V w[2], wq[2], a[2][K][4];
+            weights(r.w + q, r.wq + q, w, wq);
 #pragma GCC unroll 2
             for (int e = 0; e < K; ++e) {
                 Set x;
                 load(FP[e] + 8 * q, 8, x);
-                load(FQ[e] + 16 * q, 16, ca[e]), load(FQ[e] + 16 * q + 8, 16, cb[e]);
 #pragma GCC unroll 4
                 for (int k = 0; k < 4; ++k) {
-                    const V hi = mont(x[k + 4], s);
-                    a[e][k] = M::add(x[k], hi), b[e][k] = M::sub(x[k], hi);
+                    const V hi = wmul(x[k + 4], w[0], wq[0]);
+                    a[0][e][k] = M::add(x[k], hi), a[1][e][k] = M::sub(x[k], hi);
                 }
             }
-            const Set* pa[K];
-            const Set* pb[K];
 #pragma GCC unroll 2
-            for (int e = 0; e < K; ++e) pa[e] = &ca[e], pb[e] = &cb[e];
-            spread_product<K>(a, pa, s, out);
-            store(R + 16 * q, 16, out);
-            spread_product<K>(b, pb, L::sub(p, s), out);
-            store(R + 16 * q + 8, 16, out);
+            for (int side = 0; side < 2; ++side) {
+                const u32* fq[K];
+#pragma GCC unroll 2
+                for (int e = 0; e < K; ++e) fq[e] = FQ[e] + 16 * q + 8 * side;
+                product_side<K>(a[side], fq, w[side], wq[side], R + 16 * q + 8 * side);
+            }
         }
+    }
+    // One leaf of each pair: R's from a (P^'s, per term) and Q's leaves at fq (stride 16), to r.
+    // Inline: out of line 84 against 77 ns per 8 pairs (Zen 3, issue #149 round 3).
+    template <int K>
+    [[gnu::always_inline]] static void product_side(const V (&a)[K][4], const u32* const (&fq)[K], V t, V tq, u32* r) {
+        Set c[K], out;
+        const Set* pc[K];
+#pragma GCC unroll 2
+        for (int e = 0; e < K; ++e) load(fq[e], 16, c[e]), pc[e] = &c[e];
+        spread_product<K>(a, pc, t, tq, out);
+        store(r, 16, out);
     }
 };
 
@@ -672,9 +789,10 @@ inline void add_strided(u32* out, std::size_t count, const u32* b, std::size_t l
     }
 }
 
-// out[i] = f[count - 1 - i] for i < count (lanes reversed by a permute).
-inline void reverse_words(const u32* f, std::size_t count, u32* out) {
+// out[i] = f[count - 1 - i] times scale for i < count (lanes reversed by a permute; canonical).
+inline void reverse_words(const u32* f, std::size_t count, u32* out, u32 scale = 1) {
     using S = Stride2::S;
+    using M = Stride2::M;
     constexpr std::size_t W = Stride2::W;
     static const S::Index reverse = [] {
         std::array<int, W> lanes{};
@@ -682,8 +800,24 @@ inline void reverse_words(const u32* f, std::size_t count, u32* out) {
         return S::index(lanes);
     }();
     std::size_t i = 0;
-    for (; i + W <= count; i += W) S::store(out + i, S::permute(S::load(f + count - W - i), reverse));
-    for (; i < count; ++i) out[i] = f[count - 1 - i];
+    if (scale == 1) {
+        for (; i + W <= count; i += W) S::store(out + i, S::permute(S::load(f + count - W - i), reverse));
+        for (; i < count; ++i) out[i] = f[count - 1 - i];
+        return;
+    }
+    const S::V w = S::broadcast(scale), q = S::broadcast(shoup_quotient(scale));
+    for (; i + W <= count; i += W)
+        S::store(out + i, M::template reduce<kP>(M::shoup(S::permute(S::load(f + count - W - i), reverse), w, q)));
+    for (; i < count; ++i) out[i] = mul(f[count - 1 - i], scale);
+}
+
+// out[i] = x[i] + y[i] mod P for i < n, canonical (spans of any alignment).
+inline void add_words_to(const u32* x, const u32* y, u32* out, std::size_t n) {
+    using S = Stride2::S;
+    using M = Stride2::M;
+    std::size_t i = 0;
+    for (; i + Stride2::W <= n; i += Stride2::W) S::store(out + i, M::add(S::load(x + i), S::load(y + i)));
+    for (; i < n; ++i) out[i] = x[i] + y[i] >= kP ? x[i] + y[i] - kP : x[i] + y[i];
 }
 
 // p[0, n) = 0 by vector stores (fill_n of a few words became rep stos, slow on Intel: below).
@@ -839,16 +973,14 @@ inline void column_down(const ntt::Transform& t, std::span<const ntt::Term> term
     t.inverse_product(terms, work, Out(out, N));
     out[N] = out[0], out[0] = 0;
     if (!c) return;
-    u32* __restrict o = out;
-    const u32* __restrict d = c;
-    if (negate) {
-        for (std::size_t y = 0; y <= N / 2; ++y) o[y] = sub(o[y], twice(d[y]));
-        return;
+    using S = Stride2::S;
+    using M = Stride2::M;
+    std::size_t y = 0;
+    for (; y + Stride2::W <= N / 2 + 1; y += Stride2::W) {
+        const S::V x = S::load(out + y), d = Stride2::twice(S::load(c + y));
+        S::store(out + y, negate ? M::sub(x, d) : M::add(x, d));
     }
-    for (std::size_t y = 0; y <= N / 2; ++y) {
-        const u32 x = o[y] + twice(d[y]);
-        o[y] = x >= kP ? x - kP : x;
-    }
+    for (; y <= N / 2; ++y) out[y] = negate ? sub(out[y], twice(c[y])) : (out[y] + twice(c[y])) % kP;
 }
 
 // The column levels' arrays, carved from an Arena: per level (L = 8, 4) the columns c_k, their leaf
@@ -1100,35 +1232,38 @@ inline std::size_t second_level(u32* q, u32* p, std::size_t m, std::size_t e, u3
 // ---- Doubling (issue #149 round 2, lc-opt's Doubling) -----------------------------------------
 // A generic level s > first with L = m / 2^s >= 16 gets its leaf forms at 4m from the previous
 // level's V (and W) at 2m without their y levels: that level's rows of 2L words are the blocks of
-// ntt::Transform's doubling ops. Its hook writes V (W) into the lower half of the next level's
-// array times 8 / (2L) (the blocks' factor 2L / 8 undone: Crt factor 2^32 8 / (2L)). From m =
-// kDoublingMin on: at m = 128 doubling lost 1.5-5% (Zen 3), 2-3% (Neoverse V2), 4-7% (Zen 5), at
-// 256 0-2%; from 512 it wins (notes/149-r2.md).
+// ntt::Transform's doubling ops, and its hook writes V (W) into the lower half of the next level's
+// array by Crt::twice() (issue #149 round 3, lc-opt's; round 2 scaled the Crt by 8 / (2L), which
+// made the leaf forms exact at 8 Montgomery products per leaf and a table per level). So a doubled
+// level's leaf forms are c times the true ones (doubled_factor); the last doubled level's hook
+// undoes c^2 (scaled_crt), and compose's up pass, whose products carry the c's, starts from f
+// divided by their product. From m = kDoublingMin on: at m = 128 doubling lost 1.5-5% (Zen 3),
+// 2-3% (Neoverse V2), 4-7% (Zen 5), at 256 0-2%; from 512 it wins (notes/149-r2.md).
 inline constexpr std::size_t kDoublingMin = 512;
 inline bool doubled(int s, int first, int generic, std::size_t m) {
     return m >= kDoublingMin && s > first && s >= 3 && s < generic && (m >> s) >= 16;
 }
 
-// The Crt of a level whose V (W) the next level doubles: blocks of L words.
-inline Crt doubling_crt(const PairTables& t, std::size_t pairs, std::size_t L, u32* table) {
-    return scaled_crt(t, pairs, mul(power(u32(L / 8), kP - 2), kR), table);
-}
+// The factor of the next level's leaf forms, doubled from a level with L columns whose leaf forms
+// carry c, by Crt::twice(): V's leaves 2^-31 c^2, truncate_blocks' blocks of L words L / 8.
+inline u32 doubled_factor(u32 c, std::size_t L) { return mul(mul(mul(c, c), power(kHalf, 31)), u32(L / 8)); }
 
-// F (4m words): F[0, 2m) holds the previous level's V (or W) at 2m times 8 / (2L) -> the leaf form
-// at 4m of Q_s (or P_s): x below L at stride 2L, Y = 2m / (2L) rows. The lower half (mod y^Y - 1:
-// V's rows cut to x < L) by truncate_blocks; the upper half (mod y^Y + 1) from the rows, which
-// join_blocks gives, by forward_upper_hooked; for a denominator Q, row Y wraps onto the true row 0
-// = 1 with the opposite sign there, so row 0 becomes 2 - row 0. hook on every leaf.
+// F (4m words): F[0, 2m) holds the previous level's V (or W) at 2m times 8 / (2L) c -> the leaf
+// form at 4m of Q_s (or P_s) times c: x below L at stride 2L, Y = 2m / (2L) rows. The lower half
+// (mod y^Y - 1: V's rows cut to x < L) by truncate_blocks; the upper half (mod y^Y + 1) from the
+// rows, which join_blocks gives, by forward_upper_hooked; for a denominator Q, row Y wraps onto the
+// true row 0 = c with the opposite sign there, so row 0 becomes 2c - row 0: fix = 2c (0 for a
+// numerator). hook on every leaf.
 template <class Hook>
-[[gnu::noinline]] void double_level(u32* F, std::size_t m, std::size_t L, bool denominator, Hook hook) {
+[[gnu::noinline]] void double_level(u32* F, std::size_t m, std::size_t L, u32 fix, Hook hook) {
     using S = Stride2::S;
     const int T = std::countr_zero(m);
     u32* const upper = F + 2 * m;
     transform(T + 1).truncate_blocks(F, 2 * L, upper, hook);
     transform(T + 1).join_blocks(upper, 2 * L, 1);
-    if (denominator) {
+    if (fix) {
         for (std::size_t i = 0; i < L; i += Stride2::W) S::store(upper + i, Stride2::negate(S::load(upper + i)));
-        upper[0] = upper[0] + 2 >= kP ? upper[0] + 2 - kP : upper[0] + 2;
+        upper[0] = upper[0] + fix >= kP ? upper[0] + fix - kP : upper[0] + fix;
     }
     transform(T + 2).forward_upper_hooked(upper, hook, L);
 }
@@ -1163,15 +1298,23 @@ inline void compose_levels(Span f, Span g, Out h) {
     }
     // Levels first .. generic - 1: Q_s's leaf form at 4m in levels[s], from q's rows or by doubling;
     // its Graeffe to the next level's array (doubled), or to G and by its inverse to q.
+    // c: level s's leaf form is c times Q_s's (doubled_factor); scale: the product of the c's, which
+    // the up pass's products by them carry: f is reversed times 1 / scale.
+    u32 c = 1, scale = 1;
     for (int s = first; s < generic; ++s) {
         const std::size_t L = m >> s;
         u32* const F = levels[std::size_t(s)];
         const bool next = doubled(s + 1, first, generic, m);
-        const GraeffeHook graeffe{next ? levels[std::size_t(s + 1)] : G, tables,
-                                  next ? doubling_crt(tables, pairs, L, work) : tables.plain()};  // work: free until the columns
-        if (doubled(s, first, generic, m)) double_level(F, m, L, true, graeffe);
+        const Crt k = next     ? PairTables::twice()
+                      : c == 1 ? tables.plain()
+                               : scaled_crt(tables, pairs, power(mul(c, c), kP - 2), work);  // work: free until the columns
+        const GraeffeHook graeffe{next ? levels[std::size_t(s + 1)] : G, tables, k};
+        if (doubled(s, first, generic, m)) double_level(F, m, L, twice(c), graeffe);
         else t4.forward_hooked(Span(q, size), F, graeffe, L);
-        if (next) continue;
+        if (next) {
+            c = doubled_factor(c, L), scale = mul(scale, c);
+            continue;
+        }
         t2.inverse_hooked(kNoHook, G, Out(q, 2 * m), {}, L / 2);
         next_level(q, m, L, s + 1 < generic);
         size = 2 * m + L / 2;
@@ -1190,7 +1333,7 @@ inline void compose_levels(Span f, Span g, Out h) {
     // r0 = f reversed and r1 = P^ c1 mod (y^m - 1), rows m/2 .. m - 1.
     u32* const A = q;  // q is free from here
     zero_words(A, m - f.size());
-    reverse_words(f.data(), f.size(), A + m - f.size());
+    reverse_words(f.data(), f.size(), A + m - f.size(), scale == 1 ? 1 : power(scale, kP - 2));
     u32 *const r0 = A + m / 2, *const r1 = G;
     t1.cyclic_product(Span(A, m), FP, work, Out(r1, m / 2), {.offset = m / 2});
     if (columns) {
@@ -1305,10 +1448,9 @@ inline void projection_columns(const u32* p, const u32* q, std::size_t m, Column
     // Level T - 1: a = p1 + p0 c1.
     const std::size_t n = a.size();
     ntt::multiply(Span(pc.p2[0], m / 2), Span(cols.c2, m / 2 + 1), Out(prod, n));
-    for (std::size_t k = 0; k < n; ++k) {
-        const u32 x = (k < m / 2 ? pc.p2[1][k] : 0) + prod[k];
-        a[k] = x >= kP ? x - kP : x;
-    }
+    const std::size_t low = std::min(n, m / 2);
+    add_words_to(pc.p2[1], prod, a.data(), low);
+    std::copy(prod + low, prod + n, a.data() + low);
 }
 
 inline void projection_levels(Span g, Out a) {
@@ -1320,10 +1462,11 @@ inline void projection_levels(Span g, Out a) {
     const PairTables& tables = pair_tables(pairs);
     const std::size_t level1 = 3 * footprint(m) + 5 * footprint(m / 2) + 5 * footprint(m / 4);
     const std::size_t words = 2 * footprint(4 * m) + 2 * footprint(2 * m) + footprint(3 * m) + footprint(2 * m) + level1 +
-                              (columns ? Columns::words(m) + ProjectionColumns::words(m) : 0) + 16;
+                              footprint(pairs) + (columns ? Columns::words(m) + ProjectionColumns::words(m) : 0) + 16;
     Arena arena(thread_words(words), words);
     u32 *const FQ = arena.take(4 * m), *const FP = arena.take(4 * m), *const GV = arena.take(2 * m);
     u32 *const GW = arena.take(2 * m), *const q = arena.take(3 * m), *const p = arena.take(2 * m);
+    u32* const table = arena.take(pairs);  // the last doubled level's Crt
 
     // Level 0, one-dimensional: Q_1 as compose's; P_0 = x^e, e = m - n, so P_1 (stride m, rows 0,
     // 1, x < m/2) = [e odd] u^((e-1)/2) - y W, W[i] = (-1)^j g_j for j = 2i + 1 - e.
@@ -1348,19 +1491,24 @@ inline void projection_levels(Span g, Out a) {
     // Levels first .. generic - 1: P_s's and Q_s's leaf forms at 4m in FP and FQ, from p's and q's
     // rows or by doubling; V and W into FQ and FP below the leaves read (the next level doubles
     // them), or into GV and GW and by their inverses to q and p. GV: the Crt table while it is free.
+    // c: level s's leaf forms are c times the true ones (doubled_factor).
+    u32 c = 1;
     for (int s = first; s < generic; ++s) {
         const std::size_t L = m >> s;
         const bool next = doubled(s + 1, first, generic, m);
-        const ProjectionHook projection{FP, next ? FQ : GV, next ? FP : GW, tables,
-                                        next ? doubling_crt(tables, pairs, L, GV) : tables.plain()};
+        const Crt k = next ? PairTables::twice() : c == 1 ? tables.plain() : scaled_crt(tables, pairs, power(mul(c, c), kP - 2), table);
+        const ProjectionHook projection{FP, next ? FQ : GV, next ? FP : GW, tables, k};
         if (doubled(s, first, generic, m)) {
-            double_level(FP, m, L, false, kNoHook);
-            double_level(FQ, m, L, true, projection);
+            double_level(FP, m, L, 0, kNoHook);
+            double_level(FQ, m, L, twice(c), projection);
         } else {
             t4.forward_hooked(Span(p, 2 * m), FP, kNoHook, L);
             t4.forward_hooked(Span(q, size), FQ, projection, L);
         }
-        if (next) continue;
+        if (next) {
+            c = doubled_factor(c, L);
+            continue;
+        }
         t2.inverse_hooked(kNoHook, GW, Out(p, 2 * m), {}, L / 2);
         if (s + 1 < generic) zero_columns(p, 2 * m, L / 2);
         t2.inverse_hooked(kNoHook, GV, Out(q, 2 * m), {}, L / 2);
