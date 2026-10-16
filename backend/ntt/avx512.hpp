@@ -1,14 +1,16 @@
 // Variant avx512: the intrinsics variant on zmm (intrinsics.hpp, Ntt<S>) with generated asm in
 // place of some kernels, scheduled for the target's machine by gen_avx512_kernels.py:
 // avx512_kernels.hpp for Emerald Rapids (avx512 target), zen5_kernels.hpp for Zen 5 (zen5 target,
-// -march=znver5). On both: the forward radix-4 groups k > 0 of 4 columns and more, in place, and
-// the bottom stage of products (forward butterflies, leaf products, inverse butterflies; also
-// squares and Transform's cyclic products). On Zen 5 also the identity and inverse groups, forward
-// groups of two columns and the transforms' bottom level; and (issue #152 round 2) the scaled
-// inverse top groups and first levels from other memory. Same splitting, tables, lazy ranges and
-// outputs as every variant. The other kernels ran as fast in asm as in intrinsics (or, on Zen 5,
-// slowed products) and stay intrinsics. Design and measurements: notes.md (avx512),
-// notes/150-r1.md, notes/152-r1.md, notes/152-r2.md.
+// -march=znver5). On both: the forward radix-4 groups k > 0 of 4 columns and more, in place, the
+// bottom stage of products (forward butterflies, leaf products, inverse butterflies; also squares
+// and Transform's cyclic products) and the transforms' bottom level (statements of 2 and 4 pairs;
+// on Emerald Rapids the inverse of 4 only: issue #176). On Zen 5 also the identity and inverse
+// groups and forward groups of two columns; and (issue #152 round 2) the scaled inverse top groups
+// and first levels from other memory. At 2^6 and 2^7 the bottoms of all subtrees run in one call
+// (kJoinBottoms), so these kernels take them. Same splitting, tables, lazy ranges and outputs as
+// every variant. The other kernels ran as fast in asm as in intrinsics (or, on Zen 5, slowed
+// products) and stay intrinsics. Design and measurements: notes.md (avx512), notes/150-r1.md,
+// notes/152-r1.md, notes/152-r2.md, notes/176-r1.md.
 #pragma once
 
 #include "backend/ntt/intrinsics.hpp"
@@ -45,6 +47,9 @@ struct Narrow<avx512::Zmm> {
 template <>
 struct Generated<avx512::Zmm> {
     static constexpr bool kOn = true;
+    // At 2^6 and 2^7 the top levels run the bottoms of all their single-group subtrees in one call
+    // (Ntt::kJoin), so the pair kernels below and WideBottom's take them (issue #176).
+    static constexpr bool kJoinBottoms = true;
 #if defined(__znver4__) || defined(__znver5__)
     // Single groups run through the group levels' functions, so each asm loop is inlined once in
     // the hot code, not twice: a product at 2^14 ran 6.8K distinct instructions per call (5.7K now)
@@ -142,9 +147,13 @@ struct Generated<avx512::Zmm> {
         return true;
     }
 
+#endif
+
     // The bottom level of groups [first, first + count) (both even): 4 pairs of groups per
     // statement from a multiple of 8, then 2 from a multiple of 4; other pairs by the intrinsics
     // (one pair per statement ran as fast). Forward: in < 4P, canonical leaves out; inverse: < 2P.
+    // On Emerald Rapids (issue #176) the inverse has statements of 4 pairs only (2 pairs ran as fast
+    // as the intrinsics on L1 data): other runs go to WideBottom whole.
     static void bottom_forward(u32* f, std::size_t count, std::size_t first, const u32* r) {
         namespace K = avx512::kernels;
         const std::size_t end = first + count;
@@ -157,13 +166,17 @@ struct Generated<avx512::Zmm> {
     static void bottom_inverse(u32* f, std::size_t count, std::size_t first, const u32* ir) {
         namespace K = avx512::kernels;
         const std::size_t end = first + count;
+#if defined(__znver4__) || defined(__znver5__)
         for (std::size_t k = first; k < end;) {
             if (k % 8 == 0 && k + 8 <= end) K::bottom_inverse4(f, ir + slot(k), ir + slot(2 * k)), k += 8, f += 256;
             else if (k % 4 == 0 && k + 4 <= end) K::bottom_inverse2(f, ir + slot(k), ir + slot(2 * k)), k += 4, f += 128;
             else WideBottom<avx512::Zmm>::inverse(f, 2, k, ir), k += 2, f += 64;
         }
-    }
+#else
+        if (first % 8 != 0 || count % 8 != 0) return WideBottom<avx512::Zmm>::inverse(f, count, first, ir);
+        for (std::size_t k = first; k < end; k += 8, f += 256) K::bottom_inverse4(f, ir + slot(k), ir + slot(2 * k));
 #endif
+    }
 
     // The bottom stage of a product, groups [first, first + count) (both even), as WideBottom's
     // multiply: pair j's leaf products and inverse butterflies interleaved with pair j + 1's

@@ -1134,16 +1134,40 @@ ZEN5_LOOPS += [
 ]
 
 
-def zen5_bottoms():
+# The bottom level in statements of 2 and 4 pairs, knobs per target from timing families on L1 data
+# (issue #176, notes/176-r1.md), time against WideBottom<Avx512>. Zen 5: 4 pairs on its model with
+# a window of 128 (forward 0.75, inverse 0.81; round 152's no window 0.80, 0.86), forward 2 pairs
+# on the Emerald Rapids model (0.86; 0.89), inverse 2 pairs as round 152's (0.91: the Emerald
+# Rapids model's 0.89 made inverse_values/9 10% slower, its loads close behind the join's stores).
+# Emerald Rapids: forward 2 pairs on its model, window 128 (0.86-0.87), 4 pairs on the Zen 5 model,
+# window 128 (0.85-0.88: its own scheduler deadlocks there); inverse 4 pairs on the Zen 5 model,
+# window 64 (0.95-0.97), 2 pairs 1.00 and 1 pair 1.08-1.10 (not emitted: the intrinsics run).
+PAIR_KNOBS = {
+    'zen5': {('bottom_forward', 4): Knobs(window=128), ('bottom_inverse', 4): Knobs(window=128),
+             ('bottom_forward', 2): Knobs(window=128, model='avx512'), ('bottom_inverse', 2): Knobs()},
+    'avx512': {('bottom_forward', 4): Knobs(window=128, model='zen5'), ('bottom_forward', 2): Knobs(window=128),
+               ('bottom_inverse', 4): Knobs(window=64, model='zen5')},
+}
+
+
+def pair_bottoms(target):
     named = {b.name: b for b in BOTTOMS}
     out = []
     for name, build in (('bottom_forward', bottom_forward), ('bottom_inverse', bottom_inverse)):
         base = named[name]
         for pairs in (2, 4):
+            knobs = PAIR_KNOBS[target].get((name, pairs))
+            if knobs is None:
+                continue
             doc = (f'{base.doc}\n{name}{pairs}(): {pairs} such pairs, k a multiple of {2 * pairs}: pair p (groups k + 2p, k + 2p + 1)\n'
                    f'at a + 64 p words.')
-            out.append(replace(base, name=f'{name}{pairs}', doc=doc, knobs=Knobs(), twiddles='bcst', ostore='perm',
+            out.append(replace(base, name=f'{name}{pairs}', doc=doc, knobs=knobs, twiddles='bcst', ostore='perm',
                                build=lambda g, build=build, pairs=pairs: build(g, pairs), in_place=True))
+    return out
+
+
+def zen5_bottoms():
+    out = pair_bottoms('zen5')
     for name, inverse, window in (('forward_groups4', False, 128),):
         doc = (f'{"Inverse" if inverse else "Forward"} radix-4 groups k .. k + 3 (k a multiple of 4) on quarters of 32 words, group\n'
                f'k + i at a + 128 i words, in place; {"in and out < 2P" if inverse else "in < 4P, out < 4P"}. x = t + slot(k), y = t + slot(2k)\n'
@@ -1268,7 +1292,7 @@ def generate(out):
 
 OUTPUTS = [
     Output('avx512', OUT, 'avx512_kernels', [l for l in LOOPS if l.name in EMITTED_LOOPS], PREFETCHED,
-           [b for b in BOTTOMS if b.name in EMITTED_BOTTOMS]),
+           pair_bottoms('avx512') + [b for b in BOTTOMS if b.name in EMITTED_BOTTOMS]),
     Output('zen5', HERE / 'zen5_kernels.hpp', 'zen5_kernels', ZEN5_LOOPS, (), ZEN5_BOTTOMS),
 ]
 

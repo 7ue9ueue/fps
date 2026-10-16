@@ -2112,23 +2112,37 @@ struct Ntt : Butterflies<S> {
         inverse_into(f, out, count, lg, ir, s, NoTile{});
     }
 
+    // inverse_into at 2^6 and 2^7 with kJoin (the subtrees' bottoms in one call), in a function of
+    // its own: with the joins inlined in inverse_into, its code for the other lengths changed and the
+    // zmm variant's inverse of the values form at 2^9 ran 11% slower on Zen 5 (notes/176-r1.md).
     template <class Tile>
-    static void inverse_into(u32* f, u32* out, std::size_t count, int lg, const u32* ir, u32 s, Tile tile) {
+    [[gnu::noinline]] static void inverse_into_joined(u32* f, u32* out, std::size_t count, int lg, const u32* ir, u32 s,
+                                                      Tile tile) {
         const std::size_t len = std::size_t(1) << lg, nv = len / 8;
+        tile(f, nv), bottom_inverse(f, nv / 4, 0, ir);
         if (!has_radix2(lg)) {
             const u32* fold = fold_scale(nv / 4, lg, false);
-            if (kJoin && nv == 16) tile(f, 16), bottom_inverse(f, 4, 0, ir);
-            else for (std::size_t t = 0; t < 4; ++t) inverse_tiles(f + t * len / 4, nv / 4, t, ir, fold, tile);
             if (out == f) return inverse_radix4(f, len / 4, ir, fold ? 0 : s);
             return inverse_radix4_out(f, len / 4, out, count, ir, fold ? 0 : s);
         }
         const u32* fold = fold_scale(nv / 2, lg, false);
-        if (kJoin && nv == 8) {
-            tile(f, 8), bottom_inverse(f, 2, 0, ir);
-        } else {
-            inverse_tiles(f, nv / 2, 0, ir, fold, tile);
-            inverse_tiles(f + len / 2, nv / 2, 1, ir, fold, tile);
+        if (out == f) return inverse_radix2(f, len / 2, fold ? 0 : s);
+        inverse_radix2_out(f, len / 2, out, count, fold ? 0 : s);
+    }
+    template <class Tile>
+    static void inverse_into(u32* f, u32* out, std::size_t count, int lg, const u32* ir, u32 s, Tile tile) {
+        if constexpr (kJoin)
+            if (lg <= 7) return inverse_into_joined(f, out, count, lg, ir, s, tile);
+        const std::size_t len = std::size_t(1) << lg, nv = len / 8;
+        if (!has_radix2(lg)) {
+            const u32* fold = fold_scale(nv / 4, lg, false);
+            for (std::size_t t = 0; t < 4; ++t) inverse_tiles(f + t * len / 4, nv / 4, t, ir, fold, tile);
+            if (out == f) return inverse_radix4(f, len / 4, ir, fold ? 0 : s);
+            return inverse_radix4_out(f, len / 4, out, count, ir, fold ? 0 : s);
         }
+        const u32* fold = fold_scale(nv / 2, lg, false);
+        inverse_tiles(f, nv / 2, 0, ir, fold, tile);
+        inverse_tiles(f + len / 2, nv / 2, 1, ir, fold, tile);
         if (out == f) return inverse_radix2(f, len / 2, fold ? 0 : s);
         inverse_radix2_out(f, len / 2, out, count, fold ? 0 : s);
     }
