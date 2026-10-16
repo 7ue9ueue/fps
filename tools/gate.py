@@ -200,7 +200,8 @@ def run_tests(machine: str, name: str, new_tar: bytes, base_tar: bytes | None, t
         stop = (f'sid=$(cat {run}/pid 2>/dev/null) && [ ! -e {run}/exit ] && '
                 f'{{ pkill -TERM -s $sid; sleep 5; pkill -KILL -s $sid; }}; ')
         with contextlib.suppress(subprocess.TimeoutExpired):
-            ssh(machine, stop + f'rm -rf {path} {base_path} {run}', timeout=120)
+            ssh(machine, stop + f'rm -rf {path} {base_path} {run} {path}.lock' + (f' {base_path}.lock' if base_path else ''),
+                timeout=120)
 
 
 def run_detached(machine: str, run: str, command: str) -> subprocess.CompletedProcess:
