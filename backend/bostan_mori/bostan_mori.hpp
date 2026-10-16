@@ -477,6 +477,8 @@ template <int NP, int NQ>
     return q[0] == 1 ? p[0] : mul(p[0], inverse(q[0]));
 }
 
+// [x^k] p / q for p, q of 1 to kTinyMax words (zero top words allowed), q[0] != 0, any k: the
+// shape (nq - 1, nq) if p is shorter than q, else (np, np).
 inline u32 tiny(std::span<const u32> p, std::span<const u32> q, u64 k) {
     u32 a[kTinyMax] = {}, b[kTinyMax] = {};
     for (std::size_t i = 0; i < p.size(); ++i) a[i] = p[i];
