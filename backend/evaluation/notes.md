@@ -81,46 +81,49 @@ trees (`backend/product_tree`, with a `Keep` hook added) and `ntt::Transform` (w
 
 ## Measurements
 
-Bench (`bench.cpp`), n = m = 2^lg, GCC 15.2, medians of 7 rounds, ns per point, commit 9323462
-(issue #104 round 1; the product_tree reorder after it changes no evaluation code path's work):
+Bench (`bench.cpp`), n = m = 2^lg, GCC 15.2, medians of 11 paired rounds against main e88390e
+(in brackets), ns per point, issue #136 round 1 (notes/136-r1.md):
 
-| ns per point | lc-bench (Zen 3, avx2) | lc-intel (Emerald Rapids, avx512) | lc-zen5 (Zen 5, zen5) | lc-arm (Neoverse V2, arm) |
+| ns per point (new/base) | lc-bench (Zen 3, avx2) | lc-intel (Emerald Rapids, avx512) | lc-zen5 (Zen 5, zen5) | lc-arm (Neoverse V2, arm) |
 |---|---:|---:|---:|---:|
-| evaluate/6 | 14.6 | 10.3 | 9.2 | 15.4 |
-| interpolate/6 | 244.2 | 204.9 | 153.4 | 329.4 |
-| newton/6 | 121.6 | 92.5 | 97.1 | 142.1 |
-| evaluate/8 | 54.4 | 27.5 | 16.4 | 58.7 |
-| interpolate/8 | 71.5 | 57.1 | 45.5 | 94.4 |
-| newton/8 | 44.6 | 36.4 | 28.5 | 58.9 |
-| evaluate/10 | 47.9 | 38.0 | 27.3 | 70.7 |
-| interpolate/10 | 71.0 | 56.8 | 42.8 | 104.9 |
-| newton/10 | 43.3 | 35.0 | 25.1 | 64.3 |
-| evaluate/12 | 54.9 | 45.8 | 29.4 | 84.6 |
-| interpolate/12 | 81.7 | 64.4 | 46.3 | 125.5 |
-| newton/12 | 50.0 | 40.2 | 27.1 | 77.9 |
-| evaluate/14 | 65.8 | 54.9 | 34.5 | 103.2 |
-| interpolate/14 | 96.9 | 81.1 | 53.4 | 152.6 |
-| newton/14 | 60.4 | 50.5 | 31.6 | 95.3 |
-| evaluate/16 | 77.9 | 66.8 | 39.9 | 125.8 |
-| interpolate/16 | 114.4 | 97.9 | 60.9 | 185.7 |
-| newton/16 | 71.9 | 61.7 | 36.7 | 116.7 |
-| evaluate/17 | 84.6 | 74.7 | 42.6 | 137.9 |
-| interpolate/17 | 124.3 | 105.8 | 65.6 | 202.8 |
-| newton/17 | 78.4 | 68.9 | 39.3 | 128.0 |
-| evaluate/18 | 95.5 | 86.0 | 50.9 | 150.4 |
-| interpolate/18 | 139.2 | 121.3 | 75.9 | 220.6 |
-| newton/18 | 86.5 | 76.6 | 43.8 | 140.7 |
-| evaluate/20 | 111.5 | 119.1 | 58.9 | 177.7 |
-| interpolate/20 | 162.4 | 166.3 | 86.9 | 260.0 |
-| newton/20 | 102.8 | 101.4 | 52.7 | 168.2 |
+| evaluate/6 | 14.6 (0.999) | 11.2 (0.986) | 9.1 (1.000) |  |
+| interpolate/6 | 93.1 (0.376) | 76.1 (0.343) | 56.7 (0.366) |  |
+| newton/6 | 14.0 (0.116) | 11.4 (0.118) | 8.2 (0.085) |  |
+| evaluate/8 | 43.0 (0.792) | 29.7 (1.006) | 16.4 (1.000) |  |
+| interpolate/8 | 63.5 (0.874) | 54.3 (0.863) | 39.2 (0.864) |  |
+| newton/8 | 39.1 (0.859) | 27.8 (0.692) | 19.6 (0.683) |  |
+| evaluate/10 | 43.5 (0.888) | 37.2 (0.916) | 25.1 (0.904) |  |
+| interpolate/10 | 65.7 (0.904) | 55.8 (0.915) | 38.6 (0.911) |  |
+| newton/10 | 39.2 (0.876) | 33.9 (0.887) | 22.7 (0.906) |  |
+| evaluate/12 | 49.9 (0.906) | 44.8 (0.897) | 27.0 (0.918) |  |
+| interpolate/12 | 75.0 (0.915) | 66.8 (0.940) | 41.6 (0.921) |  |
+| newton/12 | 45.3 (0.898) | 41.4 (0.946) | 24.5 (0.912) |  |
+| evaluate/14 | 60.4 (0.924) | 56.7 (0.948) | 31.0 (0.924) |  |
+| interpolate/14 | 89.7 (0.928) | 83.8 (0.972) | 47.4 (0.925) |  |
+| newton/14 | 55.1 (0.915) | 51.1 (0.934) | 27.9 (0.915) |  |
+| evaluate/16 | 72.4 (0.936) | 68.9 (0.942) | 35.6 (0.933) |  |
+| interpolate/16 | 107.0 (0.941) | 100.1 (0.956) | 54.2 (0.935) |  |
+| newton/16 | 66.4 (0.928) | 63.6 (0.944) | 32.2 (0.925) |  |
+| evaluate/17 | 79.0 (0.942) | 78.2 (0.946) | 38.2 (0.942) |  |
+| interpolate/17 | 116.4 (0.947) | 112.2 (0.968) | 58.0 (0.940) |  |
+| newton/17 | 72.7 (0.935) | 70.4 (0.954) | 34.6 (0.930) |  |
+| evaluate/18 | 90.6 (0.960) | 94.6 (0.980) | 46.2 (0.956) |  |
+| interpolate/18 | 131.0 (0.954) | 133.1 (0.970) | 68.5 (0.956) |  |
+| newton/18 | 81.4 (0.956) | 81.7 (0.950) | 38.4 (0.945) |  |
+| evaluate/20 | 105.6 (0.955) | 130.4 (0.973) | 54.0 (0.958) |  |
+| interpolate/20 | 153.4 (0.956) | 182.0 (0.974) | 79.2 (0.962) |  |
+| newton/20 | 96.3 (0.945) | 113.5 (0.960) | 47.2 (0.949) |  |
 
-At 6 and 8 the direct paths run where the cost model picks them (evaluate/6 and /8 Horner; at
-2^6 the trees' fixed cost, 10-21 us, dominates interpolate and newton). Against lc-opt on
-`lc-bench` in the same run (7 rounds, its Arena reused across calls), new/lc-opt: evaluate 0.18
-(2^10: lc-opt runs Horner there), 0.97 (2^12), 0.99, 1.00, 1.00 (2^17), 1.01, 1.01 (2^20);
-interpolate 1.02-1.03; newton 1.00 (2^10, 2^12), 1.02-1.03 above. Against the frontend's plain
-`points.hpp` (#24's PR #119) at 2^17 on `lc-bench`: evaluate 60.3 -> 11.1 ms, interpolate 87.0
--> 16.3, newton 38.8 -> 10.3.
+At 6 the direct paths run (evaluate Horner; interpolate and the Newton basis in vectors since
+#136, where the trees' fixed cost, 10-21 us, used to set the time); evaluate/8 runs Horner but on
+Zen 3, where the refit cost model picks the tree. Against lc-opt on `lc-bench` in the same run (7
+rounds, its Arena reused across calls, outputs equal from 2^10 to 2^20), fps / lc-opt: evaluate
+0.158 (2^10: lc-opt runs Horner there), 0.886 (2^12), 0.917, 0.938, 0.945 (2^17), 0.965, 0.965
+(2^20); interpolate 0.935 (2^10), 0.931, 0.950, 0.956, 0.960, 0.979, 0.972; newton 0.908, 0.906,
+0.932, 0.944, 0.948, 0.971, 0.967; geomean 0.943 without evaluate/10 (before #136: 0.97-1.03).
+Earlier tables (the move, #104): notes/104-r1.md and this file's history. Against the frontend's
+plain `points.hpp` (#24's PR #119) at 2^17 on `lc-bench`: evaluate 60.3 -> 10.4 ms, interpolate
+87.0 -> 15.3, newton 38.8 -> 9.5.
 
 ## Log
 
