@@ -105,19 +105,20 @@ void test_division(std::size_t big, std::size_t n, std::size_t qn, bool transfor
     std::vector<u32> g(big, 0);
     for (std::size_t j = 0; j < n; ++j) g[big - 1 - j] = f[j];
     const std::size_t len = std::max<std::size_t>(64, std::bit_ceil(big));
-    // The tree's form of q's transform: q mod (x^L - 1) times 2^32.
-    std::vector<u32> qt;
+    // The tree's form of q's transform: q mod (x^L - 1) times 2^32 (64-byte aligned, as the
+    // transforms need).
+    std::vector<u32> buffer(len + 64, 0);
+    u32* const qt = buffer.data() + (64 - reinterpret_cast<std::uintptr_t>(buffer.data()) % 64) % 64 / sizeof(u32);
     if (transform) {
-        qt.assign(len + 16, 0);
         for (std::size_t i = 0; i < qn; ++i) qt[i % len] = add(qt[i % len], q[i]);
         for (std::size_t i = 0; i < len; ++i) qt[i] = mul(qt[i], d::kR);
-        d::transform(len).forward(qt.data());
+        d::transform(len).forward(qt);
     }
     std::vector<u32> out(big, 12345);
     d::workspace_spilled = false;
     {
         d::Workspace work(d::division_words(big));
-        d::root_window(f.data(), n, q.data(), qn, big, out.data(), work.stack, transform ? qt.data() : nullptr, transform ? len : 0);
+        d::root_window(f.data(), n, q.data(), qn, big, out.data(), work.stack, transform ? qt : nullptr, transform ? len : 0);
     }
     const std::string name = "root_window K " + std::to_string(big) + " n " + std::to_string(n) + " qn " + std::to_string(qn) +
                              (transform ? " qt" : "") + " kind " + std::to_string(kind);
