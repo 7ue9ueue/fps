@@ -303,7 +303,7 @@ void middle_into(const std::uint32_t* v, std::size_t n, const std::uint32_t* g, 
     std::uint32_t* above = Pbar + (t ? block(top) : 0);  // the top product's out, nt words
     std::uint32_t* rest = above + (t ? block(nt) : 0);
     if (t) std::fill_n(Pbar, top - t, 0u);
-    ragged::split_transposed(v, L, r, s, t, Abar, Cbar, Pbar + (top - t));
+    ragged::split_transposed(v, L, r, s, t, Abar, Cbar, t ? Pbar + (top - t) : Pbar);  // t = 0: top wraps
     {  // out[i] = (Abar g x^-(m - 1) mod (x^L - 1))[i mod L]
         std::uint32_t* a = placed(rest, Abar, out, out, L + kPadding);
         std::uint32_t* b = a + L + kPadding;
