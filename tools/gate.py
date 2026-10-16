@@ -177,8 +177,13 @@ def run_tests(machine: str, name: str, new_tar: bytes, base_tar: bytes | None, t
                 tarfile.open(fileobj=io.BytesIO(base_tar), mode='r:gz').extractall(base)
                 command += f' --base {base}'
             return run_here(command, tree)
-    share = sum(machine in spec['test'] for spec in TARGETS.values())  # targets testing here share its cores
-    command += f' -j $(( ($(nproc) + {share - 1}) / {share} ))'
+    # the test runs on this machine share its cores: this gate's targets here, or, counted when the
+    # run starts, every live gate run on it if more (gates run side by side: two gates' 6 runs on
+    # lc-amd's 4 cores each took a quarter of them, and neither finished in 80 min on 2026-10-16)
+    share = sum(machine in spec['test'] for spec in TARGETS.values())
+    live = ('$(for d in $HOME/' + ROOT_ON_VM + '/gate-*.run-*; do [ -e "$d/exit" ] || '
+            '! kill -0 "$(cat "$d/pid" 2>/dev/null)" 2>/dev/null || echo; done | wc -l)')
+    command += f' -j $(( s = {live}, s = s > {share} ? s : {share}, ($(nproc) + s - 1) / s ))'
     path, base_path = f'{ROOT_ON_VM}/{slug(name)}', f'{ROOT_ON_VM}/{slug(name + "-base")}' if base_tar else ''
     run = f'{path}.run-{secrets.token_hex(4)}'  # the detached run's pid, out, err and exit; new per call
     try:
