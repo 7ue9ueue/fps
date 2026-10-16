@@ -13,6 +13,7 @@
 #include "backend/ntt/avx2_product_kernels.hpp"
 #include "backend/ntt/common.hpp"
 #include "backend/ntt/intrinsics.hpp"
+#include "backend/simd/select.hpp"
 
 namespace fps::ntt::detail::avx2 {
 
@@ -746,7 +747,7 @@ inline void inverse(u32* words, int lg, const u32* ir) {
 // the values form (intrinsics.hpp). lc-opt's asm leaf product, one leaf per step, ran 1.29x slower
 // than the intrinsics' 4 leaves per step on Zen 3 (notes.md).
 using Leaf = intrinsics::Bottom<simd::Avx2>;
-using Values = intrinsics::Values<simd::Avx2>;
+using Values = intrinsics::ValuesFor<simd::Native>;  // Values<Avx2>, or 16 lanes on AVX-512 (issue #157)
 
 // The values form: the split runs on each run of subtrees after its bottom level, in cache.
 inline void forward_values(u32* words, int lg, const u32* r, const u32* rows) {
