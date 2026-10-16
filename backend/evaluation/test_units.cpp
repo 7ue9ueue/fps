@@ -3,6 +3,7 @@
 // root division (root_window: series::inverse and fused cyclic products) against a schoolbook
 // series division or its defining identity, in exactly division_words() of memory.
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <random>
@@ -153,7 +154,7 @@ int main() {
         for (std::size_t n : {std::size_t(1), big / 3 + 1, big})
             for (bool transform : {false, true}) {
                 const std::size_t qn = n == 1 ? big / 2 + 1 : big + 1;  // a short divisor too
-                test_division(big, n, qn, transform && std::bit_ceil(big) >= 64, int(rng() % 4));
+                test_division(big, n, qn, transform, int(rng() % 4));
             }
     std::printf("%s evaluation units: %d checks, %d failures\n", failures ? "FAIL" : "pass", checks, failures);
     return failures ? 1 : 0;

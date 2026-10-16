@@ -2,10 +2,11 @@
 
 Multipoint evaluation, interpolation and the Newton basis modulo P = 998244353. API:
 `evaluation.hpp` (`evaluate`, `interpolate`, `to_newton_basis`, on spans). The point tree and
-its passes: `tree.hpp` (`PointTree`, `Store`, `to_child`, `root_window`, `series_inverse`).
-Kernels on `backend/simd` structs: `kernels.hpp` (middle products and cross sums in lanes,
-Horner's rule, the per-base inversion, `standard_to_lanes`, transposes). Choices per target:
-`select.hpp`. Tests: `test.cpp`; bench: `bench.cpp`. From lc-opt's
+its passes: `tree.hpp` (`PointTree`, `Store`, `to_child`, `root_window`). Kernels on
+`backend/simd` structs: `kernels.hpp` (middle products and cross sums in lanes, Horner's rule,
+the per-base inversion, the direct paths `interpolate_small` and `newton_small`, transposes).
+Choices per target: `select.hpp`. Tests: `test.cpp`, `test_units.cpp`, `test_small.cpp`; bench:
+`bench.cpp`. From lc-opt's
 `lib/poly/{evaluation,interpolation,newton}.hpp` (issue #104), rewritten on this repo's product
 trees (`backend/product_tree`, with a `Keep` hook added) and `ntt::Transform` (with
 `inverse_upper` added), so every target runs it.
@@ -20,7 +21,8 @@ trees (`backend/product_tree`, with a `Keep` hook added) and `ntt::Transform` (w
   every node above the base keeps its children's transforms at its own length (both children,
   or the right one only for the Newton basis), in rooms of one block found by the split point.
   The top tree's root also keeps its product transform T_L(Q) (one more output of the root's
-  leaf products), which the division reuses when its length is L.
+  leaf products), which the division reuses when its length is L. The top tree's leaves are the
+  lane root's coefficients as 8 rows, by vector transposes (`lanes_to_rows`; strided loads before).
 - Windows (Bostan, Lecerf and Schost's transposed evaluation): with K = max(n, m8) and G =
   rev_K(f), f(a) = [x^(K-1)] G / (1 - a x). Node v of s_v points has W_v = (G / Q_v)[K - s_v, K);
   a child c with sibling d has W_c = (W_v Q_d)[s_d, s_v), exact in a cyclic product of length L
@@ -30,36 +32,51 @@ trees (`backend/product_tree`, with a `Keep` hook added) and `ntt::Transform` (w
   (`inverse_upper` of P_hi and a forward of L / 2), factor doubled (tracked as u = 1 / f, applied
   where coefficients come out); a shorter child gets coefficients and a forward.
 - Root (`root_window`): G / Q mod x^K by Karp and Markstein's division with k = ceil(K / 2):
-  h = 1 / Q mod x^k (`series_inverse`: Newton with 5 transforms of 2i per step, the recurrence
-  below 32), q0 = G h mod x^k, r = (G - Q q0)[k, K), q1 = h r mod x^(K - k), all cyclic of
-  length bit_ceil(K). 7 transforms of that length with T_L(Q) from the tree.
+  h = 1 / Q mod x^k (`fps::series::inverse` in the stack, backend/series), q0 = G h mod x^k, r =
+  (G - Q q0)[k, K), q1 = h r mod x^(K - k): a forward of h and three `cyclic_product`s of length
+  L = bit_ceil(K) (sources of at most L / 2 words), all in the output d (G, then q0 and r, then
+  q1); with the tree's T_L(Q) (times 2^32, taken out in r's pass), 7 transforms of L.
 - Top tree to lanes: each top leaf's window (an inverse of its parent's product) into a row,
   scaled by its u; the 8 rows transposed into the lanes layout, then one lanes forward: the lane
   root's state at factor 1. (The transform-domain conversion was tried: notes/104-r1.md.)
 - Base (lane nodes of at most kLaneBase = 16 slots): the window's coefficients (an inverse of
   the parent's product), the products of the base's nodes by schoolbook (`BaseProducts`, nodes
-  split at the middle, `multiply_lanes`), then middle products down to single slots
-  (`middle_lanes`: 64-bit sums of at most 9 products, one Montgomery step).
+  split at the middle), then middle products down to single slots (`middle_lanes`: 64-bit sums
+  of at most 9 products, one Montgomery step). Every product of factors 1 - a x has constant
+  term 1 (kR), so the products' terms by it are added after the Montgomery step, not multiplied
+  (`multiply_units`, in product_tree for the tree's own bases too; `middle_lanes<L, true>`,
+  `cross_units`). x86 (8 lanes of EvenOdd sums): the unrolled middle products and cross sums
+  load their operands per term (`middle_blocks`, blocks of 2 outputs; `cross_loads`) instead of
+  holding them in arrays GCC spills.
 - Interpolation: M = prod (x - a_i) from Q (M[j] = Q[m - j]); M'(a_i) by the descent from
   (rev(M') / Q mod x^m8); weights y_i / M'(a_i); then R = sum_i w_i Q / (1 - a_i x) up the tree,
   R_v = R_l Q_r + R_r Q_l in the kept transforms (`pointwise_sums`; leaf products in the top),
   doubled to the parent's length as product_tree's nodes; f = rev_m(R). The lane tree runs the
   descent and the sums in one depth-first pass (`interpolate_lanes`); each base inverts its
-  values once (`divide_slots`: prefix products, one vector power) and builds its sums
-  (`cross_lanes`) from the same products. A zero M'(a_i) (a repeated point) throws.
+  values once (`divide_slots`: prefix products in 4 interleaved chains, one vector power, lazy)
+  and builds its sums (`cross_units`) from the same products. A zero M'(a_i) (a repeated point)
+  throws.
 - Newton basis: F = rev_N(f) (N = m8), c_k = [x^(N-1-k)] F / Q_(k+1). Node v's right child's
   window is W_v[0, s_r) (from the state: `to_child` with e = L - s_l, halving when s_l = L / 2),
   its left child's (W_v Q_r)[s_r, s_v) (the product with the right sibling's kept transform).
   C is padded to the power of two above when past 0.65 of it (lc-opt's choice), so every right
-  child halves.
+  child halves. The top tree's rightmost windows are prefixes of the root's (known coefficients):
+  those right children's states are forwards of them (factor 1), no halving, and the last lane's
+  row is the root window's first C words (lc-opt's).
 - Direct paths (`select.hpp`): Horner's rule (`horner`: blocks of 4 or 8 vectors of points as
   chains, f in parts for short blocks) when its cost n m kHorner is below the tree's estimate
-  kFixed + kPerPoint m8 lg m8 + kPerCoefficient K lg K, fitted per target; O(m^2) loops for
-  interpolate up to 32 points and the Newton basis up to 64.
+  kFixed + kPerPoint m8 lg m8 + kPerCoefficient K lg K, fitted per target to a grid of n, m in
+  8 .. 16384 (notes/136-r1.md). O(m^2) in vectors below kDirectInterpolate points (about 100):
+  M = prod (x - a_i) (`product_of_linear`), M'(a_i) by `horner`, then f = sum w_i M / (x - a_i)
+  by synthetic divisions, a vector of points per chain (`interpolate_small`). The Newton basis
+  below kDirectNewton (180-400 by target): its n - 1 synthetic divisions in a systolic array of
+  4 vectors of lanes (`newton_small`: division k in one lane, a lane shift per step, 16-64
+  divisions per pass over the coefficients).
 - Memory: one region of ntt's per-thread memory (kept across calls) as a product_tree Stack:
-  the kept transforms (about 2 m8 words per lane level: 14.7 MB at m = 2^17), the trees, the
-  division's and passes' scratch. Sizes are computed up front (`tree_words`, `pass_words`,
-  `division_words`); the tests run with exact sizes and fail on a spill to the heap.
+  the kept transforms (about 2 m8 words per lane level: 14.7 MB at m = 2^17), the top tree's
+  leaf rows (m8 words), the trees, the division's and passes' scratch. Sizes are computed up
+  front (`tree_words`, `pass_words`, `division_words`); the tests run with exact sizes and fail
+  on a spill to the heap.
 - evaluate splits f and the points into chunks of 2^24 (transforms stay within 2^25).
 
 ## Measurements

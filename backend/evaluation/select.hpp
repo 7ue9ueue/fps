@@ -1,5 +1,5 @@
 // The evaluation kernel's choices per target: where the direct O(n m) paths give way to the trees.
-// Measurements: notes.md (issue #104, crossover grids on each timing machine).
+// Measurements: notes.md, notes/104-r1.md and notes/136-r1.md (grids on each timing machine).
 #pragma once
 
 #include <algorithm>
@@ -52,7 +52,7 @@ inline constexpr std::size_t kDirectInterpolate = 96, kDirectNewton = 352;  // l
 #elif defined(__ARM_NEON) && defined(__aarch64__)
 inline constexpr std::size_t kDirectInterpolate = 104, kDirectNewton = 184;  // lc-arm
 #elif defined(__SSE4_1__)
-inline constexpr std::size_t kDirectInterpolate = 80, kDirectNewton = 160;  // a guess: AVX2's at half the width
+inline constexpr std::size_t kDirectInterpolate = 80, kDirectNewton = 288;  // a guess: AVX2's times 0.8 (half the width, trees 1.3x slower)
 #else
 inline constexpr std::size_t kDirectInterpolate = 32, kDirectNewton = 64;  // a guess: the scalar loops' crossovers
 #endif
