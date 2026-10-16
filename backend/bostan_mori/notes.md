@@ -42,9 +42,16 @@ New work: lc-opt has no Bostan-Mori kernel and no kth-term problem.
   arrays. Per block of W output words, U and V together: each broadcast of qe[a] or -qo[a] feeds
   both sums (`backend/small`'s 64-bit lanes: `EvenOdd`, `Halves`, `Single`), only the a whose
   windows meet the block, a fold every 17 terms, one Montgomery reduction per word (U and V both
-  times 2^-32: the ratio is kept). The halves of the outputs by `unzip` of two blocks.
-- `tiny` (p and q of at most 4 words: Fibonacci and other order-2 recurrences): scalar sums by the
-  definition (U[j] = sum s_i p_(2j + r - i), s = q(-x)), exact, one `% P` per word.
+  times 2^-32: the ratio is kept). The halves of the outputs by `unzip` of two blocks. Zero
+  stores by loops with an opaque index (`asm("" : "+r"(j))`): GCC 16 makes them `memset` calls
+  otherwise, with vector spills around each (#198). With q[0] = 1, the inverse at the end is a
+  table entry: q[0] after h steps is 2^(-32 (2^h - 1)).
+- `tiny` (p and q of at most 8 words: Fibonacci and other short recurrences): scalar sums by the
+  definition (U[j] = sum s_i p_(2j + r - i), s = q(-x); V by its symmetry), exact, one `% P` per
+  word, on a fixed shape per size (`tiny_steps<NP, NQ>`, NP = NQ - 1 or NQ, zero-padded, which a
+  step keeps): every loop unrolled at compile time, p_(b + r) picked by a mask of r, no branch on
+  k. With q[0] = 1, q[0] stays 1: no inverse. 2.5-3.3x faster than the loop version it replaced
+  (whose variable-length loops GCC 16 compiled 1.5-2.8x slower on Zen 3, notes/198-r1.md).
 - `products`: the frontend's loop (two `ntt::multiply` per step into vectors): the fallback past
   the values form's 2^23 words, and the reference for large tests.
 - Memory: one region per thread (huge pages, `ntt::detail::map_region`) for the two arrays of 2N
@@ -104,3 +111,7 @@ d < 64, 2^7 below 128): crossovers at about d = 95 (Zen 3, Emerald Rapids), 85 (
   1.0-1.3 leaf products per word: 9-17% faster per step at 2^11 on Zen 5 and Emerald Rapids, 1-8%
   at 2^17, 0 to -6% on Zen 3. Faster values conversions in backend/ntt (#98) would help more.
 - Odd steps' pass is 1.4-1.5x the even one (the w^-1 table read and one more Montgomery product).
+- Schoolbook steps at d = 9-95 (notes/198-r1.md, Next): blocks of W words take about 3x the
+  products a half-size product needs, V's symmetry is unused, and each step's first window load
+  waits on the split's stores. Windows from registers for halves of 2-4 vectors would avoid all
+  three.
