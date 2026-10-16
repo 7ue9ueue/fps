@@ -49,6 +49,7 @@ import fcntl
 import io
 import json
 import os
+import random
 import re
 import secrets
 import shlex
@@ -77,8 +78,18 @@ ROOT = Path(os.environ.get('FPS_GATE_ROOT') or Path(__file__).resolve().parent.p
 
 
 def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(['git', *args], check=check, capture_output=True, text=True, cwd=ROOT,
-                          timeout=NETWORK_TIMEOUT)
+    """A fetch is retried: gates run side by side in one checkout, and two fetches at once can fail
+    on a ref lock (#220: PR 203's and PR 217's gates, started in the same second)."""
+    for attempt in range(5 if args[0] == 'fetch' else 1):
+        if attempt:
+            log(f'git {args[0]} failed, retrying: {result.stderr.strip()[-200:]}')
+            time.sleep(1 + 4 * random.random())
+        result = subprocess.run(['git', *args], capture_output=True, text=True, cwd=ROOT, timeout=NETWORK_TIMEOUT)
+        if result.returncode == 0:
+            break
+    if check and result.returncode:
+        raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
+    return result
 
 
 def log(message: str) -> None:
