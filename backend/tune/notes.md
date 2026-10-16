@@ -516,7 +516,9 @@ than 2% slower, worst; two runs of the program.
   one Emerald Rapids run in five change 7-8 entries and lose 0.7% on its own machine.
 - Order: `backend/small/tune.hpp` includes `backend/ntt/tune.hpp`; a program including small's,
   factorials' and the NTT's tune headers registers ntt.variant, small.variant, small.ntt,
-  factorials.variant (checked).
+  factorials.variant (checked). Since issue #155, "ntt.ragged" (the plan of ragged products, per
+  main length and sixteenth of r / L) right after ntt.variant, whose candidates it times; run time
+  rows to 2^10, 3 samples of 30 us, 3% (`kRaggedRunTime`, backend/ntt/notes/155-r1.md).
 - tune.cpp's own binary disagrees with three others at Emerald Rapids inverse/7 (asm 5.6-9.7%
   faster in it, 1.8-5.8% slower in the others): a compiled default can carry its binary's
   placement. Not fixed; run-time tuning in the validation binary moved it back (1 entry).

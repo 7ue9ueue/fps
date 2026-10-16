@@ -46,7 +46,8 @@ void calculus(bench::Suite& suite) {
 }
 
 // inverse, log, exp, pow (e a random 64-bit exponent) and sqrt of n = 2^(lg-1) random
-// coefficients, as mul/<lg> in bench.cpp; raw_exp into a kept out.
+// coefficients, as mul/<lg> in bench.cpp; raw_exp into a kept out. inverse/6e5: n = 600000, a
+// ragged length (backend issue #155).
 void newton(bench::Suite& suite) {
     for (int lg : {11, 14, 18, 22}) {
         const std::size_t n = std::size_t(1) << (lg - 1);
@@ -82,6 +83,16 @@ void newton(bench::Suite& suite) {
             fps::series::pow(f, std::uint32_t(kExponent % P), fps::mod_pow<P>(5, kExponent), o);
         });
         kernel("sqrt", 4, [](std::span<const std::uint32_t> f, std::span<std::uint32_t> o) { fps::series::sqrt(f, 2, o); });
+        if (lg == 22) {
+            const std::size_t m = 600000;
+            suite.add("inverse/6e5", [m] { return [f = random_poly(m, 5, 7)] { bench::keep(fps::inverse(f)); }; }, m);
+            suite.add("inverse@kernel/6e5", [m] {
+                return [f = random_poly(m, 5, 7), out = Poly(m)]() mutable {
+                    fps::series::inverse(f.span(), out.span());
+                    bench::keep(out);
+                };
+            }, m);
+        }
         if (lg == 14 || lg == 18)
             suite.add("raw_exp" + size, [n, seed] {
                 return [f = random_poly(n, 0, seed), out = Poly(n)]() mutable {

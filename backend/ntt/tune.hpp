@@ -8,6 +8,8 @@
 //   ntt::variant_names()                 // the candidates' names, e.g. "intrinsics_avx512"
 //   ntt::op_name(op)                     // "forward", "inverse", "multiply", "product"
 //
+//   ntt::measure_ragged(start, budget[, log])   // detail::ragged::Kinds: the plan per length and bucket
+//
 // measure: for each op and lg up to budget.max_lg, every candidate is timed in turn (tune::time_each)
 // the way the library runs it, at the op's points: forward and inverse on a Transform and an array
 // kept across calls; multiply on one Convolution, which takes this thread's kept region (memory.hpp),
@@ -176,6 +178,70 @@ inline std::optional<Choices> parse(std::string_view s) {
     return choices;
 }
 
+// The ragged plans ("ntt.ragged", ragged.hpp): for each main length 2^lg, kMinLog <= lg <=
+// budget.max_lg (and lg < kMaxLog), and each bucket b of r / L, every kind's plan at N = L + (2b - 1)
+// L / 32 (the bucket's middle), a product of factors of N / 2 + 1 and N - N / 2 words by multiply's
+// path (detail::product). The fastest kind wins unless start's is within the margin; a row keeps the
+// least kind with the plan that won (a kind falls back to a lesser one where it is no split, and the
+// middle may fall back where other words of the bucket do not). Rows run from
+// short to long and each is set before the next, so a top product runs the measured rows. Past
+// max_lg each bucket keeps start's kind, unless its choice at max_lg changed: then the longer rows
+// take the new one.
+struct RaggedTimes {
+    int lg, bucket;
+    std::vector<int> kinds;   // the distinct kinds timed
+    std::vector<double> ns;   // their times
+};
+
+inline detail::ragged::Kinds measure_ragged(const detail::ragged::Kinds& start, const Budget& budget, std::vector<RaggedTimes>* log = nullptr) {
+    detail::ragged::Kinds kinds = start;
+    const int last = std::min(budget.max_lg, kMaxLog - 1);
+    for (int lg = kMinLog; lg <= last; ++lg) {
+        const std::size_t L = std::size_t(1) << lg;
+        for (int b = 1; b <= detail::ragged::kBuckets; ++b) {
+            const std::size_t N = L + std::max<std::size_t>(1, (2 * std::size_t(b) - 1) * L / (2 * detail::ragged::kBuckets));
+            const std::size_t n = N / 2 + 1, m = N + 1 - n;
+            const std::vector<detail::Line> a = detail::random_lines(n), c = detail::random_lines(m);
+            std::vector<std::uint32_t> out(N);
+            std::vector<int> ids;  // kinds with distinct plans; kPlain first
+            for (int k = 0; k < detail::ragged::kKinds; ++k) {
+                bool fresh = true;
+                for (const int i : ids) fresh &= !(detail::ragged::plan(N, k) == detail::ragged::plan(N, i));
+                if (fresh) ids.push_back(k);
+            }
+            const int i = (lg - kMinLog) * detail::ragged::kBuckets + b - 1;
+            if (ids.size() == 1) {
+                kinds[i] = detail::ragged::kPlain;
+                continue;
+            }
+            const std::vector<double> ns = tune::time_each(budget.samples, budget.min_sample_ns, ids, [&](int k) {
+                detail::product<SelectedMultiply, false>(a.data()->words, n, c.data()->words, m, out.data(), N,
+                                                         detail::ragged::plan(N, k));
+                asm volatile("" : : "r"(out.data()) : "memory");
+            });
+            const int best = int(std::ranges::min_element(ns) - ns.begin());
+            // ids holds the least kind of each plan: stored rather than start's own kind, which may
+            // fall back to that plan at the bucket's middle and not elsewhere in it.
+            const auto now = std::ranges::find_if(ids, [&](int k) { return detail::ragged::plan(N, k) == detail::ragged::plan(N, start[i]); });
+            const bool keep = now != ids.end() && ns[now - ids.begin()] <= ns[best] * (1 + budget.margin);
+            kinds[i] = std::uint8_t(keep ? *now : ids[best]);
+            if (log) log->push_back({lg, b, ids, ns});
+        }
+#ifndef FPS_NO_TUNER
+        detail::ragged::kinds.set(kinds);
+#endif
+    }
+    for (int b = 0; b < detail::ragged::kBuckets; ++b) {
+        const int at = (last - kMinLog) * detail::ragged::kBuckets + b;
+        if (kinds[at] != start[at])
+            for (int lg = last + 1; lg < kMaxLog; ++lg) kinds[(lg - kMinLog) * detail::ragged::kBuckets + b] = kinds[at];
+    }
+    return kinds;
+}
+
+// Run time: main lengths to 2^10, 3 samples of 30 us, margin 3%.
+inline constexpr Budget kRaggedRunTime = {10, 3, 3e4, 0.03};
+
 #ifndef FPS_NO_TUNER
 
 inline const bool kVariantRegistered = tune::add({
@@ -186,6 +252,23 @@ inline const bool kVariantRegistered = tune::add({
         const auto choices = parse(s);
         if (choices && apply) variants.set(*choices);
         return choices.has_value();
+    },
+});
+
+// After "ntt.variant": the plans time the selected variants.
+inline const bool kRaggedRegistered = tune::add({
+    "ntt.ragged",
+    [] { detail::ragged::kinds.set(measure_ragged(detail::ragged::kKindDefaults, kRaggedRunTime)); },
+    [] { return tune::text(detail::ragged::kinds.get()); },
+    [](std::string_view s, bool apply) {
+        const auto values = tune::parse<std::array<unsigned, detail::ragged::kRows * detail::ragged::kBuckets>>(s);
+        if (!values || !std::ranges::all_of(*values, [](unsigned k) { return k < unsigned(detail::ragged::kKinds); })) return false;
+        if (apply) {
+            detail::ragged::Kinds kinds{};
+            std::ranges::copy(*values, kinds.begin());
+            detail::ragged::kinds.set(kinds);
+        }
+        return true;
     },
 });
 

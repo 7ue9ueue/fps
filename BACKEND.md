@@ -73,7 +73,10 @@ Kernels to start with: `simd` (per-ISA vector wrappers), `modarith`, `ntt`, `mul
   `tuned.hpp`; `tune.py --check` runs in `kernel.py check`). After a kernel gets faster, rerun
   `tools/tune.py`. Benches and tests read the compiled defaults, never fresh tuning.
 - Bench cases: `<op>/<size>` times the selected variant (gated); `<op>@<variant>/<size>` times one
-  variant (reported). Sizes 2^6..2^25, to see L1, L2, L3 and memory.
+  variant (reported). Sizes 2^6..2^25, to see L1, L2, L3 and memory; and ragged sizes, as callers
+  rarely pick powers of two: N = 2^k + 1, 1.25, 1.5, 1.75 2^k and 2^(k+1) - 1 (named `<op>/<k>+1`,
+  `<op>/<k>.25`, ..., `<op>/<k+1>-1`) and round ones (`<op>/5e5`, `<op>/1e6`), with N items, so ns
+  per item shows a staircase at powers of two (issue #155; backend/ntt/bench.cpp).
 - Before optimizing, estimate the floor: multiply uops over multiply pipes, or bytes over
   bandwidth. Report the time next to it.
 - Where lc-opt has the operation (`../cpp_hpc/lc-opt`, `~/lc-opt` on the VMs; read-only), lc-opt

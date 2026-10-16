@@ -142,13 +142,14 @@ fps::detail::Words ntt_middle(const Poly& f, const Poly& g) {
 
 // f * g for f and g of n coefficients against ntt::multiply on the same factors into new memory
 // (ntt_product). "<lg>": n = 2^lg / 2. "480x480": a shape an old cutoff (n m < 2^18) ran
-// schoolbook. Products small::beats_ntt gives to small::multiply (e.g. lg = 6 on most targets)
+// schoolbook. "6e5": n = 600000, a product of ragged length (1.2e6 - 1 words, backend issue #155). Products small::beats_ntt gives to small::multiply (e.g. lg = 6 on most targets)
 // are still timed against ntt::multiply here; short_products() times them against
 // small::multiply.
 void multiply(bench::Suite& suite) {
     std::vector<std::pair<std::string, std::size_t>> shapes;
     for (int lg = 6; lg <= 22; ++lg) shapes.emplace_back(std::to_string(lg), std::size_t(1) << (lg - 1));
     shapes.emplace_back("480x480", 480);
+    shapes.emplace_back("6e5", 600000);
     for (const auto& [size, n] : shapes) {
         const unsigned seed = unsigned(n);
         suite.add("multiply/" + size, [n, seed] {

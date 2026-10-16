@@ -7,6 +7,8 @@
 //   2. Per op and lg the candidates' geometric mean of time / fastest and their times per point;
 //      then the points the compiled and the new table send to a candidate more than 2% slower than
 //      the fastest there.
+//   3. measure_ragged(): the plan kind per main length and bucket of r / L (ragged.hpp), every main
+//      length (scalar and sse: to 2^14), 5 samples of at least 1 ms, margin 1%; the times per kind.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -66,11 +68,28 @@ int main() {
     }
     std::printf("# seconds %.1f\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count());
 
+    // The ragged plans: every main length on targets with a timing machine; scalar and sse to 2^14.
+    const bool slow = fps::tune::kTarget == fps::tune::Target::scalar || fps::tune::kTarget == fps::tune::Target::sse;
+    std::vector<RaggedTimes> ragged_log;
+    const auto kinds = measure_ragged(detail::ragged::kKindDefaults, {slow ? 14 : kMaxLog - 1, 5, 1e6, 0.01}, &ragged_log);
+    constexpr const char* kind_names[] = {"plain", "top", "floor", "ceil"};
+    for (const RaggedTimes& t : ragged_log) {
+        const int i = (t.lg - kMinLog) * detail::ragged::kBuckets + t.bucket - 1;
+        std::printf("# ragged %d %d: %s (compiled %s)", t.lg, t.bucket, kind_names[kinds[i]],
+                    kind_names[detail::ragged::kKindDefaults[i]]);
+        for (std::size_t k = 0; k < t.kinds.size(); ++k) std::printf(" %s %.1f", kind_names[t.kinds[k]], t.ns[k]);
+        std::printf("\n");
+    }
+    std::printf("# seconds %.1f\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count());
+
     std::printf("field signature int %u\n", kSignature);
     for (int op = 0; op < kOps; ++op) {
         std::printf("field %s int", std::string(op_name(Op(op))).c_str());
         for (const std::uint8_t v : choices[op]) std::printf(" %d", v);
         std::printf("\n");
     }
+    std::printf("field ragged int");
+    for (const std::uint8_t v : kinds) std::printf(" %d", v);
+    std::printf("\n");
     return 0;
 }
