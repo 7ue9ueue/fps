@@ -23,6 +23,9 @@ public products and `backend/factorials`, so every target runs them.
   `montgomery(f, x)` (multiply_chirp). The object holds words; a pass loads them into local
   vectors (stores may alias an object's arrays, and GCC's ASan stack frames misaligned an object's
   64-byte vector members: a SEGV in the avx512 ASan build of the first version).
+- arm: pass's main loop starts at a measured address (`simd::align_loop`, issue #230): chirp's
+  runs 5-12% slower anywhere but 12 mod 32, multiply_chirp's 4% at 4 mod 32 (`notes/230-r1.md`).
+  Rescan after changing the loop: the fast start depends on its instructions.
 - Evaluation, f of n coefficients at a r^i, i < m (chirp z-transform, Bluestein): with
   t(i - j) = t(i) + t(-j) - i j,
   f(a r^i) = r^t(i) sum_j A_j K_(i - j + n - 1), A_j = f_j (a r)^j r^t(j), K_v = r^-t(v - n + 1).
