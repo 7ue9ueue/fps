@@ -22,11 +22,11 @@ struct EvaluateCosts {
 #if defined(__znver5__)
 inline constexpr EvaluateCosts kEvaluateCosts{0.064, 3739, 1.59, 0.391};  // lc-zen5
 #elif defined(__AVX512F__)
-inline constexpr EvaluateCosts kEvaluateCosts{0.105, 9400, 3.5, 0.9};  // lc-intel
+inline constexpr EvaluateCosts kEvaluateCosts{0.1065, 3621, 2.353, 0.746};  // lc-intel(-test)
 #elif defined(__AVX2__)
 inline constexpr EvaluateCosts kEvaluateCosts{0.21, 4840, 2.90, 0.860};  // lc-bench
 #elif defined(__ARM_NEON) && defined(__aarch64__)
-inline constexpr EvaluateCosts kEvaluateCosts{0.227, 15000, 6.9, 1.66};  // lc-arm
+inline constexpr EvaluateCosts kEvaluateCosts{0.2286, 4247, 4.338, 1.300};  // lc-arm(-test)
 #elif defined(__SSE4_1__)
 inline constexpr EvaluateCosts kEvaluateCosts{0.42, 6450, 3.87, 1.15};  // a guess: AVX2's tree costs times 4/3, Horner at half the width
 #else
@@ -46,11 +46,11 @@ inline bool evaluate_directly(std::size_t n, std::size_t m) {
 #if defined(__znver5__)
 inline constexpr std::size_t kDirectInterpolate = 128, kDirectNewton = 400;  // lc-zen5
 #elif defined(__AVX512F__)
-inline constexpr std::size_t kDirectInterpolate = 104, kDirectNewton = 240;  // lc-intel
+inline constexpr std::size_t kDirectInterpolate = 128, kDirectNewton = 400;  // lc-intel(-test)
 #elif defined(__AVX2__)
 inline constexpr std::size_t kDirectInterpolate = 96, kDirectNewton = 352;  // lc-bench
 #elif defined(__ARM_NEON) && defined(__aarch64__)
-inline constexpr std::size_t kDirectInterpolate = 104, kDirectNewton = 184;  // lc-arm
+inline constexpr std::size_t kDirectInterpolate = 96, kDirectNewton = 192;  // lc-arm(-test)
 #elif defined(__SSE4_1__)
 inline constexpr std::size_t kDirectInterpolate = 80, kDirectNewton = 288;  // a guess: AVX2's times 0.8 (half the width, trees 1.3x slower)
 #else

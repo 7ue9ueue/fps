@@ -125,6 +125,9 @@ interpolate 1.02-1.03; newton 1.00 (2^10, 2^12), 1.02-1.03 above. Against the fr
 ## Log
 
 - 2026-10-12, issue #104 round 1 (claude): the move. `notes/104-r1.md`.
+- 2026-10-16, issue #136 round 1 (claude): the division on series::inverse and fused products,
+  unit terms and loads in the bases, the direct paths in vectors, the cost model refit; 4-6%
+  faster from 2^17 on every target, 2-11x below 100-400 points. `notes/136-r1.md`.
 
 ## Sources
 
