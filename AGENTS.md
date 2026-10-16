@@ -49,7 +49,7 @@ Run from the checkout's root. Each script's `--help` has the details.
 | `tools/kernel.py check` | anywhere | Generators and tuned tables match what is committed. |
 | `tools/sanitize.py [--issue]` | Mac | ASan/UBSan tests of every unit on every target, for `origin/main`: what the gate leaves out (it sanitizes only the kernels a pull request changes; the frontend never). Run it when the VMs are idle (nightly, after a batch of merges); `--issue` files a `ready` issue on a failure. |
 | `tools/tune.py <kernel>` | Mac | Measures a kernel's tuned choices on each target's timing machine; writes `tuned.json` and `tuned.hpp`. |
-| `tools/gate.py <pr> --merge` | Mac | Tests every affected unit on every target (it does not time), comments the report on the PR, and squash-merges on a pass. Always runs `origin/main`'s copy of `tools/`. Gates run side by side; a test that hangs is killed after an hour. On a timing machine (`lc-arm`) `kernel.py test` waits for the bench lock, so it never disturbs a benchmark. |
+| `tools/gate.py <pr> --merge` | Mac | Tests every affected unit on every target (it does not time), comments the report on the PR, and squash-merges on a pass. Always runs `origin/main`'s copy of `tools/`. Gates run side by side; a test that hangs is killed after two hours. On a timing machine (`lc-arm`) `kernel.py test` waits for the bench lock, so it never disturbs a benchmark. |
 
 ```
 python3 tools/vm.py lc-amd 'python3 tools/kernel.py test ntt --target avx2'
