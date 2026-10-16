@@ -190,6 +190,9 @@ lc-opt (issue #56): lane tree 14.4 ms and top tree 5.7 ms for 500000 factors on 
     for all of ntt's Transform lengths (memory, 2.5x the longest's); leaf products, 26 cycles per
     leaf against about 13-15 (#98); the standard-only driver's unused counting (16 ns at 16
     factors on Emerald Rapids).
+- 2026-10-16, issue #136 round 1 (claude, for backend/evaluation): `multiply_units` and the
+  `kUnitTerms` hook of `LaneTree::coefficients` (leaves whose factors have constant term 1);
+  product_tree's own code unchanged (same instructions). `notes/136-r1.md`.
 
 ## Sources
 

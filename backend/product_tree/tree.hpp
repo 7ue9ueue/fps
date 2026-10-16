@@ -156,12 +156,18 @@ inline LaneNode combine(const LaneNode& x, const LaneNode& y) {
     return z;
 }
 
+// Leaves whose factors all have constant term 1 (Leaves::kUnitTerms): their base products by
+// multiply_units.
+template <class Leaves>
+inline constexpr bool kUnitTerms = requires { requires Leaves::kUnitTerms; };
+
 // The lanes' tree over slots of 8 factors. Leaves:
 //   std::size_t count() const;                // slots, >= 1
 //   u32 degree(std::size_t k) const;          // the largest degree in slot k, >= 1
 //   LaneNode load(std::size_t k, u32* c) const;
 //       // writes the degree(k) + 1 coefficients of slot k at c (8 words each, Montgomery form,
 //       // zero past a lane's degree)
+//   static constexpr bool kUnitTerms;         // optional: every factor's constant term is 1
 // Keep: kept transforms (above); NoKeep for none.
 template <class Leaves, class Keep = NoKeep>
 class LaneTree {
@@ -242,7 +248,8 @@ private:
             std::size_t next = 0;
             for (std::size_t k = 0; k + 1 < count; k += 2) {
                 const Part &x = part[k], &y = part[k + 1];
-                multiply_lanes<Lanes>(x.c, x.degree, y.c, y.degree, to);
+                if constexpr (kUnitTerms<Leaves>) multiply_units<Lanes>(x.c, x.degree, y.c, y.degree, to);
+                else multiply_lanes<Lanes>(x.c, x.degree, y.c, y.degree, to);
                 part[next++] = {to, x.degree + y.degree};
                 to += 8 * (x.degree + y.degree + 1);
             }
