@@ -216,15 +216,59 @@ template <class L>
     }
 }
 
-// cross_units_inline, unrolled for n = k = 1, 2, 4, 8.
+// cross_units_inline for n = k = K, one output at a time with every operand loaded per term (its
+// odd words by shifts) and the sums in registers, as middle_blocks (x86, 8 lanes per vector).
+template <class L, std::size_t K>
+[[gnu::always_inline]] inline void cross_loads(const u32* a, const u32* b, const u32* c, const u32* d, u32* out) {
+    using S = Sums<L>;
+    using M = Ops<L>;
+    using V = typename L::V;
+    const auto op = [](const u32* p) { return S::of(L::load(p)); };
+#pragma GCC unroll 16
+    for (std::size_t t = 0; t < 2 * K; ++t) {
+        const std::size_t first = t > K ? t - K : 0, end = std::min(t, K);
+        const std::size_t terms = 2 * (end > first ? end - first : 0);
+        V r = t < K ? M::add(L::load(a + 8 * t), L::load(b + 8 * t)) : L::broadcast(0);
+        if (terms == 0) {
+            L::store(out + 8 * t, r);
+            continue;
+        }
+        const bool merged = terms <= std::size_t(kMaxTerms);
+        typename S::Acc s = S::mul(op(a + 8 * first), op(d + 8 * (t - first))), s2{};
+#pragma GCC unroll 8
+        for (std::size_t i = first + 1; i < end; ++i) S::mac(s, op(a + 8 * i), op(d + 8 * (t - i)));
+        if (merged) {
+#pragma GCC unroll 8
+            for (std::size_t i = first; i < end; ++i) S::mac(s, op(b + 8 * i), op(c + 8 * (t - i)));
+            r = M::add(r, S::reduce(s));
+        } else {
+            s2 = S::mul(op(b + 8 * first), op(c + 8 * (t - first)));
+#pragma GCC unroll 8
+            for (std::size_t i = first + 1; i < end; ++i) S::mac(s2, op(b + 8 * i), op(c + 8 * (t - i)));
+            r = M::add(M::add(r, S::reduce(s)), S::reduce(s2));
+        }
+        L::store(out + 8 * t, r);
+    }
+}
+
+// cross_units_inline, unrolled for n = k = 1, 2, 4, 8 (x86: cross_loads).
 template <class L>
 void cross_units(const u32* a, std::size_t n, const u32* b, std::size_t k, const u32* c, const u32* d, u32* out) {
     if (n == k) {
-        switch (n) {
-            case 1: return cross_units_inline<L>(a, 1, b, 1, c, d, out);
-            case 2: return cross_units_inline<L>(a, 2, b, 2, c, d, out);
-            case 4: return cross_units_inline<L>(a, 4, b, 4, c, d, out);
-            case 8: return cross_units_inline<L>(a, 8, b, 8, c, d, out);
+        if constexpr (std::is_same_v<Sums<L>, product_tree::detail::EvenOdd<L>> && L::lanes == 8) {
+            switch (n) {
+                case 1: return cross_loads<L, 1>(a, b, c, d, out);
+                case 2: return cross_loads<L, 2>(a, b, c, d, out);
+                case 4: return cross_loads<L, 4>(a, b, c, d, out);
+                case 8: return cross_loads<L, 8>(a, b, c, d, out);
+            }
+        } else {
+            switch (n) {
+                case 1: return cross_units_inline<L>(a, 1, b, 1, c, d, out);
+                case 2: return cross_units_inline<L>(a, 2, b, 2, c, d, out);
+                case 4: return cross_units_inline<L>(a, 4, b, 4, c, d, out);
+                case 8: return cross_units_inline<L>(a, 8, b, 8, c, d, out);
+            }
         }
     }
     cross_units_inline<L>(a, n, b, k, c, d, out);
@@ -478,28 +522,54 @@ void newton_small(u32* c, std::size_t n, const u32* p, u32* e) {
     std::copy_n(e, n, c);
 }
 
+// x^e 2^32 for x in Montgomery form, lazy: x < 2P in, < 2P out (montgomery's bounds hold, (2P)^2 <
+// 2^32 P), the squarings one chain.
+template <class S>
+typename S::V power_lazy(typename S::V x, std::size_t e) {
+    using O = Ops<S>;
+    typename S::V r = S::broadcast(kR);
+    for (; e; e >>= 1, x = O::montgomery(x, x))
+        if (e & 1) r = O::montgomery(r, x);
+    return r;
+}
+
 // v[i] = y[i] / v[i] for i < count (a multiple of L::lanes, at most 8 kLaneBase), but 0 where
-// first + i >= m (v[i] read as 1 there): prefix products over the vectors, one vector power for
-// their lanes' inverses (Montgomery's trick); canonical in and out. Returns false, v unspecified,
-// if some v[i] with first + i < m is 0.
-template <class L>
+// first + i >= m (v[i] read as 1 there): Montgomery's trick in kChains interleaved chains of prefix
+// products over the vectors (vector k in chain k % kChains), one vector power for the lanes'
+// inverses of all their products, then each chain back; lazy (< 2P) but the outputs, which are
+// canonical. The steps' latency is the cost (a base's 16 vectors); kChains chains cut the prefix
+// and back passes to a quarter. Returns false, v unspecified, if some v[i] with first + i < m is 0.
+template <class L, std::size_t kChains = 4>
 bool divide_slots(u32* v, const u32* y, std::size_t first, std::size_t m, std::size_t count) {
     using V = typename L::V;
-    constexpr std::size_t W = L::lanes;
+    using O = Ops<L>;
+    constexpr std::size_t W = L::lanes, C = kChains;
+    const std::size_t vectors = count / W;
     if (first + count > m) std::fill(v + (m > first ? m - first : 0), v + count, 1u);
     const V r2 = L::broadcast(kR2);
-    V prefix[8 * product_tree::kLaneBase / W];
-    V all = L::broadcast(kR);
-    for (std::size_t k = 0; k < count / W; ++k) prefix[k] = all = montgomery_canonical<L>(all, montgomery_canonical<L>(L::load(v + W * k), r2));
+    V prefix[8 * product_tree::kLaneBase / W], x[8 * product_tree::kLaneBase / W], total[C];
+    for (std::size_t c = 0; c < C; ++c) total[c] = L::broadcast(kR);
+    for (std::size_t k = 0; k < vectors; ++k) {
+        x[k] = montgomery_canonical<L>(L::load(v + W * k), r2);
+        prefix[k] = total[k % C] = O::montgomery(total[k % C], x[k]);
+    }
+    // The products of all but chain c's, and of all.
+    V before[C], after[C];
+    before[0] = after[C - 1] = L::broadcast(kR);
+    for (std::size_t c = 1; c < C; ++c) before[c] = O::montgomery(before[c - 1], total[c - 1]);
+    for (std::size_t c = C - 1; c-- > 0;) after[c] = O::montgomery(after[c + 1], total[c + 1]);
+    const V all = O::template reduce<kP>(O::montgomery(before[C - 1], total[C - 1]));
     alignas(64) u32 lanes[W];
     L::store(lanes, all);
     for (std::size_t l = 0; l < W; ++l)
         if (lanes[l] == 0) return false;
-    V e = power_montgomery<L>(all, kP - 2);  // (product 2^32)^(P-2) 2^32 = product^-1 2^32
-    for (std::size_t k = count / W; k-- > 0;) {
-        const V x = montgomery_canonical<L>(L::load(v + W * k), r2);
-        const V reciprocal = k ? montgomery_canonical<L>(e, prefix[k - 1]) : e;
-        e = montgomery_canonical<L>(e, x);
+    const V e = power_lazy<L>(all, kP - 2);  // (product 2^32)^(P-2) 2^32 = product^-1 2^32
+    V inverse[C];  // 1 / chain c's product, times 2^32
+    for (std::size_t c = 0; c < C; ++c) inverse[c] = O::montgomery(e, O::montgomery(before[c], after[c]));
+    for (std::size_t k = vectors; k-- > 0;) {
+        const std::size_t c = k % C;
+        const V reciprocal = k >= C ? O::montgomery(inverse[c], prefix[k - C]) : inverse[c];
+        inverse[c] = O::montgomery(inverse[c], x[k]);
         L::store(v + W * k, montgomery_canonical<L>(L::load(y + W * k), reciprocal));
     }
     return true;
