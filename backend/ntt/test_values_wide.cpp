@@ -1,6 +1,7 @@
 // Tests of the values form's split and join on 16 lanes (intrinsics::WideValues, issue #157): the
 // same words as the scalar Values for every first block and count (odd ones, which take a lone block
-// on 8 lanes), with the value rows of 2^6 to 2^14; join undoes split, in place and apart; and
+// on 8 lanes), with the value rows of 2^6 to 2^14; join undoes split but for the gain 8 (issue #98),
+// in place and apart; and
 // Transform's values-form forward, forward_upper and inverse (every variant this machine runs, and
 // the tuned one) against the leaf form and the scalar split. On targets without AVX-512 only the
 // Transform checks run (ValuesFor is Values there).
@@ -66,10 +67,11 @@ void blocks() {
                     expect(std::all_of(got.data(), got.data() + at, [](u32 x) { return x == 0xdeadbeefu; }) &&
                                std::all_of(got.data() + at + words, got.data() + len, [](u32 x) { return x == 0xdeadbeefu; }),
                            what + ": split wrote outside its blocks");
+                    const auto eight = [](u32 x, u32 y) { return u32(8 * std::uint64_t(y) % P) == x; };  // the gain 8
                     Wide::join(got.data() + at, back.data() + at, count, first, rows.data());
-                    expect(std::equal(back.data() + at, back.data() + at + words, from.data() + at), what + ": join");
+                    expect(std::equal(back.data() + at, back.data() + at + words, from.data() + at, eight), what + ": join");
                     Wide::join(got.data() + at, got.data() + at, count, first, rows.data());  // in place
-                    expect(std::equal(got.data() + at, got.data() + at + words, from.data() + at), what + ": join in place");
+                    expect(std::equal(got.data() + at, got.data() + at + words, from.data() + at, eight), what + ": join in place");
                 }
             // join against the scalar join on values that are not a split's (any canonical words).
             Words values(len), expect_join(len), got_join(len);

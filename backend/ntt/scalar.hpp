@@ -162,7 +162,8 @@ inline void split(const u32* from, u32* to, int lg, const u32* rows) {
         const auto& b = kValueLanes.forward[g % 8];
         for (int t = 0; t < 8; ++t) {
             u32 x[8];
-            for (int k = 0; k < 8; ++k) x[k] = mul(mul(c[8 * t + k], b[k][t]), a[k]);
+            x[0] = c[8 * t];
+            for (int k = 1; k < 8; ++k) x[k] = mul(mul(c[8 * t + k], b[k][8 + t]), a[k]);
             for (int half = 4; half >= 1; half /= 2)
                 for (int s = 0; s < 8; s += 2 * half)
                     for (int k = 0; k < half; ++k) {
@@ -177,6 +178,7 @@ inline void split(const u32* from, u32* to, int lg, const u32* rows) {
 // split() undone.
 inline void join(const u32* from, u32* to, int lg, const u32* rows) {
     const u32* z = kStaticTables.words[1];  // z^-k
+    constexpr u32 eighth = power(8, kP - 2);  // the 8-point transform's gain
     for (std::size_t g = 0; g < (std::size_t(1) << lg) / 64; ++g) {
         u32 c[64];
         std::copy_n(from + 64 * g, 64, c);
@@ -191,7 +193,8 @@ inline void join(const u32* from, u32* to, int lg, const u32* rows) {
                         const u32 u = x[s + k], v = mul(x[s + k + half], z[slot(eighth_root(k * 4 / half))]);
                         x[s + k] = add(u, v), x[s + k + half] = sub(u, v);
                     }
-            for (int k = 0; k < 8; ++k) to[64 * g + 8 * t + k] = mul(mul(x[k], b[k][t]), a[k]);
+            to[64 * g + 8 * t] = mul(x[0], eighth);
+            for (int k = 1; k < 8; ++k) to[64 * g + 8 * t + k] = mul(mul(mul(x[k], b[k][8 + t]), a[k]), eighth);
         }
     }
 }

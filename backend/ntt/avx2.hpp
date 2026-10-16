@@ -824,13 +824,12 @@ inline void forward_values(u32* words, int lg, const u32* r, const u32* rows) {
     forward_tiles(f, q, 8, 0, r, tile);
 }
 
-// inverse() through `words` with tile hooks, the top level writing count coefficients to out
-// (out = words: in place, count = 2^lg).
+// inverse() through `words` with tile hooks, times s (leaf_scale, or values_scale after a join), the
+// top level writing count coefficients to out (out = words: in place, count = 2^lg).
 template <class Tile>
-inline void inverse_into(u32* words, u32* out, std::size_t count, int lg, const u32* ir, Tile tile) {
+inline void inverse_into(u32* words, u32* out, std::size_t count, int lg, const u32* ir, u32 s, Tile tile) {
     auto* f = reinterpret_cast<Vec*>(words);
     const std::size_t nv = (std::size_t(1) << lg) / 8;
-    const u32 s = leaf_scale(lg);
     if (!has_radix2(lg)) {
         inverse_tiles(f, nv / 4, 4, 0, ir, tile);
         if (out == words) return inverse_radix4(f, nv / 4, ir, s);
@@ -850,18 +849,20 @@ inline void inverse_into(u32* words, u32* out, std::size_t count, int lg, const 
 // words (may be from). The runs of subtrees read their leaves from `from` (copied, or joined, into
 // words before their bottom level).
 inline void inverse(const u32* from, u32* words, u32* out, std::size_t count, int lg, const u32* ir, const u32* rows) {
-    if (rows) {
-        return inverse_into(words, out, count, lg, ir, [from, words, rows] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
+    if (rows) {  // the join leaves the gain 8 in (values_scale) and canonical leaves (inverse_leaves')
+        const auto join = [from, words, rows] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
             const std::size_t at = std::size_t(t - words);
             Values::join(from + at, t, leaves / 8, at / 64, rows);
-        });
+        };
+        return inverse_into(words, out, count, lg, ir, values_scale(lg), join);
     }
     if (from != words) {
-        return inverse_into(words, out, count, lg, ir, [from, words] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
+        const auto copy = [from, words] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
             std::memcpy(t, from + (t - words), 8 * leaves * sizeof(u32));
-        });
+        };
+        return inverse_into(words, out, count, lg, ir, leaf_scale(lg), copy);
     }
-    inverse_into(words, out, count, lg, ir, NoTile{});
+    inverse_into(words, out, count, lg, ir, leaf_scale(lg), NoTile{});
 }
 
 // Transform's fused ops (ntt.hpp): a forward transform from in (n <= 2^lg words of caller memory,

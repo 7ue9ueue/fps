@@ -100,13 +100,22 @@ Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_produc
     (64-bit sums), then on x86 an exact reduction (s = hi 2^32 + lo, hi (2^32 mod P) + lo by one
     Shoup product), elsewhere Montgomery's and a Shoup product by 2^32. Group g + 1's rows are
     filled before group g's products. avx2 runs `Bottom<Avx2>` too (lc-opt's asm was slower, Log).
+    On Zen 4 and 5 (16 lanes) `WideBottom::products`: two groups per zmm, two pairs of groups per
+    step, Montgomery then 2^32 (0.68 of Bottom<Avx512Vl>'s time on Zen 5; equal on Emerald Rapids,
+    which keeps Bottom; notes/98-r1.md).
   - Values form (`Form::values`, L <= 2^23): leaf v = 8g + t at its 8 roots rho_v z^j, rho_v =
     r(4v), word 64g + 8i + t at j = bitrev3(i) (common.hpp). Per block of 8 leaves (`Values<N>`):
     a transpose (lanes = leaves), the twist c_k rho^k as two Shoup products, B(g % 8, t)^k per lane
-    (a constexpr table, 8 KiB) and A(g / 8)^k broadcast (a table per Transform, L / 16 words for
-    both directions), the 8-point transform (5 products), stores by value. The inverse: the
-    8-point inverse, the untwist with 1/8 in the lane table, a transpose back. 19 and 20 products
-    per 64 words. Fused into the transforms through tile hooks: `forward_tiles` (copies of
+    (a constexpr table, 8 KiB; quotients first, so x86 loads the odd lanes' quotients 4 bytes on
+    instead of shifting them) and A(g / 8)^k broadcast (a table per Transform, L / 16 words for
+    both directions; A = 1 for g < 8, whose blocks skip those 7 products), the 8-point transform
+    (5 products, 84 other ops), stores by value. The inverse: the 8-point inverse, the untwist,
+    a transpose back; it leaves the 8-point transform's gain in, and the inverse after it scales by
+    values_scale(lg) = 2^-lg (folded tables: `kScaledRoots[2]`); its leaves are < 2P (canonical
+    for the avx2 variant, whose `inverse_leaves` takes canonical leaves). 19 products each way per
+    64 words (12 below block 8). Two blocks per step on 8 lanes, two pairs of blocks on 16
+    (`WideValues`), the two sets of a block on Neon: their ops interleaved in the source, for
+    ILP (issue #98, notes/98-r1.md). Fused into the transforms through tile hooks: `forward_tiles` (copies of
     `forward_trees`/`forward_tree` with a hook) call the split on each run of subtrees after its
     bottom level (in L1), `inverse_tiles` join before the bottom level. Below 2^8 the intrinsics' subtrees have 4 leaves (half a block):
     there the split runs after the transform and the join before.
