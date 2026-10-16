@@ -285,7 +285,7 @@ public:
         std::fill(s, s + top_length_ - m8_, 0u);
         std::copy_n(w, m8_, s + top_length_ - m8_);
         forward(s, top_length_);
-        newton_top(0, 8, s, 1, rows, stack);
+        newton_top(0, 8, s, 1, rows, stack, w);
         rows_to_lanes<Lanes>(rows, lane_length_, lane_length_, lanes);
         forward(lanes, 8 * lane_length_);
         newton_lanes(0, count_, lanes, 1, values, stack);
@@ -395,23 +395,38 @@ private:
 
     // The Newton basis: node v's right child's window is W_v[0, s_r), its left child's (W_v
     // Q_r)[s_r, s_v): the left one from the product, the right one from the state (to_child with
-    // e = L - s_l). The product first, as the right child's state overwrites s.
-    void newton_top(std::size_t lo, std::size_t hi, u32* s, u32 u, u32* lanes, Stack& stack) const {
+    // e = L - s_l). The product first, as the right child's state overwrites s. known: W_v itself
+    // when it is known (the top tree's rightmost path: prefixes of the root's window), else null;
+    // then the right child's state is the forward of its window (factor 1), no halving, and a
+    // right leaf's row is its window, no transform (lc-opt's).
+    void newton_top(std::size_t lo, std::size_t hi, u32* s, u32 u, u32* rows, Stack& stack, const u32* known = nullptr) const {
         const StandardTree<Store::Keeper>& tree = *top_;
-        const std::size_t length = top_length(tree.degree(lo, hi)), mid = tree.split(lo, hi);
+        const std::size_t length = top_length(tree.degree(lo, hi)), mid = tree.split(lo, hi), right = tree.degree(mid, hi);
         const std::size_t e = length - tree.degree(lo, mid);
         const Stack::Mark mark = stack.mark();
         u32* const p = stack.take(length);
         Top::product(s, top_store_.right(mid, length), p, length);
         if (mid - lo == 1) {
-            to_lane(p, length, length, lo, u, lanes);
-            to_lane(s, length, e, mid, u, lanes);
+            to_lane(p, length, length, lo, u, rows);
+            if (!known) {
+                to_lane(s, length, e, mid, u, rows);
+            } else {
+                u32* const row = rows + mid * lane_length_;
+                std::copy_n(known, right, std::fill_n(row, lane_length_ - right, 0u));
+            }
         } else {
-            const std::size_t child_length = top_length(tree.degree(lo, mid));  // both children's
+            const std::size_t child_length = top_length(tree.degree(lo, mid));
             const bool left_halved = to_child<1>(p, length, length, child_length);
-            const bool right_halved = to_child<1>(s, length, e, child_length);
-            newton_top(lo, mid, p, left_halved ? half(u) : u, lanes, stack);
-            newton_top(mid, hi, s, right_halved ? half(u) : u, lanes, stack);
+            u32 right_u = 1;
+            if (known) {
+                const std::size_t right_length = top_length(right);
+                std::copy_n(known, right, std::fill_n(s, right_length - right, 0u));
+                forward(s, right_length);
+            } else {
+                right_u = to_child<1>(s, length, e, child_length) ? half(u) : u;
+            }
+            newton_top(lo, mid, p, left_halved ? half(u) : u, rows, stack);
+            newton_top(mid, hi, s, right_u, rows, stack, known);
         }
         stack.release(mark);
     }
