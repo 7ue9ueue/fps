@@ -3,7 +3,8 @@
 Power series modulo P = 998244353: inverse, log, exp, pow and sqrt into caller memory. API:
 `series.hpp` (`inverse`, `log`, `exp` as `(f, out)`, `pow(f, e, c, out)`, `sqrt(f, c, out)`, in
 this thread's memory or with a last `scratch` argument of `*_scratch(n)` words). Tests: `test.cpp`,
-`test_pow_sqrt.cpp`; bench: `bench.cpp`, `bench_pow_sqrt.cpp`. Attempts: `notes/` (one file per
+`test_pow_sqrt.cpp`, `test_ragged.cpp`; bench: `bench.cpp`, `bench_pow_sqrt.cpp`, `bench_ragged.cpp`
+(ragged n). Attempts: `notes/` (one file per
 issue round). From lc-opt's `lib/poly/{inverse,log,exp,pow,sqrt,calculus}.hpp` (its
 `lib/poly/notes.md`: Inverse, Log, Exp, Power, Sqrt), rewritten
 on `ntt::Transform`'s leaf form and `backend/simd`, so every target runs it (lc-opt's transform
@@ -122,6 +123,18 @@ Arrays: G, H, R, h, then W (the fused ops' work array) last: an output 320 bytes
 KiB) made the last step's inverse_product of G G at 2^18 cost 590-685 us against 465-500 behind
 it (Zen 3, notes/107-r1.md); `half_residual` halves by a shift and a product of the low bit by
 (P + 1) / 2, with a fast path when f covers the block.
+
+### Ragged n (issue #214, notes/214-r1.md)
+
+n = L + r, L = bit_floor(n). inverse for r <= 9L/32: the chain (`inverse_chain`), steps whose
+lengths halve down from n so they land on it; a step to n' = L' + r' at length L' has the
+power-of-two step's transforms and two products of r' words (the corners: f_hi g_r and g_r e2 mod
+x^r'). Above 9L/32 the corners cost more than they save: the steps to L and the half step. exp,
+sqrt and the division's last block (log, pow): products of a last step's c coefficients as
+`low_product` (the NTT's ragged products, about 2c words) where c <= 9m/32 and its work fits, and to
+16 coefficients their windows of full-length products by sums of products (`window()`), no
+transform; the step before such a light last step runs as a last step too. The division takes 5
+blocks of k/2 where 3 blocks of k would leave a short one.
 
 ## Measurements
 
