@@ -81,7 +81,10 @@ GCP project `project-c73e6eb1-e167-4d7a-a31`, region `europe-west2`; `lc-intel` 
 `kernel.py` builds in the `gcc:16.2.0` Docker image (`IMAGE`; `--image` tries another compiler, and
 `bench` builds each side with its own checkout's pin); the gate also tests `avx2` with GCC 15.2.0, which
 users may still have (`COMPAT`; its #183 miscompile is worked around). Repo copies live in `~/hpc_library/<branch>`;
-keep exploration files in `~/explore/hpc_library/` and copy them back to the Mac. More capacity:
+keep exploration files in `~/explore/hpc_library/` and copy them back to the Mac.
+Each VM powers itself off after 30 minutes idle (no SSH connection, no live `vm.py` run, no
+container, load under 0.5; `tools/idle_shutdown.sh`, installed on every VM and on any new one);
+`gcloud compute instances start <vm> --zone=<zone>` brings it back. More capacity:
 create `lc-<purpose>` in the same project and region, and add it to lc-opt's machine table.
 
 ## How work flows
