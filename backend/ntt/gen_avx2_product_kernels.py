@@ -23,8 +23,9 @@ bottom_stored_*: the same for b given as leaves (Transform's fused ops): no forw
 b, the leaf products broadcast its coefficients from memory (bs, the two batches' 8 leaves).
 bottom_leaves_*: the same with a given as leaves too: the windows are filled from a's canonical
 leaves, no forward butterflies (the inverse of a leaf product, Transform::inverse_product).
-bottom_leaves2_*, bottom_leaves3_*: the sum of 2 or 3 such products (a, a1, a2 times bs, bs1,
-bs2), each reduced, then added; the leaf buffers of term k from 2 k LEAVES bytes on.
+bottom_leaves2_*: the sum of 2 such products (a, a1 times bs, bs1), each reduced, then added; the
+leaf buffers of term k from 2 k LEAVES bytes on. (Sums of 3, bottom_leaves3_*, ran 1.08-1.10x the
+time of avx2.hpp's inverse_sum<3> with its fixed-order leaf product out of L2, issue #143: gone.)
 bottom_toeplitz_*: Transform::toeplitz_product (issue #87, lc-opt's ToeplitzBottom): windows of
 S = B0 + B1, D1 = A1 - A2 and D3 = A3 - A2 (canonical, from the leaves at b0, b1, a1, a2, a3), the
 products m1 = S A2, m2 = D1 B1, m3 = D3 B0 (b_j from a2, b1, b0); m1 + m2 (each reduced, then
@@ -59,17 +60,17 @@ SQUARE_SHIFT = 0.0
 # Leaves 'both': window 14 and more deadlock (register budget); 12 does not.
 LEAVES_KNOBS = dict(SQUARE_KNOBS, both=gk.Knobs(window=12))
 # Sums 'both': windows from 8 deadlock (register budget); 6 (2 terms) and 4 (3 terms) with shift -0.05 do not.
-TERMS_KNOBS = {'leaves2': dict(LEAVES_KNOBS, both=gk.Knobs(window=6)), 'leaves3': dict(LEAVES_KNOBS, both=gk.Knobs(window=4))}
+TERMS_KNOBS = {'leaves2': dict(LEAVES_KNOBS, both=gk.Knobs(window=6))}
 TERMS_SHIFT = -0.05
 ARGS = {'first': ['a', 'b', 'buf', 'x', 'y'], 'last': ['out', 'cur', 'ix', 'iy'],
         'both': ['a', 'b', 'buf', 'x', 'y', 'out', 'cur', 'ix', 'iy']}
 SQUARE_ARGS = {part: [a for a in args if a != 'b'] for part, args in ARGS.items()}
 STORED_ARGS = {'first': SQUARE_ARGS['first'], 'last': ['out', 'cur', 'bs', 'ix', 'iy'],
                'both': SQUARE_ARGS['first'] + ['out', 'cur', 'bs', 'ix', 'iy']}
-TERMS = {'leaves2': 2, 'leaves3': 3}  # sums of leaf products
-# Toeplitz and side: as the sums of 3 products and the product of leaves.
+TERMS = {'leaves2': 2}  # sums of leaf products
+# Toeplitz and side: the knobs of the product of leaves.
 # Toeplitz 'both': windows 5 and more deadlock at every shift tried; 4 with shift 0.05 does not.
-TOEPLITZ_KNOBS = dict(TERMS_KNOBS['leaves3'], both=gk.Knobs(window=4))
+TOEPLITZ_KNOBS = dict(LEAVES_KNOBS, both=gk.Knobs(window=4))
 TOEPLITZ_SHIFT = 0.05
 SIDE_KNOBS = LEAVES_KNOBS
 TOEPLITZ_ARGS = {'first': ['a1', 'a2', 'a3', 'b0', 'b1', 'buf', 'x', 'y'],
@@ -281,7 +282,7 @@ def body(part, square=False):
     g = Batch({'P': gk.Value('creg', reg=15), '2P': gk.Value('creg', reg=14), 'NI': gk.Value('creg', reg=13)})
     if part in ('last', 'both'):
         for m in range(BATCHES):
-            g.offset = {'cur': LEAVES * m, 'out': 128 * m, 'bs': 128 * m, 'bs1': 128 * m, 'bs2': 128 * m,
+            g.offset = {'cur': LEAVES * m, 'out': 128 * m, 'bs': 128 * m, 'bs1': 128 * m,
                         'ix': 4 * m, 'iy': 8 * m, 'side': 128 * m}
             if square == 'toeplitz':  # the current batches' leaves, 256 bytes before the next ones in 'both'
                 for base in ('a2', 'b1', 'b0', 'a3'):
@@ -543,7 +544,7 @@ using avx2_kernels::Vec;
 
 def generate():
     lines = HEADER.split('\n')
-    for square in (False, True, 'stored', 'leaves', 'leaves2', 'leaves3'):
+    for square in (False, True, 'stored', 'leaves', 'leaves2'):
         for part in ('first', 'last', 'both'):
             lines += function(part, square) + ['']
     lines += ['// 2^32 mod P and its Shoup quotient: bottom_toeplitz_*\'s exact sums (kr).',

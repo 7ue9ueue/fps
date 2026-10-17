@@ -14,7 +14,7 @@ With d = deg g, k = n - d, F = rev(f), G = rev(g): Q = rev(q) = F / G mod x^k, r
 
 - Plan (`detail::plan`): long division when k d <= 2^12; else the cheapest of the blocked plans
   below by the cost model, long division included. The model: ns per word of forward(in, F),
-  cyclic_product, inverse_product (1 term, and each further term), multiply_add, series::inverse
+  cyclic_product, inverse_product (1 term, and each further term), series::inverse
   (per coefficient at 2^lg), all per transform length on this target, and per-word costs of an
   element pass and of long division's terms (also the dot products' terms); small products by
   `small::model_ns`. The search: s = 32, 64, ... up to one block, each with 4 ways for the last
@@ -27,8 +27,8 @@ With d = deg g, k = n - d, F = rev(f), G = rev(g): Q = rev(q) = F / G mod x^k, r
   of T with Gt = T_Lt(x^(Lt/2 - d) G), Lt = bit_ceil(2d): the words [Lt/2, Lt/2 + d) are (G T)[d,
   2d), so the upper-half output (negated) is the residual's head. Windows (d >= s): the sum over t
   <= min(j, d/s + 1) of (W_t Q_(j-t))[s, 2s), W_t = G[(t-1)s, (t+1)s), as one inverse_product of
-  stored transforms (upper half, negated); past 4 terms the first ones as leaf products in memory
-  (multiply, multiply_add) and that sum as a term; at most 8 windows.
+  stored transforms (upper half, negated), at most 8 windows (ntt takes 8 terms since #143; before,
+  past 4 terms the first ones went through leaf products in memory, multiply and multiply_add).
 - The last block: full (cyclic_product at 2s), short (a length >= 2c - 1 below 2s, with its own
   T(h mod x^c)), small (small::multiply of h mod x^c and R), or dot: its residual by c dot products
   of g with Q (no transform, and no T(Q_(B-2))), then small::multiply. For k = 2^j + 1 (the

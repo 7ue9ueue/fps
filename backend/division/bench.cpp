@@ -3,6 +3,7 @@
 //   "divide/<lg>"          the same, q alone
 //   "divmod_long/<lg>"     g of n / 64 words (a long quotient, a short divisor)
 //   "divmod_short/<lg>"    g of 9 words
+//   "n_max_04"             f of 500000 words by g of 277012 (lc-opt's judge test; windows plans)
 //   "divmod@frontend/<lg>" fps::divmod (include/fps/division.hpp) on the divmod shape (not gated)
 //   "multiply@ntt/<lg>"    the unit: ntt::multiply of two factors of n into n words (not gated)
 #include <cstddef>
@@ -66,5 +67,7 @@ int main(int argc, char** argv) {
             };
         }, n);
     }
+    // lc-opt's slowest judge shape (division_of_polynomials n_max_04): windows of up to 8 terms.
+    add(suite, "n_max_04", 500000, 277012, true);
     return suite.run();
 }

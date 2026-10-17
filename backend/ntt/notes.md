@@ -131,6 +131,15 @@ Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_produc
   2^-32) before its bottom level. A column bit zero in the forward's source (unused in the
   inverse's output) prunes the groups above it to half their columns, the top level included
   (`PrunedLevel` in common.hpp; avx2 `kernels::*_columns`, intrinsics `*_group_columns`).
+- `inverse_product` of up to 8 terms (issue #143, for division's windows and power projection's
+  column sums; notes/143-r1.md). Lists of products only: `inverse_sum<K, C>` (K a template
+  argument) in passes of up to C terms over a run's groups; one pass keeps each output's sum in
+  registers, more keep partial sums (< 2P) in the run's output and read 2C leaf forms at a time
+  (out of L2 that was up to 1.5x faster). C: avx2 3 (with lc-opt's fixed-order asm leaf product,
+  `AsmLeaf`; 1 and 2 products keep the generated bottoms), zmm one pass while K L <= 7 2^15 words
+  (Emerald Rapids) or 3 2^15 (Zen 5), else 1; Sse and scalar 2; Neon 1, but the neon variant runs
+  its generated passes (`inverse_sums`, one product each). Other lists (terms alone): the run-time
+  loop (`inverse_mixed`).
 
 ### avx2
 

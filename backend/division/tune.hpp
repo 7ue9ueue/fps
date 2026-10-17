@@ -4,9 +4,9 @@
 //   division::measure_costs(start, budget)   // Costs: each op timed per length up to 2^budget.max_lg
 //
 // Per length 2^lg: Transform::forward from a source of L/2 words, cyclic_product of L/2 words (the
-// lower half out), inverse_product of 1 and of 3 leaf products (the upper half out; term = half
-// the difference), multiply_add, and series::inverse of L coefficients, each the median of
-// budget.samples samples of at least budget.min_sample_ns, timed in turn; ns per word. Past
+// lower half out), inverse_product of 1 and of 5 leaf products of 10 leaf forms (the upper half
+// out; term = a quarter of the difference), and series::inverse of L coefficients, each the
+// median of budget.samples samples of at least budget.min_sample_ns, timed in turn; ns per word. Past
 // max_lg: start's values times each row's ratio new / start at max_lg. pass: reversed<true> on 2^14
 // words. Long division: k = 4096 by d = 1 and k = 128 by d = 1024, solved for long_term and
 // long_step. A value within budget.margin of start's keeps start's. tools/tune.py division runs
@@ -62,16 +62,17 @@ inline std::array<double, kRows> time_length(int lg, const Budget& budget) {
     const ntt::Transform& t = transform(lg);
     const std::size_t len = t.length(), half = len / 2;
     Array src(len, 1), A(len, 2), B(len, 3), C(len, 4), D(len, 5), E(len, 6), F(len, 7), work(len, 8), out(len, 9);
+    Array G(len, 18), H(len, 19), I(len, 20), J(len, 21);  // 10 leaf forms of their own, as the windows' sums
     const std::span<const u32> in(src.data(), half);
     const std::span<u32> o(out.data(), half);
     const ntt::Term one[] = {{A.data(), B.data()}};
-    const ntt::Term three[] = {{A.data(), B.data()}, {C.data(), D.data()}, {E.data(), F.data()}};
+    const ntt::Term five[] = {{A.data(), B.data()}, {C.data(), D.data()}, {E.data(), F.data()}, {G.data(), H.data()},
+                              {I.data(), J.data()}};
     const auto times = tune::time(
         budget.samples, budget.min_sample_ns, [&] { t.forward(in, F.data()), kept(F.data()); },
         [&] { t.cyclic_product(in, B.data(), work.data(), o), kept(o.data()); },
         [&] { t.inverse_product(one, work.data(), o, {.offset = half}), kept(o.data()); },
-        [&] { t.inverse_product(three, work.data(), o, {.offset = half}), kept(o.data()); },
-        [&] { t.multiply_add(work.data(), A.data(), B.data()), kept(work.data()); });
+        [&] { t.inverse_product(five, work.data(), o, {.offset = half}), kept(o.data()); });
     // series::inverse of len coefficients, f[0] != 0
     Array f(len, 10), g(len, 11);
     f.data()[0] = 3;
@@ -81,8 +82,8 @@ inline std::array<double, kRows> time_length(int lg, const Budget& budget) {
         kept(g.data());
     });
     const double words = double(len);
-    return {times[0] / words, times[1] / words, times[2] / words, std::max(0.0, times[3] - times[2]) / 2 / words,
-            times[4] / words, inverse[0] / words};
+    return {times[0] / words, times[1] / words, times[2] / words, std::max(0.0, times[3] - times[2]) / 4 / words,
+            inverse[0] / words};
 }
 
 // pass, long_term, long_step.

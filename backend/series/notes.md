@@ -17,7 +17,7 @@ layer is AVX2 asm on Zen 3). One variant per op: no `select.hpp` yet.
   half), `forward_product`, `forward_upper(in, H)`, `cyclic_product(in, B, work, out, {offset,
   negate})` (forward, leaf products with a kept transform and inverse in one depth-first pass, the
   lower or upper half out, negated by the top level's scale) and `inverse_product(terms, work,
-  out, ...)` (an inverse of a sum of up to 4 leaf products). So the steps copy, zero and negate
+  out, ...)` (an inverse of a sum of up to 8 leaf products). So the steps copy, zero and negate
   nothing (before: 4-6% of each op), and each product is one pass over memory, not three. Leaf v
   of a transform of 2L words sits at w_v = (-1)^v r(v / 2), which does not depend on the length,
   so the transform of L words is the lower half of that of 2L.
