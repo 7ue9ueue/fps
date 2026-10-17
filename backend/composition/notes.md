@@ -2,7 +2,8 @@
 
 Composition of power series modulo P = 998244353: `compose(f, g, out)`, `power_projection(g,
 out)`, `compositional_inverse(f, out)` (API: `composition.hpp`). Tests: `test.cpp`; bench:
-`bench.cpp`; round-2 paths: `test_doubling.cpp`. Attempts: `notes/` (one file per issue round). From lc-opt's
+`bench.cpp`; round-2 paths: `test_doubling.cpp`, round 3's: `test_twice.cpp`. Attempts: `notes/`
+(one file per issue round). From lc-opt's
 `lib/poly/{composition,projection,compositional_inverse}.hpp` (its `lib/poly/notes.md`:
 Composition, Power projection, Compositional inverse), rewritten on `ntt::Transform`'s public
 leaf-form ops and `backend/simd`, so every target runs it. One variant per op: no `select.hpp`.
@@ -32,9 +33,21 @@ leaf-form ops and `backend/simd`, so every target runs it. One variant per op: n
     the adds folded into umlal (was a Montgomery product per term); Scalar: u64.
   - CRT: (A + B) / 2 + u^4 (A - B) / (2 s); the 1/2 and 1/s are in the constants (Montgomery
     products with 2^32 / 2 and 2^32 / (2 s), a table per pair), the sums' 2^-32 stays: the hooked
-    inverse (`inverse_hooked`) takes leaves times 2^-32. A pass whose output the next level
-    doubles scales the constants by c = 2^32 8 / B (`Crt`, `scaled_crt`: a table of m/4 words per
-    level), so its leaves come out times 8 / B, which `truncate_blocks` undoes (issue #149 r2).
+    inverse (`inverse_hooked`) takes leaves times 2^-32. For a pass whose output the next level
+    doubles, `Crt::twice()` (issue #149 r3, lc-opt's): (A + B) + u^4 (A - B) / s, twice the CRT,
+    4 Shoup products per output leaf instead of 8 Montgomery ones, from sums reduced only below 2P
+    (`reduce_sums<true>`); its leaves come out times 2^-31 (r2 scaled the constants by 2^32 8 / B
+    instead, with a table of m/4 words per level).
+  - Weights (issue #149 r3): t c_j, P^'s hi times s and t a_i by Shoup products with the pair's
+    s and its quotient (`PairTables::w`, `wq`; -s has the quotient ~q): 4 multiplies on x86 where
+    Montgomery's take 6; Zen 3, ns per 8 pairs: projection 120 against 137 with Montgomery
+    weights, level 1 321 / 337.
+  - Out of line (lc-opt's bottoms' `leaves`): with 16 registers the projection's and level 1's
+    leaves are one call per leaf (`leaf_out_of_line`, `level1_out_of_line`): both leaves of a
+    pair in one body spilled the sums (Zen 3: 141 against lc-opt's 114 ns per 8 pairs, 128 out of
+    line). With 32 registers (AVX-512, Neon) inline (`kInlineLeaves`): Emerald Rapids 107 against
+    112-125 out of line at m = 2^20, Zen 5 and Neoverse V2 the same. The Graeffe's inline
+    everywhere (out of line 66 against 60 on Zen 3); the product's one leaf at a time, inline.
 - Pruned transforms (issue #149, `ntt::Transform`'s column bits): a row at stride 2L holds x < L,
   so bit L of the index is zero in Q_s's forward at 4m, and P^'s forward at 2m has bit L/2 zero;
   V's inverse at 2m uses x < L/2, R's at 4m x < L. The levels above the bit run on half the
@@ -44,10 +57,15 @@ leaf-form ops and `backend/simd`, so every target runs it. One variant per op: n
   s's leaf form at 4m from the previous level's V (W) at 2m, whose rows of 2L words are the blocks
   of `ntt::Transform::truncate_blocks` (the lower half: Q_s mod (y^Y - 1) is V cut to x < L, block
   by block, without the y levels), `join_blocks` (V's rows mod y^Y - 1) and
-  `forward_upper_hooked` (the upper half, mod y^Y + 1: the same rows, row 0 = 2 - row 0 for Q,
-  whose row Y wraps onto the true row 0 = 1 with the opposite sign there). The hook of level s - 1
+  `forward_upper_hooked` (the upper half, mod y^Y + 1: the same rows, row 0 = 2c - row 0 for Q,
+  whose row Y wraps onto the true row 0 = c with the opposite sign there). The hook of level s - 1
   writes V (and W) into the lower half of level s's array: compose's levels[s]; power projection's
   FQ and FP in place, below the leaves read (ntt's hooked forward runs in increasing order).
+  Factors (issue #149 r3, lc-opt's): by `Crt::twice()` a doubled level's leaf forms are c times
+  the true ones, c' = c^2 2^-31 (L / 8) from level to level (`doubled_factor`); the last doubled
+  level's hook undoes c^2 (`scaled_crt`, one table per call), and compose's up pass, whose
+  products by the stored Q_s carry their c's, starts from f reversed times 1 / prod c
+  (`reverse_words` with a scale).
 - One-dimensional levels (lc-opt's; issue #149):
   - Level 0: Q_1 = 1 - y (g(x) + g(-x)) + y^2 g(x) g(-x): the Graeffe of g at 2m (in the forward's
     hook) and one inverse at m. compose: h = p1(x^2) - p0(x^2) g(-x), the forward of p0 at m and
@@ -165,14 +183,33 @@ compositional_inverse 31556 / 30539; at 2^20 316885 / 322750, 301666 / 283657, 3
 0.921, Neoverse V2 0.939; every case below 1 but Emerald Rapids' n = 32 (1.035) and compose/8
 (1.003). Steps and per-phase numbers: notes/149-r2.md.
 
+### Issue #149, round 3
+
+Same run against lc-opt (`lc-bench`, GCC 16.2, as above; `issue149r3/compare.cpp`, outputs equal
+at n = 33, 1000, 1024, 4097, 2^17, 2^20), n = 2^(lg-1), median of 3, fps / lc-opt (round 2, GCC
+15.2):
+
+| op | lg 11 | 14 | 16 | 18 | 21 |
+|---|---:|---:|---:|---:|---:|
+| `compose` | 0.924 (0.989) | 0.917 (0.969) | 0.935 (0.983) | 0.955 (0.997) | 0.946 (0.982) |
+| `power_projection` | 0.927 (1.031) | 0.913 (1.001) | 0.937 (1.012) | 0.960 (1.038) | 0.985 (1.063) |
+| `compositional_inverse` | 0.914 (0.988) | 0.911 (0.986) | 0.935 (1.006) | 0.960 (1.033) | 0.988 (1.058) |
+
+At 2^17, us: compose 27999 / 29323, power projection 24890 / 25926, compositional_inverse 29244 /
+30462; at 2^20 305134 / 322545, 278978 / 283274, 321129 / 325182. `bench.cpp` (lg 21 added)
+against main e4f6e8b, geomean new/base: Zen 3 0.9425, Emerald Rapids 0.9868, Zen 5 0.9316,
+Neoverse V2 0.9719. Steps, per-target choices and what is above 1: notes/149-r3.md.
+
 ## Next
 
-- Power projection's hook with doubling costs 6.5% more than lc-opt's `ProjectionBottom` (its Q
-  doubling 13.46 against 12.87 ms at 2^17, P alone 6.80 against 6.62): per tile after the bottom
-  level, where lc-opt runs it per 16 vectors right after theirs.
-- The plain hooked forward at 4m (level 2) is 5-12% slower than lc-opt's `forward_pruned`: lc-opt's
-  h = 4 loop kernels (#210).
-- The scaled CRT table per doubled level: 66 us at 2^20 (1 MB written); the factor could go into
-  the hooks' A and B instead (8 products per leaf pair more), or a table per level kept.
+- Power projection's 5- and 7-term column sums at level T - 3 take 6 inverses where lc-opt's take
+  4 (ntt's 4 terms; 5.50 against 4.63 ms at 2^20): #143.
+- The pruned forwards of P^ at 2m are 6-9% behind lc-opt's at the mid levels (column bits of 32-64
+  vectors; compose's sum 33.3 against 31.8 ms at 2^20): #210.
+- The projection's leaf function alone is 4% behind lc-opt's (101.8 against 97.8 ns per 8 pairs on
+  Zen 3) with the same instructions within 2%; the column transposes 843 against 483 us at 2^20
+  in the call sequence (161 against 147 alone).
+- Emerald Rapids: the plain Graeffe 4.5% and the product 1% slower per pair than round 2's (compose
+  at n = 32-2^15 1.008-1.022); not Shoup's (Montgomery weights the same).
 - Memory: compose keeps T - 3 leaf forms of 4m words (1.6 GiB at n = 2^22 with the rest);
   recomputing them from the coefficients (m + L words a level) costs one forward of 4m per level.

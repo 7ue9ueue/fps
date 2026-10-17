@@ -1274,10 +1274,13 @@ inline void inverse_group_pruned(Vec* f, std::size_t h, std::size_t k, const u32
     inverse_group(f, h, k, ir);
 }
 
-// forward_tiles() with pruned groups.
+// forward_tiles() with pruned groups. h = 4 (below kPruneForward: whole groups) as one loop over
+// the run, as forward_levels (issue #149 round 3: a call per group there cost the composition's
+// pruned forwards up to 7%, #210).
 template <class Tile>
 inline void forward_pruned_tiles(Vec* f, std::size_t nv, std::size_t count, std::size_t first, const u32* r,
                                  std::size_t width, Tile tile) {
+    static_assert(kPruneForward > 4);
     if (nv > kTile) {
         for (std::size_t k = first; k < first + count; ++k, f += nv) {
             forward_group_pruned(f, nv / 4, k, r, width);
@@ -1287,8 +1290,9 @@ inline void forward_pruned_tiles(Vec* f, std::size_t nv, std::size_t count, std:
     }
     const std::size_t run = std::min(count, kTile / nv), total = run * nv;
     for (std::size_t k = first; k < first + count; k += run, f += total) {
-        for (std::size_t h = nv / 4; h >= 4; h /= 4)
+        for (std::size_t h = nv / 4; h >= 16; h /= 4)
             for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) forward_group_pruned(f + j, h, g, r, width);
+        if (nv >= 16) kernels::forward_h4(f, total / 16, r, k * (nv / 16));
         forward_bottom(f, total / 4, k * (nv / 4), r);
         tile(reinterpret_cast<u32*>(f), total);
     }
