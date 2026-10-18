@@ -55,6 +55,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -173,7 +174,10 @@ Plan idft_plan(std::size_t L) {
 
 // a, or a copy of it in this thread's scratch (kept and reused) if it overlaps out.
 inline std::span<const std::uint32_t> apart(std::span<const std::uint32_t> a, std::span<const std::uint32_t> out) {
-    if (a.empty() || out.empty() || a.data() >= out.data() + out.size() || out.data() >= a.data() + a.size()) return a;
+    const std::less<const std::uint32_t*> before;  // a total order, also for unrelated arrays
+    if (a.empty() || out.empty() || !before(a.data(), out.data() + out.size()) ||
+        !before(out.data(), a.data() + a.size()))
+        return a;
     thread_local std::vector<std::uint32_t> scratch;
     if (scratch.size() < a.size()) scratch.resize(a.size());
     std::ranges::copy(a, scratch.begin());
