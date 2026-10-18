@@ -896,9 +896,7 @@ def generate():
     for name in LEAVES:
         lines += leaves_function(name) + ['']
     lines += ['// The lowest levels of a run of groups as loops (Transform\'s forward and inverse, products).', '']
-    for name in ('forward_h4', 'forward_leaves_loop'):  # issue #87's order
-        lines += (h4_function(name) if name.endswith('h4') else leaves_loop_function(name)) + ['']
-    for name in ('forward_h4_pair', 'inverse_h4', 'inverse_leaves_loop'):
+    for name in ('forward_h4', 'forward_leaves_loop', 'forward_h4_pair', 'inverse_h4', 'inverse_leaves_loop'):
         lines += (h4_function(name) if 'h4' in name else leaves_loop_function(name)) + ['']
     lines += ['}  // namespace fps::ntt::avx2_kernels']
     return '\n'.join(lines) + '\n'
