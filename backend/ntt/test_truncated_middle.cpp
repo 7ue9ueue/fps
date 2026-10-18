@@ -228,7 +228,8 @@ void test_tuning() {
 // Long lengths, the selected variant at -O2 only (2L = 2^24 and 2^25): truncated against plain.
 void huge() {
 #if !__has_feature(address_sanitizer)
-    for (const std::size_t N : {(std::size_t(1) << 23) + (std::size_t(1) << 22) + 3, (std::size_t(1) << 24) + 3 * (std::size_t(1) << 22) + 1}) {
+    const std::size_t M = std::size_t(1) << 22;
+    for (const std::size_t N : {2 * M + M + 3, 4 * M + 3 * M + 1}) {  // 1.5 2^23 + 3, 1.75 2^24 + 1
         const auto f = random_poly(N, 0), g = random_poly(N / 2, 1);
         const std::size_t count = N - g.size() + 1;
         const auto plain = run_middle<SelectedMultiply>(f, g, count, dr::plan(N, dr::kPlain), 0);

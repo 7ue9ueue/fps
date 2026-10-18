@@ -269,7 +269,8 @@ inline detail::ragged::Kinds measure_ragged(const detail::ragged::Kinds& start, 
         for (int b = 0; b < detail::ragged::kBuckets; ++b) {
             const int at = half + (last - kMinLog) * detail::ragged::kBuckets + b;
             if (kinds[at] != start[at])
-                for (int lg = last + 1; lg < kMaxLog; ++lg) kinds[half + (lg - kMinLog) * detail::ragged::kBuckets + b] = kinds[at];
+                for (int lg = last + 1; lg < kMaxLog; ++lg)
+                    kinds[half + (lg - kMinLog) * detail::ragged::kBuckets + b] = kinds[at];
         }
     return kinds;
 }
