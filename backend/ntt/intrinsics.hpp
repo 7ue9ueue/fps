@@ -2995,10 +2995,11 @@ struct Ntt : Butterflies<S> {
             for (std::size_t t = 0; t < 4; ++t) sub(std::integral_constant<int, 4>{}, f + t * q, f + t * q, nv / 4, t);
             return;
         }
-        // Runs in increasing order (Transform::forward_hooked): the lower subtree first, as in is
-        // apart from f (from_top runs the upper one first, for a source in place).
+        // Runs in increasing order (Transform::forward_hooked): the lower subtree first, for in
+        // apart from f (from_top runs the upper one first, for a source in place); in place, the
+        // radix-2 level below.
         const std::size_t half = len / 2;
-        if (n <= half && nv / 2 >= 16 && width < kUnreadWidth) {
+        if (n <= half && nv / 2 >= 16 && width < kUnreadWidth && in != f) {
             sub(std::integral_constant<int, 2>{}, Source{in, n}, f, nv / 2, 0);
             sub(std::integral_constant<int, 2>{}, Source{in, n}, f + half, nv / 2, 1);
             return;

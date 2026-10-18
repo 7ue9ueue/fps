@@ -1346,11 +1346,13 @@ inline void compose_levels(Span f, Span g, Out h) {
         for (std::size_t b = 0; b < m / 2; ++b) p[4 * b] = r0[b], p[4 * b + 1] = r1[b];
     }
     // Levels generic - 1 .. 2: R = P^(z^2) Q_s(-z), rows Y .. 2Y - 1, x below L (column bit L
-    // unused); P^ at stride L, x < L/2 (column bit L/2 zero).
+    // unused); P^ at stride L, x < L/2 (column bit L/2 zero). P^'s leaf form in place in p, which
+    // the inverse's top level writes after the hook's last read (as lc-opt: from p into another
+    // array, the forward ran 1.03-1.07x slower at 2^20 on Zen 3; ntt notes/210-r1.md).
     for (int s = generic - 1; s >= first; --s) {
         const std::size_t L = m >> s;
-        t2.forward_hooked(Span(p, 2 * m), FP, kNoHook, L / 2);
-        t4.inverse_hooked(ProductHook{FP, levels[std::size_t(s)], tables}, work, Out(p, 2 * m), {.offset = 2 * m}, L);
+        t2.forward_hooked(Span(p, 2 * m), p, kNoHook, L / 2);
+        t4.inverse_hooked(ProductHook{p, levels[std::size_t(s)], tables}, work, Out(p, 2 * m), {.offset = 2 * m}, L);
         if (s > first) zero_columns(p, 2 * m, L);  // level 1 reads x < L only
     }
     // Level 1, one-dimensional: P^_2 = P_0 .. P_3 at stride m/2 (x < m/4); R's rows 2, 3 = P_2(x^2) +
