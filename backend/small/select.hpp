@@ -150,11 +150,24 @@ struct Model {
 
 inline constexpr Model kModel = {tuned::term[kTuned], tuned::word[kTuned], tuned::call[kTuned], tuned::square[kTuned]};
 
-// The NTT's time per transform length 2^lg, lg = 6 .. 25, in the model's ns: an ntt::Convolution
-// with the product in the caller's memory (construct, copy the factors in, multiply), times the
-// model's over multiply()'s measured time where the two cross. The compiled defaults are
-// tools/tune.py's; small::measure_ntt (tune.hpp) measures them on this machine.
+// The NTT's time for products of N words, in the model's ns: ntt::multiply into the caller's memory
+// (its ragged and truncated plans, issue #212), times the model's over multiply()'s measured time
+// where the two cross. Per lg = 6 .. 25, at lengths in (2^(lg-1), 2^lg]:
+//   ntt_times[lg - 6]               N = 2^lg (the plain product at 2^lg)
+//   ragged_times[4 (lg - 6) + j]    N = 2^(lg-1) + 1 for j = 0, (4 + j) 2^(lg-3) for j = 1 .. 3
+// ntt_ns(N) interpolates them linearly in N. The compiled defaults are tools/tune.py's;
+// small::measure_ntt and measure_ragged (tune.hpp) measure them on this machine.
+inline constexpr int kRaggedPoints = 4;
 inline constexpr std::array<double, 20> kNttDefaults = std::to_array(tuned::ntt[kTuned]);
+inline constexpr std::array<double, 20 * kRaggedPoints> kRaggedDefaults = std::to_array(tuned::ragged[kTuned]);
 inline constinit tune::Table<kNttDefaults> ntt_times;
+inline constinit tune::Table<kRaggedDefaults> ragged_times;
+
+// The product length of ragged_times[4 (lg - 6) + j] (j < kRaggedPoints), or of ntt_times[lg - 6]
+// for j = kRaggedPoints.
+constexpr std::size_t ntt_point(int lg, int j) {
+    const std::size_t half = std::size_t(1) << (lg - 1);
+    return j == 0 ? half + 1 : half + std::size_t(j) * (half / kRaggedPoints);
+}
 
 }  // namespace fps::small

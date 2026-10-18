@@ -72,11 +72,25 @@ inline double model_ns(const Model& model, std::size_t n, std::size_t m) {
     return model.term * x * y + model.word * (x + y) + model.call + model.square * s * s;
 }
 
+// The NTT's time for a product of N >= 1 words, in the model's ns (select.hpp): in (2^(lg-1), 2^lg],
+// linear between the measured lengths ntt_point(lg, j), with 2^(lg-1) + 1 taken as 2^(lg-1); up to
+// 2^5 that of 33; past 2^25 twice per doubling.
+inline double ntt_ns(std::size_t N, const std::array<double, 20>& top,
+                     const std::array<double, 20 * kRaggedPoints>& low) {
+    const int lg = std::max(6, int(std::bit_width(N - 1)));
+    if (lg > 25) return std::ldexp(top[19], lg - 25);
+    const std::size_t half = std::size_t(1) << (lg - 1);
+    const double u = N > half ? double(N - half) * kRaggedPoints / double(half) : 0;  // in [0, 4]
+    const int j = std::min(int(u), kRaggedPoints - 1);
+    const double lo = low[kRaggedPoints * (lg - 6) + j];
+    const double hi = j + 1 < kRaggedPoints ? low[kRaggedPoints * (lg - 6) + j + 1] : top[lg - 6];
+    return lo + (u - j) * (hi - lo);
+}
+inline double ntt_ns(std::size_t N) { return ntt_ns(N, ntt_times.get(), ragged_times.get()); }
+
 inline bool beats_ntt(std::size_t n, std::size_t m) {
     if (n == 0 || m == 0) return true;
-    const int lg = std::max(6, int(std::bit_width(n + m - 2)));
-    const auto& ntt = ntt_times.get();
-    return model_ns(kModel, n, m) < (lg <= 25 ? ntt[lg - 6] : std::ldexp(ntt[19], lg - 25));
+    return model_ns(kModel, n, m) < ntt_ns(n + m - 1);
 }
 
 }  // namespace fps::small
