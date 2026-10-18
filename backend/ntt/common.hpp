@@ -297,6 +297,15 @@ template <int K, class Run>
 // first level is at most kUnreadWidth words). Issue #149 round 2.
 inline constexpr std::size_t kUnreadWidth = 32;
 
+// Whether a pass from `from` to `to` (other memory) runs its columns last to first: `to` 1 to 256
+// bytes past `from` modulo 4 KiB, where in order the loads of the next columns match the stores
+// just made in their low 12 bits (4K aliasing; the fused ops' radix-2 top with out 64-128 bytes
+// past work: Emerald Rapids 1.04-1.16x at 2^18-2^20, #236). The reversed loop stays out of line
+// (cold), so the code of the common case does not move.
+inline bool backwards(const void* from, const void* to) {
+    return (reinterpret_cast<std::uintptr_t>(to) - reinterpret_cast<std::uintptr_t>(from)) % 4096 - 1 < 256;
+}
+
 // Pruned first and last levels (Transform's hooked ops, issue #149): a run for first_level or
 // last_level that runs only the columns c with (c & width) == 0 (width: words, a power of two,
 // at least the step and below the block). A first level writes zeros to the K blocks of the other

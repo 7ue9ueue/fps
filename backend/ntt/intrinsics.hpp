@@ -2112,6 +2112,7 @@ struct Ntt : Butterflies<S> {
                                                       u32 s) {
         if constexpr (requires { Generated<S>::template inverse_radix2<kStore, kUpper>(from, f, half, words, s); })
             if (Generated<S>::template inverse_radix2<kStore, kUpper>(from, f, half, words, s)) return;
+        if (backwards(from, f)) return inverse_radix2_backwards<kStore, kUpper>(from, f, half, words, s);
         B::prefetching(half, kPrefetchHalfMin, [&]<bool kPf> [[gnu::always_inline]] (std::bool_constant<kPf>) {
             if (s == 0) {
                 for (std::size_t i = 0; i < words; i += S::lanes) {
@@ -2138,6 +2139,26 @@ struct Ntt : Butterflies<S> {
                 if constexpr (kStore > 1) S::store(f + i + half, canonical(B::mul(diff(x, y), scale)));
             }
         });
+    }
+    // inverse_radix2_part with the columns last to first (common.hpp's backwards), no prefetch.
+    template <int kStore, bool kUpper>
+    [[gnu::noinline, gnu::cold]] static void inverse_radix2_backwards(const u32* from, u32* f, std::size_t half,
+                                                                      std::size_t words, u32 s) {
+        const auto columns = [&] [[gnu::always_inline]] (auto product) {
+            for (std::size_t i = words; i;) {
+                i -= S::lanes;
+                const V x = S::load(from + i), y = S::load(from + i + half);
+                if constexpr (kUpper) {
+                    S::store(f + i, canonical(product(diff(x, y))));
+                    continue;
+                }
+                S::store(f + i, canonical(product(add(x, y))));
+                if constexpr (kStore > 1) S::store(f + i + half, canonical(product(diff(x, y))));
+            }
+        };
+        if (s == 0) return columns([] [[gnu::always_inline]] (V v) { return B::low(v); });
+        const F scale = B::factor(s);
+        columns([&] [[gnu::always_inline]] (V v) { return B::mul(v, scale); });
     }
     static void inverse_radix2_out(u32* f, std::size_t half, u32* out, std::size_t count, u32 s) {
         last_level<2>(f, half, out, count, S::lanes, [&] [[gnu::always_inline]] (auto blocks, const u32* from, u32* to,

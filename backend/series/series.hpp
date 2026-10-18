@@ -471,7 +471,8 @@ inline void low_product(Span a, Span b, std::size_t c, u32* out, u32* work) {
         const auto [roots, inverse_roots] = nd::tables<Variant>(plan.lg);
         if (!plan.split) {
             const std::size_t span = (std::size_t(1) << plan.lg) + ntt::kPadding;
-            u32* const A = work + nd::place(a.data(), b.data(), out, span * sizeof(u32)) / sizeof(u32);
+            const std::size_t at = nd::place(a.data(), b.data(), out, span * sizeof(u32), nd::place_period(plan.lg));
+            u32* const A = work + at / sizeof(u32);
             const nd::Product product{a.data(), na, b.data(), nb, A, A + span, out, count, plan.lg};
             nd::run_product<Variant, false>(product, roots, inverse_roots);
         } else {

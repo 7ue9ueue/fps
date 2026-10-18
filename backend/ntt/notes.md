@@ -61,10 +61,12 @@ Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_produc
   - The levels pick T with an inlined switch, and each T is its own function. One function for
     every T (a lambda), with two 64-bit divisions per level, cost a 2^7 product 268 instructions
     and 72 cycles on Emerald Rapids (3176 -> 3444 instructions).
-  - a and b sit in the region at least 256 bytes from f's, g's and out's page offsets (`place`):
-    the bench's spans 64 bytes past a page, against a at 0 and b at 64, ran Zen 3 1.08-1.11x
-    slower than multiply() at even lg 2^14-2^22, 1.04-1.06x with the placement (4K aliasing:
-    Measurements, Convolution memory).
+  - a and b sit in the region as far as they can from f's and out's page offsets (a) and g's
+    (b) (`place`: the middle of the widest gap, modulo 2 KiB at 2^11-2^12, where the top level's
+    blocks are 2 KiB apart, else 4 KiB). The bench's spans 64 bytes past a page, against a at 0
+    and b at 64, ran Zen 3 1.08-1.11x slower than multiply() at even lg 2^14-2^22 (4K aliasing:
+    Measurements, Convolution memory); a 256-512 bytes from them (the first offset 256 bytes from
+    each, the rule before #236) 3-5% slower than 1-3 KiB (notes/236-r1.md).
   - Products in place (`Convolution`) and `Transform` keep their own top levels and kernels,
     unchanged. Through the span levels (one implementation for both) they ran 2-4% slower at
     2^6-2^7 on Emerald Rapids and Zen 5 (Log, issue #38 round 2).
@@ -123,8 +125,8 @@ Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_produc
     (or joins) each run of subtrees from F into the work array before its bottom level, so F is
     read once and stays; the top level writes out with the product's `*_out` levels (any
     alignment, count words). With an offset or add, the top level runs in place and one pass
-    copies or adds the range. Work array: the thread's region (`place` keeps it 256 bytes from
-    F's and out's page offsets), on the stack up to 2^10.
+    copies or adds the range. Work array: the thread's region (placed far from F's and out's page
+    offsets by `place`), on the stack up to 2^10.
 - Hooked and pruned ops (issue #149, for backend/composition; notes/149-r1.md):
   `forward_hooked(in, F, hook, zero)` hands each run of leaves to the caller's hook after its
   bottom level; `inverse_hooked(hook, work, out, o, unused)` lets the hook write each run (times
@@ -165,6 +167,14 @@ origins). One product, `product<Bottom>` (lc-opt had two paths, `Convolution` an
   (the first level without input reductions: 20 vector ops per column, not 33) and
   `inverse_top4`. Even lg: a radix-2 pass without reductions (canonical inputs) below 2^16,
   `forward_radix8_dense` from 2^16; `inverse_top`.
+- The fused ops' inverse top level at even lg (`split_top`, issue #236): the radix-8 top from the
+  work array to out (8 + 8 streams 2^lg / 8 words apart) where out lies 640 bytes or more past
+  work modulo 4 KiB or 448 or more before it, from 2^14 but at 2^18; else each half's last radix-4
+  group in place after its subtrees and the radix-2 level to out (lc-opt's top). Zen 3: the
+  radix-8 top ran up to 1.15x slower with out within 64 bytes past work modulo 4 KiB and up to
+  2.4x at 2^18 whatever the offset (by where the pages lay); the radix-2 level within 3% of its
+  best (notes/236-r1.md). The intrinsics' radix-2 level to other memory runs its columns in
+  reverse with the output 1-256 bytes past the input (4K aliasing).
 
 ### intrinsics
 
