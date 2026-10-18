@@ -35,10 +35,13 @@ For each round:
    close the pull request and edit the round's `Result: gain` to `Result: no gain`, with the reason.
 5. Relabel the issue once its pull request is merged or closed (or the round opened none). Leave it
    `blocked` if the agent asked for the user. Mark it `done` and close it after its round limit
-   (`Rounds:` line; 3 for speed work, 1 for a feature) or 2 `no gain` results in a row. Otherwise
-   set it back to `ready`.
+   (`Rounds:` line; 3 for speed work, 1 for a feature), after a `no gain`, or when its task is
+   done and the round's next ideas are each guessed below 3% at n = 2^20 (AGENTS.md, Issue
+   budget). Otherwise set it back to `ready`. Read the round's `Found` items: open an issue for
+   one only within the issue budget; otherwise leave it in the notes.
 6. Remove the round's worktree once its pull request is merged or closed.
 
 Keep starting rounds until no issue is `ready`, then report each issue's result in a few lines.
 
-To add work, open an issue from `.github/ISSUE_TEMPLATE/kernel.md` or `task.md` with label `ready`.
+To add work, open an issue from `.github/ISSUE_TEMPLATE/kernel.md` or `task.md` with label `ready`,
+within the issue budget (AGENTS.md).

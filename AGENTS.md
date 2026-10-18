@@ -120,12 +120,22 @@ Your brief is where you start, not the edge of your job. Look for whatever makes
 the way we work slow, fragile or wasteful: kernels, the frontend, the tools, the briefs, these
 docs. You decide what is worth doing.
 
-- If it fits in your pull request, do it. If not, open an issue right away, labeled `ready`
-  (`.github/ISSUE_TEMPLATE/task.md`, or `kernel.md` for a kernel): what you saw, the evidence, and
-  what you would try. `/work` hands it to a subagent. Search open issues first; on a match, add
-  your evidence there.
-- Something everyone waits on, or works around, is worth an issue, even if it is outside the code
-  you were asked to touch.
+- If it fits in your pull request, do it. If not, write it under `Found` in your notes entry and
+  in your issue comment: what you saw, the evidence, and what you would try. On a match with an
+  open issue, add your evidence there.
+- Agents do not open issues; the coordinators do, and only within the issue budget below. The
+  project has to finish: an open issue is work someone must do or close.
+
+### Issue budget
+
+- At most 10 open issues outside `backlog` and `build` (`ready`, `running`, `blocked`); `build`
+  issues are DESIGN.md's parts, planned by `/build`. Below that, a coordinator may open one for a finding that is a wrong result or crash,
+  blocks a `build` issue, or is measured at 3% or more at n = 2^20 (or closes a gap to lc-opt).
+  At the limit, close or backlog one first, or add the evidence to an open issue.
+- An issue closes when its task is done and the next ideas are each guessed below 3% at
+  n = 2^20, after one `no gain`, or at its `Rounds:` limit, whichever comes first.
+- `backlog` is for work the user may want later (a coordinator may move an issue there to make
+  room); only the user makes a `backlog` issue `ready` again.
 
 ## Ground rules
 
