@@ -13,16 +13,16 @@
 //   run_variant<P>(v, a, n, b, m, out)                 candidate v of select.hpp's list, n >= m >= 1
 //
 // beats_ntt(n, m), for factors of n and m coefficients: true where multiply() is expected to run
-// faster than an ntt::Convolution with the product in the caller's memory, on this target: a cost
-// model of multiply() against the NTT's time per transform length (select.hpp), one acquire load
-// per call. Both are compiled defaults measured on the target's machine by tools/tune.py; the NTT
-// times are a tuned choice ("small.ntt", tune.hpp) that tune::run() measures on this machine and
-// tune::save() / load() keep, after "small.variant". Rerun tools/tune.py small when either kernel
-// gets faster. On the timed targets: min(n, m) up to 38-109 next to a factor of about 1000
-// coefficients, 55-161 next to one of 16000 (the higher ends where the product just passes a power
-// of two), and n = m up to 27-94. Lengths past 2^25 count the NTT at twice the time per doubling,
-// so huge products still go to the NTT (which throws) and a short factor of any length to
-// multiply().
+// faster than ntt::multiply into the caller's memory, on this target: a cost model of multiply()
+// against the NTT's time at the product's length N = n + m - 1 (ntt_ns: measured at 2^lg and four
+// lengths in each (2^(lg-1), 2^lg), linear between; the NTT runs ragged and truncated plans there,
+// issue #212), two acquire loads per call. Both are compiled defaults measured on the target's
+// machine by tools/tune.py; the NTT times are tuned choices ("small.ntt", "small.ragged",
+// tune.hpp) that tune::run() measures on this machine and tune::save() / load() keep, after
+// "small.variant". Rerun tools/tune.py small when either kernel gets faster. Where it picks
+// multiply() on the timed targets: notes.md (Cutoff against the NTT). Lengths past 2^25 count the
+// NTT at twice the time per doubling, so huge products still go to the NTT (which throws) and a
+// short factor of any length to multiply().
 // Design and measurements: notes.md.
 #pragma once
 
