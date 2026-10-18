@@ -18,9 +18,14 @@ both also over any span of items with a projection to their words). Trees: `tree
   multiplies the 8 lane products (read in place, every 8th word) and the other factors. The
   result leaves Montgomery form times the constant in one pass into the caller's out. Two passes
   over the factors: the first also counts the degrees below 1024 (`kCounted`, on the stack), the
-  counting sort's histogram when its cut is below that; the second places them. A slot of 8
-  linear factors loads their words in pairs and transposes them in registers (`load_linear`,
-  AVX2 and Neon; `kLinearSlots`: not on Zen 3, where it was slower).
+  counting sort's histogram when its cut is below that; the second places them. The first pass
+  counts a first run of factors of one size by a loop of its own (no histogram, no extremes per
+  factor); when every factor is small, of one degree and none constant, the sort is the identity
+  and there is no second pass (`Slots` with a null order). A slot of 8 linear factors loads their
+  words in pairs and transposes them in registers (`load_linear`, AVX2 and Neon; `kLinearSlots`:
+  not on Zen 3, where it was slower); a slot of 8 factors of one degree d > 1 loads each one's
+  words as vectors (the last by a masked or lane load: no word past a factor is read) and
+  transposes them (`load_full`).
 - Node lengths (both trees): a node covers leaves [lo, hi) and splits where the prefix sums of
   the leaves' degrees come closest to halves (lc-opt's split). Its length L is a power of two >=
   its degree (the wrap trick): from its children's transforms of length L its product p comes out
@@ -50,37 +55,60 @@ both also over any span of items with a projection to their words). Trees: `tree
   written before their products read them). Nodes up to degree 32
   (`kStandardBase`) by `small::multiply` in pairs (each product of Montgomery forms carries one
   more 2^32: one pass at the end takes them out). Length >= 64.
+- Lanes to the standard tree (`Pairs`, issue #91 round 2): the standard tree's nodes over lane
+  products 2j, 2j + 1 (all 8 lanes alone: its bottom level) take their product transform of
+  length T = 2L (L the lane root's length) from the lane root's transform at twice its length
+  (`LaneTree::root_doubled`: the root's product pass writes the lower half, forward_upper from the
+  coefficients the upper), instead of the lane products' forwards (with loads of every 8th word)
+  and the pairs' leaf products. `lane_pairs`: lanes 2j and 2j + 1 multiplied pointwise; standard
+  leaf u of length T from lanes leaves 8u .. 8u + 7, the 8 roots of x^8 - w_u in ntt's values
+  form order, by an 8-point inverse and an untwist by rho_u^-k / 8 (`untwist_factors`). The pairs
+  go where the root's left child was; the doubled transform, and the lanes' coefficients when
+  every pair is taken (`pair_nodes`), are released before the standard tree is built, so the peak
+  memory does not grow.
 - Montgomery form throughout (x 2^32 mod P): pointwise and leaf products need no correction.
 - Memory: one region of ntt's per-thread memory (`ntt::detail::take_region`, kept across calls,
   huge pages), used as a stack (`Stack`; past it, blocks from the heap). Nothing of the number of
   factors goes to the heap: fresh pages cost about 1.7 us per 4 KiB page on Zen 3 (lc-opt's notes),
   and `product@standard/18` lost 6 ms to a `std::vector` of leaves (Log). Per thread, kept: ntt's
-  `Transform` per length (tables of about 1.25 2^lg bytes each, so up to 2.5x the longest's) and
-  the leaf weights w_v 2^32.
+  `Transform` per length, all on the tables of the longest reserved (`reserve_transforms`, ntt's
+  `Transform(lg, tables)`: the tables are prefix compatible), about 1.25 bytes per word of the
+  longest (one table per length was 2.5x that); the leaf weights w_v 2^32 and the untwist factors.
 
 ## Measurements
 
-Bench (`bench.cpp`), GCC 15.2, medians of 11 rounds, ns per factor, commit 7d34d0c (issue #91
-round 1, on main ad1e1b4; `lc-intel` moves 5-10% between runs, the paired ratios less).
-`product/<lg>`: 2^lg factors x - r; `product_mixed`: degrees 0 .. 8, a quarter constants (sum
-about 3.4 2^lg); `product_few/<lg>`: 8 factors of 2^lg / 8 or 2^lg / 8 + 1 coefficients.
+Bench (`bench.cpp`), GCC 16.2, medians of 11 rounds, ns per factor, issue #91 round 2 (on main
+e948ff1; `lc-intel` moves 5-10% between runs, the paired ratios less). `product/<lg>`: 2^lg
+factors x - r; `product_mixed`: degrees 0 .. 8, a quarter constants (sum about 3.4 2^lg);
+`product_few/<lg>`: 8 factors of 2^lg / 8 or 2^lg / 8 + 1 coefficients.
 
 | case | `lc-bench` (Zen 3, avx2) | `lc-intel` (Emerald Rapids, avx512) | `lc-zen5` (zen5) | `lc-arm` (Neoverse V2) |
 |---|---:|---:|---:|---:|
-| product/4 | 27.9 | 20.9 | 18.5 | 27.5 |
-| product/6 | 18.5 | 17.8 | 12.7 | 20.2 |
-| product/8 | 18.1 | 17.1 | 12.5 | 22.7 |
-| product/10 | 19.6 | 18.5 | 12.7 | 27.2 |
-| product/14 | 27.1 | 25.4 | 15.9 | 40.7 |
-| product/18 | 37.9 | 38.5 | 21.0 | 59.9 |
-| product@standard/18 | 60.5 | 60.4 | 35.3 | 82.1 |
-| product_mixed/18 | 166 | 177 | 94.7 | 268 |
-| product_few/20 (ms) | 11.31 | 11.60 | 5.45 | 19.86 |
+| product/4 | 27.1 | 19.0 | 17.2 | 26.5 |
+| product/6 | 16.6 | 14.3 | 9.7 | 17.2 |
+| product/8 | 15.1 | 13.8 | 10.5 | 17.4 |
+| product/10 | 17.2 | 15.9 | 11.0 | 21.3 |
+| product/14 | 24.3 | 22.6 | 13.5 | 32.8 |
+| product/18 | 34.3 | 34.9 | 17.7 | 49.4 |
+| product/20 | 40.6 | 42.9 | 21.1 | 59.2 |
+| product@standard/18 | 57.8 | 51.0 | 32.5 | 77.1 |
+| product_mixed/18 | 155 | 153 | 79.4 | 233 |
+| product_mixed/20 | 193 | 204 | 102 | 277 |
+| product_few/20 (ms) | 10.91 | 11.17 | 4.95 | 17.83 |
 
-Against main ad1e1b4 (#56's tree), same run, new/base, gated geomean: Zen 3 0.960, Emerald
-Rapids 0.919, Zen 5 0.947, Neoverse V2 0.947 (Log, issue #91). Frontend `product/<lg>` at lg
-10 / 14 / 18: Zen 3 0.959 / 0.949 / 0.954, Emerald Rapids 0.905 / 0.915 / 0.929, Zen 5 0.972 /
-0.939 / 0.933, Neoverse V2 0.898 / 0.917 / 0.938.
+Against main e948ff1 (#91 round 1's tree), same run, new/base, gated geomean: Zen 3 0.948,
+Emerald Rapids 0.908, Zen 5 0.921, Neoverse V2 0.919 (notes/91-r2.md). Same-run against lc-opt's
+product_of_polynomial_sequence on `lc-bench` (its walk, sort, trees and scaling on the same
+tokens), fps / lc-opt: product/18 0.921, product/20 0.925, product_mixed/20 0.962, geomean of 11
+cases 0.903 (main: 0.943).
+
+Round 1 (commit 7d34d0c on main ad1e1b4, GCC 15.2), ns per factor, lc-bench / lc-intel / lc-zen5
+/ lc-arm: product/10 19.6 / 18.5 / 12.7 / 27.2, product/18 37.9 / 38.5 / 21.0 / 59.9,
+product@standard/18 60.5 / 60.4 / 35.3 / 82.1, product_mixed/18 166 / 177 / 94.7 / 268,
+product_few/20 (ms) 11.31 / 11.60 / 5.45 / 19.86; against main ad1e1b4 (#56's tree), gated
+geomean 0.960 / 0.919 / 0.947 / 0.947; frontend `product/<lg>` at lg 10 / 14 / 18: Zen 3 0.959 /
+0.949 / 0.954, Emerald Rapids 0.905 / 0.915 / 0.929, Zen 5 0.972 / 0.939 / 0.933, Neoverse V2
+0.898 / 0.917 / 0.938.
 
 Issue #56's tree (commit 328b28a on main a34ce14, 5 rounds; `lc-arm` 3 rounds of 2bd03d3), ns
 per factor, lc-bench / lc-intel / lc-zen5 / lc-arm: product/10 20.5 / 20.5 / 13.5 / 30.3,

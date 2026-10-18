@@ -16,9 +16,11 @@
 // (select.hpp) have degree at most 1/64 of those factors' sum, they are sorted by degree and dealt
 // to 8 lanes, and one tree multiplies the 8 lanes side by side (pointwise products of transforms);
 // a standard tree (one polynomial per node, leaf products) multiplies the 8 lane products and the
-// larger factors. Both trees use one transform of each length per node (transform doubling, the
-// wrap trick): tree.hpp. Memory: one region of this thread, kept across calls (ntt's), and ntt's
-// transforms per length, kept per thread. Design and measurements: notes.md.
+// larger factors; its nodes over two lane products come from the lane root's transform at twice
+// its length (lane_pairs). Both trees use one transform of each length per node (transform
+// doubling, the wrap trick): tree.hpp. Memory: one region of this thread, kept across calls
+// (ntt's), and ntt's transforms per length on one table, kept per thread. Design and
+// measurements: notes.md.
 #pragma once
 
 #include <algorithm>
@@ -72,10 +74,12 @@ enum class Mode { automatic, standard, lanes };
 template <class F>
 struct Slots {
     const F& fs;
-    std::span<const u32> order;  // indices into fs, by degree, largest first
+    const u32* order;  // `size` indices into fs, by degree, largest first; null: 0, 1, .., size - 1
+    std::size_t size;
 
-    std::size_t count() const { return (order.size() + 7) / 8; }
-    u32 degree(std::size_t k) const { return u32(fs[order[8 * k]].size() - 1); }
+    std::size_t index(std::size_t i) const { return order ? order[i] : i; }
+    std::size_t count() const { return (size + 7) / 8; }
+    u32 degree(std::size_t k) const { return u32(fs[index(8 * k)].size() - 1); }
 
     LaneNode load(std::size_t k, u32* c) const {
         static constexpr u32 kOne = 1;
@@ -84,16 +88,18 @@ struct Slots {
         LaneNode node;
         bool full = true;
         for (std::size_t l = 0; l < 8; ++l) {
-            if (8 * k + l < order.size()) {
-                const std::span<const u32> f = fs[order[8 * k + l]];
+            if (8 * k + l < size) {
+                const std::span<const u32> f = fs[index(8 * k + l)];
                 p[l] = f.data(), node.degree[l] = u32(f.size() - 1);
             } else {
                 p[l] = &kOne, node.degree[l] = 0;
             }
             full &= node.degree[l] == d;
         }
-        if (kLinearSlots && full && d == 1) {
+        if (full && d == 1 && kLinearSlots) {
             load_linear<Lanes>(p, c);
+        } else if (full && d > 1) {  // linear ones as below on Zen 3 (load_full: 1.02-1.06x there)
+            load_full<Lanes>(p, d, c);
         } else {
             if (full) {
                 for (u32 j = 0; j <= d; ++j)
@@ -123,14 +129,25 @@ inline constexpr u32 kCounted = 1024;
 
 template <class F>
 void product(const F& fs, std::span<u32> out, Mode mode) {
-    // The constants' product; the other factors' count, degree sum and largest degree; counts of
-    // the degrees d < kCounted in counted[d], for d <= seen (the rest of counted is not written).
-    u32 constant = 1, top = 0, seen = 0;
+    // The constants' product; the other factors' count, degree sum, largest and smallest degree;
+    // counts of the degrees d < kCounted in counted[d], for d <= seen (the rest of counted is not
+    // written).
+    u32 constant = 1, top = 0, low = ~u32(0), seen = 0;
     u32 counted[kCounted];
-    std::size_t count = 0, last = 0;
+    std::size_t count = 0, last = 0, i = 0;
     u64 total = 0;
     bool empty = false;
-    for (std::size_t i = 0; i < fs.size(); ++i) {
+    // A first run of nonconstant factors of one size (all of them for x - r) is counted without
+    // the loop's work per factor (a histogram increment through memory, the extremes): product/<lg>
+    // 0.89-0.98 of the time (notes/91-r2.md).
+    if (const std::size_t s = fs.size() ? fs[0].size() : 0; s >= 2) {
+        while (i < fs.size() && fs[i].size() == s) ++i;
+        const std::size_t d = s - 1;
+        total = u64(d) * i, count = i, last = i - 1;
+        top = low = u32(std::min<u64>(d, u64(1) << 31));
+        if (d < kCounted) std::fill(counted + 1, counted + d, 0u), counted[d] = u32(i), seen = u32(d);
+    }
+    for (; i < fs.size(); ++i) {
         const std::size_t s = fs[i].size();
         if (s <= 1) {
             if (s == 0) empty = true;
@@ -140,6 +157,7 @@ void product(const F& fs, std::span<u32> out, Mode mode) {
         const std::size_t d = s - 1;
         total += d, ++count, last = i;
         top = u32(std::min<u64>(std::max<u64>(top, d), u64(1) << 31));
+        low = u32(std::min<u64>(low, d));
         if (d < kCounted) {
             if (d > seen) std::fill(counted + seen + 1, counted + d + 1, 0u), seen = u32(d);
             ++counted[d];
@@ -165,47 +183,82 @@ void product(const F& fs, std::span<u32> out, Mode mode) {
     // MB on Zen 3 (notes.md).
     const u32 cut = std::min(top, mode == Mode::lanes ? top : mode == Mode::standard ? 0 : u32(total / 64));
     const std::size_t lane_length = LaneTree<Slots<F>>::length(u32(cut + total / 8 + 1));
-    const std::size_t lane_words = 8 * 4 * (lane_length + 1);
-    const std::size_t standard_words = 8 * (lane_length + 1) + 4 * (StandardTree<>::length(u32(total)) + 1);
+    // The lane tree; the lane root's transform at twice its length (values) below it, and the
+    // standard tree's pairs over lanes (32 lane lengths in all) beside the standard tree.
+    const std::size_t lane_words = 8 * 4 * (lane_length + 1) + 16 * lane_length + 64;
+    const std::size_t standard_words = 8 * (lane_length + 1) + 32 * lane_length + 4 * (StandardTree<>::length(u32(total)) + 1);
     constexpr std::size_t kLeafWords = sizeof(Leaf) / sizeof(u32);
     const std::size_t words = cut + 2 + (kLeafWords + 1) * (count + 8) + std::max(lane_words, standard_words) + 8192;
     RegionGuard guard{ntt::detail::take_region(words * sizeof(u32))};
     Stack stack(reinterpret_cast<u32*>(guard.region.start), guard.region.bytes / sizeof(u32));
 
-    // A counting sort of the small factors by degree, largest first: start[cut - d + 1] counts
-    // degree d, then start[cut - d] is where the next of degree d goes. Stable: the slots read
-    // factors of one degree in their order (notes.md).
-    u32* const start = stack.take(cut + 2);
-    std::fill(start, start + cut + 2, 0u);
-    std::size_t small = 0;
-    if (cut < kCounted) {
-        for (u32 d = 1; d <= std::min(cut, seen); ++d) start[cut - d + 1] = counted[d], small += counted[d];
+    // Every factor small, of one degree, none constant: the lanes take them in their own order (the
+    // sort by degree below is the identity), with no pass of placement (Slots' null order).
+    static_assert(sizeof(Leaf) % sizeof(u32) == 0 && alignof(Leaf) <= 64);
+    std::size_t small = 0, leaf_count = 0;
+    Leaf* leaves;
+    u32* order = nullptr;
+    if (count == fs.size() && low == top && top <= cut && (mode == Mode::lanes || count >= kMinLaneFactors)) {
+        small = count;
+        leaves = reinterpret_cast<Leaf*>(stack.take(kLeafWords * 8));
     } else {
+        // A counting sort of the small factors by degree, largest first: start[cut - d + 1] counts
+        // degree d, then start[cut - d] is where the next of degree d goes. Stable: the slots read
+        // factors of one degree in their order (notes.md).
+        u32* const start = stack.take(cut + 2);
+        std::fill(start, start + cut + 2, 0u);
+        if (cut < kCounted) {
+            for (u32 d = 1; d <= std::min(cut, seen); ++d) start[cut - d + 1] = counted[d], small += counted[d];
+        } else {
+            for (std::size_t i = 0; i < fs.size(); ++i) {
+                const std::size_t s = fs[i].size();
+                if (s >= 2 && s - 1 <= cut) ++start[cut - (s - 1) + 1], ++small;
+            }
+        }
+        if (mode == Mode::automatic && small < kMinLaneFactors) small = 0;
+        leaves = reinterpret_cast<Leaf*>(stack.take(kLeafWords * (count - small + 8)));
+        order = small ? stack.take(small) : nullptr;
+        for (u32 d = 1; d <= cut + 1; ++d) start[d] += start[d - 1];
         for (std::size_t i = 0; i < fs.size(); ++i) {
             const std::size_t s = fs[i].size();
-            if (s >= 2 && s - 1 <= cut) ++start[cut - (s - 1) + 1], ++small;
+            if (s < 2) continue;
+            if (small && s - 1 <= cut) order[start[cut - (s - 1)]++] = u32(i);
+            else leaves[leaf_count++] = {fs[i].data(), u32(s - 1), false};
         }
     }
-    if (mode == Mode::automatic && small < kMinLaneFactors) small = 0;
-    static_assert(sizeof(Leaf) % sizeof(u32) == 0 && alignof(Leaf) <= 64);
-    Leaf* const leaves = reinterpret_cast<Leaf*>(stack.take(kLeafWords * (count - small + 8)));
-    u32* const order = small ? stack.take(small) : nullptr;
-    std::size_t leaf_count = 0;
-    for (u32 d = 1; d <= cut + 1; ++d) start[d] += start[d - 1];
-    for (std::size_t i = 0; i < fs.size(); ++i) {
-        const std::size_t s = fs[i].size();
-        if (s < 2) continue;
-        if (small && s - 1 <= cut) order[start[cut - (s - 1)]++] = u32(i);
-        else leaves[leaf_count++] = {fs[i].data(), u32(s - 1), false};
-    }
+    // Transforms on the tables of the longest: the standard root's, or the lanes' at twice the root.
+    // The standard tree's nodes over two lane products by lane_pairs from the lane root's transform
+    // at twice its length (Pairs, tree.hpp), when the lanes' length is at least kPairsLength: the
+    // pairs go where the root's left child was, the root's transform at twice its length is
+    // released before the standard tree, and the lanes' coefficients too when every pair is taken.
+    const std::size_t standard_length = StandardTree<>::length(u32(total));
+    Pairs pairs;
     if (small) {
-        const Slots<F> slots{fs, {order, small}};
+        const Slots<F> slots{fs, order, small};
         LaneTree<Slots<F>> tree(slots, stack);
-        const auto root = tree.root();
+        const std::size_t len = LaneTree<Slots<F>>::length(tree.degree(0, slots.count()));
+        const bool doubled = small >= 8 && len >= kPairsLength && !tree.base(0, slots.count());
+        reserve_transforms(std::max(standard_length, doubled ? 16 * len : 8 * len));
+        const auto [root, values, room, coefficients_mark, values_mark] =
+            doubled ? tree.root_doubled() : typename LaneTree<Slots<F>>::Doubled{tree.root()};
+        const std::size_t first_lane = leaf_count;
         for (std::size_t l = 0; l < 8; ++l)  // a lane of degree 0 holds 1: only with fewer than 8 small factors
             if (root.node.degree[l]) leaves[leaf_count++] = {root.coefficients + l, root.node.degree[l], true, 8};
+        if (doubled) {
+            const std::size_t T = 2 * len;
+            const unsigned bits = leaf_count == first_lane + 8 ? pair_nodes({leaves, leaf_count}, first_lane, T) : 0;
+            u32* at[4] = {};
+            for (int j = 0; j < 4; ++j)
+                if (bits >> j & 1) at[j] = room + j * T;
+            if (bits) lane_pairs<Lanes>(values, T, at, untwist_factors(T / 8));
+            pairs = {first_lane, T};
+            for (int j = 0; j < 4; ++j) pairs.at[j] = at[j], pairs.lead[j] = montgomery(root.node.lead[2 * j], root.node.lead[2 * j + 1]);
+            stack.release(bits == 15 ? coefficients_mark : values_mark);  // the lane leaves are only read through pairs
+        }
     }
+    if (!small) reserve_transforms(standard_length);
     StandardTree<> tree({leaves, leaf_count}, stack);
+    tree.pairs(pairs);
     scale<Wide>(tree.root(), constant, out.data(), n);
 }
 

@@ -4,10 +4,12 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
+#include <vector>
 
 #include "backend/modarith/modarith.hpp"
 #include "backend/ntt/common.hpp"
@@ -273,6 +275,51 @@ void leaf_products(const u32* a, const u32* b, u32* out, std::size_t count, cons
     }
 }
 
+// x = [x0 .. x(W-1)], y alike -> even = their even words, odd = their odd words, in one order of
+// the word pairs (x_2i, x_2i+1) and (y_2i, y_2i+1), the same in both: AVX2 [x0 x2 y0 y2 x4 x6 y4
+// y6], SSE and Neon [x0 x2 y0 y2].
+template <class L>
+[[gnu::always_inline]] inline void deinterleave(typename L::V x, typename L::V y, typename L::V& even, typename L::V& odd) {
+    using V = typename L::V;
+    if constexpr (false) {
+#if defined(__AVX2__)
+    } else if constexpr (L::lanes == 8 && sizeof(V) == 32) {
+        const __m256 a = _mm256_castsi256_ps(x), b = _mm256_castsi256_ps(y);
+        even = _mm256_castps_si256(_mm256_shuffle_ps(a, b, 0x88)), odd = _mm256_castps_si256(_mm256_shuffle_ps(a, b, 0xdd));
+#endif
+#if defined(__SSE4_1__)
+    } else if constexpr (L::lanes == 4 && sizeof(V) == 16) {
+        const __m128 a = _mm_castsi128_ps(x), b = _mm_castsi128_ps(y);
+        even = _mm_castps_si128(_mm_shuffle_ps(a, b, 0x88)), odd = _mm_castps_si128(_mm_shuffle_ps(a, b, 0xdd));
+#endif
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    } else if constexpr (L::lanes == 4) {
+        even = vuzp1q_u32(x, y), odd = vuzp2q_u32(x, y);
+#endif
+    } else {
+        static_assert(L::lanes == 0, "product_tree: no deinterleave for this struct");
+    }
+}
+
+// The untwist factors for standard leaves u < count: words [8u, 8u + 8) = rho_u^-k / 8 in
+// Montgomery form (k < 8), rho_u = r(4u) (ntt's values form: an 8th root of leaf u's w_u). Prefix
+// compatible across lengths; this thread's, kept for the most leaves yet.
+inline const u32* untwist_factors(std::size_t count) {
+    thread_local std::vector<u32> table;
+    if (table.size() < 8 * count) {
+        const std::size_t n = std::bit_ceil(count);
+        std::vector<u32> rho(n);  // rho_u^-1
+        rho[0] = 1;
+        for (std::size_t bit = 1, j = 2; bit < n; bit *= 2, ++j)
+            for (std::size_t i = 0; i < bit; ++i) rho[bit + i] = multiply_mod(rho[i], ntt::detail::kRoots[1][j]);
+        table.resize(8 * n);
+        const u32 eighth = multiply_mod(power(8, kP - 2), kR);
+        for (std::size_t u = 0; u < n; ++u)
+            for (u32 k = 0, f = eighth; k < 8; ++k, f = multiply_mod(f, rho[u])) table[8 * u + k] = f;
+    }
+    return table.data();
+}
+
 // Rows r[0 .. L::lanes): word t of r[i] <-> word i of r[t].
 template <class L>
 [[gnu::always_inline]] inline void transpose(typename L::V* r) {
@@ -344,6 +391,82 @@ template <class L>
         transpose<L>(r);
 #pragma GCC unroll 8
         for (int t = 0; t < W; ++t) L::store(p + 8 * t + u * W, r[t]);
+    }
+}
+
+// Lanes to the standard layout, for the standard tree's nodes over two lane products: lanes is a
+// lanes transform of 8 T words (leaf v holds the 8 lanes at w_v, v < T); out[j] (j < 4; null: not
+// written) gets the standard leaf form of length T of q_j = p_2j p_(2j+1) 2^-32 (T / 8 leaves of
+// 8 words). The 8 roots of standard leaf u (x^8 - w_u) are lanes leaves 8u + i, at rho_u
+// z^bitrev3(i) (ntt's values form): pointwise products, an 8-point inverse transform, then c_k
+// rho_u^-k / 8 (untwist_factors). T a power of two >= 64; canonical in and out.
+template <class L>
+void lane_pairs(const u32* lanes, std::size_t T, u32* const out[4], const u32* untwist) {
+    using V = typename L::V;
+    using M = Ops<L>;
+    constexpr int W = L::lanes;
+    const auto factor = [](u32 x) { return L::broadcast(multiply_mod(x, kR)); };
+    const V r1 = factor(ntt::detail::kRoots[1][0]), z1 = factor(ntt::detail::kRoots[1][1]);
+    const V r3 = factor(multiply_mod(ntt::detail::kRoots[1][0], ntt::detail::kRoots[1][1]));
+    const auto mul = [](V x, V y) { return montgomery_canonical<L>(x, y); };
+    // The 8-point inverse of y (values at s_i, s_2m+1 = -s_2m: 1, r(1), z, r(3)), times 8.
+    const auto inverse8 = [&](V (&y)[8]) {
+        const V u0 = M::add(y[0], y[1]), u1 = M::sub(y[0], y[1]), u2 = M::add(y[2], y[3]), u3 = mul(M::sub(y[2], y[3]), r1);
+        const V u4 = M::add(y[4], y[5]), u5 = mul(M::sub(y[4], y[5]), z1), u6 = M::add(y[6], y[7]), u7 = mul(M::sub(y[6], y[7]), r3);
+        const V v0 = M::add(u0, u2), v1 = M::add(u1, u3), v2 = M::sub(u0, u2), v3 = M::sub(u1, u3);
+        const V v4 = M::add(u4, u6), v5 = M::add(u5, u7), v6 = mul(M::sub(u4, u6), r1), v7 = mul(M::sub(u5, u7), r1);
+        y[0] = M::add(v0, v4), y[1] = M::add(v1, v5), y[2] = M::add(v2, v6), y[3] = M::add(v3, v7);
+        y[4] = M::sub(v0, v4), y[5] = M::sub(v1, v5), y[6] = M::sub(v2, v6), y[7] = M::sub(v3, v7);
+    };
+    const auto put = [&](std::size_t j, std::size_t u, int half, V c) {
+        if (out[j]) L::store(out[j] + 8 * u + half, c);
+    };
+    if constexpr (W == 8) {
+        // Two leaves u, u + 1 per step; lane 4h + 2b + a of a vector: pair 2h + a of leaf u + b.
+        for (std::size_t u = 0; u < T / 8; u += 2) {
+            V y[8];
+#pragma GCC unroll 8
+            for (int i = 0; i < 8; ++i) {
+                V even, odd;
+                deinterleave<L>(L::load(lanes + 8 * (8 * u + i)), L::load(lanes + 8 * (8 * u + 8 + i)), even, odd);
+                y[i] = mul(even, odd);
+            }
+            inverse8(y);
+            transpose<L>(y);  // y[r]: lane r's 8 coefficients
+#pragma GCC unroll 8
+            for (int r = 0; r < 8; ++r) {
+                const std::size_t j = 2 * (r / 4) + r % 2, at = u + (r / 2) % 2;
+                put(j, at, 0, mul(y[r], L::load(untwist + 8 * at)));
+            }
+        }
+    } else if constexpr (W == 4) {
+        // One leaf per step; lane j: pair j.
+        for (std::size_t u = 0; u < T / 8; ++u) {
+            V y[8];
+#pragma GCC unroll 8
+            for (int i = 0; i < 8; ++i) {
+                V even, odd;
+                deinterleave<L>(L::load(lanes + 8 * (8 * u + i)), L::load(lanes + 8 * (8 * u + i) + 4), even, odd);
+                y[i] = mul(even, odd);
+            }
+            inverse8(y);
+            V lo[4] = {y[0], y[1], y[2], y[3]}, hi[4] = {y[4], y[5], y[6], y[7]};
+            transpose<L>(lo), transpose<L>(hi);
+            const V f0 = L::load(untwist + 8 * u), f1 = L::load(untwist + 8 * u + 4);
+#pragma GCC unroll 4
+            for (int r = 0; r < 4; ++r) {
+                put(r, u, 0, mul(lo[r], f0)), put(r, u, 4, mul(hi[r], f1));
+            }
+        }
+    } else {
+        static_assert(W == 1);
+        for (std::size_t u = 0; u < T / 8; ++u)
+            for (std::size_t j = 0; j < 4; ++j) {
+                V y[8];
+                for (int i = 0; i < 8; ++i) y[i] = mul(lanes[8 * (8 * u + i) + 2 * j], lanes[8 * (8 * u + i) + 2 * j + 1]);
+                inverse8(y);
+                for (int k = 0; k < 8; ++k) put(j, u, k, mul(y[k], untwist[8 * u + k]));
+            }
     }
 }
 
@@ -424,6 +547,73 @@ void load_linear(const u32* const* p, u32* c) {
 #endif
     for (int l = 0; l < 8; ++l) c[l] = p[l][0], c[8 + l] = p[l][1];
     for (int i = 0; i < 16; i += L::lanes) L::store(c + i, montgomery_canonical<L>(L::load(c + i), r2));
+}
+
+// Lanes: 8 factors of degree d >= 1, words p[l][0 .. d], into rows c[8j + l] (j <= d) in
+// Montgomery form. AVX2 and Neon: each factor's words as vectors (the last one by a masked load,
+// vpmaskmovd or vmovdqu32 {k}, or by lane loads on Neon: no word past a factor is read), then
+// transposed in registers. Elsewhere word by word, then one pass to Montgomery form.
+template <class L>
+void load_full(const u32* const* p, u32 d, u32* c) {
+    using V = typename L::V;
+    const V r2 = L::broadcast(kR2);
+    const std::size_t n = d + 1;
+#if defined(__AVX2__)
+    if constexpr (L::lanes == 8 && sizeof(V) == 32) {
+        for (std::size_t j = 0; j < n; j += 8) {
+            const std::size_t m = std::min<std::size_t>(8, n - j);
+            V r[8];
+            if (m == 8) {
+#pragma GCC unroll 8
+                for (int l = 0; l < 8; ++l) r[l] = L::load(p[l] + j);
+            } else if constexpr (requires { L::load_mask(p[0], 0u); }) {
+#pragma GCC unroll 8
+                for (int l = 0; l < 8; ++l) r[l] = L::load_mask(p[l] + j, (1u << m) - 1);
+            } else {
+                const V mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(int(m)), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+#pragma GCC unroll 8
+                for (int l = 0; l < 8; ++l) r[l] = _mm256_maskload_epi32(reinterpret_cast<const int*>(p[l] + j), mask);
+            }
+            transpose<L>(r);
+            for (std::size_t t = 0; t < m; ++t) L::store(c + 8 * (j + t), montgomery_canonical<L>(r[t], r2));
+        }
+        return;
+    }
+#endif
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    if constexpr (L::lanes == 4 && std::is_same_v<V, uint32x4_t>) {
+        const auto part = [](const u32* q, std::size_t m) -> V {  // q[0 .. m), m < 4, zeros past
+            const uint32x2_t zero = vdup_n_u32(0);
+            if (m == 1) return vcombine_u32(vld1_lane_u32(q, zero, 0), zero);
+            if (m == 2) return vcombine_u32(vld1_u32(q), zero);
+            return vcombine_u32(vld1_u32(q), vld1_lane_u32(q + 2, zero, 0));
+        };
+        for (std::size_t j = 0; j < n; j += 4) {
+            const std::size_t m = std::min<std::size_t>(4, n - j);
+#pragma GCC unroll 2
+            for (int h = 0; h < 8; h += 4) {
+                V r[4];
+#pragma GCC unroll 4
+                for (int t = 0; t < 4; ++t) r[t] = m == 4 ? L::load(p[h + t] + j) : part(p[h + t] + j, m);
+                transpose<L>(r);
+                for (std::size_t i = 0; i < m; ++i) L::store(c + 8 * (j + i) + h, montgomery_canonical<L>(r[i], r2));
+            }
+        }
+        return;
+    }
+#endif
+    for (std::size_t j = 0; j < n; ++j)
+        for (int l = 0; l < 8; ++l) c[8 * j + l] = p[l][j];
+    for (std::size_t i = 0; i < 8 * n; i += L::lanes) L::store(c + i, montgomery_canonical<L>(L::load(c + i), r2));
+}
+
+// out = copy = in, n words, n a multiple of S::lanes.
+template <class S>
+void copy2(const u32* in, u32* out, u32* copy, std::size_t n) {
+    for (std::size_t i = 0; i < n; i += S::lanes) {
+        const typename S::V x = S::load(in + i);
+        S::store(out + i, x), S::store(copy + i, x);
+    }
 }
 
 // out[i] = in[i] y 2^-32 (canonical) for i < n; in[i] < P, y < P. out may be in.

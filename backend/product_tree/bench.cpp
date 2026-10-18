@@ -1,6 +1,6 @@
 // Benchmarks of product_tree::product. Items: factors.
-//   product/<lg>            2^lg factors x - r (the frontend's product/<lg>)
-//   product@standard/<lg>   the same with the standard tree alone (no lanes)
+//   product/<lg>            2^lg factors x - r (the frontend's product/<lg>), lg 4 .. 20
+//   product@standard/<lg>   the same with the standard tree alone (no lanes), lg <= 18
 //   product@lanes/<lg>      the same with every factor in lanes
 //   product_mixed/<lg>      2^lg factors of degrees 0 .. 8 (a quarter constants), sum about 3.4 2^lg
 //   product_few/<lg>        8 factors of degree 2^lg / 8 - 1 and 2^lg / 8: the standard tree's top
@@ -74,12 +74,14 @@ void add(bench::Suite& suite, const std::string& name, Make make, Mode mode, std
 
 int main(int argc, char** argv) {
     bench::Suite suite(argc, argv);
-    for (int lg : {4, 6, 8, 10, 14, 18}) {
+    for (int lg : {4, 6, 8, 10, 14, 18, 20}) {
         const std::size_t count = std::size_t(1) << lg;
         const std::string size = "/" + std::to_string(lg);
         add(suite, "product" + size, [=] { return linear(count, unsigned(lg)); }, Mode::automatic, count);
-        add(suite, "product@standard" + size, [=] { return linear(count, unsigned(lg)); }, Mode::standard, count);
-        add(suite, "product@lanes" + size, [=] { return linear(count, unsigned(lg)); }, Mode::lanes, count);
+        if (lg <= 18) {
+            add(suite, "product@standard" + size, [=] { return linear(count, unsigned(lg)); }, Mode::standard, count);
+            add(suite, "product@lanes" + size, [=] { return linear(count, unsigned(lg)); }, Mode::lanes, count);
+        }
         if (lg >= 10) add(suite, "product_mixed" + size, [=] { return mixed(count, unsigned(lg)); }, Mode::automatic, count);
     }
     for (int lg : {12, 16, 20}) add(suite, "product_few/" + std::to_string(lg), [=] { return few(lg, unsigned(lg)); }, Mode::automatic, 8);

@@ -87,12 +87,42 @@ private:
     bool ever_spilled_ = false;
 };
 
-// This thread's transforms, one per length, kept across calls.
+// This thread's transforms, one per length, kept across calls, on the tables of the longest
+// reserved (ntt's tables are prefix compatible: about 1.25 bytes per word of the longest in all,
+// not that per length). A length past the reserved one gets tables of its own until the next
+// reserve. reserve_transforms(words) moves every transform onto tables for at least `words` in
+// place (references stay valid); not while one of them runs (a hook).
+struct Transforms {
+    std::unique_ptr<ntt::Transform> tables;  // the longest reserved
+    std::array<std::unique_ptr<ntt::Transform>, ntt::kMaxLog + 1> at;
+};
+inline Transforms& transforms() {
+    thread_local Transforms t;
+    return t;
+}
+
+inline void reserve_transforms(std::size_t words) {
+    Transforms& t = transforms();
+    if (t.tables && t.tables->length() >= words) return;
+    const int lg = std::max(ntt::kMinLog, int(std::bit_width(words - 1)));
+    auto tables = std::make_unique<ntt::Transform>(lg);
+    for (int k = ntt::kMinLog; k <= lg; ++k)
+        if (t.at[k]) *t.at[k] = ntt::Transform(k, *tables);
+    t.tables = std::move(tables);
+}
+
+// transform()'s first call for a length: on the reserved tables if they are long enough.
+[[gnu::noinline]] inline const ntt::Transform& new_transform(int lg) {
+    Transforms& t = transforms();
+    if (t.tables && t.tables->length() >> lg) t.at[lg] = std::make_unique<ntt::Transform>(lg, *t.tables);
+    else t.at[lg] = std::make_unique<ntt::Transform>(lg);
+    return *t.at[lg];
+}
+
 inline const ntt::Transform& transform(std::size_t words) {
-    thread_local std::array<std::unique_ptr<ntt::Transform>, ntt::kMaxLog + 1> cache;
     const int lg = std::countr_zero(words);
-    if (!cache[lg]) cache[lg] = std::make_unique<ntt::Transform>(lg);
-    return *cache[lg];
+    if (const ntt::Transform* t = transforms().at[lg].get()) return *t;
+    return new_transform(lg);
 }
 
 inline void forward(u32* f, std::size_t words) { transform(words).forward(f); }
@@ -217,6 +247,40 @@ public:
         return {a, node, len};
     }
 
+    // root() and the root's transform at twice its length, for the standard tree's pairs (Pairs):
+    // values (16 L words, L = length(degree(0, count()))) holds the lanes at the 2L roots of X^(2L)
+    // - 1 (the product pass writes the lower half, forward_upper from the coefficients the upper);
+    // room (8 L words) below the coefficients is free (the left child's transform was there). The
+    // stack holds room, the coefficients, then values: release(values_mark) frees values,
+    // release(coefficients_mark) the coefficients too. NoKeep; the root not a base node.
+    struct Doubled {
+        Root root;
+        u32 *values, *room;
+        Stack::Mark coefficients_mark, values_mark;
+    };
+    Doubled root_doubled() {
+        const std::size_t count = leaves_.count(), len = length(degree(0, count));
+        u32* const a = stack_.take(8 * len + 8);
+        const Stack::Mark coefficients_mark = stack_.mark();
+        u32* const b = stack_.take(8 * len + 8);
+        const std::size_t mid = split(0, count);
+        const LaneNode left = build(0, mid, a, len);
+        const LaneNode node = combine(left, build(mid, count, b, len));
+        const Stack::Mark values_mark = stack_.mark();
+        u32* const values = stack_.take(16 * len);
+        pointwise2<Wide>(a, b, values, b, 8 * len);
+        inverse(b, 8 * len);
+        alignas(32) u32 top[8];
+        for (int l = 0; l < 8; ++l) {
+            top[l] = node.degree[l] == len ? node.lead[l] : 0;
+            b[l] = subtract(b[l], add(top[l], top[l]));  // p mod (X^L + 1) = p - top X^L - top, for a moment
+            b[8 * len + l] = top[l];
+        }
+        transform(16 * len).forward_upper(std::span<const u32>(b, 8 * len), values + 8 * len);
+        for (int l = 0; l < 8; ++l) b[l] = add(b[l], top[l]);
+        return {{b, node, len}, values, a, coefficients_mark, values_mark};
+    }
+
     // The structure, for descents: the degree of slots [lo, hi) (every lane's largest), where the
     // node splits, and whether it is a base node (multiplied out and transformed, no children).
     u32 degree(std::size_t lo, std::size_t hi) const { return prefix_[hi] - prefix_[lo]; }
@@ -331,6 +395,17 @@ struct Node {
     u32 degree, lead;  // lead in Montgomery form
 };
 
+// Nodes over two leaves with their product transforms given (lane_pairs: the standard tree's nodes
+// over two lane products): node [first + 2j, first + 2j + 2) of length `length` takes its product
+// transform from at[j] (length words; null: built as any other) and its leading coefficient from
+// lead[j], instead of its leaves' forwards and leaf products. Only for nodes whose parent has
+// length `length` or 2 `length` (pair_nodes).
+struct Pairs {
+    std::size_t first = 0, length = 0;
+    const u32* at[4] = {};
+    u32 lead[4] = {};
+};
+
 // Keep: kept transforms (above); NoKeep for none.
 template <class Keep = NoKeep>
 class StandardTree {
@@ -375,6 +450,9 @@ public:
     u32 degree(std::size_t lo, std::size_t hi) const { return prefix_[hi] - prefix_[lo]; }
     std::size_t split(std::size_t lo, std::size_t hi) const { return detail::split(prefix_, lo, hi); }
     bool base(std::size_t lo, std::size_t hi) const { return hi - lo == 1 || degree(lo, hi) <= kStandardBase; }
+
+    // Nodes with their product transforms given (Pairs, pair_nodes).
+    void pairs(const Pairs& p) { pairs_ = p; }
 
 private:
     Node load(std::size_t k, u32* c) const {
@@ -430,6 +508,13 @@ private:
         return {d, lead};
     }
 
+    // j if node [lo, hi) of length len takes its product transform from pairs_.at[j], else -1.
+    int pair(std::size_t lo, std::size_t hi, std::size_t len) const {
+        if (hi - lo != 2 || lo < pairs_.first || (lo - pairs_.first) % 2 || len != pairs_.length) return -1;
+        const std::size_t j = (lo - pairs_.first) / 2;
+        return j < 4 && pairs_.at[j] ? int(j) : -1;
+    }
+
     // out = the transform of node [lo, hi) of out_length words (out_length >= its length).
     Node build(std::size_t lo, std::size_t hi, u32* out, std::size_t out_length) {
         const u32 d = degree(lo, hi);
@@ -440,6 +525,8 @@ private:
             return node;
         }
         const std::size_t len = length(d);
+        if constexpr (std::is_same_v<Keep, NoKeep>)
+            if (const int j = pair(lo, hi, len); j >= 0) return build_pair(j, d, out, out_length);
         const Stack::Mark mark = stack_.mark();
         u32* const a = out_length >= 2 * len ? out + len : stack_.take(len);
         u32* const c = stack_.take(len + 8);  // the right child's transform, then p's coefficients
@@ -477,11 +564,66 @@ private:
         return node;
     }
 
+    // build() of a Pairs node: its product transform copied from pairs_.at[j], then as build().
+    Node build_pair(int j, u32 d, u32* out, std::size_t out_length) {
+        const std::size_t len = length(d);
+        const Node node{d, pairs_.lead[j]};
+        if (out_length == len) {
+            std::copy_n(pairs_.at[j], len, out);
+            return node;
+        }
+        const Stack::Mark mark = stack_.mark();
+        u32* const a = out_length >= 2 * len ? out + len : stack_.take(len);
+        const bool longer = out_length > 2 * len;
+        u32* const c = longer ? stack_.take(len + 8) : nullptr;  // p's coefficients
+        u32* const h = longer ? c : a;
+        copy2<Wide>(pairs_.at[j], out, h, len);
+        inverse(h, len);
+        const u32 top = d == len ? node.lead : 0;
+        if (longer) {
+            c[0] = subtract(c[0], top), c[len] = top;
+            std::copy_n(c, len, a);
+            a[0] = subtract(a[0], top);
+        } else {
+            a[0] = subtract(a[0], add(top, top));
+        }
+        forward_upper(a, 2 * len);
+        for (std::size_t m = 2 * len; m < out_length; m *= 2) {  // p mod (x^m + 1) = p
+            std::fill(std::copy_n(c, len + 1, out + m), out + 2 * m, 0u);
+            forward_upper(out + m, 2 * m);
+        }
+        stack_.release(mark);
+        return node;
+    }
+
     std::span<const Leaf> leaves_;
     Stack& stack_;
     [[no_unique_address]] Keep keep_;
     u32* prefix_;
     const u32* weights_;
+    Pairs pairs_;
 };
+
+// Pairs: bit j set if node [first + 2j, first + 2j + 2) (j < 4) is in the standard tree over these
+// leaves, has length `length` and a parent of length `length` or 2 `length`. From the leaves'
+// degrees alone (the tree's split and lengths), before the tree exists; at most 63 leaves, else 0.
+inline unsigned pair_nodes(std::span<const Leaf> leaves, std::size_t first, std::size_t length) {
+    if (leaves.size() >= 64) return 0;
+    u32 prefix[64];
+    prefix[0] = 0;
+    for (std::size_t k = 0; k < leaves.size(); ++k) prefix[k + 1] = prefix[k] + leaves[k].degree;
+    unsigned bits = 0;
+    const auto walk = [&](auto& self, std::size_t lo, std::size_t hi, std::size_t parent) -> void {
+        const u32 d = prefix[hi] - prefix[lo];
+        if (hi - lo == 1 || d <= kStandardBase) return;
+        const std::size_t len = StandardTree<>::length(d);
+        if (hi - lo == 2 && lo >= first && (lo - first) % 2 == 0 && lo - first < 8 && len == length && parent && parent <= 2 * len)
+            bits |= 1u << (lo - first) / 2;
+        const std::size_t mid = split(prefix, lo, hi);
+        self(self, lo, mid, len), self(self, mid, hi, len);
+    };
+    walk(walk, 0, leaves.size(), 0);
+    return bits;
+}
 
 }  // namespace fps::product_tree::detail

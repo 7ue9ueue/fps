@@ -22,6 +22,7 @@
 //   into.multiply();                           // a[0, n + m - 1) = f g; the rest of a is scratch
 //
 //   fps::ntt::Transform t(lg);                 // twiddle tables for the length L = 2^lg
+//   fps::ntt::Transform u(lg2, t);             // lg2 <= lg, on t's tables (t outlives u)
 //   t.forward(f);                              // f: L coefficients -> leaf form
 //   t.inverse(f);                              // leaf form -> L coefficients
 //   t.forward_upper(h);                        // h: L / 2 words, p mod (x^(L/2) + 1) -> the upper
@@ -524,10 +525,19 @@ using Term = detail::LeafTerm;
 // Forward and inverse transforms of length 2^lg, kMinLog <= lg <= kMaxLog, with their tables.
 class Transform {
 public:
-    explicit Transform(int lg) : lg_(checked(lg)), tables_(new Line[2 * lines(lg) + value_lines(lg)]) {
+    explicit Transform(int lg)
+        : lg_(checked(lg)), tables_lg_(lg), tables_(new Line[2 * lines(lg) + value_lines(lg)]), lines_(tables_.get()) {
         Native::build_table(roots(), length() / 16, false);
         Native::build_table(inverse_roots(), length() / 16, true);
         if (lg <= kValuesMaxLog) detail::build_value_rows(value_rows(), lg);
+    }
+
+    // A transform of length 2^lg on the tables of `tables` (lg <= its, else std::invalid_argument),
+    // which must outlive it: the twiddle tables and the value rows are prefix compatible across
+    // lengths, so one longest transform serves every shorter one (backend/product_tree keeps one
+    // per thread). Its values form needs tables' length <= 2^kValuesMaxLog.
+    Transform(int lg, const Transform& tables) : lg_(checked(lg)), tables_lg_(tables.tables_lg_), lines_(tables.lines_) {
+        if (lg > tables.lg_) throw std::invalid_argument("fps::ntt::Transform: tables of a shorter transform");
     }
 
     std::size_t length() const { return std::size_t(1) << lg_; }
@@ -813,16 +823,18 @@ private:
     static std::size_t lines(int lg) { return (detail::table_words(lg) + 15) / 16; }
     static std::size_t value_lines(int lg) { return lg <= kValuesMaxLog ? 2 * detail::value_row_count(lg) : 0; }
 
-    std::uint32_t* roots() const { return tables_[0].words; }
-    std::uint32_t* inverse_roots() const { return tables_[lines(lg_)].words; }
-    std::uint32_t* value_rows() const { return tables_[2 * lines(lg_)].words; }
+    // The tables of length 2^tables_lg_ at lines_: owned (tables_) or another transform's.
+    std::uint32_t* roots() const { return lines_[0].words; }
+    std::uint32_t* inverse_roots() const { return lines_[lines(tables_lg_)].words; }
+    std::uint32_t* value_rows() const { return lines_[2 * lines(tables_lg_)].words; }
     const std::uint32_t* checked_rows() const {
-        if (lg_ > kValuesMaxLog) throw std::length_error("fps::ntt::Transform: the values form needs lg <= 23");
+        if (tables_lg_ > kValuesMaxLog) throw std::length_error("fps::ntt::Transform: the values form needs lg <= 23");
         return value_rows();
     }
 
-    int lg_;
-    std::unique_ptr<Line[]> tables_;
+    int lg_, tables_lg_;
+    std::unique_ptr<Line[]> tables_;  // null if on another transform's tables
+    Line* lines_;
 };
 
 }  // namespace fps::ntt
