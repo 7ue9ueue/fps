@@ -80,8 +80,8 @@ leaf-form ops and `backend/simd`, so every target runs it. One variant per op: n
     c'_1 = c1^2 - 2 c2, c'_2 = c2^2 - 2 c1 c3 + 2 c4, c'_3 = c3^2 + 2 c1 c5 - 2 c2 c4 - 2 c6 (6
     products in 3 `inverse_product`s, the factors 2 in scaled leaf forms); compose's R columns
     r_c = sum_(2j+k=c) P_j c_k (up to 4 terms, upper half); power projection's p'_j =
-    sum_(a+b=2j+1) p_a c_b (sums of 5 and 7 in two inverses, added). Columns in and out by 8 x 8
-    transposes (`columns8_from`, `columns8_to`).
+    sum_(a+b=2j+1) p_a c_b (sums of 1, 3, 5 and 7 terms, one inverse each since #143). Columns
+    in and out by 8 x 8 transposes (`columns8_from`, `columns8_to`).
   - Level T - 1: Q_(T-1) = 1 + x q(y), c1 = -q. compose: a cyclic product of length m of f
     reversed with c1, upper half; power projection: a = p1 + p0 c1 (`ntt::multiply`).
 - Memory: one region per thread kept across calls (`ntt::detail::map_region`), carved into
@@ -202,8 +202,6 @@ Neoverse V2 0.9719. Steps, per-target choices and what is above 1: notes/149-r3.
 
 ## Next
 
-- Power projection's 5- and 7-term column sums at level T - 3 take 6 inverses where lc-opt's take
-  4 (ntt's 4 terms; 5.50 against 4.63 ms at 2^20): #143.
 - The pruned forwards of P^ at 2m are 6-9% behind lc-opt's at the mid levels (column bits of 32-64
   vectors; compose's sum 33.3 against 31.8 ms at 2^20): #210.
 - The projection's leaf function alone is 4% behind lc-opt's (101.8 against 97.8 ns per 8 pairs on

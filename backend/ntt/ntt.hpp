@@ -518,8 +518,10 @@ struct Output {
     bool negate = false;     // out[i] = -it
 };
 
-// A term of Transform::inverse_product: the leaf products of the leaf forms a and b, or a alone.
+// A term of Transform::inverse_product: the leaf products of the leaf forms a and b, or a alone;
+// it takes up to kMaxTerms of them.
 using Term = detail::LeafTerm;
+inline constexpr int kMaxTerms = detail::kMaxTerms;
 
 // Forward and inverse transforms of length 2^lg, kMinLog <= lg <= kMaxLog, with their tables.
 class Transform {
@@ -680,12 +682,14 @@ public:
 
     // out[i] = coefficient o.offset + i of the polynomial whose leaf form is the sum over the terms
     // of a b leaf by leaf (of a, if b is null), negated if o.negate: the leaf products in each
-    // subtree of the inverse transform, in cache. 1 to 4 terms (else std::invalid_argument); work,
-    // o: as cyclic_product; out apart from the terms.
+    // subtree of the inverse transform, in cache. 1 to 8 terms (else std::invalid_argument); work,
+    // o: as cyclic_product; out apart from the terms. 5 to 8 products in one call took 0.79-0.91 of
+    // the time of the split forms callers used before (leaf products in memory and 4 terms, or two
+    // inverses and an add) on Zen 3, 2^12-2^20 (notes/143-r1.md).
     template <class Variant = SelectedInverse>
     void inverse_product(std::span<const Term> terms, std::uint32_t* work, std::span<std::uint32_t> out, Output o = {}) const {
         if (terms.empty() || terms.size() > std::size_t(detail::kMaxTerms))
-            throw std::invalid_argument("fps::ntt::Transform::inverse_product: 1 to 4 terms");
+            throw std::invalid_argument("fps::ntt::Transform::inverse_product: 1 to 8 terms");
         const unsigned output = checked_output(out, o);
         if (out.empty()) return;
         Variant::inverse_product(terms.data(), int(terms.size()), work, out.data(), out.size(), lg_, roots(),

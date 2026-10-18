@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
+#include <utility>
 
 #include "backend/modarith/modarith.hpp"
 #include "backend/ntt/common.hpp"
@@ -537,6 +538,16 @@ struct Butterflies : Arith<S> {
     }
 };
 
+// sum.template operator()<K>() for a list of K = 2 .. kMaxTerms products (every term has b), K a
+// template argument (the bottoms' inverse_sum<K>); false for other lists.
+template <class Sum>
+[[gnu::always_inline]] inline bool for_products(const LeafTerm* terms, int n, Sum sum) {
+    if (n < 2 || !std::all_of(terms, terms + n, [](const LeafTerm& t) { return t.b != nullptr; })) return false;
+    return [&]<int... I>(std::integer_sequence<int, I...>) {
+        return ((n == I + 2 && (sum.template operator()<I + 2>(), true)) || ...);
+    }(std::make_integer_sequence<int, kMaxTerms - 1>{});
+}
+
 // The bottom level (quarters of 8 words, one leaf each) and the leaf products, on L (<= 8 lanes).
 template <class L>
 struct Bottom : Butterflies<L> {
@@ -763,7 +774,17 @@ struct Bottom : Butterflies<L> {
     // sum over the terms (common.hpp, LeafTerm; at a + 32 g, b + 32 g) of their leaf products, or of
     // a times 2^-32; then the inverse butterflies, out < 2P, with the factor 2^-32. Group g + 1's
     // rows are filled before group g's products.
+    // Products only: inverse_sum in passes of kSumPass terms. One pass of 4 to 8 products spilled on
+    // Sse (1.4-1.7x the time of passes of 2 on Zen 3); Neon: passes of 1, 0.89-1.00 of one pass's
+    // time (Neoverse V2; the neon variant runs its asm passes instead, notes/143-r1.md).
+    static constexpr int kSumPass = L::lanes == 8 ? 3 : requires(V v) { L::mul_wide_lo(v, v); } ? 1 : 2;
     static void inverse_terms(u32* out, const LeafTerm* terms, int n, std::size_t count, std::size_t first, const u32* r,
+                              const u32* ir) {
+        if (for_products(terms, n, [&]<int K> { inverse_sum<K, kSumPass>(out, terms, count, first, r, ir); })) return;
+        inverse_mixed(out, terms, n, count, first, r, ir);
+    }
+    // inverse_terms for any list, the term count at run time.
+    static void inverse_mixed(u32* out, const LeafTerm* terms, int n, std::size_t count, std::size_t first, const u32* r,
                               const u32* ir) {
         static constexpr u32 kRinverse = power(kR, kP - 2);  // 2^-32 mod P
         const F to_montgomery = B::factor(kRinverse);
@@ -796,6 +817,86 @@ struct Bottom : Butterflies<L> {
             const F x = B::entry(ir, k), y = B::entry(ir, 2 * k), z = B::entry(ir, 2 * k + 1);
             #pragma GCC unroll 8
             for (int u = 0; u < kWords; ++u) B::inverse4(c[u], x, y, z), B::store(out + 32 * g + u * L::lanes, 8, c[u]);
+        }
+    }
+
+    // A leaf's product for inverse_sum: leaf_product (avx2.hpp passes its asm one).
+    struct LeafProduct {
+        [[gnu::always_inline]] V operator()(const u32* window, const u32* b, std::size_t j) const {
+            return leaf_product(window, b, j);
+        }
+    };
+
+    // inverse_terms of K products (every term has b; lc-opt's InverseProductSumBottom<K>) in passes
+    // of up to C terms over the groups: one pass sums in registers; more keep partial sums in out (in
+    // cache) and read fewer streams at a time. product(row, b, j): words [j, j + lanes) of a leaf's
+    // product, as leaf_product (on Neon leaf_products' pairs instead).
+    template <int K, int C = K, class Product = LeafProduct>
+    static void inverse_sum(u32* out, const LeafTerm* terms, std::size_t count, std::size_t first, const u32* r,
+                            const u32* ir, Product product = {}) {
+        [&]<int... P>(std::integer_sequence<int, P...>) {
+            (sum_pass<std::min(C, K - C * P), P == 0, P + 1 == int(sizeof...(P))>(out, terms + C * P, count, first, r, ir,
+                                                                                    product), ...);
+        }(std::make_integer_sequence<int, (K + C - 1) / C>{});
+    }
+    // One pass: the leaf products of terms [0, C) on groups [first, first + count), each reduced,
+    // then added (to out's partial sums, < 2P, unless kFirst); then the inverse butterflies into out
+    // (< 2P, with the factor 2^-32) if kLast, else the sums to out. Group g + 1's rows are filled
+    // before group g's products.
+    template <int C, bool kFirst, bool kLast, class Product>
+    static void sum_pass(u32* out, const LeafTerm* terms, std::size_t count, std::size_t first, const u32* r,
+                         const u32* ir, Product product) {
+        Rows rows[2][C];
+        const auto fill = [&] [[gnu::always_inline]] (std::size_t k, Rows* to) {
+            #pragma GCC unroll 8
+            for (int i = 0; i < C; ++i) fill_rows(terms[i].a + 32 * k, to[i], k, r);
+        };
+        fill(first, rows[0]);
+        for (std::size_t g = 0; g < count; ++g) {
+            const std::size_t k = first + g;
+            if (g + 1 < count) fill(k + 1, rows[(g + 1) % 2]);
+            const Rows* in = rows[g % 2];
+            const auto at = [&](int u, int t) { return out + 32 * g + 8 * t + u * L::lanes; };
+            V c[kWords][4];
+            if constexpr (requires(V v) { L::mul_wide_lo(v, v); }) {  // Neon
+                (void)product;
+                #pragma GCC unroll 8
+                for (int i = 0; i < C; ++i) {
+                    V d[kWords][4];
+                    leaf_products(in[i].window, terms[i].b + 32 * k, 8, d);
+                    #pragma GCC unroll 8
+                    for (int u = 0; u < kWords; ++u) {
+                        #pragma GCC unroll 8
+                        for (int t = 0; t < 4; ++t)
+                            c[u][t] = kFirst && i == 0 ? d[u][t]
+                                                       : low(B::add(i == 0 ? L::load(at(u, t)) : c[u][t], d[u][t]));
+                    }
+                }
+            } else {
+                #pragma GCC unroll 8
+                for (int u = 0; u < kWords; ++u) {
+                    #pragma GCC unroll 8
+                    for (int t = 0; t < 4; ++t) {
+                        V s = product(in[0].window[t], terms[0].b + 32 * k + 8 * t, u * L::lanes);
+                        if constexpr (!kFirst) s = low(B::add(L::load(at(u, t)), s));
+                        #pragma GCC unroll 8
+                        for (int i = 1; i < C; ++i)
+                            s = low(B::add(s, product(in[i].window[t], terms[i].b + 32 * k + 8 * t, u * L::lanes)));
+                        c[u][t] = s;
+                    }
+                }
+            }
+            if constexpr (kLast) {
+                const F x = B::entry(ir, k), y = B::entry(ir, 2 * k), z = B::entry(ir, 2 * k + 1);
+                #pragma GCC unroll 8
+                for (int u = 0; u < kWords; ++u) B::inverse4(c[u], x, y, z), B::store(out + 32 * g + u * L::lanes, 8, c[u]);
+            } else {
+                #pragma GCC unroll 8
+                for (int u = 0; u < kWords; ++u) {
+                    #pragma GCC unroll 8
+                    for (int t = 0; t < 4; ++t) L::store(at(u, t), c[u][t]);
+                }
+            }
         }
     }
 
@@ -1198,7 +1299,26 @@ struct WideBottom : Butterflies<S> {
     }
 
     // Bottom::inverse_terms; count and first even.
+    // Sums of K products at length 2^lg: one pass while K 2^lg <= kFusedWords, else passes of kPass
+    // terms, fewer streams at a time once the leaf forms outgrow L2 (notes/143-r1.md: one pass took
+    // up to 1.2x (Emerald Rapids) and 1.5x (Zen 5) the time of passes of one term past there;
+    // passes 1.00-1.10x one pass's time below).
+    static constexpr int kPass = 1;
+#if defined(__znver4__) || defined(__znver5__)
+    static constexpr std::size_t kFusedWords = 3 << 15;  // Zen 5: 1 MiB of L2
+#else
+    static constexpr std::size_t kFusedWords = 7 << 15;  // Emerald Rapids: 2 MiB of L2
+#endif
     static void inverse_terms(u32* out, const LeafTerm* terms, int nterms, std::size_t count, std::size_t first,
+                              const u32* r, const u32* ir, int lg) {
+        if (for_products(terms, nterms, [&]<int K> {
+                if ((std::size_t(K) << lg) > kFusedWords) inverse_sum<K, kPass>(out, terms, count, first, r, ir);
+                else inverse_sum<K>(out, terms, count, first, r, ir);
+            }))
+            return;
+        inverse_mixed(out, terms, nterms, count, first, r, ir);
+    }
+    static void inverse_mixed(u32* out, const LeafTerm* terms, int nterms, std::size_t count, std::size_t first,
                               const u32* r, const u32* ir) {
         static constexpr u32 kRinverse = power(kR, kP - 2);  // 2^-32 mod P
         const F to_montgomery = B::factor(kRinverse);
@@ -1225,6 +1345,54 @@ struct WideBottom : Butterflies<S> {
             const Pair iw = twiddles(ir, k);
             B::inverse4(f, iw.x, iw.y, iw.z);
             store(out, f, n);
+        }
+    }
+
+    // Bottom::inverse_sum on S; count and first even. One pass's partial sums go to out as its
+    // quarter vectors (not permuted back).
+    template <int K, int C = K>
+    static void inverse_sum(u32* out, const LeafTerm* terms, std::size_t count, std::size_t first, const u32* r,
+                            const u32* ir) {
+        [&]<int... P>(std::integer_sequence<int, P...>) {
+            (sum_pass<std::min(C, K - C * P), P == 0, P + 1 == int(sizeof...(P))>(out, terms + C * P, count, first, r,
+                                                                                    ir), ...);
+        }(std::make_integer_sequence<int, (K + C - 1) / C>{});
+    }
+    template <int C, bool kFirst, bool kLast>
+    static void sum_pass(u32* out, const LeafTerm* terms, std::size_t count, std::size_t first, const u32* r,
+                         const u32* ir) {
+        const Indices n;
+        Leaves leaves[2][C];
+        const auto fill = [&] [[gnu::always_inline]] (std::size_t k, Leaves* to) {
+            #pragma GCC unroll 8
+            for (int i = 0; i < C; ++i) fill_rows(terms[i].a + 32 * k, k, r, n, to[i]);
+        };
+        fill(first, leaves[0]);
+        for (std::size_t g = 0; g < count; g += 2, out += 64) {
+            const std::size_t k = first + g;
+            if (g + 2 < count) fill(k + 2, leaves[(g / 2 + 1) % 2]);
+            const Leaves* in = leaves[g / 2 % 2];
+            V f[4];
+            #pragma GCC unroll 4
+            for (int t = 0; t < 4; ++t) {
+                const u32* b = terms[0].b + 32 * k + 8 * t;
+                V s = leaf_products_at(in[0], t, b, b + 32);
+                if constexpr (!kFirst) s = low(B::add(S::load(out + 16 * t), s));
+                #pragma GCC unroll 8
+                for (int i = 1; i < C; ++i) {
+                    b = terms[i].b + 32 * k + 8 * t;
+                    s = low(B::add(s, leaf_products_at(in[i], t, b, b + 32)));
+                }
+                f[t] = s;
+            }
+            if constexpr (kLast) {
+                const Pair iw = twiddles(ir, k);
+                B::inverse4(f, iw.x, iw.y, iw.z);
+                store(out, f, n);
+            } else {
+                #pragma GCC unroll 4
+                for (int t = 0; t < 4; ++t) S::store(out + 16 * t, f[t]);
+            }
         }
     }
 
@@ -1798,12 +1966,13 @@ struct Ntt : Butterflies<S> {
             if (count % 2 == 0) return WideBottom<S>::multiply_stored(a, b, count, first, r, ir);
         Leaf::multiply_stored(a, b, count, first, r, ir);
     }
+    // lg: the transform's (the sums' passes; 0: one pass).
     static void bottom_inverse_terms(u32* out, const LeafTerm* terms, int n, std::size_t count, std::size_t first,
-                                     const u32* r, const u32* ir) {
+                                     const u32* r, const u32* ir, int lg = 0) {
         if constexpr (requires { Generated<S>::inverse_terms(out, terms, n, count, first, r, ir); })
             if (count % 2 == 0 && Generated<S>::inverse_terms(out, terms, n, count, first, r, ir)) return;
         if constexpr (kWideBottom)
-            if (count % 2 == 0) return WideBottom<S>::inverse_terms(out, terms, n, count, first, r, ir);
+            if (count % 2 == 0) return WideBottom<S>::inverse_terms(out, terms, n, count, first, r, ir, lg);
         Leaf::inverse_terms(out, terms, n, count, first, r, ir);
     }
     static void bottom_toeplitz(u32* out, const Toeplitz& z, std::size_t count, std::size_t first, const u32* r,
@@ -2644,7 +2813,7 @@ struct Ntt : Butterflies<S> {
                                 const u32* ir, unsigned output) {
         if (n == 1 && !terms[0].b && output == 0) return inverse(terms[0].a, f, out, count, lg, ir, leaf_scale(lg), nullptr);
         inverse_staged(f, out, count, lg, ir, output, [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
-            bottom_inverse_terms(t, terms, n, leaves / 4, std::size_t(t - f) / 32, r, ir);
+            bottom_inverse_terms(t, terms, n, leaves / 4, std::size_t(t - f) / 32, r, ir, lg);
         });
     }
 

@@ -24,8 +24,7 @@
 //   i] = (G T)[d + i] for T = Q[js - d, js), one cyclic product of length Lt >= 2d with the stored
 //   transform of x^(Lt/2 - d) G (the upper half out, negated). Else ("windows") the sum over t <=
 //   min(j, d / s + 1) of (W_t Q_(j-t))[s, 2s), W_t = G[(t-1)s, (t+1)s), from stored transforms
-//   of W_t and of the last blocks, by one inverse_product (sums past 4 terms: leaf products in
-//   memory first).
+//   of W_t and of the last blocks, by one inverse_product of up to kMaxWindows terms.
 // - Remainder: (wrap) q g mod (x^L - 1) for L = bit_ceil(d): its word j < d is (q g)[j] + f[j + L]
 //   + f[j + 2L] + ..., so r[j] = (f[j] + f[j + L] + ...) - (q g mod (x^L - 1))[j]. (split) for L'
 //   = L/2 < d and k + d - L' <= L' + 1: q g mod (x^L' - 1), and (q g)[L', d) as words [k - 1, k - 1
@@ -89,6 +88,7 @@ constexpr u32 sub1(u32 a, u32 b) { return a >= b ? a - b : a + kP - b; }
 
 inline constexpr std::size_t kLongDivision = std::size_t(1) << 12;  // long division when k d <= this
 inline constexpr std::size_t kMaxWindows = 8;                       // stored window transforms
+static_assert(kMaxWindows <= std::size_t(ntt::kMaxTerms));          // a residual: one inverse_product
 inline constexpr std::size_t kMaxDirect = 128;                      // the direct remainder: k <= this
 inline constexpr int kMinLg = ntt::kMinLog, kMaxLg = ntt::kMaxLog;
 
@@ -374,7 +374,7 @@ inline std::size_t quotient_words(const Plan& p) {
     std::size_t later = footprint(p.k) + footprint(block_work(p));
     if (p.tail_transform()) later += footprint(std::size_t(1) << p.lg_tail);
     if (p.remainder == Remainder::tail) later += footprint(p.d);
-    if (p.windows) later += 2 * p.windows * footprint(len) + (p.windows > 4 ? footprint(len) : 0);
+    if (p.windows) later += 2 * p.windows * footprint(len);
     if (p.last_method == Last::short_length && p.blocks > 1) later += footprint(std::size_t(1) << p.lg_last);
     if (p.small_last()) later += footprint(2 * p.last);
     const std::size_t h = p.h_length() ? footprint(p.h_length()) : 0;
@@ -449,7 +449,6 @@ inline void divide_blocks(const Plan& p, Span f, Span g, Out q, Out r, Arena& ar
         const std::size_t from = i * s;
         t2->forward(Span(G.data() + from, std::min(len, G.size() - from)), W[i]);
     }
-    u32* const sum = p.windows > 4 ? arena.take(len) : nullptr;  // leaf products past 4 terms
     u32* Hc = nullptr;
     if (p.last_method == Last::short_length && B > 1) {
         Hc = arena.take(std::size_t(1) << p.lg_last);
@@ -479,15 +478,9 @@ inline void divide_blocks(const Plan& p, Span f, Span g, Out q, Out r, Arena& ar
         } else {
             const std::size_t terms = std::min(j, p.reach);
             const auto stored = [&](std::size_t t) { return ring[(j - 1 - t) % p.windows]; };  // T(Q_(j-1-t))
-            std::array<ntt::Term, 4> sums{};
-            std::size_t used = 0, t = 0;
-            if (terms > 4) {
-                t2->multiply(W[0], stored(0), sum);
-                for (t = 1; t + 3 < terms; ++t) t2->multiply_add(sum, W[t], stored(t));
-                sums[used++] = {sum, nullptr};
-            }
-            for (; t < terms; ++t) sums[used++] = {W[t], stored(t)};
-            t2->inverse_product(std::span<const ntt::Term>(sums.data(), used), work, R, {.offset = s, .negate = true});
+            std::array<ntt::Term, kMaxWindows> sums{};
+            for (std::size_t t = 0; t < terms; ++t) sums[t] = {W[t], stored(t)};
+            t2->inverse_product(std::span<const ntt::Term>(sums.data(), terms), work, R, {.offset = s, .negate = true});
             take_f(at, block, count, true);
         }
         // Q_j = h R mod x^count.

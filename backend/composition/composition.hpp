@@ -1384,7 +1384,7 @@ inline void compose_levels(Span f, Span g, Out h) {
 }
 
 // Power projection's P columns at the column levels: p8 (P_(T-3), m/8 rows each) and P8 (their
-// leaf forms at m/4), p4 (P_(T-2), m/4 rows) and P4 (at m/2), p2 (P_(T-1), m/2 rows); tmp: m/4 words.
+// leaf forms at m/4), p4 (P_(T-2), m/4 rows) and P4 (at m/2), p2 (P_(T-1), m/2 rows).
 struct ProjectionColumns {
     ProjectionColumns(Arena& arena, std::size_t m) {
         for (auto& x : p8) x = arena.take(m / 8);
@@ -1392,25 +1392,19 @@ struct ProjectionColumns {
         for (auto& x : p4) x = arena.take(m / 4);
         for (auto& x : P4) x = arena.take(m / 2);
         for (auto& x : p2) x = arena.take(m / 2);
-        tmp = arena.take(m / 4);
     }
     static std::size_t words(std::size_t m) {
         return 8 * footprint(m / 8) + 7 * footprint(m / 4) + 4 * footprint(m / 4) + 3 * footprint(m / 2) +
-               2 * footprint(m / 2) + footprint(m / 4);
+               2 * footprint(m / 2);
     }
-    u32 *p8[8], *P8[7], *p4[4], *P4[3], *p2[2], *tmp;
+    u32 *p8[8], *P8[7], *p4[4], *P4[3], *p2[2];
 };
 
-// out (N words) = the inverse of the sum of the terms' products (up to 8; past 4 a second inverse
-// into tmp, added) plus c (N/2 words).
-inline void column_sum(const ntt::Transform& t, std::span<const ntt::Term> terms, u32* work, u32* out, u32* tmp,
-                       const u32* c) {
+// out (N words) = the inverse of the sum of the terms' products (up to 7, one inverse_product)
+// plus c (N/2 words).
+inline void column_sum(const ntt::Transform& t, std::span<const ntt::Term> terms, u32* work, u32* out, const u32* c) {
     const std::size_t N = t.length();
-    t.inverse_product(terms.first(std::min<std::size_t>(terms.size(), 4)), work, Out(out, N));
-    if (terms.size() > 4) {
-        t.inverse_product(terms.subspan(4), work, Out(tmp, N));
-        ntt::detail::add_words(out, tmp, N);
-    }
+    t.inverse_product(terms, work, Out(out, N));
     ntt::detail::add_words(out, c, N / 2);
 }
 
@@ -1431,10 +1425,10 @@ inline void projection_columns(const u32* p, const u32* q, std::size_t m, Column
                         j2[5] = {{P[4], C[1]}, {P[3], C[2]}, {P[2], C[3]}, {P[1], C[4]}, {P[0], C[5]}},
                         j3[7] = {{P[6], C[1]}, {P[5], C[2]}, {P[4], C[3]}, {P[3], C[4]}, {P[2], C[5]}, {P[1], C[6]},
                                  {P[0], C[7]}};
-        column_sum(t8, j0, work, pc.p4[0], pc.tmp, pc.p8[1]);
-        column_sum(t8, j1, work, pc.p4[1], pc.tmp, pc.p8[3]);
-        column_sum(t8, j2, work, pc.p4[2], pc.tmp, pc.p8[5]);
-        column_sum(t8, j3, work, pc.p4[3], pc.tmp, pc.p8[7]);
+        column_sum(t8, j0, work, pc.p4[0], pc.p8[1]);
+        column_sum(t8, j1, work, pc.p4[1], pc.p8[3]);
+        column_sum(t8, j2, work, pc.p4[2], pc.p8[5]);
+        column_sum(t8, j3, work, pc.p4[3], pc.p8[7]);
     }
     // Level T - 2 (N = m/2).
     for (int c = 0; c < 3; ++c) t4.forward(Span(pc.p4[c], m / 4), pc.P4[c]);
@@ -1442,8 +1436,8 @@ inline void projection_columns(const u32* p, const u32* q, std::size_t m, Column
         u32* const* P = pc.P4;
         u32* const* C = cols.C4;
         const ntt::Term j0[1] = {{P[0], C[1]}}, j1[3] = {{P[2], C[1]}, {P[1], C[2]}, {P[0], C[3]}};
-        column_sum(t4, j0, work, pc.p2[0], pc.tmp, pc.p4[1]);
-        column_sum(t4, j1, work, pc.p2[1], pc.tmp, pc.p4[3]);
+        column_sum(t4, j0, work, pc.p2[0], pc.p4[1]);
+        column_sum(t4, j1, work, pc.p2[1], pc.p4[3]);
     }
     // Level T - 1: a = p1 + p0 c1.
     const std::size_t n = a.size();

@@ -14,7 +14,7 @@ int main() {
     std::printf("# cpu %s\n# target %s\n", fps::tune::cpu_name().c_str(), std::string(fps::tune::target_name()).c_str());
     const Costs c = measure_costs(kCostDefaults, {25, 7, 1e6, 0.02});
     std::printf("# seconds %.1f\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count());
-    const char* rows[kRows] = {"forward", "cyclic", "product", "term", "leaf", "inverse"};
+    const char* rows[kRows] = {"forward", "cyclic", "product", "term", "inverse"};
     for (int r = 0; r < kRows; ++r) {
         std::printf("field %s double", rows[r]);
         for (int i = 0; i < kLgs; ++i) std::printf(" %.4g", c[std::size_t(r * kLgs + i)]);

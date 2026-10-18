@@ -6,7 +6,8 @@
 //   cyclic_product/<lg>                         cyclic_product(in, B, work, out): in of 2^lg / 2
 //                                               words, the lower half out (a Newton step's).
 //   cyclic_product_upper/<lg>                   in of 2^lg words, the upper half out.
-//   inverse_product/<lg>, inverse_product3/<lg> inverse_product: 1 and 3 terms, the upper half out.
+//   inverse_product/<lg>, inverse_product3/<lg> inverse_product: 1 and 3 terms, the upper half out;
+//   inverse_product5/<lg>, inverse_product8/<lg> 5 and 8 terms (issue #143).
 //   multiply@steps/<lg>                         what cyclic_product replaces: in copied and zeroed,
 //                                               forward, multiply, inverse in place, half copied out.
 #include "backend/ntt/ntt.hpp"
@@ -64,6 +65,27 @@ void add(bench::Suite& suite, const std::string& name, int lg, Op op) {
     }, std::size_t(1) << lg);
 }
 
+// inverse_product<k>/<lg>: k products of 2k leaf forms of their own, the upper half out.
+void add_sum(bench::Suite& suite, int k, int lg) {
+    suite.add("inverse_product" + std::to_string(k) + "/" + std::to_string(lg), [k, lg] {
+        struct Sum {
+            Transform t;
+            std::vector<Words> forms;
+            std::vector<Term> terms;
+            Words work;
+            std::vector<u32> out;
+        };
+        const std::size_t len = std::size_t(1) << lg;
+        auto c = std::make_shared<Sum>(Sum{Transform(lg), {}, {}, Words(len, 6), std::vector<u32>(len / 2)});
+        for (int i = 0; i < 2 * k; ++i) c->forms.emplace_back(c->t.length(), unsigned(10 + i));
+        for (int i = 0; i < k; ++i) c->terms.push_back({c->forms[2 * i].begin(), c->forms[2 * i + 1].begin()});
+        return [c] {
+            c->t.inverse_product(c->terms, c->work.begin(), std::span<u32>(c->out), {.offset = c->t.length() / 2});
+            bench::keep(c->out);
+        };
+    }, std::size_t(1) << lg);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -88,6 +110,7 @@ int main(int argc, char** argv) {
             const Term terms[] = {{c.B.begin(), c.C.begin()}, {c.C.begin(), c.D.begin()}, {c.D.begin(), c.B.begin()}};
             c.t.inverse_product(terms, c.work.begin(), std::span<u32>(c.out.data(), c.len / 2), {.offset = c.len / 2});
         });
+        for (int k : {5, 8}) add_sum(suite, k, lg);
         add(suite, "multiply@steps", lg, [](Case& c) {
             u32* w = c.work.begin();
             std::fill(std::copy_n(c.in.data(), c.len / 2, w), w + c.len, 0u);

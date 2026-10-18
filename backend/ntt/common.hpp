@@ -199,11 +199,13 @@ struct Product {
 
 // A term of a leaf form computed from stored ones (Transform::inverse_product, cyclic_product): the
 // leaf products of a and b, or a alone if b is null. a, b: leaf forms of the transform's length.
+// Up to kMaxTerms of them (lc-opt's InverseProductSumBottom<K>, K <= 8: division's windows, power
+// projection's column sums; issue #143).
 struct LeafTerm {
     const std::uint32_t* a;
     const std::uint32_t* b;
 };
-inline constexpr int kMaxTerms = 4;
+inline constexpr int kMaxTerms = 8;
 // The leaf forms of Transform::toeplitz_product (issue #87): a3 is written.
 struct Toeplitz {
     const std::uint32_t *a1, *a2;

@@ -1012,35 +1012,21 @@ struct LeavesBottom {
     }
 };
 
-// The same for a sum of K = 2 or 3 leaf products (bottom_leaves2_*, bottom_leaves3_*: each product
-// reduced, then added). Term k's leaf buffers at leaves[.][2k].
-template <int K>
+// The same for a sum of 2 leaf products (bottom_leaves2_*: each product reduced, then added). Term
+// k's leaf buffers at leaves[.][2k].
 struct SumBottom {
     static void run(Vec* out, const LeafTerm* terms, std::size_t at, std::size_t nv, std::size_t first, const u32* r,
                     const u32* ir) {
-        static_assert(K == 2 || K == 3);
-        Leaves leaves[2][2 * K];
-        const u32 *a0 = terms[0].a + at, *a1 = terms[1].a + at, *a2 = terms[K - 1].a + at;
-        const u32 *b0 = terms[0].b + at, *b1 = terms[1].b + at, *b2 = terms[K - 1].b + at;
-        const auto fill = [&](std::size_t j, std::size_t k, Leaves* buf) {
-            if constexpr (K == 2) product_kernels::bottom_leaves2_first(a0 + 8 * j, a1 + 8 * j, buf, r + slot(k), r + slot(2 * k));
-            else product_kernels::bottom_leaves3_first(a0 + 8 * j, a1 + 8 * j, a2 + 8 * j, buf, r + slot(k), r + slot(2 * k));
-        };
-        fill(0, first, leaves[0]);
+        Leaves leaves[2][4];
+        const u32 *a0 = terms[0].a + at, *a1 = terms[1].a + at, *b0 = terms[0].b + at, *b1 = terms[1].b + at;
+        product_kernels::bottom_leaves2_first(a0, a1, leaves[0], r + slot(first), r + slot(2 * first));
         for (std::size_t j = 0, k = first;; j += 8, k += 2) {
             const std::size_t cur = j / 8 % 2, next = cur ^ 1;
             const u32 *ix = ir + slot(k), *iy = ir + slot(2 * k);
-            if (j + 8 == nv) {
-                if constexpr (K == 2) return product_kernels::bottom_leaves2_last(out + j, leaves[cur], b0 + 8 * j, b1 + 8 * j, ix, iy);
-                else return product_kernels::bottom_leaves3_last(out + j, leaves[cur], b0 + 8 * j, b1 + 8 * j, b2 + 8 * j, ix, iy);
-            }
+            if (j + 8 == nv) return product_kernels::bottom_leaves2_last(out + j, leaves[cur], b0 + 8 * j, b1 + 8 * j, ix, iy);
             const std::size_t n8 = 8 * (j + 8);
-            if constexpr (K == 2)
-                product_kernels::bottom_leaves2_both(a0 + n8, a1 + n8, leaves[next], r + slot(k + 2), r + slot(2 * k + 4), out + j,
-                                                     leaves[cur], b0 + 8 * j, b1 + 8 * j, ix, iy);
-            else
-                product_kernels::bottom_leaves3_both(a0 + n8, a1 + n8, a2 + n8, leaves[next], r + slot(k + 2), r + slot(2 * k + 4),
-                                                     out + j, leaves[cur], b0 + 8 * j, b1 + 8 * j, b2 + 8 * j, ix, iy);
+            product_kernels::bottom_leaves2_both(a0 + n8, a1 + n8, leaves[next], r + slot(k + 2), r + slot(2 * k + 4), out + j,
+                                                 leaves[cur], b0 + 8 * j, b1 + 8 * j, ix, iy);
         }
     }
 };
@@ -1087,6 +1073,74 @@ struct ToeplitzBottom {
 // Sums with a term alone (but one product and one term alone, SideBottom): the intrinsics' bottom on
 // Avx2 (Bottom::inverse_terms).
 using TermsLeaf = intrinsics::Bottom<simd::Avx2>;
+
+// Sums of 3 to kMaxTerms products: TermsLeaf::inverse_sum<K, kSumPass> with lc-opt's leaf product
+// (its lib/poly/transform.hpp), one asm statement per leaf in a fixed order: b_i broadcast once,
+// times the windows at 8 - i and 9 - i (even and odd lanes), then Montgomery's reduction, < 2P.
+// Zen 3 (notes/143-r1.md): against the intrinsics' leaf_product there (GCC spilled sums and
+// reloaded constants) 0.87-0.97 of the time at 2^12-2^20; for 3 products against bottom_leaves3_*
+// (two groups per asm statement) 1.00 at 2^12, 0.90-0.92 at 2^14-2^20. Passes of 3 terms: 0.77-0.94
+// of one pass's time at 2^14-2^16 (4 to 8 products), 0.99-1.02 elsewhere.
+inline constexpr int kSumPass = 3;
+struct AsmLeaf {
+    [[gnu::always_inline]] Vec operator()(const u32* w, const u32* b, std::size_t) const {
+        const Vec ni = broadcast(kernels::kNI), p = broadcast(kP), p2 = broadcast(2 * kP);
+        Vec even, odd, bi, t0, t1, t2, t3;
+        asm("vpbroadcastd (%[b]), %[bi]\n\t"
+            "vpmuludq 36(%[w]), %[bi], %[odd]\n\t"
+            "vpmuludq 32(%[w]), %[bi], %[even]\n\t"
+            "vpbroadcastd 4(%[b]), %[bi]\n\t"
+            "vpmuludq 32(%[w]), %[bi], %[t0]\n\t"
+            "vpmuludq 28(%[w]), %[bi], %[t1]\n\t"
+            "vpbroadcastd 8(%[b]), %[bi]\n\t"
+            "vpmuludq 28(%[w]), %[bi], %[t2]\n\t"
+            "vpmuludq 24(%[w]), %[bi], %[t3]\n\t"
+            "vpaddq %[t0], %[odd], %[odd]\n\t"
+            "vpaddq %[t1], %[even], %[even]\n\t"
+            "vpbroadcastd 12(%[b]), %[bi]\n\t"
+            "vpmuludq 24(%[w]), %[bi], %[t0]\n\t"
+            "vpmuludq 20(%[w]), %[bi], %[t1]\n\t"
+            "vpaddq %[t2], %[odd], %[odd]\n\t"
+            "vpaddq %[t3], %[even], %[even]\n\t"
+            "vpbroadcastd 16(%[b]), %[bi]\n\t"
+            "vpmuludq 20(%[w]), %[bi], %[t2]\n\t"
+            "vpmuludq 16(%[w]), %[bi], %[t3]\n\t"
+            "vpaddq %[t0], %[odd], %[odd]\n\t"
+            "vpaddq %[t1], %[even], %[even]\n\t"
+            "vpbroadcastd 20(%[b]), %[bi]\n\t"
+            "vpmuludq 16(%[w]), %[bi], %[t0]\n\t"
+            "vpmuludq 12(%[w]), %[bi], %[t1]\n\t"
+            "vpaddq %[t2], %[odd], %[odd]\n\t"
+            "vpaddq %[t3], %[even], %[even]\n\t"
+            "vpbroadcastd 24(%[b]), %[bi]\n\t"
+            "vpmuludq 12(%[w]), %[bi], %[t2]\n\t"
+            "vpmuludq 8(%[w]), %[bi], %[t3]\n\t"
+            "vpaddq %[t0], %[odd], %[odd]\n\t"
+            "vpaddq %[t1], %[even], %[even]\n\t"
+            "vpbroadcastd 28(%[b]), %[bi]\n\t"
+            "vpmuludq 8(%[w]), %[bi], %[t0]\n\t"
+            "vpmuludq 4(%[w]), %[bi], %[t1]\n\t"
+            "vpaddq %[t2], %[odd], %[odd]\n\t"
+            "vpaddq %[t3], %[even], %[even]\n\t"
+            "vpaddq %[t0], %[odd], %[odd]\n\t"
+            "vpaddq %[t1], %[even], %[even]\n\t"
+            "vpmuludq %[ni], %[even], %[t0]\n\t"
+            "vpmuludq %[ni], %[odd], %[t1]\n\t"
+            "vpmuludq %[p], %[t0], %[t0]\n\t"
+            "vpmuludq %[p], %[t1], %[t1]\n\t"
+            "vpaddq %[t0], %[even], %[even]\n\t"
+            "vpaddq %[t1], %[odd], %[odd]\n\t"
+            "vpsrlq $32, %[even], %[even]\n\t"
+            "vpblendd $0xaa, %[odd], %[even], %[even]\n\t"
+            "vpsubd %[p2], %[even], %[t0]\n\t"
+            "vpminud %[t0], %[even], %[even]"
+            : [even] "=&x"(even), [odd] "=&x"(odd), [bi] "=&x"(bi), [t0] "=&x"(t0), [t1] "=&x"(t1), [t2] "=&x"(t2),
+              [t3] "=&x"(t3)
+            : [w] "r"(w), [b] "r"(b), [ni] "x"(ni), [p] "x"(p), [p2] "x"(p2),
+              "m"(*reinterpret_cast<const u32(*)[17]>(w)), "m"(*reinterpret_cast<const u32(*)[8]>(b)));
+        return even;
+    }
+};
 
 // Upper halves of the inverse top levels (Transform's fused ops): count words of the upper half of
 // the result to out. Radix 4, radix 8: the generated kernels; radix 2: the differences.
@@ -1183,19 +1237,22 @@ template <class Stage>
 inline void inverse_product(const LeafTerm* terms, int n, u32* words, u32* out, std::size_t count, int lg, const u32* r,
                             const u32* ir, unsigned output) {
     if (n == 1 && !terms[0].b && output == 0) return inverse(terms[0].a, words, out, count, lg, ir, nullptr);
-    // Products only, 1 to 3 of them, or a product and a term alone: the asm bottoms; other terms
-    // alone, or 4 terms: the intrinsics'.
-    const int products = std::all_of(terms, terms + n, [](const LeafTerm& t) { return t.b != nullptr; }) && n <= 3 ? n : 0;
-    const int side = n == 2 && !products && (terms[0].b || terms[1].b) ? (terms[0].b ? 1 : 0) : -1;  // the term alone
+    // Products only, 1 or 2 of them, or a product and a term alone: the generated bottoms; 3 to 8
+    // products: inverse_sum with AsmLeaf, in passes of kSumPass; other lists: the intrinsics' bottom.
+    const bool all = std::all_of(terms, terms + n, [](const LeafTerm& t) { return t.b != nullptr; });
+    const int products = all ? n : 0;
+    const int side = n == 2 && !all && (terms[0].b || terms[1].b) ? (terms[0].b ? 1 : 0) : -1;  // the term alone
     inverse_staged(words, out, count, lg, ir, output, [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
         const std::size_t at = std::size_t(t - words);
         auto* v = reinterpret_cast<Vec*>(t);
         if (products == 1) LeavesBottom::run(v, terms[0].a + at, terms[0].b + at, leaves, at / 32, r, ir);
-        else if (products == 2) SumBottom<2>::run(v, terms, at, leaves, at / 32, r, ir);
-        else if (products == 3) SumBottom<3>::run(v, terms, at, leaves, at / 32, r, ir);
+        else if (products == 2) SumBottom::run(v, terms, at, leaves, at / 32, r, ir);
         else if (side >= 0)
             SideBottom::run(v, terms[1 - side].a + at, terms[1 - side].b + at, terms[side].a + at, leaves, at / 32, r, ir);
-        else TermsLeaf::inverse_terms(t, terms, n, leaves / 4, at / 32, r, ir);
+        else if (!intrinsics::for_products(terms, n, [&]<int K> {
+                     TermsLeaf::inverse_sum<K, kSumPass>(t, terms, leaves / 4, at / 32, r, ir, AsmLeaf{});
+                 }))
+            TermsLeaf::inverse_mixed(t, terms, n, leaves / 4, at / 32, r, ir);
     });
 }
 
