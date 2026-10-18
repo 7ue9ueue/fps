@@ -259,7 +259,7 @@ u32 horner(std::span<const u32> f, u32 x) {
 // The trees with the lanes' transforms at 16 L words twisted (as at m8 = 2^25), at sizes with C =
 // L and C < L (the Newton basis' windows then do not halve).
 void test_trees_twisted() {
-    for (const std::size_t m : {std::size_t(136), std::size_t(256), std::size_t(500), std::size_t(1024), std::size_t(1200), std::size_t(4096)}) {
+    for (const std::size_t m : {136, 256, 500, 1024, 1200, 4096}) {
         const std::size_t slots = ev::padded(m) / 8;
         ev::twisted_from = 8 * ev::lane_length(slots);  // the 16 L words ones
         const Vec f = random_words(m, 0);

@@ -61,4 +61,13 @@ inline constexpr std::size_t kDirectInterpolate = 32, kDirectNewton = 64;  // a 
 // fraction of it (lc-opt's choice; newton_slots).
 inline constexpr double kNewtonPad = 0.65;
 
+// The lanes' halvings leave their combine (P_lo -+ T) to the child's products, which then read
+// both halves (pointwise_twice): the descent at 2^17 0.978 of the time on Zen 3 and 0.985 on
+// Emerald Rapids, 0.976-1.003 on Zen 5 (two runs), 1.005 on Neoverse V2 (notes/136-r2.md).
+#if defined(__ARM_NEON) && defined(__aarch64__)
+inline constexpr bool kDeferredCombine = false;
+#else
+inline constexpr bool kDeferredCombine = true;
+#endif
+
 }  // namespace fps::evaluation
