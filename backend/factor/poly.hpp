@@ -9,6 +9,7 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -17,6 +18,7 @@
 #include <vector>
 
 #include "backend/factor/kernels.hpp"
+#include "backend/factor/large.hpp"
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -98,13 +100,38 @@ private:
     Pool* pool_;
 };
 
-// A monic g of degree m >= 1 with T_j = x^(m + j) mod g, j < m - 1, at table + j stride.
+// A monic g of degree m >= 1 with T_j = x^(m + j) mod g, j < m - 1, at table + j stride; or, from
+// the ring's NTT degree on, no table but products by NTT (large.hpp).
 struct Modulus {
     Poly g;
     int m = 0;
     int stride = 0;
     std::vector<u32> table;
+    std::unique_ptr<Products> ntt;
 };
+
+// Products modulo g by NTT (large.hpp) in place of the table (multiply_mod) and the multiplication
+// matrices (the rows of the Berlekamp matrix, the powers in the split) where they cost less: a row
+// by NTT about H lg H (transforms of 2H words, H = bit_ceil(m) = 2^lg), by the matrix m^2. NTT won
+// x^((P-1)/2) and the Krylov rows together from m^2 >= K H lg H (random f, m = 64 to 320, notes/
+// 200-r1.md): Zen 3 from m = 112 below 128 and 160 below 256 (K 14 and 12.5), Emerald Rapids 116
+// and 152, Zen 5 none and 210, Neoverse V2 90 and below 144. K: Zen 5 22, other AVX-512 15,
+// Neoverse V2 10, else 14 (one K: a few percent lost near the crossovers).
+inline constexpr int kNttCost =
+#if defined(__znver5__)
+    22;
+#elif defined(__AVX512F__)
+    15;
+#elif defined(__aarch64__)
+    10;
+#else
+    14;
+#endif
+
+constexpr bool ntt_products(int m) {
+    const int lg = std::max(ntt::kMinLog, int(std::bit_width(unsigned(std::max(m, 2)) - 1)));
+    return m >= 2 && std::int64_t(m) * m >= (std::int64_t(kNttCost) * lg << lg);
+}
 
 // Whether S runs polynomials modulo g of degree <= 8 in one ymm register (lc-opt's register path).
 // -DFPS_FACTOR_SMALL=0 turns it off.
@@ -117,16 +144,21 @@ constexpr bool small_path() {
 #endif
 }
 
+// Quotient words per block of Ring::divide_words (at least the widest struct's lanes).
+inline constexpr int kDivisionBlock = 16;
+
 template <class S>
 class Ring {
 public:
     static constexpr int W = S::lanes;
+    static_assert(W <= kDivisionBlock);
 
     // Polynomials of degree < limit; pool buffers of cap(limit) words.
     static constexpr int cap(int limit) { return round_up(limit, 16) + 16; }
 
-    explicit Ring(int limit)
-        : pool_(cap(limit)), scratch_(std::size_t(23) * cap(limit) + 2 * kBlock<S> * W) {}
+    // ntt_degree: NTT products from this degree on (tests); 0: where ntt_products() says.
+    explicit Ring(int limit, int ntt_degree = 0)
+        : ntt_degree_(ntt_degree), pool_(cap(limit)), scratch_(std::size_t(23) * cap(limit) + 2 * kBlock<S> * W) {}
 
     Pool& pool() { return pool_; }
     int stride(int m) const { return round_up(m, std::max(W, 8)); }  // rows of m words
@@ -157,7 +189,10 @@ public:
     }
 
     // Monic gcd (zero if both are zero). Fraction-free Euclid: a <- lc(b) a - lc(a) x^s b kills
-    // the leading term without inverses; remainders are right up to constant factors.
+    // the leading term without inverses; remainders are right up to constant factors. A degree-1
+    // quotient (deg a = deg b + 1, the usual case) in one pass: with a = A1 x^n + A0 x^(n-1) + ...,
+    // b = B1 x^(n-1) + B0 x^(n-2) + ..., the two steps give B1^2 a - B1 A1 x b - (B1 A0 - A1 B0) b
+    // (3 products per word, one reduction: backend/gcd's step).
     Poly gcd(const Poly& a0, const Poly& b0) {
         int na = a0.n, nb = b0.n;
         const int lead = std::max(na, nb), span = round_up(lead, 16) + 16;  // reads reach a - lead, a + span
@@ -168,6 +203,14 @@ public:
         std::copy(b0.c, b0.c + nb, b);
         if (na < nb) std::swap(a, b), std::swap(na, nb);
         while (nb > 0) {
+            if (na == nb + 1 && nb >= 2) {
+                const u32 a1 = a[na - 1], a0 = a[na - 2], b1 = b[nb - 1], b0 = b[nb - 2];
+                const u32 gamma = sub(mul(a1, b0), mul(b1, a0));
+                lincomb3<S>(a, a, mul(b1, b1), b - 1, neg(mul(b1, a1)), b, gamma, na - 2);
+                a[na - 1] = a[na - 2] = 0;
+                na -= 2;
+                while (na > 0 && a[na - 1] == 0) --na;
+            }
             while (na >= nb) {
                 lincomb<S>(a, a, b[nb - 1], b - (na - nb), neg(a[na - 1]), na - 1);
                 a[--na] = 0;
@@ -183,14 +226,40 @@ public:
     // h = q d + r with deg r < deg d, d monic. q or r may be null.
     void divide(const Poly& h, const Poly& d, Poly* q, Poly* r) { divide_words(h.c, h.n, d, q, r); }
 
-    // The same for h of hn <= 2 cap words (q only for hn <= cap).
+    // The same for h of hn <= 2 cap words (q only for hn <= cap). Quotient words in blocks of
+    // kDivisionBlock from the top: the block's words from its top rows by a triangular solve
+    // (scalar, sums folded once), then the rows below by one combine of the block's shifts of d
+    // (each word one pass, not one axpy per quotient word, whose load waited on the last one's
+    // store); the last words one by one.
     void divide_words(const u32* h, int hn, const Poly& d, Poly* q, Poly* r) {
         u32* a = scratch_.data();
         const int dd = d.n - 1;
         std::copy(h, h + hn, a);
         std::fill(a + hn, a + round_up(hn, 16) + 16, 0);
         if (q) *q = zero();
-        for (int i = hn - 1; i >= dd; --i) {
+        int i = hn - 1;
+        if (dd >= 1 && hn - dd >= kDivisionBlock) {
+            constexpr int B = kDivisionBlock;
+            u32* padded = scratch_.data() + 4 * pool_.cap() + B;  // d, B zeros before, W after
+            std::fill(padded - B, padded, 0);
+            std::copy(d.c, d.c + dd + 1, padded);
+            std::fill(padded + dd + 1, padded + dd + 1 + std::max(B, W), 0);
+            u32 c[B], minus[B];
+            for (; i - dd + 1 >= B; i -= B) {
+                const int i0 = i - dd - B + 1;  // the block's quotient words i0 .. i0 + B - 1
+                for (int t = B - 1; t >= 0; --t) {
+                    u64 sum = 0;
+                    for (int u = t + 1; u < std::min(B, t + dd + 1); ++u) sum += u64(c[u]) * padded[dd + t - u];  // < 16 products: fold once
+                    c[t] = sub(a[i0 + t + dd], reduce(fold(sum)));
+                    minus[t] = neg(c[t]);
+                    if (q) q->c[i0 + t] = c[t];
+                }
+                // Words i0 .. i0 + dd - 1: a[i0 + w] -= sum_t c[t] d[w - t] (the block's top, from
+                // i0 + dd on, gets words that are not read again).
+                combine<S>(a + i0, dd, a + i0, minus, B, padded, -1);
+            }
+        }
+        for (; i >= dd; --i) {
             const u32 c = a[i];
             if (q) q->c[i - dd] = c;
             if (c != 0) axpy<S>(a + i - dd, a + i - dd, neg(c), d.c, dd + 1);  // a[i] -> 0
@@ -241,10 +310,16 @@ public:
 
     // The table goes into storage (its capacity is reused).
     Modulus modulus(const Poly& g, std::vector<u32>&& storage = {}) {
-        Modulus M{g, 0, 0, {}};
+        Modulus M{g, 0, 0, {}, nullptr};
         M.m = g.n - 1;
         M.stride = stride(M.m);
         M.table = std::move(storage);
+        if (ntt_degree_ ? M.m >= ntt_degree_ : ntt_products(M.m)) {
+            std::vector<u32> canonical(std::size_t(M.m) + 1);
+            for (int i = 0; i <= M.m; ++i) canonical[std::size_t(i)] = from_montgomery(g.c[i]);
+            M.ntt = std::make_unique<Products>(canonical.data(), M.m);
+            return M;
+        }
         M.table.assign(std::size_t(std::max(M.m - 1, 0)) * M.stride, 0);
         if (M.m >= 2) {
             u32* t = M.table.data();
@@ -260,7 +335,7 @@ public:
         if (a.n == 0 || b.n == 0) return r;
 #if defined(__AVX2__)
         if constexpr (small_path<S>()) {
-            if (M.m <= 8) {
+            if (M.m <= 8 && !M.ntt) {
                 const __m256i x = multiply_small(load8(a.c), load8(b.c), M);
                 _mm256_storeu_si256(reinterpret_cast<__m256i*>(r.c), x);
                 r.set_size(M.m);
@@ -268,6 +343,12 @@ public:
             }
         }
 #endif
+        if (M.ntt) {  // (a b mod g) 2^32 from Montgomery words: times 2^-32 (a product by 1)
+            M.ntt->multiply(a.c, b.c, r.c);
+            combine_scaled<S>(r.c, M.m, r.c, 1, nullptr, 0, r.c, 0);
+            r.set_size(M.m);
+            return r;
+        }
         u32* product = scratch_.data() + 4 * pool_.cap();
         multiply<S>(a.c, a.n, b.c, b.n, product, product + 2 * pool_.cap());
         const int len = a.n + b.n - 1;
@@ -288,10 +369,23 @@ public:
         return r;
     }
 
-    // x^e mod g, e >= 1, deg g >= 2.
+    // x^e mod g, e >= 1, deg g >= 2. The longest leading bits of e worth at most 2m - 2 (m - 1
+    // without a table) give x^prefix directly, a word or a row of the table: (P - 1) / 2 = 119
+    // 2^22 starts at x^119, 6 of 29 squarings fewer for m from 60 to 119 (1 more each doubling).
     Poly power_of_x(u64 e, const Modulus& M) {
-        Poly r = linear(0);
-        for (int bit = 62 - __builtin_clzll(e); bit >= 0; --bit) {
+        const u64 limit = M.ntt ? u64(M.m) - 1 : 2 * u64(M.m) - 2;
+        u64 prefix = 1;
+        int bit = 62 - __builtin_clzll(e);
+        for (; bit >= 0 && (prefix << 1 | (e >> bit & 1)) <= limit; --bit) prefix = prefix << 1 | (e >> bit & 1);
+        Poly r = zero();
+        if (prefix < u64(M.m)) {
+            r.c[prefix] = kOne, r.n = int(prefix) + 1;
+        } else {
+            const u32* row = M.table.data() + (prefix - u64(M.m)) * u64(M.stride);
+            std::copy(row, row + M.m, r.c);
+            r.set_size(M.m);
+        }
+        for (; bit >= 0; --bit) {
             r = multiply_mod(r, r, M);
             if (e >> bit & 1) r = times_x(r, M);
         }
@@ -303,7 +397,7 @@ public:
         Poly r = linear(neg(a));
 #if defined(__AVX2__)
         if constexpr (small_path<S>()) {
-            if (M.m <= 8) {
+            if (M.m <= 8 && !M.ntt) {
                 __m256i x = load8(r.c);
                 for (int bit = 62 - __builtin_clzll(e); bit >= 0; --bit) {
                     x = multiply_small(x, x, M);
@@ -358,6 +452,7 @@ public:
     u32* rows() { return scratch_.data() + 7 * pool_.cap() + 2 * kBlock<S> * W; }
 
 private:
+    int ntt_degree_;
     Pool pool_;
     // Words from 0: gcd (2 (lead + span) <= 4 cap), divide and times_x (cap + 16); from 4 cap: a
     // product (2 cap), then multiply's scratch (cap + 2 kBlock W); then rows() (16 cap).

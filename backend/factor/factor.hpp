@@ -13,26 +13,29 @@
 // random choices inside use a fixed seed, so the time is too. A constant f gives no factors.
 // f = 0 throws std::invalid_argument, deg f > kMaxDegree std::length_error.
 //
-// Cost: O(m^3) per square-free part of degree m (the Krylov sequence and the elimination below),
-// two m x m matrices of words. Random f on Zen 3 (notes.md): degree 100 about 0.2 ms, 256 about
-// 2 ms, 1024 about 0.1 s, 4096 (the limit: 2 x 64 MiB of matrices) several seconds. Degree 2^20 is
-// out of reach here (4 TiB of matrices); it wants a distinct-degree split by baby steps and giant
-// steps (Kaltofen-Shoup) on NTT products. Up to kKeepDegree, each thread keeps its factorizer
-// (buffers, matrices) between calls.
+// Cost: O(m^3) per square-free part of degree m (the elimination below; the Krylov sequence too
+// up to m about 100-210, then O(m^2 log m) by NTT products), one m x m matrix of words (two below
+// the NTT degree). Random f on Zen 3 (notes.md): degree 100 about 0.2 ms, 256 about 1 ms, 1024
+// about 33 ms, 4096 (the limit: 64 MiB of matrix) about 2 s. Degree 2^20 is out of reach here (4
+// TiB of matrix); it wants a distinct-degree split by baby steps and giant steps (Kaltofen-Shoup)
+// on NTT products. Up to kKeepDegree, each thread keeps its factorizer (buffers, matrices) between
+// calls.
 //
 // Algorithm (lc-opt's, but for the root finding):
 // - square-free decomposition by Yun's algorithm (deg f < P, so f' = 0 only for a constant);
 // - per square-free part g of degree m: x^((P-1)/2^j) mod g for j = K .. 1 by squarings (a
-//   product, then the reduction by the table x^(m + j) mod g), x^P = x (x^((P-1)/2))^2; the linear
-//   factors L = gcd(g, x^P - x);
+//   product, then the reduction by the table x^(m + j) mod g, or by NTT products past the NTT
+//   degree, poly.hpp's ntt_products()), x^P = x (x^((P-1)/2))^2; the linear factors L = gcd(g,
+//   x^P - x);
 // - roots (of L, and of mu below) by 2-power characters: P - 1 = 119 2^23, so w = (x + a)^((P-1)
 //   / 2^k) takes 2^k-th roots of unity at the roots; gcds with w^(2^(k-j-1)) - (a root of unity)
 //   split them bit by bit of those values, k - j - 1 squarings at depth j (for L, a = 0 and w
-//   comes from the squarings above);
+//   comes from the squarings above); quadratic nodes in scalars, one inverse per pair;
 // - the rest by Berlekamp: rows q_j = x^(P j) mod g, the first 8 by mat-vecs with the matrix of
 //   the multiplication by x^P, then each block of 8 the block before times the matrix of the
-//   multiplication by q_8 (combine_rows), transposed into A = (Q - I)^T; the kernel of A
-//   (dimension k = the number of factors) by fraction-free blocked elimination (linear.hpp);
+//   multiplication by q_8 (combine_rows), or by NTT products (large.hpp: each block's rows from
+//   its first times x^P .. x^(8P)), transposed into A = (Q - I)^T; the kernel of A (dimension k =
+//   the number of factors) by fraction-free blocked elimination (linear.hpp);
 // - k > 1: two random kernel elements v, w. The factors are grouped by the value of v
 //   (v = c_i mod g_i): the c_i are the roots of the minimal polynomial mu of v, found from the
 //   coordinates of v^j at the free columns (a k x (k + 1) kernel). Groups by divide and conquer
@@ -46,6 +49,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -75,12 +79,13 @@ namespace detail {
 
 // Collide (tests only): the first sample becomes v^((P-1)/2), so at most 3 groups (values 0, 1,
 // -1), and every other step the second sample is the constant 1, so groups of several factors
-// pass as single ones: both repair paths of split() run.
-template <class S, bool Collide = false>
+// pass as single ones: both repair paths of split() run. NttDegree (tests): moduli of this degree
+// on run their products by NTT; 0: where poly.hpp's ntt_products() says.
+template <class S, bool Collide = false, int NttDegree = 0>
 class Factorizer {
 public:
     // Polynomials of degree <= n.
-    explicit Factorizer(int n) : n_(n), R_(n + 1) {}
+    explicit Factorizer(int n) : n_(n), R_(n + 1, NttDegree) {}
 
     int limit() const { return n_; }
 
@@ -219,14 +224,15 @@ private:
     // node does not split). Roots whose values agree to all k bits (or -a) start again with a new
     // shift.
     void split_roots(const Poly& Q, const Poly& w, int j, u32 low, int k, std::vector<u32>& roots) {
-        if (Q.n <= 3) return small_roots(Q, roots);
+        if (Q.n <= 2) return small_roots(Q, roots);
         if (j == k) return find_roots(Q, roots);
+        if (Q.n == 3) return quadratic_roots(Q, w, j, low, k, roots);
         Poly u = w;  // w^(2^(k-j-1)) mod Q
         if (j + 1 < k) {
             const Modulus M = R_.modulus(Q);
             for (int i = j + 1; i < k; ++i) u = R_.multiply_mod(u, u, M);
         }
-        u.c[0] = sub(u.c[0], power(kRootsOfUnity[j + 1], low));
+        u.c[0] = sub(u.c[0], unity_power(j + 1, low));
         u.set_size(std::max(u.n, 1));
         const Poly G = R_.gcd(Q, u);
         if (G.n == 1) return split_roots(Q, w, j + 1, low | 1u << j, k, roots);
@@ -234,6 +240,48 @@ private:
         const Poly H = R_.quotient(Q, G);
         split_roots(G, R_.remainder(w, G), j + 1, low, k, roots);
         split_roots(H, R_.remainder(w, H), j + 1, low | 1u << j, k, roots);
+    }
+
+    // split_roots for Q = x^2 + b x + c0 in scalars: w^(2^t) mod Q = alpha_t x + beta_t by
+    // (alpha x + beta)^2 = alpha (2 beta - alpha b) x + beta^2 - alpha^2 c0. At level j, u =
+    // alpha x + beta (t = k - j - 1) takes +-c (c = w_(j+1)^low) at the roots, or 0 at -a. alpha =
+    // 0: the same bit j for both (beta = c: 0, -c: 1), the next level; else they part here: the
+    // root with value c (or -c) is (c - beta) / alpha, the other -b minus it. One inverse and a few
+    // products per level, against Cipolla's square root (about 200 products in F_P^2's chain).
+    void quadratic_roots(const Poly& Q, const Poly& w, int j, u32 low, int k, std::vector<u32>& roots) {
+        const u32 b = Q.c[1], c0 = Q.c[0];
+        std::array<u32, 24> alpha{}, beta{};
+        alpha[0] = w.n > 1 ? w.c[1] : 0, beta[0] = w.n > 0 ? w.c[0] : 0;
+        for (int t = 1; t < k - j; ++t) {
+            const u32 a = alpha[t - 1], e = beta[t - 1];
+            alpha[t] = mul(a, sub(add(e, e), mul(a, b)));
+            beta[t] = sub(mul(e, e), mul(mul(a, a), c0));
+        }
+        const auto is_root = [b, c0](u32 r) { return add(mul(add(r, b), r), c0) == 0; };
+        for (; j < k; ++j) {
+            const u32 c = unity_power(j + 1, low), a = alpha[std::size_t(k - j - 1)], e = beta[std::size_t(k - j - 1)];
+            if (a == 0) {
+                if (e == c) continue;
+                if (e != neg(c)) break;
+                low |= 1u << j;
+                continue;
+            }
+            const u32 inverse_alpha = inverse(a);
+            u32 r = mul(sub(c, e), inverse_alpha);
+            if (!is_root(r)) r = mul(sub(neg(c), e), inverse_alpha);
+            if (!is_root(r)) break;
+            roots.push_back(r);
+            roots.push_back(sub(neg(b), r));
+            return;
+        }
+        small_roots(Q, roots);  // values equal to all k bits (or -a among them)
+    }
+
+    // w_t^low for low < 2^t: w_t^(2^b) = w_(t-b), a product over the set bits of low.
+    static u32 unity_power(int t, u32 low) {
+        u32 r = kOne;
+        for (; low; low &= low - 1) r = mul(r, kRootsOfUnity[t - std::countr_zero(low)]);
+        return r;
     }
 
     // w_t = 3^((P-1)/2^t), a primitive 2^t-th root of unity (Montgomery form), t <= 23.
@@ -250,6 +298,45 @@ private:
         columns.assign(std::size_t(m) * stride, 0);
         std::copy(u.c, u.c + u.n, columns.begin());
         R_.times_x_chain(columns.data(), m, stride, M.g);
+    }
+
+    // Rows u^j mod g, j < count, at stride M.stride (zero from m on), 8 at a time: sink(j0, rows)
+    // for j0 = 0, 8, 16, ... gets rows j0 .. min(j0 + 8, count) - 1. With a table, by the
+    // multiplication matrices (Sequence); by NTT (M.ntt, large.hpp), each row the one before times u
+    // mod g (Multiplier: about 3.5 transforms of 2 bit_ceil(m) words, against m^2 products), or
+    // from kPowersFrom rows on each block's rows from its first times u .. u^8 (Powers: about 2.1
+    // transforms a row, and a setup of about 30).
+    static constexpr int kPowersFrom = 64;
+    template <class Sink>
+    void power_rows(Modulus& M, const Poly& u, int count, Sink&& sink) {
+        const int m = M.m, stride = M.stride;
+        u32* buffer = R_.rows();
+        if (!M.ntt) {
+            multiplication_matrix(M, u);
+            Sequence sequence{*this, M, buffer, count};
+            for (int j0 = 0; j0 < count; j0 += 8) sink(j0, static_cast<const u32*>(sequence.next(j0)));
+            return;
+        }
+        std::vector<u32> canonical(std::size_t(m), 0);  // u canonical: the rows keep their Montgomery form
+        for (int i = 0; i < u.n; ++i) canonical[std::size_t(i)] = from_montgomery(u.c[i]);
+        std::fill(buffer, buffer + 16 * stride, 0);
+        buffer[0] = kOne;
+        if (count >= kPowersFrom) {  // a block's rows from its first: its transform once
+            Powers Y(*M.ntt, canonical.data());
+            for (int j0 = 0; j0 < count; j0 += 8) {
+                u32* rows = buffer + (j0 / 8 % 2) * 8 * stride;
+                Y.steps(rows, rows + stride, stride, buffer + ((j0 / 8 + 1) % 2) * 8 * stride);
+                sink(j0, static_cast<const u32*>(rows));
+            }
+            return;
+        }
+        Multiplier X(*M.ntt, canonical.data());
+        for (int j0 = 0; j0 < count; j0 += 8) {
+            u32* rows = buffer + (j0 / 8 % 2) * 8 * stride;
+            if (j0 > 0) X.step(buffer + ((j0 / 8 + 1) % 2) * 8 * stride + 7 * stride, rows);
+            for (int q = 1; q < std::min(8, count - j0); ++q) X.step(rows + (q - 1) * stride, rows + q * stride);
+            sink(j0, static_cast<const u32*>(rows));
+        }
     }
 
     // Rows j0 .. j0 + 7 (< count) of the sequence u_j = u_(j-1) X, u_0 = 1, at rows + (j - j0) stride
@@ -287,13 +374,10 @@ private:
 
     void berlekamp(Modulus& M, const Poly& r) {
         const int m = M.m;
-        multiplication_matrix(M, r);
         // A = (Q - I)^T for the rows q_j = x^(P j) mod g, 8 rows at a time: the kernel of A is
         // {v : v^P = v mod g}.
         Matrix A(m, m, std::move(matrix_));
-        Sequence sequence{*this, M, R_.rows(), m};
-        for (int j0 = 0; j0 < m; j0 += 8) {
-            const u32* rows = sequence.next(j0);
+        power_rows(M, r, m, [&](int j0, const u32* rows) {
             const int width = std::min(8, m - j0);
             if (width == 8) {
                 transpose_rows<S>(A.a.data(), A.ld, m, j0, rows, M.stride);
@@ -301,7 +385,7 @@ private:
                 for (int i = 0; i < m; ++i)
                     for (int q = 0; q < width; ++q) A.row(i)[j0 + q] = rows[q * M.stride + i];
             }
-        }
+        });
         const int stride = M.stride;
         for (int i = 0; i < m; ++i) A.row(i)[i] = sub(A.row(i)[i], kOne);
         const Echelon E = eliminate<S>(A);
@@ -329,14 +413,11 @@ private:
     void split(Modulus& M, const std::vector<int>& free, const u32* samples, const Poly& r) {
         const int m = M.m, stride = M.stride, k = int(free.size());
         const Poly v = R_.from_words(samples, m);
-        multiplication_matrix(M, v);
         std::vector<u32>& powers = matrix_;  // v^j mod g, j <= k
         powers.assign(std::size_t(k + 1) * stride, 0);
-        Sequence sequence{*this, M, R_.rows(), k + 1};
-        for (int j0 = 0; j0 <= k; j0 += 8) {
-            const u32* rows = sequence.next(j0);
+        power_rows(M, v, k + 1, [&](int j0, const u32* rows) {
             std::copy(rows, rows + std::min(8, k + 1 - j0) * stride, &powers[std::size_t(j0) * stride]);
-        }
+        });
         Matrix C(k, k + 1, std::move(M.table));
         for (int t = 0; t < k; ++t)
             for (int j = 0; j <= k; ++j) C.row(t)[j] = powers[std::size_t(j) * stride + free[t]];

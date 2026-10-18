@@ -3,6 +3,8 @@
 //                               and 10 (2^20 is out of reach: notes.md, Limits)
 //   "factor_split/<lg>"         n / 2 random irreducible quadratics (lc-opt's same_degree: Berlekamp
 //                               with k = n / 2, the split by the minimal polynomial), lg 4 to 8
+//   "factor_irreducible/<lg>"   (x + b)^n - 3, irreducible (Berlekamp with k = 1), lg 6 to 8 and 10
+//   "factor/11"                 random f of degree 2048 (#200: NTT rows, wide elimination blocks)
 //   "<case>@avx512vl/<lg>"      AVX-512 targets: on ymm (Avx512Vl) instead of zmm (not gated)
 //   "<case>@frontend/<lg>"      fps::factor (include/fps/algebra.hpp: distinct-degree split and
 //                               Cantor-Zassenhaus) on the same f, factor to 2^8, factor_split to
@@ -62,6 +64,17 @@ Vec quadratics(std::size_t k, unsigned seed) {
     return f;
 }
 
+// (x + b)^n - 3 for a random b: irreducible for n a power of two (3 generates the units mod P).
+Vec binomial(std::size_t n, unsigned seed) {
+    std::mt19937 rng(seed);
+    const u32 b = rng() % P;
+    Vec f = {1}, power = {b, 1};
+    for (std::size_t e = n; e; e >>= 1, power = multiply(power, power))
+        if (e & 1) f = multiply(f, power);
+    f[0] = (f[0] + P - 3) % P;
+    return f;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -85,7 +98,12 @@ int main(int argc, char** argv) {
         };
         add("factor", random_poly(n, unsigned(11 * lg)), true);
         add("factor_split", quadratics(n / 2, unsigned(13 * lg)), lg <= 6);
+        if (lg >= 6) suite.add("factor_irreducible" + size, [f = binomial(n, unsigned(17 * lg))] {
+            return [f] { bench::keep(fz::factor(f)); };
+        }, n);
     }
     suite.add("factor/10", [] { return [f = random_poly(1024, 110)] { bench::keep(fz::factor(f)); }; }, 1024);
+    suite.add("factor_irreducible/10", [f = binomial(1024, 170)] { return [f] { bench::keep(fz::factor(f)); }; }, 1024);
+    suite.add("factor/11", [] { return [f = random_poly(2048, 121)] { bench::keep(fz::factor(f)); }; }, 2048);
     return suite.run();
 }
