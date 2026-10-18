@@ -95,7 +95,12 @@
 // 2L cut to the first N words of its leaf form (rounded up to nodes of 128 words), the variants'
 // group products on its nodes and generic levels above them; it wins most of (1.25, 1.94) 2^k from
 // 2^12 on: 1.75 2^20 0.90-0.92x the time of the plain product (1.05-1.14 per word of 2^20's, was
-// 1.17-1.24), 1.625 2^20 0.90-0.96x, 1.875 2^20 0.95-0.98x. Middle products have no truncated form.
+// 1.17-1.24), 1.625 2^20 0.90-0.96x, 1.875 2^20 0.95-0.98x. Middle products have one too (round 3,
+// truncated.hpp's Middle products, notes/155-r3.md): v extended past its N words so that it vanishes
+// on the nodes past the cut, then the group products and an inverse pruned to them, writing words
+// [m - 1, N); its plan is the table's second half (choose_middle). Against the plain middle product,
+// same binary (notes/155-r3.md): 1.25 2^20 0.63-0.66x, 1.5 2^20 0.73-0.77x, 1.75 2^20 0.87-0.91x,
+// 1.875 2^20 0.93-0.97x; 4.4-4.6 ns per word on Zen 3 from 1.25 to 1.875 2^20.
 // Convolution::length and Transform stay powers of two: callers size memory and Newton steps by
 // them.
 //
@@ -341,24 +346,46 @@ void ragged_into(const std::uint32_t* f, std::size_t n, const std::uint32_t* g, 
 inline std::size_t middle_words(std::size_t m, std::size_t count, const ragged::Plan& p) {
     const std::size_t len = std::size_t(1) << p.lg;
     const auto block = [](std::size_t w) { return (w + kPadding + 15) / 16 * 16; };
+    if (p.truncated) return ragged::truncated_words(len);
     if (!p.split) return 2 * block(len) + 1024;
     const std::size_t s = p.s, t = p.t, nt = std::min(count, t), mt = std::min(m, t);
     const std::size_t arrays = block(len) + (s ? block(s) : 0) + (t ? block(nt + mt - 1) + block(nt) : 0);
     std::size_t more = 2 * block(len) + 1024;
     if (s) more = std::max(more, 3 * block(s) + 1024);
-    if (t) more = std::max(more, middle_words(mt, nt, ragged::choose(nt + mt - 1)));
+    if (t) more = std::max(more, middle_words(mt, nt, ragged::choose_middle(nt + mt - 1)));
     return arrays + more;
+}
+
+// The middle product (middle_into) by a truncated plan of n = m - 1 + count words (truncated.hpp,
+// Middle products): v extended to p, p and g to the leaf form of length 2L cut to shape(n)'s nodes,
+// the group products, and q's words [m - 1, n) into out. v and g are read before out is written,
+// so out may overlap them. work: ragged::truncated_words(L); tables of 2L.
+template <class Variant>
+void truncated_middle_into(const std::uint32_t* v, std::size_t n, const std::uint32_t* g, std::size_t m, std::uint32_t* out,
+                           std::uint32_t* work, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
+    const truncated::Shape s = truncated::shape(n);
+    const std::size_t span = (std::size_t(2) << s.lg) + kPadding;
+    std::uint32_t* const a = placed(work, v, g, out, span);
+    std::uint32_t* const b = a + span;
+    truncated::co_forward(v, a, s, roots, inverse_roots);
+    truncated::forward(g, m, b, s, roots);
+    for (int i = 0; i < s.fulls; ++i) {
+        const truncated::Node& node = s.full[i];
+        Variant::group_product(a + node.at, b + node.at, node.size / 8, node.k, roots, inverse_roots);
+    }
+    truncated::pruned_inverse(a, out, m - 1, n, s, roots, inverse_roots);
 }
 
 // out[i] = sum_{j < m} v[i + j] g[m - 1 - j] for i < count, v of n = m - 1 + count words: the
 // middle product by plan p (ragged.hpp). out apart from v and g; work: middle_words(m, count, p)
-// words, 64-byte aligned; tables for 2^p.lg at least.
+// words, 64-byte aligned; tables for 2^table_log(p) at least.
 template <class Variant>
 void middle_into(const std::uint32_t* v, std::size_t n, const std::uint32_t* g, std::size_t m, std::uint32_t* out,
                  std::size_t count, std::uint32_t* work, const ragged::Plan& p, const std::uint32_t* roots,
                  const std::uint32_t* inverse_roots) {
     const std::size_t L = std::size_t(1) << p.lg;
     const auto block = [](std::size_t w) { return (w + kPadding + 15) / 16 * 16; };
+    if (p.truncated) return truncated_middle_into<Variant>(v, n, g, m, out, work, roots, inverse_roots);
     if (!p.split) {  // a cyclic product of length L >= n: its wrapped terms land below word m - 1
         std::uint32_t* a = placed(work, v, g, out, L + kPadding);
         std::uint32_t* b = a + L + kPadding;
@@ -389,13 +416,13 @@ void middle_into(const std::uint32_t* v, std::size_t n, const std::uint32_t* g, 
         ragged::unfold_add(Cbar, s, m - 1, out, count);
     }
     if (t) {  // += the middle product of [0 .. 0, Tbar] and g[0, mt) in the top nt words
-        middle_into<Variant>(Pbar, top, g, mt, above, nt, rest, ragged::choose(top), roots, inverse_roots);
+        middle_into<Variant>(Pbar, top, g, mt, above, nt, rest, ragged::choose_middle(top), roots, inverse_roots);
         add_words(out + (count - nt), above, nt);
     }
 }
 
-// middle_product(f, g, out) by a split plan: f of m - 1 + count words read, out of count words.
-// Out of line, as ragged_product.
+// middle_product(f, g, out) by a split or truncated plan: f of m - 1 + count words read, out of
+// count words. Out of line, as ragged_product.
 template <class Variant>
 [[gnu::noinline]] void ragged_middle(const std::uint32_t* f, const std::uint32_t* g, std::size_t m, std::uint32_t* out,
                                      std::size_t count, const ragged::Plan& p) {
@@ -404,10 +431,11 @@ template <class Variant>
         const auto o = reinterpret_cast<std::uintptr_t>(out), b = reinterpret_cast<std::uintptr_t>(x);
         return o + count * sizeof(std::uint32_t) <= b || b + len * sizeof(std::uint32_t) <= o;
     };
-    // out itself when apart from f and g; else the region, then copied.
-    const bool direct = apart(f, n) && apart(g, m);
+    // out itself when apart from f and g (a truncated plan reads them before it writes out); else the
+    // region, then copied.
+    const bool direct = p.truncated || (apart(f, n) && apart(g, m));
     const std::size_t own = direct ? 0 : (count + kPadding + 15) / 16 * 16;
-    const auto [roots, inverse_roots] = tables<Variant>(p.lg);
+    const auto [roots, inverse_roots] = tables<Variant>(table_log(p));
     const Region region = take_region(sizeof(std::uint32_t) * (own + middle_words(m, count, p)));
     auto* start = reinterpret_cast<std::uint32_t*>(region.start);
     std::uint32_t* c = direct ? out : start;
@@ -459,12 +487,12 @@ void product(const std::uint32_t* f, std::size_t n, const std::uint32_t* g, std:
 }
 
 // out[i] = (f g)[m - 1 + i] for i < count (f: m - 1 + count words read, g: m) by plan p: the plain
-// middle product, a cyclic product of length 2^p.lg >= m - 1 + count, or a split (ragged_middle);
-// not truncated (ragged::choose).
+// middle product, a cyclic product of length 2^p.lg >= m - 1 + count, or a split or truncated one
+// (ragged_middle).
 template <class Variant>
 void middle(const std::uint32_t* f, const std::uint32_t* g, std::size_t m, std::uint32_t* out, std::size_t count,
             const ragged::Plan& p) {
-    if (p.split) return ragged_middle<Variant>(f, g, m, out, count, p);
+    if (p.split || p.truncated) return ragged_middle<Variant>(f, g, m, out, count, p);
     const auto [roots, inverse_roots] = tables<Variant>(p.lg);
     const Region region = take_region(region_bytes(p.lg));
     const std::size_t len = std::size_t(1) << p.lg, span = len + kPadding;
@@ -515,7 +543,7 @@ void middle_product(std::span<const std::uint32_t> f, std::span<const std::uint3
     if (count == 0) return;
     const std::size_t n = m - 1 + count;  // the words of f read
     if (int(std::bit_width(n - 1)) > kMaxLog) throw std::length_error("fps::ntt::middle_product: longer than 2^kMaxLog");
-    detail::middle<Variant>(f.data(), g.data(), m, out.data(), count, detail::ragged::choose(n));
+    detail::middle<Variant>(f.data(), g.data(), m, out.data(), count, detail::ragged::choose_middle(n));
 }
 
 // The product of a of n and b of m coefficients, n + m - 1 <= 2^kMaxLog. a and b: length() +

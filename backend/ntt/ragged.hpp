@@ -2,12 +2,13 @@
 // the cost of N words, not of the transform of 2L. ntt.hpp runs them (multiply, square, and
 // middle_product as the transpose, below); this header has the plans and the passes around the
 // power-of-two products. A second form, the truncated transform of 2L (truncated.hpp, round 2),
-// serves multiply and square; it is a plan kind here.
+// serves multiply and square, and middle products (round 3); it is a plan kind here.
 //
 //   plan(N, kind), options(N, plans)   the plan of a kind; the distinct plans of N
 //   choose_product(N)                  the tuned plan of multiply and square ("ntt.ragged")
-//   choose(N)                          the tuned plan of the others (middle products, ragged_into's
-//                                      callers outside ntt): never truncated
+//   choose_middle(N)                   the tuned plan of middle products of N words read (round 3)
+//   choose(N)                          the tuned plan of ragged_into's callers outside ntt: never
+//                                      truncated
 //   truncates(N), rounded(size, n)     whether N has a truncated plan; the words it computes
 //   twist_fold, fold, combine          the passes of a split product
 //   split_transposed, stage_turned, unfold_add   those of a middle product
@@ -361,23 +362,28 @@ constexpr int options(std::size_t N, std::array<Plan, kKinds>& plans) {
     return count;
 }
 
-// The tuned choice "ntt.ragged" (backend/tune): an entry per main length L = 2^lg (kMinLog <= lg <
-// kMaxLog) and bucket of r / L, (b - 1) / 16 < r / L <= b / 16. Entry v < kTruncated: the kind of
-// every product there; v >= kTruncated: products (multiply, square) truncated, the others (middle
-// products, which have no truncated form, and ragged_into's callers outside ntt) kind v - kTruncated.
-// tune.hpp measures it: every kind at the middle of each bucket; compiled defaults from
-// tools/tune.py ntt (tuned.hpp).
-inline constexpr int kBuckets = 16, kRows = kMaxLog - kMinLog, kEntries = 2 * kTruncated;
-using Kinds = std::array<std::uint8_t, kRows * kBuckets>;
+// The tuned choice "ntt.ragged" (backend/tune): two tables, each an entry per main length L = 2^lg
+// (kMinLog <= lg < kMaxLog) and bucket of r / L, (b - 1) / 16 < r / L <= b / 16. The first (entries
+// [0, kTable)), for products: entry v < kTruncated is the kind of every product there; v >=
+// kTruncated: products (multiply, square) truncated, the others (ragged_into's callers outside ntt,
+// which have no truncated form) kind v - kTruncated. The second ([kTable, 2 kTable)), for middle
+// products: the kind (middle_kind: v >= kTruncated is truncated). tune.hpp measures them: every kind
+// at the middle of each bucket; compiled defaults from tools/tune.py ntt (tuned.hpp: ragged, middle).
+inline constexpr int kBuckets = 16, kRows = kMaxLog - kMinLog, kEntries = 2 * kTruncated, kTable = kRows * kBuckets;
+using Kinds = std::array<std::uint8_t, 2 * kTable>;
 
 constexpr int product_kind(int v) { return v < kTruncated ? v : kTruncated; }
 constexpr int other_kind(int v) { return v < kTruncated ? v : v - kTruncated; }
+constexpr int middle_kind(int v) { return v < kTruncated ? v : kTruncated; }
 // The entry for a product kind and the others' kind (< kTruncated).
 constexpr std::uint8_t encode(int product, int other) { return std::uint8_t(product == kTruncated ? kTruncated + other : product); }
 
 inline constexpr Kinds kKindDefaults = [] {
     Kinds kinds{};
-    for (int i = 0; i < kRows * kBuckets; ++i) kinds[i] = std::uint8_t(tuned::ragged[int(tune::kTarget)][i]);
+    for (int i = 0; i < kTable; ++i) {
+        kinds[i] = std::uint8_t(tuned::ragged[int(tune::kTarget)][i]);
+        kinds[kTable + i] = std::uint8_t(tuned::middle[int(tune::kTarget)][i]);
+    }
     return kinds;
 }();
 static_assert(std::ranges::all_of(kKindDefaults, [](std::uint8_t k) { return k < kEntries; }));
@@ -390,8 +396,8 @@ constexpr int entry(std::size_t N) {
     return (lg - kMinLog) * kBuckets + int((r * kBuckets - 1) >> lg);
 }
 
-// The plan for N words outside multiply and square: the table's kind for its length and bucket (one
-// table read), never truncated (middle products; backend/series' ragged_into).
+// The plan for N words outside multiply, square and middle products: the table's kind for its
+// length and bucket (one table read), never truncated (backend/series' ragged_into).
 inline Plan choose(std::size_t N) {
     if (N <= (std::size_t(1) << kMinLog) || N > (std::size_t(1) << kMaxLog)) return split_plan(N, kPlain);
     return split_plan(N, other_kind(kinds.get()[entry(N)]));
@@ -404,6 +410,14 @@ inline Plan choose(std::size_t N) {
 inline Plan choose_product(std::size_t N) {
     if (N <= (std::size_t(1) << kMinLog) || N > (std::size_t(1) << kMaxLog)) return split_plan(N, kPlain);
     const int v = kinds.get()[entry(N)];
+    if (v >= kTruncated) return truncated_choice(N);
+    return split_plan(N, v);
+}
+
+// The plan of a middle product reading N words: the second table's kind.
+inline Plan choose_middle(std::size_t N) {
+    if (N <= (std::size_t(1) << kMinLog) || N > (std::size_t(1) << kMaxLog)) return split_plan(N, kPlain);
+    const int v = kinds.get()[kTable + entry(N)];
     if (v >= kTruncated) return truncated_choice(N);
     return split_plan(N, v);
 }

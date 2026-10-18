@@ -1,12 +1,15 @@
 // Truncated products (issue #155 round 2): c = f g of N words, L < N < 2L, L = 2^lg, from a
 // truncated transform of length 2L: the variants' group products on the nodes of the leaf form's
 // first rr >= N words, about N words of products where the plain one runs 2L. ntt.hpp runs them
-// (truncated_into) for multiply and square when ragged.hpp's plan is truncated; this header has the
-// shape and the levels above the group products.
+// (truncated_into) for multiply and square when ragged.hpp's plan is truncated, and middle products
+// of N words (truncated_middle_into, round 3: Middle products below); this header has the shape and
+// the levels above the group products.
 //
 //   shape(N)                          the levels (the partial nodes, the root first), the full nodes
 //   forward(f, n, F, s, r)            f mod each full node, into F (the leaf form of length 2L, cut)
 //   inverse(F, out, count, s, r, ir)  F's group products -> out = c[0, count), count <= N
+//   co_forward(v, F, s, r, ir)        a middle product's v (N words) extended to p: p mod each full node
+//   pruned_inverse(F, out, lo, hi, s, r, ir)  F's group products, zero past them -> out = q[lo, hi)
 //
 // Node k of s words is x^s - r(k)^2 (r: the twiddles of common.hpp); its halves are nodes 2k and 2k
 // + 1, its quarters 4k + t, the root x^(2L) - 1 node 0. A node whose s / 8 is a power of 4 is the
@@ -420,6 +423,365 @@ inline void inverse(u32* F, u32* out, std::size_t count, const Shape& s, const u
     for (int d = 0; d < s.levels; ++d) step(d, false);
     for (int d = s.levels - 1; d >= 0; --d)
         if (s.level[d].n % (s.level[d].node.size / std::size_t(s.level[d].radix))) step(d, true);
+}
+
+// ---- Middle products (round 3)
+//
+// out[i] = (v g)[m - 1 + i] for i < count, v of N = m - 1 + count words (ntt::middle_product). These
+// words of the cyclic product p g mod (x^(2L) - 1) read only p[0, N), for any p (no term wraps). So
+// take p = v on [0, rr) (zero from N on) and its words [rr, 2L) such that p = 0 mod each node past
+// the leaf form's first rr words (S': at each level the children past the partial one; 2L - rr words
+// in all, as many conditions as free words: p = v + x^rr h, h = -v x^-rr mod their product). Then q
+// = p g mod (x^(2L) - 1) is 0 mod those nodes too, so it follows from its residues at the full nodes
+// alone: co_forward gives p's there, the group products (with g's, from forward) q's, and
+// pruned_inverse q's words [m - 1, N), an inverse whose inputs past the full nodes are zero. This
+// costs about what the truncated product of N words does, with the variants' group products as they
+// are (the transposed truncated product, Tellegen's form, would need transposed ones).
+//
+// co_forward per level: a partial node of s words, chunks p_u of c words, its first n words known
+// (the root's: v), t = n / c full children, a partial child t with rest = n mod c known words if
+// rest > 0, the children past it zero. Column j: P(X) = sum_u p_u[j] X^u, R_v = P(lambda_v) (lambda
+// = y, -y, z, -z as Level's comment). Step 1, top-down, on j < rest (all j, with t - 1, if rest = 0:
+// child t - 1 is full): p_u known for u <= t and P = 0 at lambda_v for v > t give p_u for u > t (the
+// node's free words) and R_v for v <= t (R_t: the partial child's known word j). Step 2, bottom-up,
+// after the partial child, on j >= rest: p_u known for u < t, R_t (the child's free word j) and the
+// zeros give p_u for u >= t and R_v for v < t. Free words go in place of the zero children's and of
+// the partial child's own free words, where the parent's step 2 reads them; the root's are not
+// written. True scale, words in [0, 2P).
+//
+// pruned_inverse, bottom-up: a node's words from its children's, zero past the partial child, by the
+// variants' unnormalized inverse: a node's words come out times its leaves 2^-32, the scale of a
+// group product of its size, so the levels need no rescaling; the root's carry 1 / its scale.
+
+// A level's constants (names: what they multiply by): node k's x = r(k), y = r(2k), z = r(2k + 1),
+// their inverses and products; the root's sc (1 / its scale) and sc z^-1. lg2: the transform's log.
+struct MiddleConstants {
+    Constant x, y, z, inv_x, inv_y, inv_z, inv_xy, half, inv_2y, quarter, quarter_x, quarter_y, quarter_xy, sc, sc_z;
+    MiddleConstants() = default;  // unset
+    MiddleConstants(const u32* r, const u32* ir, std::size_t k, int lg2) {
+        constexpr u32 h = (kP + 1) / 2, q = u32(std::uint64_t(h) * h % kP);
+        const u32 ix = ir[slot(k)], iy = ir[slot(2 * k)], ixy = multiply_mod(ix, iy);
+        x = Constant::entry(r, k), y = Constant::entry(r, 2 * k), z = Constant::entry(r, 2 * k + 1);
+        inv_x = Constant::entry(ir, k), inv_y = Constant::entry(ir, 2 * k), inv_z = Constant::entry(ir, 2 * k + 1);
+        inv_xy = Constant(ixy), half = Constant(h), inv_2y = Constant(multiply_mod(h, iy)), quarter = Constant(q);
+        quarter_x = Constant(multiply_mod(q, ix)), quarter_y = Constant(multiply_mod(q, iy));
+        quarter_xy = Constant(multiply_mod(q, ixy));
+        sc = Constant(product_scale(lg2)), sc_z = Constant(multiply_mod(product_scale(lg2), ir[slot(1)]));
+    }
+};
+
+// A product by x, y or their inverses, which are 1 at the root: there a is returned, < 2P. The sums
+// that feed them: lazy (< 4P) below the root, reduced (< 2P) at it.
+template <bool kRoot>
+[[gnu::always_inline]] inline V by(const Constant& w, V a) {
+    if constexpr (kRoot) return a;
+    else return w.times(a);
+}
+template <bool kRoot>
+[[gnu::always_inline]] inline V lazy_add(V a, V b) {
+    if constexpr (kRoot) return add2(a, b);
+    else return add4(a, b);
+}
+template <bool kRoot>
+[[gnu::always_inline]] inline V lazy_sub(V a, V b) {
+    if constexpr (kRoot) return sub2(a, b);
+    else return sub4(a, b);
+}
+[[gnu::always_inline]] inline V twice(V a) { return add2(a, a); }
+
+// Column j of a radix-4 level's co_forward (above): p(u) is p_u's word j (u <= kT in step 1, u < kT
+// in step 2), X + v c + j gets R_v (v <= kT in step 1, v < kT in step 2; R_kT is read there in step
+// 2) and, below the root, the free p_u (u > kT in step 1, u >= kT in step 2). kRoot: node 0 (x = y =
+// 1, z = r(1)), kT >= 2 there (rr > L: t = 2 with rest > 0, or 3). In [0, 2P) from [0, 2P).
+template <bool kSecond, int kT, bool kRoot, class Load>
+[[gnu::always_inline]] inline void co_column4(Load p, u32* X, std::size_t c, std::size_t j, const MiddleConstants& k) {
+    const auto R = [&](int v) { return Vec::load(X + std::size_t(v) * c + j); };
+    const auto put = [&](int u, V v) { Vec::store(X + std::size_t(u) * c + j, v); };
+    if constexpr (!kSecond && kT == 3) {  // the plain forward
+        const V q0 = p(0), q1 = p(1), xq2 = by<kRoot>(k.x, p(2)), xq3 = by<kRoot>(k.x, p(3));
+        const V e = add2(q0, xq2), g = sub2(q0, xq2), f = by<kRoot>(k.y, lazy_add<kRoot>(q1, xq3)), h = k.z.times(sub4(q1, xq3));
+        put(0, add2(e, f)), put(1, sub2(e, f)), put(2, add2(g, h)), put(3, sub2(g, h));
+    } else if constexpr (!kSecond && kT == 2) {  // R3 = 0: z H = G, so R2 = 2G and F = 2 p1 - G / z
+        const V q0 = p(0), q1 = p(1), xq2 = by<kRoot>(k.x, p(2));
+        const V e = add2(q0, xq2), g = sub2(q0, xq2), gz = k.inv_z.times(g);
+        const V f = by<kRoot>(k.y, lazy_sub<kRoot>(twice(q1), gz));
+        put(0, add2(e, f)), put(1, sub2(e, f)), put(2, twice(g));
+        if constexpr (!kRoot) put(3, k.inv_x.times(sub4(q1, gz)));
+    } else if constexpr (!kSecond && kT == 1) {  // R2 = R3 = 0: p2 = p0 / x, p3 = p1 / x
+        static_assert(!kRoot);
+        const V q0 = p(0), q1 = p(1), yq1 = k.y.times(q1);
+        put(0, twice(add2(q0, yq1))), put(1, twice(sub2(q0, yq1))), put(2, k.inv_x.times(q0)), put(3, k.inv_x.times(q1));
+    } else if constexpr (!kSecond) {  // kT = 0: P = p0 (X + y)(X^2 + x) / (x y)
+        static_assert(!kRoot);
+        const V q0 = p(0);
+        put(0, twice(twice(q0))), put(1, k.inv_y.times(q0)), put(2, k.inv_x.times(q0)), put(3, k.inv_xy.times(q0));
+    } else if constexpr (kT == 0) {  // P = R0 (X + y)(X^2 + x) / (4 x y)
+        static_assert(!kRoot);
+        const V r0 = R(0);
+        put(0, k.quarter.times(r0)), put(1, k.quarter_y.times(r0)), put(2, k.quarter_x.times(r0));
+        put(3, k.quarter_xy.times(r0));
+    } else if constexpr (kT == 1) {  // R2 = R3 = 0: R0 + R1 = 4 p0, y p1 = p0 - R1 / 2
+        static_assert(!kRoot);
+        const V q0 = p(0), r1 = R(1), q1 = sub2(k.inv_y.times(q0), k.inv_2y.times(r1));
+        put(0, sub2(twice(twice(q0)), r1)), put(1, q1), put(2, k.inv_x.times(q0)), put(3, k.inv_x.times(q1));
+    } else if constexpr (kT == 2) {  // R3 = 0: G = R2 / 2, H = G / z
+        const V q0 = p(0), q1 = p(1), g = k.half.times(R(2)), h = k.inv_z.times(g);
+        const V e = sub2(twice(q0), g), f = by<kRoot>(k.y, lazy_sub<kRoot>(twice(q1), h));
+        put(0, add2(e, f)), put(1, sub2(e, f));
+        if constexpr (!kRoot) put(2, k.inv_x.times(sub4(q0, g))), put(3, k.inv_x.times(sub4(q1, h)));
+    } else {  // kT = 3: H = (G - R3) / z
+        const V q0 = p(0), q1 = p(1), xq2 = by<kRoot>(k.x, p(2)), r3 = R(3);
+        const V e = add2(q0, xq2), g = sub2(q0, xq2), d = k.inv_z.times(sub4(r3, g));
+        const V f = by<kRoot>(k.y, lazy_add<kRoot>(twice(q1), d));
+        put(0, add2(e, f)), put(1, sub2(e, f)), put(2, sub2(twice(g), r3));
+        if constexpr (!kRoot) put(3, k.inv_x.times(add4(q1, d)));
+    }
+}
+
+// The same for a radix-2 root (x^L - 1, x^L + 1; t = 1): R0, R1 = p0 +- p1; step 2: R0 = 2 p0 - R1.
+template <bool kSecond, class Load>
+[[gnu::always_inline]] inline void co_column2(Load p, u32* X, std::size_t c, std::size_t j) {
+    if constexpr (!kSecond) {
+        const V q0 = p(0), q1 = p(1);
+        Vec::store(X + j, add2(q0, q1)), Vec::store(X + c + j, sub2(q0, q1));
+    } else {
+        Vec::store(X + j, sub2(twice(p(0)), Vec::load(X + c + j)));
+    }
+}
+
+// Columns [j0, j1) of a level below the root, in place (X: its words).
+template <bool kSecond, int kT>
+[[gnu::noinline]] void co_columns(u32* X, std::size_t c, std::size_t j0, std::size_t j1, const MiddleConstants& k) {
+    const auto column = [&] [[gnu::always_inline]] (std::size_t j) {
+        const auto p = [&] [[gnu::always_inline]] (int u) { return Vec::load(X + std::size_t(u) * c + j); };
+        co_column4<kSecond, kT, false>(p, X, c, j, k);
+    };
+    if (prefetches<4>(c)) {
+        for (std::size_t j = j0; j < j1; j += kLanes) {
+            if (j % 16 == 0)
+                for (int u = 0; u < 4; ++u) ahead_write(X + std::size_t(u) * c + j);
+            column(j);
+        }
+        return;
+    }
+    for (std::size_t j = j0; j < j1; j += kLanes) column(j);
+}
+
+// Root columns [j0, j1): p_u from v (N words, zero past them), chunks u < kLoad read whole, or each
+// to N (kEdge); the children to X.
+template <int kRadix, bool kSecond, int kT, int kLoad, bool kEdge>
+[[gnu::noinline]] void co_root_columns(const u32* v, std::size_t N, u32* X, std::size_t c, std::size_t j0, std::size_t j1,
+                                       const MiddleConstants& k) {
+    const auto column = [&] [[gnu::always_inline]] (std::size_t j) {
+        const auto p = [&] [[gnu::always_inline]] (int u) {
+            const std::size_t at = std::size_t(u) * c + j;
+            if constexpr (kEdge) return ragged::load_upto(v, at, N);
+            else return u < kLoad ? Vec::load(v + at) : Vec::broadcast(0);
+        };
+        if constexpr (kRadix == 2) co_column2<kSecond>(p, X, c, j);
+        else co_column4<kSecond, kT, true>(p, X, c, j, k);
+    };
+    if (!kEdge && prefetches<kRadix>(c)) {
+        for (std::size_t j = j0; j < j1; j += kLanes) {
+            if (j % 16 == 0) {  // a line per chunk read and written
+                for (int u = 0; u < kLoad; ++u) ahead(v + std::size_t(u) * c + j);
+                for (int u = 0; u < kRadix; ++u) ahead_write(X + std::size_t(u) * c + j);
+            }
+            column(j);
+        }
+        return;
+    }
+    for (std::size_t j = j0; j < j1; j += kLanes) column(j);
+}
+
+// Root columns [j0, j1): N = whole c + e words of v; columns below e read whole + 1 chunks, the one
+// holding e reads each to N, the rest whole.
+template <int kRadix, bool kSecond, int kT>
+void co_root(const u32* v, std::size_t N, u32* X, std::size_t c, std::size_t j0, std::size_t j1, const MiddleConstants& k) {
+    const std::size_t whole = N / c, e = N % c, e0 = e / kLanes * kLanes, e1 = e0 == e ? e : e0 + kLanes;
+    const auto part = [&](std::size_t a, std::size_t b, int load) {
+        a = std::max(a, j0), b = std::min(b, j1);
+        if (a >= b) return;
+        if (load < 0) return co_root_columns<kRadix, kSecond, kT, kRadix, true>(v, N, X, c, a, b, k);
+        with_blocks<kRadix>(load, [&](auto blocks) {
+            co_root_columns<kRadix, kSecond, kT, decltype(blocks)::value, false>(v, N, X, c, a, b, k);
+        });
+    };
+    part(0, e0, int(whole) + 1);
+    part(e0, e1, -1);
+    part(e1, c, int(whole));
+}
+
+// p's residues at s's full nodes into F (the leaf form of length 2L, cut; 2L words kept), from v of
+// s.N words (canonical): above. r, ir: the tables of 2L. Outputs < 2P (group products take < 4P).
+inline void co_forward(const u32* v, u32* F, const Shape& s, const u32* r, const u32* ir) {
+    MiddleConstants constants[kMaxLevels];
+    const auto step = [&](int d, bool second) {
+        const Level& l = s.level[d];
+        const std::size_t c = l.node.size / std::size_t(l.radix), t = l.n / c, rest = l.n % c;
+        const std::size_t j0 = second ? rest : 0, j1 = second || !rest ? c : rest;
+        const int kt = int(rest || second ? t : t - 1);
+        u32* const X = F + l.node.at;
+        const MiddleConstants& k = constants[d];
+        if (d == 0 && l.radix == 2) {  // t = 1, rest > 0
+            if (second) co_root<2, true, 1>(v, s.N, X, c, j0, j1, k);
+            else co_root<2, false, 1>(v, s.N, X, c, j0, j1, k);
+            return;
+        }
+        with_blocks<3>(kt, [&](auto u) {
+            constexpr int kT = decltype(u)::value;
+            if (d > 0) {
+                if (second) co_columns<true, kT>(X, c, j0, j1, k);
+                else co_columns<false, kT>(X, c, j0, j1, k);
+            } else if constexpr (kT >= 2) {  // a radix-4 root: kt >= 2 (rr > L)
+                if (second) co_root<4, true, kT>(v, s.N, X, c, j0, j1, k);
+                else co_root<4, false, kT>(v, s.N, X, c, j0, j1, k);
+            }
+        });
+    };
+    for (int d = 0; d < s.levels; ++d) {
+        constants[d] = MiddleConstants(r, ir, s.level[d].node.k, s.lg + 1);
+        step(d, false);
+    }
+    for (int d = s.levels - 1; d >= 0; --d)
+        if (s.level[d].n % (s.level[d].node.size / std::size_t(s.level[d].radix))) step(d, true);
+}
+
+// Column j of a radix-4 level's pruned inverse below the root: R_v (v <= kT; zero past) at X + v c +
+// j -> the node's words p_u at X + u c + j, unnormalized. [0, 2P) from [0, 2P).
+template <int kT>
+[[gnu::always_inline]] inline void pi_column4(u32* X, std::size_t c, std::size_t j, const MiddleConstants& k) {
+    const auto R = [&](int v) { return Vec::load(X + std::size_t(v) * c + j); };
+    const auto put = [&](int u, V v) { Vec::store(X + std::size_t(u) * c + j, v); };
+    if constexpr (kT == 0) {  // p0 = R0 in place
+        const V r0 = R(0);
+        put(1, k.inv_y.times(r0)), put(2, k.inv_x.times(r0)), put(3, k.inv_xy.times(r0));
+    } else {
+        const V r0 = R(0), r1 = R(1), e = add2(r0, r1), f = k.inv_y.times(sub4(r0, r1));
+        if constexpr (kT == 1) {
+            put(0, e), put(1, f), put(2, k.inv_x.times(e)), put(3, k.inv_x.times(f));
+        } else {
+            V g = R(2), h;
+            if constexpr (kT == 3) {
+                const V r2 = g, r3 = R(3);
+                g = add2(r2, r3), h = k.inv_z.times(sub4(r2, r3));
+            } else {
+                h = k.inv_z.times(g);
+            }
+            put(0, add2(e, g)), put(1, add2(f, h)), put(2, k.inv_x.times(sub4(e, g))), put(3, k.inv_x.times(sub4(f, h)));
+        }
+    }
+}
+
+template <int kT>
+[[gnu::noinline]] void pi_columns(u32* X, std::size_t c, const MiddleConstants& k) {
+    if (prefetches<4>(c)) {
+        for (std::size_t j = 0; j < c; j += kLanes) {
+            if (j % 16 == 0)
+                for (int u = 0; u < 4; ++u) ahead_write(X + std::size_t(u) * c + j);
+            pi_column4<kT>(X, c, j, k);
+        }
+        return;
+    }
+    for (std::size_t j = 0; j < c; j += kLanes) pi_column4<kT>(X, c, j, k);
+}
+
+// The root's words at column j (true scale, canonical) to sink(u, word): radix 2 from R0, R1;
+// radix 4 from R_v, v <= kT (zero past; kT >= 2: rr > L).
+template <int kRadix, int kT, class Sink>
+[[gnu::always_inline]] inline void pi_root_column(const u32* X, std::size_t c, std::size_t j, const MiddleConstants& k,
+                                                  Sink sink) {
+    const auto R = [&](int v) { return Vec::load(X + std::size_t(v) * c + j); };
+    const auto out = [&](int u, V v) { sink(u, Mod::reduce<kP>(v)); };
+    const V r0 = R(0), r1 = R(1);
+    if constexpr (kRadix == 2) {
+        out(0, k.sc.times(add4(r0, r1))), out(1, k.sc.times(sub4(r0, r1)));
+    } else {
+        const V s01 = add2(r0, r1), a = k.sc.times(sub4(r0, r1));
+        V s23 = R(2), b;
+        if constexpr (kT == 3) {
+            const V r2 = s23, r3 = R(3);
+            s23 = add2(r2, r3), b = k.sc_z.times(sub4(r2, r3));
+        } else {
+            b = k.sc_z.times(s23);
+        }
+        out(0, k.sc.times(add4(s01, s23))), out(1, add2(a, b)), out(2, k.sc.times(sub4(s01, s23))), out(3, sub2(a, b));
+    }
+}
+
+// Root columns [j0, j1) whose chunks u with bit u of kMask lie in [lo, hi) (the others outside):
+// those to out[u c + j - lo].
+template <int kRadix, int kT, int kMask>
+[[gnu::noinline]] void pi_root_columns(const u32* X, std::size_t c, std::size_t j0, std::size_t j1, u32* out, std::size_t lo,
+                                       const MiddleConstants& k) {
+    for (std::size_t j = j0; j < j1; j += kLanes) {
+        if (prefetches<kRadix>(c) && j % 16 == 0)
+            for (int u = 0; u < kRadix; ++u) {
+                ahead(X + std::size_t(u) * c + j);
+                if (kMask >> u & 1) ahead_write(out + (std::size_t(u) * c + j - lo));
+            }
+        pi_root_column<kRadix, kT>(X, c, j, k, [&] [[gnu::always_inline]] (int u, V v) {
+            if (kMask >> u & 1) Vec::store(out + (std::size_t(u) * c + j - lo), v);
+        });
+    }
+}
+
+// The root's words [lo, hi) to out (0 <= lo < hi <= 2L): runs of columns with the same chunks inside,
+// and the vectors across an edge one by one.
+template <int kRadix, int kT>
+void pi_root(const u32* X, std::size_t c, u32* out, std::size_t lo, std::size_t hi, const MiddleConstants& k) {
+    std::size_t cut[2 * kRadix], a[kRadix], b[kRadix];  // chunk u's columns inside: [a_u, b_u)
+    for (int u = 0; u < kRadix; ++u) {
+        const std::size_t first = std::size_t(u) * c;
+        a[u] = std::clamp(lo, first, first + c) - first, b[u] = std::clamp(hi, first, first + c) - first;
+        cut[2 * u] = a[u], cut[2 * u + 1] = b[u];
+    }
+    for (std::size_t j = 0; j < c;) {
+        std::size_t next = c;  // the first cut past j
+        bool edge = false;
+        for (const std::size_t p : cut) {
+            if (p > j) next = std::min(next, p);
+            edge |= p > j && p < j + kLanes;
+        }
+        if (edge) {  // a cut inside the vector at j: each word apart
+            pi_root_column<kRadix, kT>(X, c, j, k, [&] [[gnu::always_inline]] (int u, V v) {
+                alignas(64) u32 lanes[kLanes];
+                Vec::store(lanes, v);
+                for (std::size_t l = 0; l < kLanes; ++l)
+                    if (j + l >= a[u] && j + l < b[u]) out[std::size_t(u) * c + j + l - lo] = lanes[l];
+            });
+            j += kLanes;
+            continue;
+        }
+        const std::size_t end = next / kLanes * kLanes;
+        int mask = 0;
+        for (int u = 0; u < kRadix; ++u) mask |= int(a[u] <= j && j < b[u]) << u;
+        if (mask)
+            with_blocks<(1 << kRadix) - 1>(mask, [&](auto m) {
+                if constexpr (decltype(m)::value > 0) pi_root_columns<kRadix, kT, decltype(m)::value>(X, c, j, end, out, lo, k);
+            });
+        j = end;
+    }
+}
+
+// out = q[lo, hi) (lo < hi <= s.N) from F after the group products (q's residues at s's full nodes
+// times their scale, < 2P; zero past them): the levels bottom-up. F is overwritten.
+inline void pruned_inverse(u32* F, u32* out, std::size_t lo, std::size_t hi, const Shape& s, const u32* r, const u32* ir) {
+    for (int d = s.levels - 1; d >= 0; --d) {
+        const Level& l = s.level[d];
+        const std::size_t c = l.node.size / std::size_t(l.radix), t = l.n / c, rest = l.n % c;
+        const MiddleConstants k(r, ir, l.node.k, s.lg + 1);
+        u32* const X = F + l.node.at;
+        if (d == 0 && l.radix == 2) {
+            pi_root<2, 1>(X, c, out, lo, hi, k);
+            continue;
+        }
+        with_blocks<3>(int(rest ? t : t - 1), [&](auto u) {
+            constexpr int kT = decltype(u)::value;
+            if (d > 0) pi_columns<kT>(X, c, k);
+            else if constexpr (kT >= 2) pi_root<4, kT>(X, c, out, lo, hi, k);  // kt >= 2 at a radix-4 root (rr > L)
+        });
+    }
 }
 
 }  // namespace fps::ntt::detail::truncated

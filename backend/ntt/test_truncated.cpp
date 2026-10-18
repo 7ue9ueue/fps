@@ -216,8 +216,9 @@ void test_long(const char* name, int max_lg) {
 }
 
 // The API with every entry of the table truncated (others floor, then plain): multiply and square
-// (truncated where it exists), middle products (floor or plain), split plans (whose top products
-// are truncated) by ragged_into; out overlapping f and g.
+// (truncated where it exists), middle products (truncated too since round 3: the middle table's
+// entries are >= kTruncated; else ceil), split plans (whose top products are truncated) by
+// ragged_into; out overlapping f and g.
 void test_api() {
     for (const int other : {int(dr::kFloor), int(dr::kPlain)}) {
         dr::Kinds all;
