@@ -23,8 +23,8 @@
 // node [lo, hi) above the base, keep.place(lo, mid, hi, words) gives the rooms where the tree
 // builds its children's transforms of the node's length (words each); a null room is the tree's
 // own memory, overwritten later (the tree still takes it from its stack, unused: with NoKeep the
-// code is as without the hook). The standard tree's root also writes its product transform
-// (before the inverse) to keep.root(words) if not null.
+// code is as without the hook). Both trees' roots also write their product transform (before the
+// inverse) to keep.root(words) if not null (the lanes': 8 L words, L the lane root's length).
 #pragma once
 
 #include <algorithm>
@@ -218,7 +218,8 @@ public:
     }
 
     // The product of all leaves. Its coefficients stay in the stack; what root() takes past them
-    // is released.
+    // is released. A root above the base also writes its product transform (8 L words, L its
+    // length: the lanes at the roots of X^L - 1) to keep.root(8 L) if not null.
     Root root() {
         const std::size_t count = leaves_.count();
         const u32 d = degree(0, count);
@@ -236,7 +237,8 @@ public:
         u32* const right_at = room.right ? room.right : b;
         const LaneNode left = build(0, mid, left_at, len);
         const LaneNode node = combine(left, build(mid, count, right_at, len));
-        pointwise<Wide>(left_at, right_at, a, 8 * len);
+        if (u32* const copy = keep_.root(8 * len)) pointwise2<Wide>(left_at, right_at, a, copy, 8 * len);
+        else pointwise<Wide>(left_at, right_at, a, 8 * len);
         inverse(a, 8 * len);
         for (int l = 0; l < 8; ++l) {
             const u32 top = node.degree[l] == len ? node.lead[l] : 0;

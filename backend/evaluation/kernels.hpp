@@ -6,10 +6,12 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <span>
 #include <type_traits>
+#include <vector>
 
 #include "backend/product_tree/kernels.hpp"
 
@@ -308,6 +310,217 @@ void combine_halves(u32* f, std::size_t h, int sign) {
         for (std::size_t i = 0; i < h; i += S::lanes) S::store(f + i, M::sub(S::load(f + i), S::load(f + h + i)));
     } else {
         for (std::size_t i = 0; i < h; i += S::lanes) S::store(f + i, M::add(S::load(f + i), S::load(f + h + i)));
+    }
+}
+
+// From the residues mod x^h - 1 and x^h + 1 of p (deg p < 2h) at f and f + h: p's low and high
+// halves, (a + b) / 2 and (a - b) / 2; canonical, h a multiple of S::lanes.
+template <class S>
+void halves_of_residues(u32* f, std::size_t h) {
+    using M = Ops<S>;
+    const typename S::V two = S::broadcast(multiply_mod((kP + 1) / 2, kR));  // 1/2 in Montgomery form
+    for (std::size_t i = 0; i < h; i += S::lanes) {
+        const typename S::V a = S::load(f + i), b = S::load(f + h + i);
+        S::store(f + i, montgomery_canonical<S>(M::add(a, b), two));
+        S::store(f + h + i, montgomery_canonical<S>(M::sub(a, b), two));
+    }
+}
+
+// The lanes' halving with a sign per lane: f[i] = f[i] - f[h + i] in even lanes (word i even), f[i]
+// + f[h + i] in odd ones; canonical, h a multiple of 8.
+template <class S>
+void combine_alternating(u32* f, std::size_t h) {
+    using M = Ops<S>;
+    if constexpr (S::lanes == 1) {
+        for (std::size_t i = 0; i < h; i += 2) f[i] = M::sub(f[i], f[h + i]), f[i + 1] = M::add(f[i + 1], f[h + i + 1]);
+    } else {
+        for (std::size_t i = 0; i < h; i += S::lanes) {
+            const typename S::V x = S::load(f + i), y = S::load(f + h + i);
+            S::store(f + i, S::template blend<0xaaaaaaaau>(M::sub(x, y), M::add(x, y)));
+        }
+    }
+}
+
+// The top tree's leaves in the lanes (issue #136 round 2). A lanes transform of 8 T words (T = 2L,
+// L the lane root's length) holds the 8 lane products at the T roots of X^T - 1; standard leaf u
+// of length T (x^8 - w_u) has its 8 roots at lanes leaves 8u + i, at rho_u z^bitrev3(i) (ntt's
+// values form; product_tree's lane_pairs). The pairs of the top tree (nodes over lanes 2j, 2j + 1)
+// convert between the two.
+
+// Element of order 2^(j + 2), j <= 21 (ntt's kRoots stop at 2^22; the lanes at T = 2^23 need
+// 2^23): 3^((P - 1) / 2^(j + 2)), and its inverse.
+inline constexpr auto kTopRoots = [] {
+    std::array<std::array<u32, 22>, 2> t{};
+    for (int j = 0; j < 22; ++j) t[0][j] = power(3, (kP - 1) >> (j + 2)), t[1][j] = power(t[0][j], kP - 2);
+    return t;
+}();
+
+// The twist factors for standard leaves u < count: words [8u, 8u + 8) = rho_u^k 2^32 mod P (k <
+// 8), rho_u = r(4u); inverse: rho_u^-k 2^32 / 8 (product_tree's untwist_factors). This thread's,
+// kept for the most leaves yet.
+template <bool kInverse>
+const u32* twist_factors(std::size_t count) {
+    thread_local std::vector<u32> table;
+    if (table.size() < 8 * count) {
+        const std::size_t n = std::bit_ceil(count);
+        std::vector<u32> rho(n);
+        rho[0] = 1;
+        for (std::size_t bit = 1, j = 2; bit < n; bit *= 2, ++j)
+            for (std::size_t i = 0; i < bit; ++i) rho[bit + i] = multiply_mod(rho[i], kTopRoots[kInverse][j]);
+        table.assign(8 * n, 0);
+        const u32 first = kInverse ? multiply_mod(power(8, kP - 2), kR) : kR;
+        for (std::size_t u = 0; u < n; ++u)
+            for (u32 k = 0, f = first; k < 8; ++k, f = multiply_mod(f, rho[u])) table[8 * u + k] = f;
+    }
+    return table.data();
+}
+
+// a, b -> [a0 b0 a1 b1 ...]: lo the first half's words of each, hi the second's; within 128-bit
+// halves on AVX2 (vpunpckldq, vpunpckhdq): lo = [a0 b0 a1 b1 | a4 b4 a5 b5], hi = [a2 b2 a3 b3 |
+// a6 b6 a7 b7]. Undoes product_tree's deinterleave: words 2i, 2i + 1 of x and y back from their
+// even and odd vectors.
+template <class L>
+[[gnu::always_inline]] inline void interleave(typename L::V a, typename L::V b, typename L::V& lo, typename L::V& hi) {
+    if constexpr (false) {
+#if defined(__AVX2__)
+    } else if constexpr (L::lanes == 8 && sizeof(typename L::V) == 32) {
+        lo = _mm256_unpacklo_epi32(a, b), hi = _mm256_unpackhi_epi32(a, b);
+#endif
+#if defined(__SSE4_1__)
+    } else if constexpr (L::lanes == 4 && sizeof(typename L::V) == 16) {
+        lo = _mm_unpacklo_epi32(a, b), hi = _mm_unpackhi_epi32(a, b);
+#endif
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    } else if constexpr (L::lanes == 4) {
+        lo = vzip1q_u32(a, b), hi = vzip2q_u32(a, b);
+#endif
+    } else {
+        static_assert(L::lanes == 0, "evaluation: no interleave for this struct");
+    }
+}
+
+// The descent's leaves: s[j] (j < 4) the standard leaf form of length T of pair j's state; out (8
+// T words) gets the lanes transform of the 8 leaves' products: lane l = 2j + b at lanes leaf v,
+// s_j's value there times lanes[8 v + (l ^ 1)] 2^-32 (its sibling's product, in Montgomery form);
+// kRightOnes (the Newton basis): odd lanes s_j's value alone. Per standard leaf u: the twist by
+// rho_u^k (twist_factors<false>), the 8-point transform to the values at rho_u z^bitrev3(i), the
+// products with the siblings' lanes (deinterleaved, as lane_pairs reads them), the two leaves of
+// each pair interleaved back. lane_pairs' conversion run forward. T a power of two >= 64;
+// canonical in and out.
+template <class L, bool kRightOnes = false>
+void pairs_to_lanes(const u32* const s[4], const u32* lanes, std::size_t T, u32* out, const u32* twist) {
+    using V = typename L::V;
+    using M = Ops<L>;
+    constexpr int W = L::lanes;
+    const auto factor = [](u32 x) { return L::broadcast(multiply_mod(x, kR)); };
+    const V r1 = factor(kTopRoots[0][0]), z1 = factor(kTopRoots[0][1]), r3 = factor(multiply_mod(kTopRoots[0][0], kTopRoots[0][1]));
+    const auto mul = [](V x, V y) { return montgomery_canonical<L>(x, y); };
+    // x[k] (coefficients) -> x[i] = the value at s_i: 1, -1, r(1), -r(1), z, -z, r(3), -r(3).
+    const auto forward8 = [&](V (&x)[8]) {
+        const V a0 = M::add(x[0], x[4]), a4 = M::sub(x[0], x[4]), a2 = M::add(x[2], x[6]), a6 = mul(M::sub(x[2], x[6]), r1);
+        const V a1 = M::add(x[1], x[5]), a5 = M::sub(x[1], x[5]), a3 = M::add(x[3], x[7]), a7 = mul(M::sub(x[3], x[7]), r1);
+        const V b0 = M::add(a0, a2), b2 = M::sub(a0, a2), b4 = M::add(a4, a6), b6 = M::sub(a4, a6);
+        const V b1 = M::add(a1, a3), b3 = mul(M::sub(a1, a3), r1), b5 = mul(M::add(a5, a7), z1), b7 = mul(M::sub(a5, a7), r3);
+        x[0] = M::add(b0, b1), x[1] = M::sub(b0, b1), x[2] = M::add(b2, b3), x[3] = M::sub(b2, b3);
+        x[4] = M::add(b4, b5), x[5] = M::sub(b4, b5), x[6] = M::add(b6, b7), x[7] = M::sub(b6, b7);
+    };
+    // y: the pairs' values in deinterleave's order of the lanes' vectors at words a and b; their
+    // products into out at the same words.
+    const auto put = [&](auto y, std::size_t a, std::size_t b) {
+        V even, odd, lo, hi;
+        product_tree::detail::deinterleave<L>(L::load(lanes + a), L::load(lanes + b), even, odd);
+        if constexpr (kRightOnes) interleave<L>(mul(y, odd), y, lo, hi);
+        else interleave<L>(mul(y, odd), mul(y, even), lo, hi);
+        L::store(out + a, lo), L::store(out + b, hi);
+    };
+    if constexpr (W == 8) {
+        // Two leaves u, u + 1 per step; lane 4h + 2b + a of a vector: pair 2h + a of leaf u + b.
+        for (std::size_t u = 0; u < T / 8; u += 2) {
+            V x[8];
+#pragma GCC unroll 8
+            for (int q = 0; q < 8; ++q) {
+                const std::size_t j = 2 * (q / 4) + q % 2, at = u + (q / 2) % 2;
+                x[q] = mul(L::load(s[j] + 8 * at), L::load(twist + 8 * at));
+            }
+            product_tree::detail::transpose<L>(x);  // x[k] lane q: coefficient k
+            forward8(x);
+#pragma GCC unroll 8
+            for (int i = 0; i < 8; ++i) put(x[i], 8 * (8 * u + i), 8 * (8 * u + 8 + i));
+        }
+    } else if constexpr (W == 4) {
+        // One leaf per step; lane j: pair j.
+        for (std::size_t u = 0; u < T / 8; ++u) {
+            V lo[4], hi[4];
+            const V t0 = L::load(twist + 8 * u), t1 = L::load(twist + 8 * u + 4);
+#pragma GCC unroll 4
+            for (int j = 0; j < 4; ++j) lo[j] = mul(L::load(s[j] + 8 * u), t0), hi[j] = mul(L::load(s[j] + 8 * u + 4), t1);
+            product_tree::detail::transpose<L>(lo), product_tree::detail::transpose<L>(hi);
+            V x[8] = {lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]};
+            forward8(x);
+#pragma GCC unroll 8
+            for (int i = 0; i < 8; ++i) put(x[i], 8 * (8 * u + i), 8 * (8 * u + i) + 4);
+        }
+    } else {
+        static_assert(W == 1);
+        for (std::size_t u = 0; u < T / 8; ++u)
+            for (std::size_t j = 0; j < 4; ++j) {
+                V x[8];
+                for (int k = 0; k < 8; ++k) x[k] = mul(s[j][8 * u + k], twist[8 * u + k]);
+                forward8(x);
+                for (int i = 0; i < 8; ++i) {
+                    const std::size_t v = 8 * (8 * u + i) + 2 * j;
+                    const u32 left = mul(x[i], lanes[v + 1]), right = kRightOnes ? x[i] : mul(x[i], lanes[v]);
+                    out[v] = left, out[v + 1] = right;
+                }
+            }
+    }
+}
+
+// The interpolation's ascent at the pairs: r and q lanes transforms of 8 T words (the lanes' sums
+// R_l and products Q_l at the roots of X^T - 1); out[j] (j < 4) gets the standard leaf form of
+// length T of R_2j Q_2j+1 + R_2j+1 Q_2j (times 2^-32), and copy[j] the same if copy is not null.
+// lane_pairs with sums for products; untwist: twist_factors<true>.
+template <class L>
+void lane_pair_sums(const u32* r, const u32* q, std::size_t T, u32* const out[4], const u32* untwist, u32* const* copy = nullptr) {
+    using S = Sums<L>;
+    const auto pair = [r, q] [[gnu::always_inline]] (std::size_t a, std::size_t b) {
+        if constexpr (L::lanes == 1) {
+            typename S::Acc s = S::mul(r[a], q[b]);
+            S::mac(s, r[b], q[a]);
+            return S::reduce(s);
+        } else {
+            typename L::V re, ro, qe, qo;
+            product_tree::detail::deinterleave<L>(L::load(r + a), L::load(r + b), re, ro);
+            product_tree::detail::deinterleave<L>(L::load(q + a), L::load(q + b), qe, qo);
+            typename S::Acc s = S::mul(S::of(re), S::of(qo));
+            S::mac(s, S::of(ro), S::of(qe));
+            return S::reduce(s);
+        }
+    };
+    product_tree::detail::lane_pairs_by<L>(T, out, untwist, pair, copy);
+}
+
+// The Newton basis' leaves when their windows do not halve: lanes (8 T words of coefficients, lane
+// l at word 8 i + l) -> out (8 L words, L = T / 2): lane l's coefficients [e_l - L, e_l) times
+// u[l] 2^-32, e_l = T in even lanes and T - shift in odd ones (shift <= L). canonical.
+template <class L>
+void lane_windows(const u32* lanes, std::size_t T, std::size_t shift, const u32* u, u32* out) {
+    constexpr int W = L::lanes;
+    const std::size_t half = T / 2;
+    const u32* even = lanes + 8 * half;
+    const u32* odd = lanes + 8 * (half - shift);
+    if constexpr (W == 1) {
+        for (std::size_t j = 0; j < half; ++j)
+            for (int l = 0; l < 8; ++l) out[8 * j + l] = montgomery_canonical<L>((l % 2 ? odd : even)[8 * j + l], u[l]);
+    } else {
+        typename L::V f[8 / W];
+        for (int h = 0; h < 8 / W; ++h) f[h] = L::load(u + W * h);
+        for (std::size_t j = 0; j < half; ++j)
+            for (int h = 0; h < 8 / W; ++h) {
+                const std::size_t at = 8 * j + W * h;
+                const typename L::V x = L::template blend<0xaa>(L::load(even + at), L::load(odd + at));
+                L::store(out + at, montgomery_canonical<L>(x, f[h]));
+            }
     }
 }
 
