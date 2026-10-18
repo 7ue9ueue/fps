@@ -75,7 +75,7 @@ target's candidates (struct, R, U, Solo, T), the variant per shape class and bea
   there, so the switch falls where the measured times cross. The fit and the NTT times are
   `tools/tune.py`'s (`tune.cpp`); `tune::run()` measures "small.ntt" at lg 6-16 on this machine,
   scales the rest, and keeps a default within 5%; the points between powers of two follow it by
-  their compiled ratios (a choice of their own cost 110-117 ms more at run time to 2^12, and a
+  their compiled ratios (a choice of their own cost 108-121 ms more at run time to 2^12, and a
   line in the wisdom; notes/212-r1.md). Before #212 the NTT cost the same over each class (the
   plain product at 2^lg, measured by a Convolution at 3 2^(lg-2)): since #155 a product just past
   2^k costs about half of that, so small took shapes the NTT ran up to 2.1x faster. Past 2^25 the
