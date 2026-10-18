@@ -497,7 +497,7 @@ void lane_pair_sums(const u32* r, const u32* q, std::size_t T, u32* const out[4]
             return S::reduce(s);
         }
     };
-    product_tree::detail::lane_pairs_by<L>(T, out, untwist, pair, copy);
+    product_tree::detail::lane_pairs_by<L>(nullptr, T, out, untwist, pair, copy);
 }
 
 // The Newton basis' leaves when their windows do not halve: lanes (8 T words of coefficients, lane

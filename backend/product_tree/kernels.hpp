@@ -405,9 +405,12 @@ template <class L>
 // lane_pairs_by: the same with the pointwise step as pair(a, b), the vector (word on Scalar) of
 // lanes 2j, 2j + 1 combined (canonical): a and b are word offsets in the lanes transform of two
 // vectors whose even and odd words, by deinterleave(), are lanes 2j and 2j + 1 (Scalar: of the
-// words of lanes 2j and 2j + 1). lane_pairs takes their products; backend/evaluation also sums.
-template <class L, class Pair, class Copy = std::nullptr_t>
-void lane_pairs_by(std::size_t T, u32* const out[4], const u32* untwist, Pair pair, Copy copy = nullptr) {
+// words of lanes 2j and 2j + 1). LanePairProducts: lane_pairs' products of `lanes` (inline: as a
+// functor GCC scheduled the loop 5% slower on Zen 3); backend/evaluation also sums.
+struct LanePairProducts {};
+
+template <class L, class Pair = LanePairProducts, class Copy = std::nullptr_t>
+void lane_pairs_by(const u32* lanes, std::size_t T, u32* const out[4], const u32* untwist, Pair pair = {}, Copy copy = nullptr) {
     using V = typename L::V;
     using M = Ops<L>;
     constexpr int W = L::lanes;
@@ -434,7 +437,15 @@ void lane_pairs_by(std::size_t T, u32* const out[4], const u32* untwist, Pair pa
         for (std::size_t u = 0; u < T / 8; u += 2) {
             V y[8];
 #pragma GCC unroll 8
-            for (int i = 0; i < 8; ++i) y[i] = pair(8 * (8 * u + i), 8 * (8 * u + 8 + i));
+            for (int i = 0; i < 8; ++i) {
+                if constexpr (std::is_same_v<Pair, LanePairProducts>) {
+                    V even, odd;
+                    deinterleave<L>(L::load(lanes + 8 * (8 * u + i)), L::load(lanes + 8 * (8 * u + 8 + i)), even, odd);
+                    y[i] = mul(even, odd);
+                } else {
+                    y[i] = pair(8 * (8 * u + i), 8 * (8 * u + 8 + i));
+                }
+            }
             inverse8(y);
             transpose<L>(y);  // y[r]: lane r's 8 coefficients
 #pragma GCC unroll 8
@@ -448,7 +459,15 @@ void lane_pairs_by(std::size_t T, u32* const out[4], const u32* untwist, Pair pa
         for (std::size_t u = 0; u < T / 8; ++u) {
             V y[8];
 #pragma GCC unroll 8
-            for (int i = 0; i < 8; ++i) y[i] = pair(8 * (8 * u + i), 8 * (8 * u + i) + 4);
+            for (int i = 0; i < 8; ++i) {
+                if constexpr (std::is_same_v<Pair, LanePairProducts>) {
+                    V even, odd;
+                    deinterleave<L>(L::load(lanes + 8 * (8 * u + i)), L::load(lanes + 8 * (8 * u + i) + 4), even, odd);
+                    y[i] = mul(even, odd);
+                } else {
+                    y[i] = pair(8 * (8 * u + i), 8 * (8 * u + i) + 4);
+                }
+            }
             inverse8(y);
             V lo[4] = {y[0], y[1], y[2], y[3]}, hi[4] = {y[4], y[5], y[6], y[7]};
             transpose<L>(lo), transpose<L>(hi);
@@ -463,7 +482,11 @@ void lane_pairs_by(std::size_t T, u32* const out[4], const u32* untwist, Pair pa
         for (std::size_t u = 0; u < T / 8; ++u)
             for (std::size_t j = 0; j < 4; ++j) {
                 V y[8];
-                for (int i = 0; i < 8; ++i) y[i] = pair(8 * (8 * u + i) + 2 * j, 8 * (8 * u + i) + 2 * j + 1);
+                for (int i = 0; i < 8; ++i) {
+                    const std::size_t a = 8 * (8 * u + i) + 2 * j;
+                    if constexpr (std::is_same_v<Pair, LanePairProducts>) y[i] = mul(lanes[a], lanes[a + 1]);
+                    else y[i] = pair(a, a + 1);
+                }
                 inverse8(y);
                 for (int k = 0; k < 8; ++k) put(j, u, k, mul(y[k], untwist[8 * u + k]));
             }
@@ -472,16 +495,7 @@ void lane_pairs_by(std::size_t T, u32* const out[4], const u32* untwist, Pair pa
 
 template <class L, class Copy = std::nullptr_t>
 void lane_pairs(const u32* lanes, std::size_t T, u32* const out[4], const u32* untwist, Copy copy = nullptr) {
-    const auto pair = [lanes] [[gnu::always_inline]] (std::size_t a, std::size_t b) {
-        if constexpr (L::lanes == 1) {
-            return montgomery_canonical<L>(lanes[a], lanes[b]);
-        } else {
-            typename L::V even, odd;
-            deinterleave<L>(L::load(lanes + a), L::load(lanes + b), even, odd);
-            return montgomery_canonical<L>(even, odd);
-        }
-    };
-    lane_pairs_by<L>(T, out, untwist, pair, copy);
+    lane_pairs_by<L>(lanes, T, out, untwist, LanePairProducts{}, copy);
 }
 
 // leaf_products, L::lanes leaves at a time in columns (word t of a vector: leaf t): coefficient
