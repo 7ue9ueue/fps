@@ -9,7 +9,9 @@ Number-theoretic transforms and products modulo P = 998244353. API: `ntt.hpp` (`
 a list of candidates and a table of one per op (forward, inverse, multiply, product) and lg, with
 compiled defaults in `tuned.hpp` (`tools/tune.py ntt`, `tune.cpp`); `tune.hpp` measures it at run
 time. `ragged.hpp`: products of ragged length (issue #155), their plan a tuned choice
-("ntt.ragged"). `memory.hpp`: `Convolution`'s memory, kept per thread. Tests: `test.cpp`,
+("ntt.ragged"). `memory.hpp`: `Convolution`'s memory, kept per thread. `dft.hpp`: `dft` and
+`idft` in natural order, 2^6-2^23, the values form and a permutation (issue #138, notes/138-r1.md).
+Tests: `test.cpp`,
 `test_no_tuner.cpp`; benches: `bench.cpp`.
 Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_product_kernels.hpp`
 (`gen_avx2_product_kernels.py`), `avx512_kernels.hpp` (`gen_avx512_kernels.py`).

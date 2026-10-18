@@ -320,12 +320,13 @@ Polynomial<P> to_coefficients(const Values<P>& A);   // L coefficients: the prod
 - `fps::dft(f, L)` returns f(w^i) for i < L, natural order, with w = 3^((P - 1) / L) (3
   generates the units mod P): the DFT of f mod (x^L - 1), any `f.size()`. `fps::idft<P>(values)`
   returns the f of L = `values.size()` coefficients with f(w^i) = values[i]. L is 0 or any divisor
-  of P - 1, not only a power of two (else `std::domain_error`): both run a chirp z-transform
-  (fps/geometric.hpp), one middle product of transforms of length about 2L, slower than
-  `to_values` for powers of two. Among powers of two they stop at 2^23 (P - 1 = 119 2^23 has no
-  roots of higher order), while `Values` goes on to 2^25: its leaves x^8 - w need roots of order
-  L/8 only. The middle product limits dft to f.size() + L - 1 <= 2^25 and idft to L <= 2^24
-  (`std::length_error`, before allocating).
+  of P - 1, not only a power of two (else `std::domain_error`). Powers of two from 2^6 to 2^23 run
+  the NTT's own transform of length L and a permutation into natural order (backend/ntt/dft.hpp,
+  issue #138); other L a chirp z-transform (fps/geometric.hpp), one middle product of transforms of
+  length about 2L, several times slower. Among powers of two they stop at 2^23 (P - 1 = 119 2^23
+  has no roots of higher order), while `Values` goes on to 2^25: its leaves x^8 - w need roots of
+  order L/8 only. For the other L the middle product limits dft to f.size() + L - 1 <= 2^25 and
+  idft to L <= 2^24 (`std::length_error`, before allocating).
 
 ## Raw functions
 
