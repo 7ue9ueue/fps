@@ -303,15 +303,20 @@ template <class L>
 
 // The untwist factors for standard leaves u < count: words [8u, 8u + 8) = rho_u^-k / 8 in
 // Montgomery form (k < 8), rho_u = r(4u) (ntt's values form: an 8th root of leaf u's w_u). Prefix
-// compatible across lengths; this thread's, kept for the most leaves yet.
+// compatible across lengths; this thread's, kept for the most leaves yet. count <= 2^20 (rho_u's
+// order up to 2^23; past ntt's kRoots, to 2^22, the roots are computed here).
 inline const u32* untwist_factors(std::size_t count) {
     thread_local std::vector<u32> table;
     if (table.size() < 8 * count) {
         const std::size_t n = std::bit_ceil(count);
         std::vector<u32> rho(n);  // rho_u^-1
         rho[0] = 1;
-        for (std::size_t bit = 1, j = 2; bit < n; bit *= 2, ++j)
-            for (std::size_t i = 0; i < bit; ++i) rho[bit + i] = multiply_mod(rho[i], ntt::detail::kRoots[1][j]);
+        for (std::size_t bit = 1, j = 2; bit < n; bit *= 2, ++j) {
+            // the inverse of a root of order 2^(j + 2), as kRoots[1][j]
+            const u32 root = j < std::size_t(ntt::detail::kRootCount) ? ntt::detail::kRoots[1][j]
+                                                                       : power(power(3, (kP - 1) >> (j + 2)), kP - 2);
+            for (std::size_t i = 0; i < bit; ++i) rho[bit + i] = multiply_mod(rho[i], root);
+        }
         table.resize(8 * n);
         const u32 eighth = multiply_mod(power(8, kP - 2), kR);
         for (std::size_t u = 0; u < n; ++u)
