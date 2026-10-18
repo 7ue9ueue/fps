@@ -1,15 +1,18 @@
 // Tests of fps/geometric.hpp: evaluate on geometric points against Horner's rule at each point,
 // interpolate by evaluating back (the f of degree < m through m points is unique), extrapolate
-// against Horner on the polynomial that made the samples, dft against its sum and idft back; on
+// against Horner on the polynomial that made the samples, dft against its sum and idft back,
+// raw::dft and raw::idft against them (into other memory and over their input); on
 // pairs of edge sizes, special a, r and c, roots of unity, large sizes; threads and every error.
 #include <sys/mman.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <random>
 #include <span>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "fps/fps.hpp"
@@ -267,6 +270,42 @@ void test_dft() {
     }
 }
 
+// raw::dft and raw::idft against fps::dft and fps::idft (tested above): into other memory (filled
+// with garbage), in place, and into out shifted by one word over the input; the transform's lengths
+// and the chirp's.
+void test_raw_dft() {
+    const std::vector<std::size_t> lengths = {0, 1, 2, 7, 8, 17, 32, 34, 56, 64, 119, 128, 1024, 1904, 4096, std::size_t(1) << 17};
+    for (std::size_t L : lengths)
+        for (std::size_t n : {std::size_t(0), std::size_t(1), L / 2, L - (L > 0), L, L + 1, 2 * L + 3}) {
+            if (L == std::size_t(1) << 17 && n != L) continue;
+            const Vec f = random_vec(n, int(n % 3));
+            const Vec want = fps::dft(poly(f), L);
+            Vec out(L, ~u32(0));
+            fps::raw::dft<P>(f, out);
+            CHECK(out == want, L, n);
+            // In one buffer of max(n, L) + 1 words: the input at word `in`, out at word `at`.
+            const std::pair<std::size_t, std::size_t> places[] = {{0, 0}, {0, 1}, {1, 0}};
+            for (auto [in, at] : places) {
+                Vec buffer(std::max(n, L) + 1, ~u32(0));
+                std::ranges::copy(f, buffer.begin() + std::ptrdiff_t(in));
+                fps::raw::dft<P>(std::span<const u32>(buffer).subspan(in, n), std::span(buffer).subspan(at, L));
+                CHECK(Vec(buffer.begin() + std::ptrdiff_t(at), buffer.begin() + std::ptrdiff_t(at + L)) == want, L, n, in * 2 + at);
+            }
+            if (n != L) continue;
+            const Vec v = random_vec(L, int(L % 3));
+            const Vec back = vec(fps::idft<P>(v));
+            Vec coefficients(L, ~u32(0));
+            fps::raw::idft<P>(v, coefficients);
+            CHECK(coefficients == back, L);
+            for (auto [in, at] : places) {
+                Vec buffer(L + 1, ~u32(0));
+                std::ranges::copy(v, buffer.begin() + std::ptrdiff_t(in));
+                fps::raw::idft<P>(std::span<const u32>(buffer).subspan(in, L), std::span(buffer).subspan(at, L));
+                CHECK(Vec(buffer.begin() + std::ptrdiff_t(at), buffer.begin() + std::ptrdiff_t(at + L)) == back, L, in * 2 + at);
+            }
+        }
+}
+
 void test_threads() {
     std::vector<std::thread> threads;
     int bad[4] = {};
@@ -358,6 +397,32 @@ void test_errors() {
     CHECK(throws<std::length_error>([] { (void)fps::dft(Poly{1, 2}, std::size_t(17) << 21); }));
     CHECK(throws<std::length_error>([] { (void)fps::dft(Poly((std::size_t(1) << 22) + 2), std::size_t(7) << 22); }));
     CHECK(fps::dft(Poly{5}, std::size_t(17) << 21).size() == std::size_t(17) << 21);  // one coefficient: no product
+
+    // raw::dft and raw::idft: the same errors, and out of the wrong size; nothing written.
+    for (std::size_t L : {3, 5, 9, 239}) {
+        Vec out(L, 7), values(L, 1);
+        CHECK(throws<domain_error>([&] { fps::raw::dft<P>(f.span(), out); }) && out == Vec(L, 7), L);
+        CHECK(throws<domain_error>([&] { fps::raw::idft<P>(values, out); }) && out == Vec(L, 7), L);
+    }
+    for (std::size_t L : {0, 1, 8, 64, 1024}) {
+        Vec values(L, 1), shorter(L + 1, 7), longer(L + 1, 7);
+        CHECK(throws<domain_error>([&] { fps::raw::idft<P>(values, std::span(longer)); }) && longer == Vec(L + 1, 7), L);
+        if (L > 0) CHECK(throws<domain_error>([&] { fps::raw::idft<P>(values, std::span(shorter).first(L - 1)); }), L);
+    }
+    {
+        // Lengths past the chirp's middle product, into memory never touched (thrown before writing).
+        const std::size_t words = std::size_t(17) << 21, bytes = words * sizeof(u32);
+        void* map = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        CHECK(map != MAP_FAILED);
+        if (map != MAP_FAILED) {
+            const std::span<u32> big(static_cast<u32*>(map), words);
+            CHECK(throws<std::length_error>([&] { fps::raw::dft<P>(Vec{1, 2}, big); }));
+            CHECK(throws<std::length_error>([&] { fps::raw::idft<P>(big.first(std::size_t(7) << 22), big.first(std::size_t(7) << 22)); }));
+            for (std::size_t L : {std::size_t(1) << 24, std::size_t(1) << 25})
+                CHECK(throws<domain_error>([&] { fps::raw::dft<P>(Vec{1, 2}, big.first(L)); }), L);
+            munmap(map, bytes);
+        }
+    }
 }
 
 }  // namespace
@@ -367,6 +432,7 @@ int main() {
     test_interpolate();
     test_extrapolate();
     test_dft();
+    test_raw_dft();
     test_threads();
     test_errors();
     if (failures) {

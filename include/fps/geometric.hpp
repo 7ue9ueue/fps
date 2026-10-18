@@ -9,6 +9,9 @@
 //                                             // f(j) = values[j], j < n = values.size()
 //   fps::dft(f, L)                            // f(w^i), i < L: L values
 //   fps::idft<P>(values)                      // the f with f.size() = L and f(w^i) = values[i]
+//   fps::raw::dft<P>(f, out)                  // dft(f, L) into out, L = out.size(); out may overlap f
+//   fps::raw::idft<P>(values, out)            // idft(values) into out, out.size() = values.size();
+//                                             // out may overlap values; values unchecked (< P)
 //
 // w = 3^((P - 1) / L), a primitive L-th root of unity (3 generates the units mod P). The order is
 // natural: dft(f, L)[i] = f(w^i), for any f.size(), so it is the DFT of f mod (x^L - 1), and
@@ -25,9 +28,11 @@
 // and distinct points (a != 0 for m >= 2, r != 0 for m >= 3, r^k != 1 for 0 < k < m); else
 // std::domain_error. extrapolate needs n <= P (std::domain_error); any c, and c + i wraps mod P.
 // idft needs L = values.size() to be 0 or a divisor of P - 1, as dft its L (std::domain_error:
-// L = 2^24 and 2^25 too).
+// L = 2^24 and 2^25 too). raw::dft and raw::idft throw the same errors, and raw::idft
+// std::domain_error if out.size() != values.size(), all before writing; raw::idft does not check
+// that the values are below P (as raw::to_values), a check that costs 4-8% of idft at 2^20.
 //
-// Paths: one backend call each, into the result's memory.
+// Paths: one backend call each, into the result's memory (raw::dft, raw::idft: out).
 // - dft, idft for L = 2^6 .. 2^23: ntt::dft, ntt::idft (backend/ntt/dft.hpp, issue #138): the
 //   NTT's forward transform of length L (of f mod (x^L - 1)) and a permutation into natural order;
 //   idft the reverse, its 1 / L in the inverse's scale.
@@ -41,8 +46,9 @@
 // The middle products and products throw std::length_error past 2^25 words (interpolate: m > 2^25,
 // before any work); small sizes run Horner or divided differences and have no limit.
 //
-// Memory: the results are new vectors and polynomials; the kernels work in a per-thread scratch,
-// grown to the longest call and kept.
+// Memory: the results are new vectors and polynomials; the raw functions write only out. The
+// kernels work in a per-thread scratch, grown to the longest call and kept; so does the chirp's
+// copy of the input of raw::dft and raw::idft when out overlaps it (the chirp needs them apart).
 #pragma once
 
 #include <algorithm>
@@ -145,6 +151,56 @@ inline bool transform_length(std::size_t L) {
     return std::has_single_bit(L) && L >= (std::size_t(1) << ntt::kMinLog) && L <= (std::size_t(1) << ntt::kValuesMaxLog);
 }
 
+// The path of a dft or idft of length L and its root (w; w^-1 for idft), the errors checked.
+struct Plan {
+    std::uint32_t w;
+    bool transform;
+};
+
+template <std::uint32_t P>
+Plan dft_plan(std::size_t n, std::size_t L) {
+    const Plan plan{root<P>(L, false, "fps::dft: L does not divide P - 1"), transform_length(L)};
+    if (!plan.transform) check_chirp(n, L, "fps::dft: f.size() + L - 1 > 2^25");
+    return plan;
+}
+
+template <std::uint32_t P>
+Plan idft_plan(std::size_t L) {
+    const Plan plan{root<P>(L, true, "fps::idft: values.size() does not divide P - 1"), transform_length(L)};
+    if (!plan.transform) check_chirp(L, L, "fps::idft: L > 2^24");
+    return plan;
+}
+
+// a, or a copy of it in this thread's scratch (kept and reused) if it overlaps out.
+inline std::span<const std::uint32_t> apart(std::span<const std::uint32_t> a, std::span<const std::uint32_t> out) {
+    if (a.empty() || out.empty() || a.data() >= out.data() + out.size() || out.data() >= a.data() + a.size()) return a;
+    thread_local std::vector<std::uint32_t> scratch;
+    if (scratch.size() < a.size()) scratch.resize(a.size());
+    std::ranges::copy(a, scratch.begin());
+    return {scratch.data(), a.size()};
+}
+
+// Into out of L words. ntt::dft and ntt::idft read their input before writing out; the chirp does not.
+template <std::uint32_t P>
+void dft(std::span<const std::uint32_t> f, std::span<std::uint32_t> out, Plan plan) {
+    if (plan.transform) ntt::dft(f, out);
+    else if (!out.empty()) chirp::evaluate_geometric(apart(f, out), 1, plan.w, out);
+}
+
+template <std::uint32_t P>
+void idft(std::span<const std::uint32_t> values, std::span<std::uint32_t> out, Plan plan) {
+    const std::size_t L = values.size();
+    if (plan.transform) {
+        ntt::idft(values, out);
+        return;
+    }
+    if (L == 0) return;
+    // f_j = (1 / L) sum_i values[i] w^(-i j): the values as coefficients, at the points w^-j.
+    chirp::evaluate_geometric(apart(values, out), 1, plan.w, out);
+    // 1 / L = P - (P - 1) / L, as L (P - 1) / L = P - 1 = -1.
+    chirp::multiply_chirp(P - std::uint32_t((P - 1) / L), 1, 1, out);
+}
+
 }  // namespace detail::geometric
 
 template <std::uint32_t P>
@@ -184,33 +240,34 @@ std::vector<std::uint32_t> extrapolate(std::span<const std::uint32_t> values, st
 
 template <std::uint32_t P>
 std::vector<std::uint32_t> dft(const Polynomial<P>& f, std::size_t L) {
-    const std::uint32_t w = detail::geometric::root<P>(L, false, "fps::dft: L does not divide P - 1");
-    const bool transform = detail::geometric::transform_length(L);
-    if (!transform) detail::geometric::check_chirp(f.size(), L, "fps::dft: f.size() + L - 1 > 2^25");
+    const auto plan = detail::geometric::dft_plan<P>(f.size(), L);
     std::vector<std::uint32_t> values(L);
-    if (transform) ntt::dft(f.span(), values);
-    else chirp::evaluate_geometric(f.span(), 1, w, values);
+    detail::geometric::dft<P>(f.span(), values, plan);
     return values;
 }
 
 template <std::uint32_t P>
 Polynomial<P> idft(std::span<const std::uint32_t> values) {
-    const std::size_t L = values.size();
-    const std::uint32_t w_inverse = detail::geometric::root<P>(L, true, "fps::idft: values.size() does not divide P - 1");
-    const bool transform = detail::geometric::transform_length(L);
-    if (!transform) detail::geometric::check_chirp(L, L, "fps::idft: L > 2^24");
+    const auto plan = detail::geometric::idft_plan<P>(values.size());
     detail::geometric::check_canonical<P>(values, "fps::idft: value >= P");
-    Polynomial<P> f = detail::unwritten_polynomial<P>(L);
-    if (transform) {
-        ntt::idft(values, f.span());
-        return f;
-    }
-    // f_j = (1 / L) sum_i values[i] w^(-i j): the values as coefficients, at the points w^-j.
-    if (L == 0) return f;
-    chirp::evaluate_geometric(values, 1, w_inverse, f.span());
-    // 1 / L = P - (P - 1) / L, as L (P - 1) / L = P - 1 = -1.
-    chirp::multiply_chirp(P - std::uint32_t((P - 1) / L), 1, 1, f.span());
+    Polynomial<P> f = detail::unwritten_polynomial<P>(values.size());
+    detail::geometric::idft<P>(values, f.span(), plan);
     return f;
 }
+
+namespace raw {
+
+template <std::uint32_t P>
+void dft(std::span<const std::uint32_t> f, std::span<std::uint32_t> out) {
+    detail::geometric::dft<P>(f, out, detail::geometric::dft_plan<P>(f.size(), out.size()));
+}
+
+template <std::uint32_t P>
+void idft(std::span<const std::uint32_t> values, std::span<std::uint32_t> out) {
+    if (out.size() != values.size()) throw std::domain_error("fps::raw::idft: out.size() != values.size()");
+    detail::geometric::idft<P>(values, out, detail::geometric::idft_plan<P>(values.size()));
+}
+
+}  // namespace raw
 
 }  // namespace fps

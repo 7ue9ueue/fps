@@ -348,7 +348,18 @@ fps::raw::to_coefficients<P>(const Values<P>& A, std::span<std::uint32_t> out, s
 fps::raw::add_coefficients<P>(const Values<P>& A, std::span<std::uint32_t> out, std::size_t offset);
                                           // out[i] += coefficient offset + i
                                           // offset + out.size() <= L, else std::domain_error
+fps::raw::dft<P>(std::span<const std::uint32_t> f, std::span<std::uint32_t> out);  // dft(f, L), L = out.size();
+                                          // out may overlap f
+fps::raw::idft<P>(std::span<const std::uint32_t> values, std::span<std::uint32_t> out);
+                                          // idft(values); out.size() = values.size(), else
+                                          // std::domain_error; out may overlap values
 ```
+
+`raw::dft` and `raw::idft` (#272) are `fps::dft` and `fps::idft` without the result's allocation
+and, for idft, without the check that the values are below P (unchecked, as `raw::to_values`;
+4-8% of idft at 2^20); their other errors are the same, thrown before out is written. For
+L = 2^6 .. 2^23 the NTT reads its input before it writes out; on the chirp path an input that
+overlaps out is first copied to this thread's scratch.
 
 Each function documents whether `out` may overlap an input.
 
