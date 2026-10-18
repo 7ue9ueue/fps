@@ -8,6 +8,8 @@
 //   cyclic_product_upper/<lg>                   in of 2^lg words, the upper half out.
 //   inverse_product/<lg>, inverse_product3/<lg> inverse_product: 1 and 3 terms, the upper half out;
 //   inverse_product5/<lg>, inverse_product8/<lg> 5 and 8 terms (issue #143).
+//   toeplitz_product/<lg>                       toeplitz_product of 5 leaf forms, the upper half out
+//                                               (issue #218; log's block 2).
 //   multiply@steps/<lg>                         what cyclic_product replaces: in copied and zeroed,
 //                                               forward, multiply, inverse in place, half copied out.
 #include "backend/ntt/ntt.hpp"
@@ -86,6 +88,27 @@ void add_sum(bench::Suite& suite, int k, int lg) {
     }, std::size_t(1) << lg);
 }
 
+// toeplitz_product/<lg>: A1, A2, A3, B0, B1 of their own (A3 rewritten each call), the upper half out.
+void add_toeplitz(bench::Suite& suite, int lg) {
+    suite.add("toeplitz_product/" + std::to_string(lg), [lg] {
+        struct Toep {
+            Transform t;
+            std::vector<Words> forms;
+            Words work;
+            std::vector<u32> out;
+        };
+        const std::size_t len = std::size_t(1) << lg;
+        auto c = std::make_shared<Toep>(Toep{Transform(lg), {}, Words(len, 6), std::vector<u32>(len / 2)});
+        for (int i = 0; i < 5; ++i) c->forms.emplace_back(len, unsigned(20 + i));
+        return [c] {
+            auto& f = c->forms;
+            c->t.toeplitz_product(f[0].begin(), f[1].begin(), f[2].begin(), f[3].begin(), f[4].begin(), c->work.begin(),
+                                  std::span<u32>(c->out), {.offset = c->t.length() / 2});
+            bench::keep(c->out);
+        };
+    }, std::size_t(1) << lg);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -111,6 +134,7 @@ int main(int argc, char** argv) {
             c.t.inverse_product(terms, c.work.begin(), std::span<u32>(c.out.data(), c.len / 2), {.offset = c.len / 2});
         });
         for (int k : {5, 8}) add_sum(suite, k, lg);
+        add_toeplitz(suite, lg);
         add(suite, "multiply@steps", lg, [](Case& c) {
             u32* w = c.work.begin();
             std::fill(std::copy_n(c.in.data(), c.len / 2, w), w + c.len, 0u);
