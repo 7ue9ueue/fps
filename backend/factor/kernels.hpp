@@ -9,6 +9,7 @@
 //       combine_scaled for several rows at once (a matrix product): row r of out from row r of
 //       init and coefficients coef[r cstride + s sstride]; each column's words serve kRows rows
 //   lincomb<S>(out, x, a, y, b, len)          out[t] = a x[t] + b y[t]
+//   lincomb3<S>(out, x, a, y, b, z, c, len)   out[t] = a x[t] + b y[t] + c z[t]
 //   axpy<S>(out, x, c, y, len)                out[t] = x[t] + c y[t] (no product for x)
 //   times_x<S>(y, a, g, m)                    y = x a mod g, g monic of degree m
 //   times_x_chain<S>(first, count, stride, g, m)
@@ -410,16 +411,34 @@ inline void combine(u32* out, int len, const u32* init, const u32* coef, int cou
     combine_scaled<S>(out, len, init, detail::kOne, coef, count, base, stride);
 }
 
-// out[t] = a x[t] + b y[t] for t < len rounded up to W; out may alias x or y.
+// out[t] = a x[t] + b y[t] for t < len rounded up to W; out may alias x or y. From the top
+// vector down, as lincomb3.
 template <class S>
 inline void lincomb(u32* out, const u32* x, u32 a, const u32* y, u32 b, int len) {
     using A = detail::Sums<S>;
     constexpr int W = S::lanes;
     const typename S::V va = S::broadcast(a), vb = S::broadcast(b);
-    for (int t = 0; t < len; t += W) {
+    for (int t = detail::round_up(len, W) - W; t >= 0; t -= W) {
         typename A::Acc s = A::zero();
         A::mac(s, va, S::load(x + t));
         A::mac(s, vb, S::load(y + t));  // 2 products < 2^32 P: no fold
+        S::store(out + t, A::reduce(s));
+    }
+}
+
+// out[t] = a x[t] + b y[t] + c z[t] for t < len rounded up to W; out may alias x, y or z. 3
+// products < 2^32 P: no fold. From the top vector down: in Euclid's steps (Ring::gcd) the next
+// step's factors come from the top words, so it starts before this pass ends.
+template <class S>
+inline void lincomb3(u32* out, const u32* x, u32 a, const u32* y, u32 b, const u32* z, u32 c, int len) {
+    using A = detail::Sums<S>;
+    constexpr int W = S::lanes;
+    const typename S::V va = S::broadcast(a), vb = S::broadcast(b), vc = S::broadcast(c);
+    for (int t = detail::round_up(len, W) - W; t >= 0; t -= W) {
+        typename A::Acc s = A::zero();
+        A::mac(s, va, S::load(x + t));
+        A::mac(s, vb, S::load(y + t));
+        A::mac(s, vc, S::load(z + t));
         S::store(out + t, A::reduce(s));
     }
 }
