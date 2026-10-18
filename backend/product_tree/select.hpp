@@ -35,6 +35,15 @@ inline constexpr bool kLinearSlots = false;
 inline constexpr bool kLinearSlots = true;
 #endif
 
+// Leaf products two leaves per zmm (leaf_products_k): on Zen 5 0.80-0.83 of the time of one leaf
+// per ymm, two products of one a 0.63-0.65 per product; on Emerald Rapids 1.16-1.24
+// (notes/136-r3.md). Zen 4 as Zen 5 (a guess, as ntt's WideBottom).
+#if defined(__AVX512F__) && defined(__AVX512BW__) && (defined(__znver4__) || defined(__znver5__))
+inline constexpr bool kWideLeaves = true;
+#else
+inline constexpr bool kWideLeaves = false;
+#endif
+
 // Nodes of the lane tree up to this degree are multiplied out by schoolbook (at most 9 terms per
 // sum: Montgomery's step needs no fold); the standard tree's by small::multiply.
 inline constexpr std::uint32_t kLaneBase = 16;

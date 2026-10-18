@@ -233,19 +233,61 @@ template <class S, class F, class G>
     for (; i < n; ++i) g(i);
 }
 
-// Standard layout: out leaf v = a b 2^-32 mod (x^8 - w_v) for leaves v < count (8 words each), with
-// weights[v] = w_v 2^32 mod P; inputs canonical, out canonical; the same into copy if not null.
-// out and copy may be a or b.
-template <class L>
-void leaf_products(const u32* a, const u32* b, u32* out, std::size_t count, const u32* weights, u32* copy = nullptr) {
+#if defined(__ARM_NEON) && defined(__aarch64__)
+// Neon leaf products, terms i .. 7: sums lo, hi (words 0-1, 2-3 of each 4-word half u) of leaf k's
+// product j += x^i A_k mod (x^8 - w) (row k, words 8 - i ..) times b_jk[i], an element of b_jk's
+// half i / 4 (umlal by lane: no broadcasts).
+template <int i, int kLeaves, int K>
+[[gnu::always_inline]] inline void neon_leaf_terms(const u32* const (&row)[kLeaves], const uint32x4_t (&b)[kLeaves][K][2],
+                                                   uint64x2_t (&lo)[kLeaves][K][2], uint64x2_t (&hi)[kLeaves][K][2]) {
+#pragma GCC unroll 4
+    for (int k = 0; k < kLeaves; ++k)
+#pragma GCC unroll 2
+        for (int u = 0; u < 2; ++u) {
+            const uint32x4_t x = vld1q_u32(row[k] + 8 - i + 4 * u);
+#pragma GCC unroll 2
+            for (int j = 0; j < K; ++j) {
+                const uint32x4_t bi = b[k][j][i / 4];
+                if constexpr (i == 0) {
+                    lo[k][j][u] = vmull_laneq_u32(vget_low_u32(x), bi, 0), hi[k][j][u] = vmull_high_laneq_u32(x, bi, 0);
+                } else {
+                    lo[k][j][u] = vmlal_laneq_u32(lo[k][j][u], vget_low_u32(x), bi, i % 4);
+                    hi[k][j][u] = vmlal_high_laneq_u32(hi[k][j][u], x, bi, i % 4);
+                }
+            }
+        }
+    if constexpr (i < 7) neon_leaf_terms<i + 1, kLeaves, K>(row, b, lo, hi);
+}
+#endif
+
+// Standard layout: out[j] leaf v = a b[j] 2^-32 mod (x^8 - w_v) for j < K and leaves v < count (8
+// words each), with weights[v] = w_v 2^32 mod P; inputs canonical, out canonical; for K = 1 the
+// same into copy if not null. out[j] and copy may be a or b[j]. One window of each leaf of a serves
+// its K products (backend/evaluation's descent multiplies one state by two kept transforms).
+//
+// Rows [w A, A] of 16 leaves, one 64-byte line each (x^i A mod (x^8 - w) is the 8 words from 8 - i:
+// in the line; on x86 the odd words' load one word on crosses into the next row for i = 0 only),
+// are written before their products read them. x86: one leaf per 8 lanes, b_i broadcast, 64-bit
+// sums of even and odd words; Zen 4/5 (kWideLeaves): two leaves per zmm, their rows' windows by
+// load_halves and b_i by broadcast_halves (ntt's WideBottom); Neon: two leaves per step for K = 1
+// (8 sums), one for K = 2, b_i an element of b's vectors (umlal by lane). Measurements:
+// notes/136-r3.md.
+template <class L, int K>
+void leaf_products_k(const u32* a, const u32* const (&b)[K], u32* const (&out)[K], std::size_t count, const u32* weights,
+                     u32* copy = nullptr) {
     using S = Sums<L>;
     using V = typename L::V;
     constexpr int kVectors = 8 / L::lanes, kBatch = 16;
-    // Row t: [w A, A, 0 ...] for leaf A: x^i A mod (x^8 - w) is the 8 words from 8 - i. Loads read
-    // one word past the 16 (EvenOdd::load).
-    alignas(64) u32 window[kBatch][24] = {};
+    // Row kBatch (and row n of a short batch) only for the x86 loads one word past a row.
+    alignas(64) u32 window[kBatch + 1][16];
+    std::fill_n(window[kBatch], 16, 0u);
+    const auto store = [&](int j, std::size_t v, int word, V r) {
+        L::store(out[j] + 8 * v + word, r);
+        if (K == 1 && copy) L::store(copy + 8 * v + word, r);
+    };
     for (std::size_t v0 = 0; v0 < count; v0 += kBatch) {
         const std::size_t n = std::min<std::size_t>(kBatch, count - v0);
+        if (n < kBatch) std::fill_n(window[n], 16, 0u);
         for (std::size_t t = 0; t < n; ++t) {
             const V w = L::broadcast(weights[v0 + t]);
 #pragma GCC unroll 8
@@ -255,24 +297,97 @@ void leaf_products(const u32* a, const u32* b, u32* out, std::size_t count, cons
                 L::store(window[t] + u * L::lanes, montgomery_canonical<L>(x, w));
             }
         }
-        for (std::size_t t = 0; t < n; ++t) {
-            const u32* bt = b + 8 * (v0 + t);
-            V r[kVectors];
-#pragma GCC unroll 8
-            for (int u = 0; u < kVectors; ++u) {
-                typename S::Acc s = S::mul(S::load(window[t] + 8 + u * L::lanes), S::broadcast(bt[0]));
-#pragma GCC unroll 8
-                for (int i = 1; i < 8; ++i) S::mac(s, S::load(window[t] + 8 - i + u * L::lanes), S::broadcast(bt[i]));
-                r[u] = S::reduce(s);
-            }
-#pragma GCC unroll 8
-            for (int u = 0; u < kVectors; ++u) L::store(out + 8 * (v0 + t) + u * L::lanes, r[u]);
-            if (copy) {
-#pragma GCC unroll 8
-                for (int u = 0; u < kVectors; ++u) L::store(copy + 8 * (v0 + t) + u * L::lanes, r[u]);
+        std::size_t t = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+        if constexpr (std::is_same_v<L, simd::Neon>) {
+            constexpr int kLeaves = K == 1 ? 2 : 1;
+            const V p = L::broadcast(kP), ninv = L::broadcast(kNegInverse);
+            for (; t + kLeaves <= n; t += kLeaves) {
+                const u32* row[kLeaves];
+                V bv[kLeaves][K][2];
+                uint64x2_t lo[kLeaves][K][2], hi[kLeaves][K][2];
+#pragma GCC unroll 2
+                for (int k = 0; k < kLeaves; ++k) {
+                    row[k] = window[t + k];
+#pragma GCC unroll 2
+                    for (int j = 0; j < K; ++j) {
+                        const u32* bt = b[j] + 8 * (v0 + t + k);
+                        bv[k][j][0] = L::load(bt), bv[k][j][1] = L::load(bt + 4);
+                    }
+                }
+                neon_leaf_terms<0, kLeaves, K>(row, bv, lo, hi);
+#pragma GCC unroll 2
+                for (int k = 0; k < kLeaves; ++k)
+#pragma GCC unroll 2
+                    for (int j = 0; j < K; ++j)
+#pragma GCC unroll 2
+                        for (int u = 0; u < 2; ++u) {
+                            const V m = L::mul_lo(L::lo_halves(lo[k][j][u], hi[k][j][u]), ninv);
+                            const uint64x2_t l = L::mla_wide_lo(lo[k][j][u], m, p), h = L::mla_wide_hi(hi[k][j][u], m, p);
+                            store(j, v0 + t + k, 4 * u, canonical4<L>(L::hi_halves(l, h)));
+                        }
             }
         }
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+        if constexpr (kWideLeaves && std::is_same_v<L, simd::Avx512Vl>) {
+            using Z = simd::Avx512;
+            using E = EvenOdd<Z>;
+            for (; t + 2 <= n; t += 2) {
+                typename E::Acc s[K];
+#pragma GCC unroll 8
+                for (int i = 0; i < 8; ++i) {
+                    const typename E::Op x = {Z::load_halves(window[t] + 8 - i, window[t + 1] + 8 - i),
+                                              Z::load_halves(window[t] + 9 - i, window[t + 1] + 9 - i)};
+#pragma GCC unroll 2
+                    for (int j = 0; j < K; ++j) {
+                        const u32* bt = b[j] + 8 * (v0 + t) + i;
+                        const typename Z::V bi = Z::broadcast_halves(bt, bt + 8);
+                        if (i == 0) s[j] = E::mul(x, {bi, bi});
+                        else E::mac(s[j], x, {bi, bi});
+                    }
+                }
+#pragma GCC unroll 2
+                for (int j = 0; j < K; ++j) {
+                    const typename Z::V r = E::reduce(s[j]);
+                    Z::store(out[j] + 8 * (v0 + t), r);
+                    if (K == 1 && copy) Z::store(copy + 8 * (v0 + t), r);
+                }
+            }
+        }
+#endif
+        for (; t < n; ++t) {
+            typename S::Acc s[K][kVectors];
+#pragma GCC unroll 8
+            for (int u = 0; u < kVectors; ++u) {
+                const auto x = S::load(window[t] + 8 + u * L::lanes);
+#pragma GCC unroll 2
+                for (int j = 0; j < K; ++j) s[j][u] = S::mul(x, S::broadcast(b[j][8 * (v0 + t)]));
+#pragma GCC unroll 8
+                for (int i = 1; i < 8; ++i) {
+                    const auto y = S::load(window[t] + 8 - i + u * L::lanes);
+#pragma GCC unroll 2
+                    for (int j = 0; j < K; ++j) S::mac(s[j][u], y, S::broadcast(b[j][8 * (v0 + t) + i]));
+                }
+            }
+#pragma GCC unroll 2
+            for (int j = 0; j < K; ++j)
+#pragma GCC unroll 8
+                for (int u = 0; u < kVectors; ++u) store(j, v0 + t, u * L::lanes, S::reduce(s[j][u]));
+        }
     }
+}
+
+// leaf_products_k with one product: out = a b, the same into copy if not null.
+template <class L>
+void leaf_products(const u32* a, const u32* b, u32* out, std::size_t count, const u32* weights, u32* copy = nullptr) {
+    leaf_products_k<L, 1>(a, {b}, {out}, count, weights, copy);
+}
+
+// leaf_products_k with two: out0 = a b0, out1 = a b1.
+template <class L>
+void leaf_products_twice(const u32* a, const u32* b0, const u32* b1, u32* out0, u32* out1, std::size_t count, const u32* weights) {
+    leaf_products_k<L, 2>(a, {b0, b1}, {out0, out1}, count, weights);
 }
 
 // x = [x0 .. x(W-1)], y alike -> even = their even words, odd = their odd words, in one order of

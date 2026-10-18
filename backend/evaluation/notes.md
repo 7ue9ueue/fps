@@ -6,7 +6,7 @@ its passes: `tree.hpp` (`PointTree`, `Store`, `to_child`, `root_window`). Kernel
 `backend/simd` structs: `kernels.hpp` (middle products and cross sums in lanes, Horner's rule,
 the per-base inversion, the direct paths `interpolate_small` and `newton_small`, transposes).
 Choices per target: `select.hpp`. Tests: `test.cpp`, `test_units.cpp`, `test_small.cpp`,
-`test_top.cpp`; bench: `bench.cpp`. From lc-opt's
+`test_top.cpp`, `test_groups.cpp`; bench: `bench.cpp`. From lc-opt's
 `lib/poly/{evaluation,interpolation,newton}.hpp` (issue #104), rewritten on this repo's product
 trees (`backend/product_tree`, with a `Keep` hook added) and `ntt::Transform` (with
 `inverse_upper` added), so every target runs it.
@@ -46,8 +46,10 @@ trees (`backend/product_tree`, with a `Keep` hook added) and `ntt::Transform` (w
   8-point transform to its 8 roots' values, the products with the siblings' lanes), then one
   halving of the lanes at T: the lane root's state, factor 8 (no leaf products, inverses of T or
   rows; before: each leaf's window into a row, rows_to_lanes and a lanes forward, notes/104-r1.md
-  and 136-r1.md). A lane node's two children's products come from one read of its state
-  (`pointwise_twice`); on x86 the halvings' combine is left to them (`kDeferredCombine`). At m8 =
+  and 136-r1.md). The root's and halves' two children's products come from one window of their
+  state (product_tree's `leaf_products_twice`, #136 r3; the root's state read in place from the
+  division's output when C = L), a lane node's from one read of its state (`pointwise_twice`); on
+  x86 the halvings' combine is left to them (`kDeferredCombine`). At m8 =
   2^25 the lanes' transforms of 16 L words pass ntt's 2^25 and run twisted (`lanes_forward_upper`
   and the others: coefficient j of each lane times zeta^j, a transform of 8 L).
 - Base (lane nodes of at most kLaneBase = 16 slots): the window's coefficients (an inverse of
@@ -64,19 +66,23 @@ trees (`backend/product_tree`, with a `Keep` hook added) and `ntt::Transform` (w
   R_v = R_l Q_r + R_r Q_l in the kept transforms (`pointwise_sums`; leaf products in the top;
   the pairs' from the lanes' sums at T by `lane_pair_sums`, lane_pairs with sums for products),
   doubled to the parent's length as product_tree's nodes; f = rev_m(R). The lane tree runs the
-  descent and the sums in one depth-first pass (`interpolate_lanes`); each base inverts its
-  values once (`divide_slots`: prefix products in 4 interleaved chains, one vector power, lazy)
-  and builds its sums (`cross_units`) from the same products. A zero M'(a_i) (a repeated point)
-  throws.
+  descent and the sums in one depth-first pass (`interpolate_lanes`) down to nodes of at most
+  kInterpolateGroup = 64 slots, which run as groups (#136 r3, `interpolate_group`): the descent to
+  all their bases' values, each base's products kept, one inversion for the group (`divide_slots`:
+  prefix products in 8 interleaved chains, one vector power, lazy; before, one per base, whose
+  power's latency nothing hid), then the sums up the group, the bases' (`cross_units`) from the
+  kept products. A zero M'(a_i) (a repeated point) throws.
 - Newton basis: F = rev_N(f) (N = m8), c_k = [x^(N-1-k)] F / Q_(k+1). Node v's right child's
   window is W_v[0, s_r) (from the state: `to_child` with e = L - s_l, halving when s_l = L / 2),
   its left child's (W_v Q_r)[s_r, s_v) (the product with the right sibling's kept transform).
-  C is padded to the power of two above when past 0.65 of it (lc-opt's choice), so every right
-  child halves. The top tree's rightmost windows are prefixes of the root's (known coefficients):
-  those right children's states are forwards of them, no halving, scaled by 2 per level as the
-  halvings scale the others (lc-opt's path). The leaves: `pairs_to_lanes<L, true>` (right leaves
-  take the pair's values alone), then for C = L one halving of the lanes with a sign per lane
-  (`combine_alternating`), else the lanes' inverse and each lane's window (`lane_windows`).
+  C is padded to the power of two above when past 0.65 of it (lc-opt's choice; within 2% of the
+  best on every timing machine, notes/136-r3.md), so every right child halves. The top tree's
+  rightmost windows are prefixes of the root's (known coefficients): those right children's
+  states are forwards of them, no halving, scaled by 2 per level as the halvings scale the others
+  (lc-opt's path). The leaves: `pairs_to_lanes<L, true>` (right leaves take the pair's values
+  alone), then for C = L one halving of the lanes with a sign per lane (`combine_alternating`),
+  else the lanes' inverse and each lane's window (`lane_windows`). On x86 the lanes' halving
+  combines (those signs too) go into the child's one product (`combine_product`, #136 r3).
 - Direct paths (`select.hpp`): Horner's rule (`horner`: blocks of 4 or 8 vectors of points as
   chains, f in parts for short blocks) when its cost n m kHorner is below the tree's estimate
   kFixed + kPerPoint m8 lg m8 + kPerCoefficient K lg K, fitted per target to a grid of n, m in
@@ -95,50 +101,50 @@ trees (`backend/product_tree`, with a `Keep` hook added) and `ntt::Transform` (w
 
 ## Measurements
 
-Bench (`bench.cpp`), n = m = 2^lg, GCC 16.2, medians of 11 paired rounds against main ff90ae6
-(in brackets), ns per point, issue #136 round 2 (notes/136-r2.md; `lc-intel` noisy, its
-newton/16 and /18 0.996 and 0.992 in a rerun):
+Bench (`bench.cpp`), n = m = 2^lg, GCC 16.2, medians of 11 paired rounds against main 9fd0030
+(in brackets), ns per point, issue #136 round 3 (notes/136-r3.md; `lc-intel` noisy, IQRs to
+1.13):
 
 | ns per point (new/base) | lc-bench (Zen 3, avx2) | lc-intel (Emerald Rapids, avx512) | lc-zen5 (Zen 5, zen5) | lc-arm (Neoverse V2, arm) |
 |---|---:|---:|---:|---:|
-| evaluate/6 | 14.0 (1.000) | 10.2 (1.012) | 9.2 (1.000) | 15.4 (0.999) |
-| interpolate/6 | 91.6 (1.001) | 70.6 (1.002) | 57.2 (0.997) | 132.8 (1.000) |
-| newton/6 | 13.8 (1.000) | 10.7 (1.008) | 8.2 (1.000) | 22.1 (0.999) |
-| evaluate/8 | 37.6 (0.909) | 28.2 (1.011) | 16.4 (1.001) | 58.9 (1.000) |
-| interpolate/8 | 54.1 (0.895) | 43.4 (0.878) | 34.1 (0.892) | 70.9 (0.896) |
-| newton/8 | 40.0 (1.000) | 25.5 (1.004) | 19.6 (1.000) | 44.0 (0.940) |
-| evaluate/10 | 40.7 (0.939) | 33.0 (0.948) | 23.2 (0.942) | 58.2 (0.937) |
-| interpolate/10 | 60.3 (0.933) | 49.0 (0.943) | 35.9 (0.950) | 85.3 (0.931) |
-| newton/10 | 37.6 (0.966) | 30.9 (0.966) | 21.4 (0.971) | 53.0 (0.965) |
-| evaluate/12 | 47.9 (0.953) | 41.1 (0.960) | 25.4 (0.950) | 71.2 (0.947) |
-| interpolate/12 | 71.2 (0.949) | 58.8 (0.948) | 39.1 (0.949) | 104.2 (0.942) |
-| newton/12 | 44.4 (0.977) | 39.0 (0.990) | 23.5 (0.977) | 65.3 (0.971) |
-| evaluate/14 | 58.2 (0.957) | 50.8 (0.948) | 29.5 (0.961) | 87.7 (0.951) |
-| interpolate/14 | 85.9 (0.954) | 75.7 (0.956) | 45.1 (0.963) | 128.0 (0.946) |
-| newton/14 | 54.3 (0.982) | 48.9 (0.985) | 27.4 (0.992) | 80.7 (0.975) |
-| evaluate/16 | 70.0 (0.960) | 64.9 (0.969) | 33.9 (0.958) | 106.0 (0.951) |
-| interpolate/16 | 103.3 (0.955) | 93.6 (0.979) | 51.6 (0.961) | 154.4 (0.947) |
-| newton/16 | 65.6 (0.980) | 60.5 (1.011) | 31.7 (0.991) | 98.5 (0.975) |
-| evaluate/17 | 77.0 (0.958) | 72.3 (0.979) | 36.5 (0.956) | 116.7 (0.954) |
-| interpolate/17 | 113.2 (0.955) | 103.1 (0.962) | 55.5 (0.957) | 169.6 (0.948) |
-| newton/17 | 72.3 (0.983) | 66.6 (0.991) | 34.1 (0.993) | 108.4 (0.977) |
-| evaluate/18 | 87.5 (0.963) | 83.2 (0.973) | 44.0 (0.950) | 127.8 (0.950) |
-| interpolate/18 | 126.2 (0.953) | 119.9 (0.975) | 65.3 (0.957) | 185.5 (0.947) |
-| newton/18 | 80.6 (0.978) | 76.6 (1.020) | 38.1 (0.982) | 119.5 (0.977) |
-| evaluate/20 | 102.1 (0.961) | 112.7 (0.928) | 51.5 (0.962) | 150.7 (0.957) |
-| interpolate/20 | 148.1 (0.958) | 160.6 (0.936) | 76.0 (0.962) | 219.0 (0.953) |
-| newton/20 | 94.8 (0.981) | 102.7 (0.988) | 46.5 (0.990) | 143.0 (0.980) |
+| evaluate/6 | 14.1 (1.000) | 10.1 (0.998) | 9.1 (0.997) | 15.4 (1.000) |
+| interpolate/6 | 91.9 (1.001) | 70.6 (0.999) | 57.0 (0.996) | 132.8 (1.000) |
+| newton/6 | 13.8 (0.999) | 10.6 (1.002) | 8.2 (0.999) | 22.1 (1.000) |
+| evaluate/8 | 37.1 (0.986) | 28.0 (1.000) | 16.4 (1.000) | 58.9 (1.000) |
+| interpolate/8 | 52.8 (0.972) | 42.4 (0.984) | 31.6 (0.921) | 67.5 (0.955) |
+| newton/8 | 40.1 (0.999) | 25.5 (1.001) | 19.6 (1.000) | 43.0 (0.975) |
+| evaluate/10 | 40.2 (0.991) | 32.7 (0.993) | 22.0 (0.953) | 56.4 (0.969) |
+| interpolate/10 | 58.7 (0.971) | 48.4 (0.985) | 32.9 (0.922) | 82.0 (0.963) |
+| newton/10 | 37.3 (0.988) | 31.0 (1.004) | 20.8 (0.982) | 52.1 (0.984) |
+| evaluate/12 | 47.7 (0.996) | 39.3 (0.990) | 24.2 (0.964) | 69.4 (0.976) |
+| interpolate/12 | 70.0 (0.980) | 58.0 (0.981) | 36.4 (0.937) | 100.9 (0.970) |
+| newton/12 | 44.1 (0.994) | 38.8 (0.987) | 22.9 (0.990) | 64.4 (0.986) |
+| evaluate/14 | 58.1 (0.998) | 50.5 (0.988) | 28.5 (0.976) | 85.8 (0.980) |
+| interpolate/14 | 85.0 (0.983) | 73.4 (0.974) | 42.5 (0.949) | 124.6 (0.975) |
+| newton/14 | 54.0 (0.995) | 48.1 (1.000) | 26.8 (0.992) | 79.7 (0.988) |
+| evaluate/16 | 69.9 (0.996) | 64.1 (0.986) | 32.9 (0.980) | 104.0 (0.983) |
+| interpolate/16 | 101.9 (0.987) | 90.5 (0.976) | 49.1 (0.957) | 150.8 (0.979) |
+| newton/16 | 65.2 (0.997) | 59.1 (0.985) | 31.1 (0.991) | 97.4 (0.993) |
+| evaluate/17 | 76.8 (0.995) | 70.9 (1.000) | 35.5 (0.983) | 115.0 (0.987) |
+| interpolate/17 | 112.1 (0.989) | 102.5 (0.994) | 53.1 (0.958) | 166.2 (0.981) |
+| newton/17 | 71.8 (0.996) | 66.5 (1.004) | 33.5 (0.993) | 107.3 (0.991) |
+| evaluate/18 | 87.0 (0.998) | 82.2 (0.999) | 43.1 (0.982) | 125.9 (0.989) |
+| interpolate/18 | 124.8 (0.989) | 115.5 (0.989) | 62.6 (0.961) | 182.3 (0.985) |
+| newton/18 | 80.0 (0.994) | 74.7 (0.995) | 37.9 (0.994) | 118.4 (0.996) |
+| evaluate/20 | 101.8 (0.997) | 111.2 (0.999) | 50.6 (0.986) | 148.8 (0.990) |
+| interpolate/20 | 146.3 (0.988) | 158.7 (0.993) | 72.5 (0.955) | 215.1 (0.986) |
+| newton/20 | 94.2 (0.992) | 100.7 (0.996) | 46.2 (0.996) | 141.7 (0.994) |
 
 At 6 the direct paths run (evaluate Horner; interpolate and the Newton basis in vectors since
 #136 r1); evaluate/8 runs Horner but on Zen 3, where the cost model picks the tree. Against
 lc-opt on `lc-bench` in the same run (7 rounds, its Arena reused across calls, outputs equal from
-2^10 to 2^20, GCC 16.2), fps / lc-opt: evaluate 0.148 (2^10: lc-opt runs Horner there), 0.827
-(2^12), 0.880, 0.887, 0.919 (2^17), 0.913, 0.921 (2^20); interpolate 0.857 (2^10), 0.871, 0.906,
-0.914, 0.930, 0.925, 0.921; newton 0.872, 0.883, 0.914, 0.926, 0.937, 0.946, 0.952; geomean
-0.905 without evaluate/10 (round 1: 0.943; before #136: 0.97-1.03). Earlier tables (the move,
-#104; round 1): notes/104-r1.md, notes/136-r1.md and this file's history. Against the frontend's
-plain `points.hpp` (#24's PR #119) at 2^17 on `lc-bench` (round 1): evaluate 60.3 -> 10.4 ms,
-interpolate 87.0 -> 15.3, newton 38.8 -> 9.5.
+2^10 to 2^20, GCC 16.2), fps / lc-opt: evaluate 0.147 (2^10: lc-opt runs Horner there), 0.832
+(2^12), 0.868, 0.884, 0.900 (2^17), 0.908, 0.922 (2^20); interpolate 0.838 (2^10), 0.865, 0.893,
+0.903, 0.909, 0.918, 0.919; newton 0.863, 0.881, 0.910, 0.924, 0.934, 0.945, 0.943; geomean
+0.897 without evaluate/10 (round 2: 0.905; round 1: 0.943; before #136: 0.97-1.03). Earlier
+tables (the move, #104; rounds 1 and 2): notes/104-r1.md, notes/136-r1.md, notes/136-r2.md and
+this file's history. Against the frontend's plain `points.hpp` (#24's PR #119) at 2^17 on
+`lc-bench` (round 1): evaluate 60.3 -> 10.4 ms, interpolate 87.0 -> 15.3, newton 38.8 -> 9.5.
 
 ## Log
 

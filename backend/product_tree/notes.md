@@ -51,8 +51,10 @@ both also over any span of items with a projection to their words). Trees: `tree
   (64-bit sums of at most 9 products, one Montgomery step, no fold; lc-opt's base was 32 with a
   fold and measured the same as 16), then transformed. Lane length >= 8 (64 words).
 - Standard (`StandardTree`): leaf products mod (x^8 - w_v) (`leaf_products`: a window [w A, A]
-  per leaf, 8 broadcast products in 64-bit sums, one Montgomery step; windows of 16 leaves are
-  written before their products read them). Nodes up to degree 32
+  per leaf, one 64-byte row, 8 products in 64-bit sums, one Montgomery step; windows of 16 leaves
+  are written before their products read them; x86 b_i broadcast, Zen 4/5 two leaves per zmm,
+  Neon two leaves per step with b_i by lane; `leaf_products_k` gives K products of one a from one
+  window, notes/136-r3.md). Nodes up to degree 32
   (`kStandardBase`) by `small::multiply` in pairs (each product of Montgomery forms carries one
   more 2^32: one pass at the end takes them out). Length >= 64.
 - Lanes to the standard tree (`Pairs`, issue #91 round 2): the standard tree's nodes over lane

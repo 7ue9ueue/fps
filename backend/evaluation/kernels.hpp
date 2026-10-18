@@ -538,6 +538,32 @@ void pointwise_twice(u32* s, const u32* b, const u32* c, u32* out, std::size_t n
     }
 }
 
+// The Newton basis' lane node: its state's halving combine left undone, then its one product: x =
+// s[i] - s[n + i] (kSign < 0), s[i] + s[n + i] (kSign > 0; kSign = 2: - in even lanes, word i
+// even, + in odd ones, as combine_alternating); s[i] = x, out[i] = x b[i] 2^-32 (canonical). s, b
+// < P; n a multiple of S::lanes (and of 2).
+template <class S, int kSign>
+void combine_product(u32* s, const u32* b, u32* out, std::size_t n) {
+    using M = Ops<S>;
+    if constexpr (kSign == 2 && S::lanes == 1) {
+        for (std::size_t i = 0; i < n; i += 2) {
+            const u32 x = M::sub(s[i], s[n + i]), y = M::add(s[i + 1], s[n + i + 1]);
+            s[i] = x, s[i + 1] = y;
+            out[i] = montgomery_canonical<S>(x, b[i]), out[i + 1] = montgomery_canonical<S>(y, b[i + 1]);
+        }
+    } else {
+        for (std::size_t i = 0; i < n; i += S::lanes) {
+            const typename S::V a = S::load(s + i), c = S::load(s + n + i);
+            typename S::V x;
+            if constexpr (kSign == 2) x = S::template blend<0xaaaaaaaau>(M::sub(a, c), M::add(a, c));
+            else if constexpr (kSign < 0) x = M::sub(a, c);
+            else x = M::add(a, c);
+            S::store(s + i, x);
+            S::store(out + i, montgomery_canonical<S>(x, S::load(b + i)));
+        }
+    }
+}
+
 // out = a b + c d (pointwise, each product times 2^-32), canonical; the same into copy if not
 // null. n a multiple of S::lanes; out and copy may be a or c.
 template <class S>
@@ -761,13 +787,14 @@ typename S::V power_lazy(typename S::V x, std::size_t e) {
     return r;
 }
 
-// v[i] = y[i] / v[i] for i < count (a multiple of L::lanes, at most 8 kLaneBase), but 0 where
-// first + i >= m (v[i] read as 1 there): Montgomery's trick in kChains interleaved chains of prefix
+// v[i] = y[i] / v[i] for i < count (a multiple of L::lanes, at most kMaxWords), but 0 where first
+// + i >= m (v[i] read as 1 there): Montgomery's trick in kChains interleaved chains of prefix
 // products over the vectors (vector k in chain k % kChains), one vector power for the lanes'
 // inverses of all their products, then each chain back; lazy (< 2P) but the outputs, which are
 // canonical. The steps' latency is the cost (a base's 16 vectors); kChains chains cut the prefix
-// and back passes to a quarter. Returns false, v unspecified, if some v[i] with first + i < m is 0.
-template <class L, std::size_t kChains = 4>
+// and back passes to a quarter, and a group of bases shares the power (#136 r3). Returns false, v
+// unspecified, if some v[i] with first + i < m is 0.
+template <class L, std::size_t kChains = 4, std::size_t kMaxWords = 8 * product_tree::kLaneBase>
 bool divide_slots(u32* v, const u32* y, std::size_t first, std::size_t m, std::size_t count) {
     using V = typename L::V;
     using O = Ops<L>;
@@ -775,7 +802,7 @@ bool divide_slots(u32* v, const u32* y, std::size_t first, std::size_t m, std::s
     const std::size_t vectors = count / W;
     if (first + count > m) std::fill(v + (m > first ? m - first : 0), v + count, 1u);
     const V r2 = L::broadcast(kR2);
-    V prefix[8 * product_tree::kLaneBase / W], x[8 * product_tree::kLaneBase / W], total[C];
+    V prefix[kMaxWords / W], x[kMaxWords / W], total[C];
     for (std::size_t c = 0; c < C; ++c) total[c] = L::broadcast(kR);
     for (std::size_t k = 0; k < vectors; ++k) {
         x[k] = montgomery_canonical<L>(L::load(v + W * k), r2);
