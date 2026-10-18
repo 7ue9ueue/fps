@@ -33,7 +33,9 @@ restart them.
 The only lock is the merge lock, held for seconds: from the last look at main to the merge. If
 main moved while the tests ran, the tests run again only when the new commits touch a unit this
 pull request affects (with the same include closure) or a shared file, and then only for those
-units: the others build the same text as before, so their result still holds.
+units: the others build the same text as before, so their result still holds. A gate started
+again on a head that already passed (its merge was refused, or the gate was stopped) starts
+from the passes in its earlier reports the same way; --fresh tests everything.
 
 It runs as origin/main's copy of tools/ (gate.py, kernel.py, vm.py), whatever the checkout it is
 started from: a coordinator's checkout can lag main by hours, and the gate's rules are main's.
@@ -399,6 +401,26 @@ def merge_lock(label: str):
             lock.truncate()
 
 
+REPORT = re.compile(r'Gate for pr\d+ \((\w+)\) merged into origin/main \((\w+)\)\.')
+
+
+def earlier_passes(pr: str, head: str) -> dict[str, str]:
+    """unit -> the main it passed against, from this gate's earlier reports on the same head."""
+    owner = gh_json('repo', 'view', '--json', 'owner')['owner']['login']
+    tested = {}
+    for comment in gh_json('pr', 'view', pr, '--json', 'comments')['comments']:
+        body = comment['body'].strip()
+        match = REPORT.match(body)
+        if comment['author']['login'] != owner or not body.endswith('Gate: pass') or not match \
+                or not head.startswith(match[1]):
+            continue
+        base = git('rev-parse', match[2], check=False).stdout.strip()
+        units = re.search(r'^Units: (.*)$', body, re.M)
+        if base and units:
+            tested.update(dict.fromkeys(units[1].split(', '), base))
+    return tested
+
+
 def stale(base: str, tip: str, merged: str, units: list[str]) -> bool:
     """Whether commits that landed on main between base and tip can change this gate's result.
     merged: the pull request merged into tip, whose includes decide what depends on what."""
@@ -411,10 +433,24 @@ def main() -> int:
     parser.add_argument('target', help='pull request number or git revision')
     parser.add_argument('--base', default='origin/main')
     parser.add_argument('--merge', action='store_true', help='squash-merge the pull request on a pass')
+    parser.add_argument('--fresh', action='store_true', help='ignore earlier passes on this head')
     args = parser.parse_args()
     pr = args.target if args.target.isdigit() else None
     only = None
     tested = {}  # unit -> the main it last passed against
+    if pr and args.base == 'origin/main' and not args.fresh:
+        git('fetch', '--quiet', 'origin', 'main')
+        git('fetch', '--quiet', 'origin', f'pull/{pr}/head')
+        head = git('rev-parse', 'FETCH_HEAD').stdout.strip()
+        tested = earlier_passes(pr, head)
+        tip = git('rev-parse', 'origin/main').stdout.strip()
+        merged = git('merge-tree', '--write-tree', tip, head, check=False)
+        if tested and not merged.returncode:
+            tree = merged.stdout.split()[0]
+            only = {u for u in tested if stale(tested[u], tip, tree, [u])}
+            only |= set(affected(tip, tree)) - set(tested)
+            log(f'{", ".join(sorted(set(tested) - only)) or "no unit"} passed on this head before; '
+                f'testing {", ".join(sorted(only)) or "nothing"}')
     for _ in range(3):
         start = time.monotonic()
         passed, report, base, head, units = gate(args, only)
