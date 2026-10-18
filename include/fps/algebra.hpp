@@ -25,12 +25,12 @@
 //   or colliding roots (up to about d^2 / 300). Its transforms of 2 bit_ceil(d + 1) words need
 //   deg f <= 2^24 - 1 (trailing zeros do not count; a factor x^z counts): std::length_error past
 //   it, before any work. Its workspace, kept per thread, is 32 to 45 d words.
-// - factor, deg f <= 2048 (trailing zeros do not count): one call into the backend's
+// - factor, deg f <= 4096 (trailing zeros do not count): one call into the backend's
 //   factorization, fps::factorization::factor (backend/factor/factor.hpp: lc-opt's Yun and
-//   Berlekamp, #123), O(m^3) per square-free part of degree m.
-// - factor, deg f > 2048: the frontend's own path, faster there (the kernel's m^3 passes it near
-//   degree 2^11; it stops at 4096, and degree 2^20 is out of its reach). Kept until the backend has
-//   a path for large degrees (#201, Kaltofen and Shoup). Yun's square-free decomposition (it needs
+//   Berlekamp, #123, #200), O(m^3) per square-free part of degree m; 2.9-11x faster than the path
+//   below at every degree to its limit (backend/factor/notes/200-r1.md).
+// - factor, deg f > 4096 (the kernel's limit; degree 2^20 is out of its reach): the frontend's own
+//   path, until the backend has a path for large degrees (#201, Kaltofen and Shoup). Yun's square-free decomposition (it needs
 //   deg f < P, so that f' = 0 only for a constant f), then per square-free part s the
 //   distinct-degree split gcd(s, x^(P^d) - x) for d = 1, 2, ... up to deg s / 2, then Cantor and
 //   Zassenhaus for each degree d: b^((P^d - 1)/2) - 1. Powers modulo m are square and multiply on
@@ -107,9 +107,10 @@ private:
     std::uint64_t state_ = 0x9e3779b97f4a7c15;
 };
 
-// fps::factor runs the backend's factorization up to this degree, the frontend's own path past it:
-// the kernel's O(m^3) passes the frontend's O(n^2 log n log P) near degree 2^11 (#209).
-inline constexpr int kFactorKernelMax = 2048;
+// fps::factor runs the backend's factorization up to this degree, its limit, and the frontend's own
+// path past it. Since #200 the kernel is faster at every degree to 4096 (they would cross near
+// 2^15-2^16); #209 had set 2048, where the kernel's O(m^3) then passed the frontend's path.
+inline constexpr int kFactorKernelMax = factorization::kMaxDegree;
 static_assert(kFactorKernelMax <= factorization::kMaxDegree);
 
 template <std::uint32_t P>
