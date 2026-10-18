@@ -1,13 +1,14 @@
 // Measures small's two tuned choices on this machine and registers them with backend/tune, in this
-// order: the variant per shape class ("small.variant") and beats_ntt's NTT times ("small.ntt"),
-// which time multiply() with the variants in place. tune::run() measures, tune::save() / load()
-// keep them.
+// order: the variant per shape class ("small.variant") and beats_ntt's NTT times at powers of two
+// ("small.ntt"), which time multiply() with the variants in place. tune::run() measures,
+// tune::save() / load() keep them.
 //
 //   small::measure_variants(start, budget[, log])  // Choices: per class the fastest, else start's
 //   small::points(c, dense)                        // the shapes class c is timed at
 //   small::text(choices), parse(text)              // wisdom: kSignature, then the variant per class
 //   small::variant_names()                         // the candidates' names, e.g. "avx512.r8.u2"
 //   small::measure_ntt(model, start, budget)       // NTT times for lg = 6 .. 25 (kNttDefaults' form)
+//   small::measure_ragged(model, start, budget)    // ns at the points between (tools/tune.py, kRagged)
 //
 // measure_variants: each class with m up to 2^budget.max_octave is timed at points(c, dense): m at
 // the octave's end and at 3/4 of it (dense: also just past its start), n / m 1 / 3 / 6 / 16 by the
@@ -16,13 +17,14 @@
 // the least geometric mean of time / fastest, unless start's is within budget.margin of it. Larger
 // octaves keep start's.
 //
-// measure_ntt: for each lg up to budget.max_lg, the probe is the n x m with n + m - 1 = 3 2^(lg - 2) (the middle
-// of the products that transform at 2^lg), n >= m, where the model's time first reaches start's
-// NTT time. There multiply() and an ntt::Convolution (the product in the caller's memory) are timed
-// in turn, and the NTT time becomes the model's time there times NTT / multiply as measured: so
-// beats_ntt switches where the measured times cross, along the model's shape. If that moves the
-// crossing by more than 25%, a second probe goes there. Past max_lg: start's times scaled by the
-// ratio at max_lg. Values within budget.margin of start keep start's.
+// measure_ntt: for each lg up to budget.max_lg, the probe is the n x m with n + m - 1 = 2^lg
+// (select.hpp's ntt_point; measure_ragged: each of its points in (2^(lg-1), 2^lg)), n >= m, where
+// the model's time first reaches start's NTT time. There multiply() and ntt::multiply (into the
+// caller's memory, as f * g runs it) are timed in turn, and the NTT time becomes the model's time
+// there times NTT / multiply as measured: so beats_ntt switches where the measured times cross,
+// along the model's shape. If that moves the crossing by more than 25%, a second probe goes there.
+// Past max_lg: start's times scaled by the ratio at max_lg (per point). Values within budget.margin
+// of start keep start's.
 //
 // kVariantRunTime and kRunTime, the budgets of tune::run(): their costs and the noise behind the
 // margins are in backend/tune/notes.md. tools/tune.py runs tune.cpp, which measures every class
@@ -166,10 +168,9 @@ inline constexpr Budget kRunTime = {16, 5, 2e5, 0.05};
 
 namespace detail {
 
-// The probe for lg: n + m - 1 = 3 2^(lg - 2), n >= m, the least m with model_ns(n, m) >= ntt
-// (the model grows with m there), or m = (n + m) / 2 if none.
-inline std::pair<std::size_t, std::size_t> probe(const Model& model, int lg, double ntt) {
-    const std::size_t length = std::size_t(3) << (lg - 2);
+// The probe for a product of `length` words: n + m - 1 = length, n >= m, the least m with
+// model_ns(n, m) >= ntt (the model grows with m there), or m = (n + m) / 2 if none.
+inline std::pair<std::size_t, std::size_t> probe(const Model& model, std::size_t length, double ntt) {
     std::size_t lo = 1, hi = (length + 1) / 2;
     while (lo < hi) {
         const std::size_t m = (lo + hi) / 2;
@@ -179,7 +180,7 @@ inline std::pair<std::size_t, std::size_t> probe(const Model& model, int lg, dou
     return {length + 1 - lo, lo};
 }
 
-// ns of multiply() and of the Convolution with the product in the same memory, timed in turn.
+// ns of multiply() and of ntt::multiply with the product in the same memory, timed in turn.
 inline std::array<double, 2> time_shape(std::size_t n, std::size_t m, const Budget& budget) {
     constexpr u32 P = 998244353;
     struct alignas(64) Line {
@@ -189,7 +190,7 @@ inline std::array<double, 2> time_shape(std::size_t n, std::size_t m, const Budg
     std::vector<u32> a(n), b(m);
     for (u32& x : a) x = rng() % P;
     for (u32& x : b) x = rng() % P;
-    std::vector<Line> lines((std::max(n + m - 1, ntt::Convolution::length(n, m) + ntt::kPadding) + 15) / 16);
+    std::vector<Line> lines((n + m - 1 + 15) / 16);
     u32* const out = lines.data()->words;
     const auto kept = [](const u32* p) { asm volatile("" : : "r"(p) : "memory"); };
     return tune::time(
@@ -199,36 +200,52 @@ inline std::array<double, 2> time_shape(std::size_t n, std::size_t m, const Budg
             kept(out);
         },
         [&] {
-            ntt::Convolution conv(n, m, out);
-            std::ranges::copy(a, out);
-            std::ranges::copy(b, conv.b());
-            conv.multiply();
+            ntt::multiply(a, b, std::span(out, n + m - 1));
             kept(out);
         });
+}
+
+// The NTT's time at length ntt_point(lg, points[i]) for lg = 6 .. 25, entry K (lg - 6) + i
+// (measure_ntt, above).
+template <std::size_t K>
+std::array<double, 20 * K> measure_points(const Model& model, const std::array<double, 20 * K>& start,
+                                          const Budget& budget, const std::array<int, K>& points) {
+    std::array<double, 20 * K> times = start;
+    std::array<double, K> ratio;
+    ratio.fill(1);
+    for (int lg = 6; lg <= budget.max_lg; ++lg)
+        for (std::size_t i = 0; i < K; ++i) {
+            const std::size_t e = K * std::size_t(lg - 6) + i;
+            double t = start[e];
+            for (int pass = 0; pass < 2; ++pass) {
+                const auto [n, m] = probe(model, ntt_point(lg, points[i]), t);
+                const auto [small, ntt] = time_shape(n, m, budget);
+                const double next = model_ns(model, n, m) * ntt / small;
+                const bool near = std::abs(next / t - 1) <= 0.25;
+                t = next;
+                if (near) break;
+            }
+            ratio[i] = t / start[e];
+            if (std::abs(ratio[i] - 1) > budget.margin) times[e] = t;
+        }
+    for (std::size_t i = 0; i < K; ++i)
+        if (std::abs(ratio[i] - 1) > budget.margin)
+            for (int lg = budget.max_lg + 1; lg <= 25; ++lg)
+                times[K * std::size_t(lg - 6) + i] = start[K * std::size_t(lg - 6) + i] * ratio[i];
+    return times;
 }
 
 }  // namespace detail
 
 inline std::array<double, 20> measure_ntt(const Model& model, const std::array<double, 20>& start,
                                           const Budget& budget) {
-    std::array<double, 20> times = start;
-    double ratio = 1;
-    for (int lg = 6; lg <= budget.max_lg; ++lg) {
-        double t = start[lg - 6];
-        for (int pass = 0; pass < 2; ++pass) {
-            const auto [n, m] = detail::probe(model, lg, t);
-            const auto [small, ntt] = detail::time_shape(n, m, budget);
-            const double next = model_ns(model, n, m) * ntt / small;
-            const bool near = std::abs(next / t - 1) <= 0.25;
-            t = next;
-            if (near) break;
-        }
-        ratio = t / start[lg - 6];
-        if (std::abs(ratio - 1) > budget.margin) times[lg - 6] = t;
-    }
-    if (std::abs(ratio - 1) > budget.margin)
-        for (int lg = budget.max_lg + 1; lg <= 25; ++lg) times[lg - 6] = start[lg - 6] * ratio;
-    return times;
+    return detail::measure_points<1>(model, start, budget, {kRaggedPoints});
+}
+
+inline std::array<double, 20 * kRaggedPoints> measure_ragged(const Model& model,
+                                                             const std::array<double, 20 * kRaggedPoints>& start,
+                                                             const Budget& budget) {
+    return detail::measure_points<kRaggedPoints>(model, start, budget, {0, 1, 2, 3});
 }
 
 #ifndef FPS_NO_TUNER
