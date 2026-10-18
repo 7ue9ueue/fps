@@ -480,8 +480,8 @@ void pairs_to_lanes(const u32* const s[4], const u32* lanes, std::size_t T, u32*
 // R_l and products Q_l at the roots of X^T - 1); out[j] (j < 4) gets the standard leaf form of
 // length T of R_2j Q_2j+1 + R_2j+1 Q_2j (times 2^-32), and copy[j] the same if copy is not null.
 // lane_pairs with sums for products; untwist: twist_factors<true>.
-template <class L>
-void lane_pair_sums(const u32* r, const u32* q, std::size_t T, u32* const out[4], const u32* untwist, u32* const* copy = nullptr) {
+template <class L, class Copy = std::nullptr_t>
+void lane_pair_sums(const u32* r, const u32* q, std::size_t T, u32* const out[4], const u32* untwist, Copy copy = nullptr) {
     using S = Sums<L>;
     const auto pair = [r, q] [[gnu::always_inline]] (std::size_t a, std::size_t b) {
         if constexpr (L::lanes == 1) {

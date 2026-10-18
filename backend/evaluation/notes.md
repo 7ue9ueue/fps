@@ -5,8 +5,8 @@ Multipoint evaluation, interpolation and the Newton basis modulo P = 998244353. 
 its passes: `tree.hpp` (`PointTree`, `Store`, `to_child`, `root_window`). Kernels on
 `backend/simd` structs: `kernels.hpp` (middle products and cross sums in lanes, Horner's rule,
 the per-base inversion, the direct paths `interpolate_small` and `newton_small`, transposes).
-Choices per target: `select.hpp`. Tests: `test.cpp`, `test_units.cpp`, `test_small.cpp`; bench:
-`bench.cpp`. From lc-opt's
+Choices per target: `select.hpp`. Tests: `test.cpp`, `test_units.cpp`, `test_small.cpp`,
+`test_top.cpp`; bench: `bench.cpp`. From lc-opt's
 `lib/poly/{evaluation,interpolation,newton}.hpp` (issue #104), rewritten on this repo's product
 trees (`backend/product_tree`, with a `Keep` hook added) and `ntt::Transform` (with
 `inverse_upper` added), so every target runs it.
@@ -17,12 +17,17 @@ trees (`backend/product_tree`, with a `Keep` hook added) and `ntt::Transform` (w
   of lane l is x[8 k + l]: point 8 k + l for evaluate and interpolate, point l C + k for the Newton
   basis (each lane a run of consecutive points, so every node covers consecutive points).
 - Tree (`PointTree`): product_tree's `LaneTree` over the C slots (factor 1 - a x per lane, in
-  Montgomery form) and `StandardTree` over the 8 lane products, each with a `Store` as its Keep:
-  every node above the base keeps its children's transforms at its own length (both children,
-  or the right one only for the Newton basis), in rooms of one block found by the split point.
-  The top tree's root also keeps its product transform T_L(Q) (one more output of the root's
-  leaf products), which the division reuses when its length is L. The top tree's leaves are the
-  lane root's coefficients as 8 rows, by vector transposes (`lanes_to_rows`; strided loads before).
+  Montgomery form; length L = bit_ceil(C)) with a `Store` as its Keep: every node above the base
+  keeps its children's transforms at its own length (both children, or the right one only for
+  the Newton basis), in rooms of one block found by the split point. Over the 8 lane products a
+  fixed top tree (since #136 r2; product_tree's StandardTree before): pairs (lanes 2j, 2j + 1) of
+  length T = 2L, two halves of 2T, the root of 4T = 8L, each keeping its children's transforms.
+  Its leaves are kept as one lanes transform: the lane root's at T (16 L words; its product pass
+  writes the lower half through LaneTree's `keep.root` hook, forward_upper of its coefficients
+  the upper). The pairs' product transforms come from it by product_tree's `lane_pairs` (lanes
+  leaves 8u + i are standard leaf u's 8 roots, ntt's values form order), each doubled to 2T in
+  its room; the halves and the root by leaf products; the root also keeps T_L(Q) (one more output
+  of its leaf products), which the division reuses when its length is L.
 - Windows (Bostan, Lecerf and Schost's transposed evaluation): with K = max(n, m8) and G =
   rev_K(f), f(a) = [x^(K-1)] G / (1 - a x). Node v of s_v points has W_v = (G / Q_v)[K - s_v, K);
   a child c with sibling d has W_c = (W_v Q_d)[s_d, s_v), exact in a cyclic product of length L
@@ -36,9 +41,15 @@ trees (`backend/product_tree`, with a `Keep` hook added) and `ntt::Transform` (w
   (G - Q q0)[k, K), q1 = h r mod x^(K - k): a forward of h and three `cyclic_product`s of length
   L = bit_ceil(K) (sources of at most L / 2 words), all in the output d (G, then q0 and r, then
   q1); with the tree's T_L(Q) (times 2^32, taken out in r's pass), 7 transforms of L.
-- Top tree to lanes: each top leaf's window (an inverse of its parent's product) into a row,
-  scaled by its u; the 8 rows transposed into the lanes layout, then one lanes forward: the lane
-  root's state at factor 1. (The transform-domain conversion was tried: notes/104-r1.md.)
+- Top tree to lanes (#136 r2): the 4 pairs' states (standard leaf forms at T) to the 8 leaves'
+  products in the lanes in one pass (`pairs_to_lanes`: per standard leaf the twist by rho_u^k, an
+  8-point transform to its 8 roots' values, the products with the siblings' lanes), then one
+  halving of the lanes at T: the lane root's state, factor 8 (no leaf products, inverses of T or
+  rows; before: each leaf's window into a row, rows_to_lanes and a lanes forward, notes/104-r1.md
+  and 136-r1.md). A lane node's two children's products come from one read of its state
+  (`pointwise_twice`); on x86 the halvings' combine is left to them (`kDeferredCombine`). At m8 =
+  2^25 the lanes' transforms of 16 L words pass ntt's 2^25 and run twisted (`lanes_forward_upper`
+  and the others: coefficient j of each lane times zeta^j, a transform of 8 L).
 - Base (lane nodes of at most kLaneBase = 16 slots): the window's coefficients (an inverse of
   the parent's product), the products of the base's nodes by schoolbook (`BaseProducts`, nodes
   split at the middle), then middle products down to single slots (`middle_lanes`: 64-bit sums
@@ -50,7 +61,8 @@ trees (`backend/product_tree`, with a `Keep` hook added) and `ntt::Transform` (w
   holding them in arrays GCC spills.
 - Interpolation: M = prod (x - a_i) from Q (M[j] = Q[m - j]); M'(a_i) by the descent from
   (rev(M') / Q mod x^m8); weights y_i / M'(a_i); then R = sum_i w_i Q / (1 - a_i x) up the tree,
-  R_v = R_l Q_r + R_r Q_l in the kept transforms (`pointwise_sums`; leaf products in the top),
+  R_v = R_l Q_r + R_r Q_l in the kept transforms (`pointwise_sums`; leaf products in the top;
+  the pairs' from the lanes' sums at T by `lane_pair_sums`, lane_pairs with sums for products),
   doubled to the parent's length as product_tree's nodes; f = rev_m(R). The lane tree runs the
   descent and the sums in one depth-first pass (`interpolate_lanes`); each base inverts its
   values once (`divide_slots`: prefix products in 4 interleaved chains, one vector power, lazy)
@@ -61,8 +73,10 @@ trees (`backend/product_tree`, with a `Keep` hook added) and `ntt::Transform` (w
   its left child's (W_v Q_r)[s_r, s_v) (the product with the right sibling's kept transform).
   C is padded to the power of two above when past 0.65 of it (lc-opt's choice), so every right
   child halves. The top tree's rightmost windows are prefixes of the root's (known coefficients):
-  those right children's states are forwards of them (factor 1), no halving, and the last lane's
-  row is the root window's first C words (lc-opt's).
+  those right children's states are forwards of them, no halving, scaled by 2 per level as the
+  halvings scale the others (lc-opt's path). The leaves: `pairs_to_lanes<L, true>` (right leaves
+  take the pair's values alone), then for C = L one halving of the lanes with a sign per lane
+  (`combine_alternating`), else the lanes' inverse and each lane's window (`lane_windows`).
 - Direct paths (`select.hpp`): Horner's rule (`horner`: blocks of 4 or 8 vectors of points as
   chains, f in parts for short blocks) when its cost n m kHorner is below the tree's estimate
   kFixed + kPerPoint m8 lg m8 + kPerCoefficient K lg K, fitted per target to a grid of n, m in
@@ -73,8 +87,8 @@ trees (`backend/product_tree`, with a `Keep` hook added) and `ntt::Transform` (w
   4 vectors of lanes (`newton_small`: division k in one lane, a lane shift per step, 16-64
   divisions per pass over the coefficients).
 - Memory: one region of ntt's per-thread memory (kept across calls) as a product_tree Stack:
-  the kept transforms (about 2 m8 words per lane level: 14.7 MB at m = 2^17), the top tree's
-  leaf rows (m8 words), the trees, the division's and passes' scratch. Sizes are computed up
+  the kept transforms (about 2 m8 words per lane level: 14.7 MB at m = 2^17; the top tree's
+  leaves 2 m8 words), the trees, the division's and passes' scratch. Sizes are computed up
   front (`tree_words`, `pass_words`, `division_words`); the tests run with exact sizes and fail
   on a spill to the heap.
 - evaluate splits f and the points into chunks of 2^24 (transforms stay within 2^25).

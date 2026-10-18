@@ -399,15 +399,15 @@ template <class L>
 // written) gets the standard leaf form of length T of q_j = p_2j p_(2j+1) 2^-32 (T / 8 leaves of
 // 8 words). The 8 roots of standard leaf u (x^8 - w_u) are lanes leaves 8u + i, at rho_u
 // z^bitrev3(i) (ntt's values form): pointwise products, an 8-point inverse transform, then c_k
-// rho_u^-k / 8 (untwist_factors). T a power of two >= 64; canonical in and out. copy (if not
-// null): copy[j] gets out[j]'s words too.
+// rho_u^-k / 8 (untwist_factors). T a power of two >= 64; canonical in and out. copy (u32* const*,
+// or none: std::nullptr_t, known at compile time): copy[j] gets out[j]'s words too.
 //
 // lane_pairs_by: the same with the pointwise step as pair(a, b), the vector (word on Scalar) of
 // lanes 2j, 2j + 1 combined (canonical): a and b are word offsets in the lanes transform of two
 // vectors whose even and odd words, by deinterleave(), are lanes 2j and 2j + 1 (Scalar: of the
 // words of lanes 2j and 2j + 1). lane_pairs takes their products; backend/evaluation also sums.
-template <class L, class Pair>
-void lane_pairs_by(std::size_t T, u32* const out[4], const u32* untwist, Pair pair, u32* const* copy = nullptr) {
+template <class L, class Pair, class Copy = std::nullptr_t>
+void lane_pairs_by(std::size_t T, u32* const out[4], const u32* untwist, Pair pair, Copy copy = nullptr) {
     using V = typename L::V;
     using M = Ops<L>;
     constexpr int W = L::lanes;
@@ -427,7 +427,7 @@ void lane_pairs_by(std::size_t T, u32* const out[4], const u32* untwist, Pair pa
     const auto put = [&](std::size_t j, std::size_t u, int half, V c) {
         if (!out[j]) return;
         L::store(out[j] + 8 * u + half, c);
-        if (copy) L::store(copy[j] + 8 * u + half, c);
+        if constexpr (!std::is_same_v<Copy, std::nullptr_t>) L::store(copy[j] + 8 * u + half, c);
     };
     if constexpr (W == 8) {
         // Two leaves u, u + 1 per step; lane 4h + 2b + a of a vector: pair 2h + a of leaf u + b.
@@ -470,8 +470,8 @@ void lane_pairs_by(std::size_t T, u32* const out[4], const u32* untwist, Pair pa
     }
 }
 
-template <class L>
-void lane_pairs(const u32* lanes, std::size_t T, u32* const out[4], const u32* untwist, u32* const* copy = nullptr) {
+template <class L, class Copy = std::nullptr_t>
+void lane_pairs(const u32* lanes, std::size_t T, u32* const out[4], const u32* untwist, Copy copy = nullptr) {
     const auto pair = [lanes] [[gnu::always_inline]] (std::size_t a, std::size_t b) {
         if constexpr (L::lanes == 1) {
             return montgomery_canonical<L>(lanes[a], lanes[b]);
