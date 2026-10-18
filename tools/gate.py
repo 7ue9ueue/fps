@@ -67,8 +67,8 @@ from pathlib import Path
 from kernel import COMPAT, TARGETS
 from vm import ROOT as ROOT_ON_VM, rev_tar, ship, slug, ssh
 
-TEST_TIMEOUT = 2 * 60 * 60  # seconds for one machine's tests: a shared-file change rebuilds every
-# unit with ASan/UBSan, over 60 min on lc-zen5-test's 4 vCPUs (PR 203)
+TEST_TIMEOUT = 3 * 60 * 60  # seconds for one machine's tests: a change to ntt or a shared file
+# rebuilds every unit with ASan/UBSan; on lc-zen5-test's 4 vCPUs that took over 2 h (PR 244)
 POLL = 30  # seconds between looks at a VM's detached tests
 MERGE_LOCK_WAIT = 30 * 60  # seconds to wait for the merge lock
 NETWORK_TIMEOUT = 300  # seconds for one git or gh call
