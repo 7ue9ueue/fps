@@ -314,6 +314,11 @@ issue #152, below). A candidate on both targets; on zen5 also `Native` (the leaf
   (notes/152-r2.md): the scaled inverse top groups (`inverse_group_scaled`, 0.88-0.95) and first
   levels from other memory with inputs < 2P (`forward_from`, 0.87-0.98); single groups run
   through the level functions (`kShareGroups`), so each asm loop is inlined once in the hot code.
+  Round 3 (notes/152-r3.md): Zen 5 runs `vpshufd` and `vpblendmd` (also from an embedded
+  broadcast) on any of its four pipes, lane-crossing ops on the permutes' pair. So the leaf
+  products' odd windows are `vpshufd` of the even ones, and the two-word broadcasts (B, pair
+  twiddles) blends instead of masked broadcasts. Product bottoms run 0.86 of WideBottom's time
+  (0.90), squares 0.78 (0.82), and the forward bottom level of 4 pairs 0.725 (0.757).
 - Zen 5 cares about code size: its op cache holds about 5.9K instructions, and past it a thread
   decodes about 3 per cycle (16-20 bytes; probe in notes/152-r2.md), where the kernels run 4-5. A
   product at 2^12-2^16 runs 5.6-5.7K distinct instructions per call (2^14: 6.8K before the

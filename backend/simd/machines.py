@@ -132,14 +132,22 @@ ZEN5 = Machine(
         ('vpermt2d', 256): (4, 0.5, 'FP1 FP2'),
         **{(m, 512): (5, 0.5, 'FP0 FP1') for m in ('vpermd', 'vpermt2d', 'vpermi2d')},
         ('vpbroadcastd{k}', 512): (5, 0.5, 'FP0 FP1'),  # merge-masked from m32: the merge uop
-        ('vinserti64x4', 512): (2, 0.25, 'FP0 FP1 FP2 FP3'),  # from m256: mixes with vpaddd at 0.25
+        # From m256: with vpaddd 0.25 (bound by the 2 loads per cycle), with vpermd 0.5, with vpsrlq or
+        # vpmuludq 0.34 (x152/probe2.cpp): a permute.
+        ('vinserti64x4', 512): (2, 0.5, 'FP0 FP1'),
+        # In-lane shuffles on any pipe, lane-crossing ones in the permutes' class (issue #152 round 3,
+        # x152/probe2.cpp: vpshufd + vpermd, + vpmuludq, + vpsrlq 0.25; vpalignr, valignq and
+        # vshufi64x2 with vpermd 0.5, with vpmuludq or vpsrlq 0.34).
+        **{(m, 512): (2, 0.25, 'FP0 FP1 FP2 FP3') for m in ('vpshufd', 'vpunpcklqdq', 'vshufps')},
+        ('vpalignr', 512): (2, 0.5, 'FP0 FP1'),
+        **{(m, 512): (5, 0.5, 'FP0 FP1') for m in ('valignq', 'vshufi64x2')},
         ('vmovdqu64 load', 512): (7, 0.5, 'load'),
         ('vmovdqu64 load split', 512): (7, 1.0, 'load'),  # across a cache line
         ('vpbroadcastd m32', 512): (7, 0.5, 'load'),
         ('vmovdqu64 store', 512): (1, 1.0, 'store'),
         ('vmovdqu32 store{k}', 512): (1, 1.0, 'store'),
     }),
-    guess=(('vpshufb', 256), ('vpermd', 256), ('vpermt2d', 256), ('vinserti64x4', 512), ('vpbroadcastd{k}', 512)),
+    guess=(('vpshufb', 256), ('vpermd', 256), ('vpermt2d', 256), ('vpbroadcastd{k}', 512)),
     notes='vpmulld costs the same as vpmuludq here (unlike Intel). IFMA shares the multiply pipes.',
 )
 
