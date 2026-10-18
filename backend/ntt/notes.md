@@ -92,6 +92,12 @@ Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_produc
   s of f(3y), g(3y) mod (y^s - 1), so mod x^s - 3^s) and a product of the top words of f and g,
   planned again. Middle products run the transpose. The plan per main length and sixteenth of r /
   L is a tuned choice ("ntt.ragged", `tune.hpp`); `Convolution` and `Transform` stay powers of two.
+  A third plan, the truncated transform of 2L (`truncated.hpp`; notes/155-r2.md): the variants'
+  group products on the nodes of the leaf form's first N words (rounded up to nodes of 128),
+  generic levels above them. Middle products (notes/155-r3.md): f's N words read, extended by its
+  words past the cut chosen so that it vanishes on the nodes past it, so the cyclic product with g
+  comes from the cut's nodes alone (an inverse pruned to them writes words [m - 1, N)); their plan is
+  the table's second half.
 - `Transform`: tables built once; forward and inverse in place on caller arrays (32-byte aligned,
   16 words of padding: the AVX2 forward kernels read 4 bytes past their last vector).
 - `Transform`'s leaf-form ops (issue #49), for `fps::Values` and the product tree. Each variant

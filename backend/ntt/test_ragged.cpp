@@ -1,8 +1,8 @@
 // Tests for backend/ntt: products of ragged length (issue #155, ragged.hpp). multiply, square and
-// middle_product by every plan of each length (the plain product and the splits) and by the chosen
-// one, against schoolbook multiplication to a few thousand words and against the plain product
-// (checked by evaluation) past it: balanced, unbalanced and cut shapes, inputs at P - 1, out
-// overlapping the factors, every variant.
+// middle_product by every plan of each length (the plain product, the splits, the truncated one)
+// and by the chosen one, against schoolbook multiplication to a few thousand words and against the
+// plain product (checked by evaluation) past it: balanced, unbalanced and cut shapes, inputs at P -
+// 1, out overlapping the factors, every variant.
 #include "backend/ntt/test_util.hpp"
 
 namespace {
@@ -55,7 +55,7 @@ std::vector<u32> run_middle(const std::vector<u32>& f, const std::vector<u32>& g
     if (!p.split) {
         std::vector<detail::Line> work(detail::middle_words(m, count, p) / 16 + 1);
         std::vector<u32> c(count);
-        const auto [roots, inverse_roots] = detail::tables<V>(p.lg);
+        const auto [roots, inverse_roots] = detail::tables<V>(detail::table_log(p));
         detail::middle_into<V>(fw.begin(), n, gw.begin(), m, c.data(), count, work.data()->words, p, roots, inverse_roots);
         expect(std::equal(c.begin(), c.end(), out.begin()), "middle_into", n);
     }
@@ -70,9 +70,8 @@ void check_middle(const char* name, const std::vector<u32>& f, const std::vector
     const std::size_t m = g.size(), n = m - 1 + count;
     std::array<detail::ragged::Plan, detail::ragged::kKinds> plans;
     const int options = detail::ragged::options(n, plans);
-    for (int i = 0; i < options; ++i)
-        if (!plans[i].truncated)  // products only
-            expect(run_middle<V>(f, g, count, plans[i], offset) == want, name, ((n * 1000000 + m) * 10 + i) * 10 + 2);
+    for (int i = 0; i < options; ++i)  // the truncated plan too (round 3)
+        expect(run_middle<V>(f, g, count, plans[i], offset) == want, name, ((n * 1000000 + m) * 10 + i) * 10 + 2);
     std::vector<u32> chosen(count);
     middle_product<V>(std::span(f).first(n), g, chosen);
     expect(chosen == want, name, (n * 1000000 + m) * 100 + 3);
