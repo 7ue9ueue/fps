@@ -43,7 +43,7 @@ Run from the checkout's root. Each script's `--help` has the details.
 
 | Tool | Runs on | What it does |
 |---|---|---|
-| `tools/vm.py <vm> [--base REV] '<cmd>'` | Mac | Copies your working tree (uncommitted changes too) to the VM and runs the command there, detached: a dropped connection resumes the output, a run killed on the VM is not restarted, Ctrl-C stops it there. A second command to the same folder waits for the first; give it `--name` to run beside it. `--base` copies REV as well, as `$BASE`. |
+| `tools/vm.py <vm> [--base REV] '<cmd>'` | Mac | Copies your working tree (uncommitted changes too) to the VM and runs the command there, detached: a dropped connection resumes the output, a run killed on the VM is not restarted, Ctrl-C stops it there. A second command to the same folder waits for the first; give it `--name` to run beside it. `--base` copies REV as well, as `$BASE`. Plain ssh to aliases it keeps (Machines). |
 | `tools/kernel.py test <unit>... --target <t>` | Mac, VM | Builds every `test*.cpp` of the units at -O2 and under ASan/UBSan, all cores at once (`-j`), and runs each once built. A unit is a kernel name or `frontend`. `--base DIR` (the gate uses it) skips a test whose preprocessed text equals that checkout's. |
 | `tools/kernel.py bench <unit> [--base DIR]` | timing VM | Times each `bench*.cpp` (one binary each); with `--base`, old and new in the same run, as paired ratios (below 1 is faster). Holds the bench lock. |
 | `tools/kernel.py check` | anywhere | Generators and tuned tables match what is committed. |
@@ -85,7 +85,11 @@ keep exploration files in `~/explore/hpc_library/` and copy them back to the Mac
 Each VM powers itself off after 30 minutes idle (no SSH connection, no live `vm.py` run, no
 container, load under 0.5; `tools/idle_shutdown.sh`, installed on every VM and on any new one);
 `vm.py`, `gate.py` and `tune.py` start a stopped VM
-(and wait for one already starting) before they connect. More capacity:
+(and wait for one already starting) when a connection to it fails. They connect with plain `ssh -F
+~/.cache/hpc_library/vm_ssh_config` (no Compute API call; `~/.ssh/config` is not used), to aliases
+written from one `gcloud compute instances list` and rewritten when a connection fails, since a VM
+gets a new external IP at each start; `python3 tools/vm.py --refresh` rewrites them by hand, and
+`FPS_VM_SSH=gcloud` goes back to `gcloud compute ssh`. More capacity:
 create `lc-<purpose>` in the same project and region, and add it to lc-opt's machine table.
 
 ## How work flows
