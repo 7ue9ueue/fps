@@ -437,7 +437,7 @@ struct scalar {
         const std::size_t len = std::size_t(1) << lg;
         hook(f, std::size_t(0), len / 8);
         detail::scalar::inverse_unscaled(f, lg, inverse_roots);
-        detail::scalar::scale(f, len, detail::product_scale(lg));  // the leaves carry 2^-32
+        detail::scalar::scale(f, len, detail::hooked_scale(lg, output & detail::kJoined));  // the leaves carry 2^-32 (2^-29)
         const std::uint32_t* from = f + (output & detail::kUpperHalf ? len / 2 : 0);
         for (std::size_t i = 0; i < count; ++i) out[i] = output & detail::kNegated ? detail::scalar::sub(0, from[i]) : from[i];
     }

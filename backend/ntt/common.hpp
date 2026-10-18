@@ -103,19 +103,22 @@ inline std::size_t copy_static_table(std::uint32_t* t, std::size_t count, bool i
 // nv^-1 mod P for nv = 2^lg / 8 leaves, the gain of a forward and an inverse transform; and
 // nv^-1 2^32 mod P, which also undoes the Montgomery factor 2^-32 of the AVX2 leaf products; and
 // 2^-lg mod P, the inverse's scale from the values form (its join leaves the 8-point transform's
-// gain 8 in). Tables: a modular power costs about 100 ns per call.
+// gain 8 in); and 2^(32 - lg) mod P, for Montgomery products of values forms joined (Transform::
+// inverse_product with Form::values). Tables: a modular power costs about 100 ns per call.
 inline constexpr auto kLeafScales = [] {
-    std::array<std::array<std::uint32_t, kMaxLog + 1>, 3> t{};
+    std::array<std::array<std::uint32_t, kMaxLog + 1>, 4> t{};
     for (int lg = kMinLog; lg <= kMaxLog; ++lg) {
         t[0][lg] = power(std::uint32_t(1) << (lg - 3), kP - 2);
         t[1][lg] = multiply_mod(t[0][lg], kR);
         t[2][lg] = multiply_mod(t[0][lg], power(8, kP - 2));
+        t[3][lg] = multiply_mod(t[2][lg], kR);
     }
     return t;
 }();
 constexpr std::uint32_t leaf_scale(int lg) { return kLeafScales[0][lg]; }
 constexpr std::uint32_t product_scale(int lg) { return kLeafScales[1][lg]; }
 constexpr std::uint32_t values_scale(int lg) { return kLeafScales[2][lg]; }
+constexpr std::uint32_t values_product_scale(int lg) { return kLeafScales[3][lg]; }
 
 // Radix-4 levels run on groups of 4 quarters. nv = 4^j leaves start with one group; nv = 2 * 4^j
 // start with a radix-2 level and two groups.
@@ -213,8 +216,17 @@ struct Toeplitz {
     const std::uint32_t *b0, *b1;
 };
 // The output of the fused ops: bits of `output`. kUpperHalf: coefficients from 2^lg / 2 on (the
-// count words written are those of the upper half); kNegated: their negatives.
-inline constexpr unsigned kUpperHalf = 1, kNegated = 2;
+// count words written are those of the upper half); kNegated: their negatives. kJoined (hooked
+// inverses): the leaves the hook writes carry a join's gain 8 too (values form, issue #251), so
+// the top level scales by values_product_scale, not product_scale.
+inline constexpr unsigned kUpperHalf = 1, kNegated = 2, kJoined = 4;
+
+// The scale of a hooked inverse's top level (leaves times 2^-32, or 2^-29 if kJoined), negated
+// for kNegated.
+constexpr std::uint32_t hooked_scale(int lg, unsigned output) {
+    const std::uint32_t s = output & kJoined ? values_product_scale(lg) : product_scale(lg);
+    return output & kNegated ? kP - s : s;
+}
 
 // f(std::integral_constant<int, t>{}) for t in [0, K]: a block count known at run time as a
 // template argument.

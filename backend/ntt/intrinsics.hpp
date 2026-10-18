@@ -1910,6 +1910,40 @@ struct ValuesOf<S> {
 template <class S>
 using ValuesFor = typename ValuesOf<S>::type;
 
+// Sums of products of values forms (Transform::inverse_product with Form::values, issue #251):
+// out[i] = the sum over the n terms of a[at + i] b[at + i] 2^-32 mod P (a[at + i] 2^-32 for a
+// term with b null), canonical, for i < words (a multiple of S::lanes); one Montgomery product a
+// term, the sums lazy below 2P.
+template <class S>
+struct ValuesTerms {
+    using V = typename S::V;
+    using M = modarith::Ops<S, kP>;
+
+    [[gnu::always_inline]] static V term(const LeafTerm& t, std::size_t i) {
+        return M::montgomery(S::load(t.a + i), t.b ? S::load(t.b + i) : S::broadcast(1));
+    }
+    template <int N>
+    static void sum(const LeafTerm* terms, std::size_t at, std::size_t words, u32* out) {
+        for (std::size_t i = 0; i < words; i += S::lanes) {
+            V acc = term(terms[0], at + i);
+            for (int j = 1; j < N; ++j) acc = M::template reduce<2 * kP>(S::add(acc, term(terms[j], at + i)));
+            S::store(out + i, M::template reduce<kP>(acc));
+        }
+    }
+    static void sum(const LeafTerm* terms, int n, std::size_t at, std::size_t words, u32* out) {
+        switch (n) {
+            case 1: return sum<1>(terms, at, words, out);
+            case 2: return sum<2>(terms, at, words, out);
+            case 3: return sum<3>(terms, at, words, out);
+            case 4: return sum<4>(terms, at, words, out);
+            case 5: return sum<5>(terms, at, words, out);
+            case 6: return sum<6>(terms, at, words, out);
+            case 7: return sum<7>(terms, at, words, out);
+            default: return sum<8>(terms, at, words, out);
+        }
+    }
+};
+
 template <class S>
 struct Ntt : Butterflies<S> {
     using N = typename Narrow<S>::type;
@@ -2971,11 +3005,11 @@ struct Ntt : Butterflies<S> {
         sub(std::integral_constant<int, 2>{}, f + half, f + half, nv / 2, 1);
     }
 
-    // product_top_out (no scale folded) with the columns (j & width) != 0 unwritten.
+    // product_top_out (no scale folded) with the columns (j & width) != 0 unwritten; values_product_scale
+    // for kJoined.
     static void product_top_out_pruned(u32* f, u32* out, std::size_t count, int lg, const u32* ir, unsigned output,
                                        std::size_t width) {
-        const u32 scale = product_scale(lg);
-        top_out_pruned(f, out, count, lg, ir, output & kNegated ? kP - scale : scale, output, width);
+        top_out_pruned(f, out, count, lg, ir, hooked_scale(lg, output), output, width);
     }
     // The same times s (not 0).
     static void top_out_pruned(u32* f, u32* out, std::size_t count, int lg, const u32* ir, u32 s, unsigned output,

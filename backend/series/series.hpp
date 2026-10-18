@@ -33,7 +33,9 @@
 //   x^(jk), (f Q)[jk, (j+1)k) = sum over i < j of (W_(j-i) q_i)[k, 2k), W_t = f[(t-1)k, (t+1)k),
 //   as one inverse of a sum of leaf products of kept transforms of length 2k; for 4 blocks, blocks
 //   2 and 3 share lc-opt's Toeplitz product (ntt::Transform::toeplitz_product: 4 leaf products, not
-//   5). About 11.5 T(n) + 5.5 LP(n). h and log's q_j are transformed in place.
+//   5). About 11.5 T(n) + 5.5 LP(n). h and log's q_j are transformed in place. With 5 blocks, and
+//   4 on Zen 5 for k = 2^11 .. 2^18 (values_division), the kept transforms are in ntt's values
+//   form, so a residual's terms cost a Montgomery product per word each (issue #251).
 // - exp: m -> 2m keeping h = 1 / g mod x^(m/2) and H = T_m(h), q = x f' (lc-opt's step, notes.md);
 //   8 transforms and 3.5 leaf products of 2m a step. The last step, to n <= 2m, runs at length m
 //   in two blocks of m/2 (lc-opt's exp_last_step): 14 transforms and 7 leaf products of m.
@@ -50,10 +52,11 @@
 // 2L (ns per coefficient at 2^20 + 1, 1.25 and 1.5 2^20 and 6e5 within 0.90-1.14 of 2^21's on Zen
 // 3, Emerald Rapids, Zen 5 and Neoverse V2, against 1.12-1.70 before; 1.06-1.14 at 1.75 2^20:
 // notes/214-r1.md, notes/214-r2.md):
-// - inverse, r <= 5L/32 (L/4 on Zen 5 and below 2^14): Newton steps whose lengths halve down from
-//   n, so they land on it; a step to n' = L' + r' runs at length L' with two products of r' words
-//   (the corners) besides (inverse_ragged_step). To r = L/2: the blocked division with N = 1
-//   (inverse_blocks: 5 blocks of L/4, or 3 of L/2). Past L/2, Newton's steps.
+// - inverse, r <= 4L/32 (5L/32 on Neoverse V2; more below L = 256 and on Zen 5 from 2^21:
+//   chain_up_to): Newton steps whose lengths halve down from n, so they land on it; a step to n' =
+//   L' + r' runs at length L' with two products of r' words (the corners) besides
+//   (inverse_ragged_step). To r = L/2: the blocked division with N = 1 (inverse_blocks: 5 blocks of
+//   L/4, in the values form, or 3 of L/2). Past L/2, Newton's steps.
 // - exp, sqrt, the division's last block (log, pow): a last step or block of c coefficients runs
 //   its products of c words as low products (about the cost of 2c words, NTT products of ragged
 //   length) to 9m/32, its windows by sums of products (window()) to kDirectWindow, and the step
@@ -64,8 +67,9 @@
 //
 // Memory: this thread's region of the NTT (ntt::detail::take_region, kept across calls), or the
 // caller's scratch: with N = bit_ceil(n), 2 N words for inverse (the chain: 3 L words and its
-// corners'; B blocks of k: 2B - 1 arrays of 2k words and k more, 4.75 or 5.5 L), about n + 2 B (n
-// / 2 + 80) for log (B <= 5 blocks), n + 5.5 N for exp, n + 7 N for pow and n + 2.25 N for sqrt.
+// corners'; B blocks of k: 2B - 1 arrays of 2k words, one more in the values form, and k more,
+// 5.25 or 5.5 L), about n + 2 B (n / 2 + 80) for log (B <= 5 blocks), n + 5.5 N for exp, n + 7 N for
+// pow and n + 2.25 N for sqrt.
 // The transforms' tables: one ntt::Transform per length, kept per thread, 2^lg bytes each.
 #pragma once
 
@@ -616,21 +620,44 @@ inline void inverse_chain(Span f, Out g, const ChainArrays& a) {
 
 // ---- The blocked division (log, pow) ----------------------------------------------------------
 
+// Whether a division whose blocks by transforms (all but a direct last block, below) number t, of
+// k coefficients, keeps W_t and Q_i in ntt's values form (issue #251): a residual of j terms is then
+// one Montgomery product per word and term, summed and joined in the inverse (Transform::
+// inverse_product with Form::values), not j leaf products, for a split in each forward of W and Q
+// and a join in each residual's inverse; products by h stay leaf products (H in the leaf form).
+// Measured (notes/251-r1.md): t = 5 (10 products in the residuals) gains on every target, log and
+// pow at 1.25 2^14 .. 2^21 0.91-0.98 of the leaf form's time on Zen 5, 0.98-0.997 on Zen 3 and
+// Neoverse V2; t = 4 on Zen 5 for k = 2^11 .. 2^18, log at 2^13 .. 2^20 0.96-0.98 (at k = 2^19 1.006,
+// the leaf form's Toeplitz sharing as fast; at k = 2^8 .. 2^10 1.004-1.02), elsewhere 1.01-1.04;
+// t = 3 1.00-1.05 everywhere. -DFPS_SERIES_VALUES=<mask> forces bit t of mask for every k.
+inline constexpr std::size_t kValues4MinK = std::size_t(1) << 11, kValues4MaxK = std::size_t(1) << 18;  // Zen 5
+constexpr bool values_division(std::size_t t, std::size_t k) {
+#ifdef FPS_SERIES_VALUES
+    return (FPS_SERIES_VALUES) >> t & 1;
+#else
+    return t == 5 || (t == 4 && tune::kTarget == tune::Target::zen5 && k >= kValues4MinK && k <= kValues4MaxK);
+#endif
+}
+
 // q = N / f mod x^count in blocks of k coefficients, k a power of two >= 32: blocks = 2 .. 4 for
 // count >= 64 (lc-opt's), or 5 blocks of half that k where they cover count (issue #214: count in
-// (4k, 5k], e.g. 2^j + 1 or 1.25 2^j, where 3 blocks of 2k would leave a short one).
+// (4k, 5k], e.g. 2^j + 1 or 1.25 2^j, where 3 blocks of 2k would leave a short one). values: the
+// kept transforms' form (values_division; a caller may keep the leaf form).
 struct DivisionShape {
     std::size_t k, blocks;
+    bool values;
     explicit DivisionShape(std::size_t count) {
         k = std::max<std::size_t>(32, std::bit_ceil((count + kLogBlocks - 1) / kLogBlocks));
         blocks = (count - 1) / k + 1;
         if (blocks == 3 && k >= 64 && count <= 5 * (k / 2)) k /= 2, blocks = 5;
+        values = values_division(blocks - (count - (blocks - 1) * k <= kDirectWindow), k);  // as last_block()
     }
 };
 
 // The division's arrays: H = T(h), W_1 .. W_(blocks-1), the blocks' transforms Q_0 .. Q_(blocks-2)
-// (2k words each), R (k words: log's last block), work (2k), hc (h mod x^c for a last block of c
-// words that is not full, below). W_1 is followed by another array of 2k words (W_2 or Q_0).
+// (2k words each; W and Q in the shape's form, H in the leaf form), R (k words: log's last block,
+// every block in the values form), work (2k), hc (h mod x^c for a last block of c words that is not
+// full, below). W_1 is followed by another array of 2k words (W_2 or Q_0).
 struct DivisionArrays {
     u32* H;
     std::array<u32*, kMaxBlocks> W, Q;
@@ -659,29 +686,34 @@ inline std::size_t division_words(const DivisionShape& s) {
 //   (f Q)[jk, (j+1)k) = sum over i < j of (W_(j-i) q_i)[k, 2k),  W_t = f[(t-1)k, (t+1)k),
 // the sum as one inverse of leaf products of kept transforms (its upper half is exact).
 // numerator(first, c, s, out): out[i] = N[first + i] - s[i] (s null: N alone), i < c, out may
-// be s. place(j): where block j's residual and q_j go (k words; a.Q[j]: its transform then runs in
-// place). done(j, first, c): q_j is at place(j); after it returns, its transform goes to a.Q[j] if
-// j + 1 < blocks. prefix(first): q mod x^first, for a direct last block. h and its transform in H
-// (in place). For 4 blocks, lc-opt's Toeplitz sharing: block 2's residual and W_3 = W_3 Q_0 + W_2
-// Q_1 by one toeplitz_product (3 leaf products), block 3's from W_3 and W_1 Q_2. (3 + 5B)
-// transforms and 2 + B + B(B - 1)/2 leaf products of 2k for B blocks, one fewer for B = 4; a short
-// last block as last_block() says.
+// be s. place(j): where block j's residual and q_j go (k words; a.Q[j], leaf form only: its
+// transform then runs in place). done(j, first, c): q_j is at place(j); after it returns, its
+// transform goes to a.Q[j] if j + 1 < blocks. prefix(first): q mod x^first, for a direct last
+// block. h and its transform in H (in place). For 4 blocks in the leaf form, lc-opt's Toeplitz
+// sharing: block 2's residual and W_3 = W_3 Q_0 + W_2 Q_1 by one toeplitz_product (3 leaf
+// products), block 3's from W_3 and W_1 Q_2. (3 + 5B) transforms and 2 + B + B(B - 1)/2 leaf
+// products of 2k for B blocks, one fewer for B = 4; a short last block as last_block() says. In the
+// values form (shape.values): the B(B - 1)/2 leaf products of the residuals are Montgomery products
+// of values, for a split in each forward of W and Q and a join in each residual's inverse.
 // kOne: N = 1, so q = 1 / f mod x^count (inverse_blocks, issue #214 r2): q_0 = h is written at
-// place(0) (h_c is read there, a.hc unused) and Q_0 = T(h) is H (a.Q[0] == a.H); the blocks from 1
-// on have N = 0 there, so their product by h is negated (no numerator pass), and a last block that is
-// not full puts its residual in R (H is one of its terms). The temporaries of h: W_1 and work.
+// place(0) (h_c is read there, a.hc unused) and Q_0 = T(h) is H (a.Q[0] == a.H; in the values form
+// its own array, from H by a split pass); the blocks from 1 on have N = 0 there, so their product by
+// h is negated (no numerator pass), and a last block that is not full puts its residual in R (H is
+// one of its terms). The temporaries of h: W_1 and work.
 template <bool kOne = false, class Numerator, class Place, class Done, class Prefix>
 void divide(Span f, std::size_t count, const DivisionShape& shape, const DivisionArrays& a, const Numerator& numerator,
             const Place& place, const Done& done, const Prefix& prefix) {
     const std::size_t k = shape.k, len = 2 * k, blocks = shape.blocks, c_last = count - (blocks - 1) * k;
     const LastBlock last = last_block(shape, count);
-    const bool direct = last == LastBlock::direct, toeplitz = blocks - direct == 4;  // 4 blocks by transforms
+    const ntt::Form form = shape.values ? ntt::Form::values : ntt::Form::leaves;  // of W and Q
+    const bool direct = last == LastBlock::direct, toeplitz = !shape.values && blocks - direct == 4;  // 4 blocks by transforms
     const ntt::Transform& t = transform(std::countr_zero(len));
     const u32* hc = a.hc;
     if constexpr (kOne) {
         u32* const h = place(0);
         inverse_newton(f.first(std::min(f.size(), k)), Out(h, k), a.W[1], a.work);  // h = 1 / f mod x^k
         t.forward(Span(h, k), a.H);
+        if (shape.values) t.to_values(a.H, a.Q[0]);
         hc = h;
     } else {
         inverse_newton(f.first(std::min(f.size(), k)), Out(a.H, k), a.W[1], a.Q[0]);  // h = 1 / f mod x^k
@@ -690,7 +722,7 @@ void divide(Span f, std::size_t count, const DivisionShape& shape, const Divisio
     }
     for (std::size_t j = 1; j < (direct ? blocks - 1 : blocks); ++j) {  // W_j = T(f[(j-1)k, (j+1)k))
         const std::size_t lo = std::min(f.size(), (j - 1) * k), hi = std::min(f.size(), (j + 1) * k);
-        t.forward(f.subspan(lo, hi - lo), a.W[j]);
+        t.forward(f.subspan(lo, hi - lo), a.W[j], form);
     }
     for (std::size_t j = kOne ? 1 : 0; j < blocks; ++j) {
         const std::size_t first = j * k, c = std::min(k, count - first);
@@ -711,7 +743,7 @@ void divide(Span f, std::size_t count, const DivisionShape& shape, const Divisio
             } else {
                 std::array<ntt::Term, kMaxBlocks - 1> terms{};
                 for (std::size_t i = 0; i < j; ++i) terms[i] = {a.W[j - i], a.Q[i]};
-                t.inverse_product(std::span<const ntt::Term>(terms.data(), j), a.work, r, {.offset = k});
+                t.inverse_product(std::span<const ntt::Term>(terms.data(), j), a.work, r, {.offset = k}, form);
             }
             if constexpr (!kOne) numerator(first, c, res, res);
         }
@@ -722,16 +754,17 @@ void divide(Span f, std::size_t count, const DivisionShape& shape, const Divisio
             t.cyclic_product(r, a.H, a.work, r, {.negate = kOne});
         }
         done(j, first, c);
-        if (j + 1 < blocks && !(direct && j + 2 == blocks)) t.forward(Span(p, k), a.Q[j]);
+        if (j + 1 < blocks && !(direct && j + 2 == blocks)) t.forward(Span(p, k), a.Q[j], form);
     }
 }
 
 // ---- inverse by blocks (issue #214 r2) ----------------------------------------------------------
 
-// The arrays of inverse_blocks: H (= Q_0), W_1 .. W_(B-1), Q_1 .. Q_(B-2), work (2k words each), R (k).
+// The arrays of inverse_blocks: H (= Q_0 in the leaf form), W_1 .. W_(B-1), Q_1 .. Q_(B-2), work
+// (2k words each), Q_0 in the values form, R (k).
 inline std::size_t inverse_block_words(std::size_t n) {
     const DivisionShape s(n);
-    return (2 * s.blocks - 1) * footprint(2 * s.k) + footprint(s.k);
+    return (2 * s.blocks - 1 + s.values) * footprint(2 * s.k) + footprint(s.k);
 }
 
 // g = 1 / f mod x^n by the blocked division with N = 1 (divide<true>), n = g.size() > 64, f mod x^n
@@ -750,6 +783,7 @@ inline void inverse_blocks(Span f, Out g, Arena arena) {
     a.Q[0] = a.H;
     for (std::size_t t = 1; t + 1 < blocks; ++t) a.Q[t] = arena.take(len);
     a.work = arena.take(len);
+    if (shape.values) a.Q[0] = arena.take(len);
     a.R = arena.take(k);
     u32* const x = g.data();
     divide<true>(
@@ -760,13 +794,20 @@ inline void inverse_blocks(Span f, Out g, Arena arena) {
 // How inverse runs at n = L + r, L = bit_floor(n) (issue #214): Newton's steps for r = 0 and past
 // kBlocksUpTo (4 blocks of L/2 cost about the step at 2L there, more on Zen 5); the ragged chain to
 // chain_up_to(L) (its corners, products of r words, are small); blocks between: 5 of L/4 to L/4, 3
-// of L/2 to L/2. In 32nds of L, measured (notes/214-r2.md): 5 blocks have 2 transforms fewer and 2
-// leaf products more than the chain's steps at r = L/4, which Zen 5's leaf products (about a
-// transform's cost there) do not repay, nor below 2^14 Emerald Rapids' and Neoverse V2's.
+// of L/2 to L/2. In 32nds of L, measured (notes/214-r2.md, notes/251-r1.md): 5 blocks have 2
+// transforms fewer and 2 leaf products more than the chain's steps at r = L/4; with their residuals
+// in the values form (issue #251) they beat the chain from r = 5L/32 on Zen 3, Emerald Rapids and
+// Zen 5 at L = 2^8 .. 2^20 (0.94-0.99 of its time there; at 4L/32 the chain is 5-10% faster), from
+// 6L/32 on Neoverse V2; at L = 128 from 7L/32 on Zen 5 and Neoverse V2. Below 128 as before. On Zen
+// 5 from L = 2^21 the blocks' arrays (10 of 2^20 words, 40 MiB) pass its L3: the chain to L/4
+// (blocks 1.06-1.12 of its time at 2^21 (1 + i/32), i = 5 .. 8).
 enum class InverseMethod { direct, newton, chain, blocks };
 inline constexpr std::size_t kBlocksUpTo = 16;
 constexpr std::size_t chain_up_to(std::size_t L) {
-    return tune::kTarget == tune::Target::zen5 || L < (std::size_t(1) << 14) ? 8 : 5;
+    if (L < 128) return 8;
+    if (L < 256) return 6;
+    if constexpr (tune::kTarget == tune::Target::zen5) return L < (std::size_t(1) << 21) ? 4 : 8;
+    return tune::kTarget == tune::Target::arm ? 5 : 4;
 }
 inline InverseMethod inverse_method(std::size_t n) {
     if (n <= kInverseBase) return InverseMethod::direct;
@@ -819,9 +860,9 @@ inline void log_newton(Span f, Out g, Arena arena) {
     divide(
         f, n - 1, shape, a,
         [f](std::size_t first, std::size_t c, const u32* s, u32* out) { index_block(f, first + 1, 1, c, s, out); },
-        [&a, blocks](std::size_t j) { return j + 1 < blocks ? a.Q[j] : a.R; },
+        [&a, blocks, values = shape.values](std::size_t j) { return j + 1 < blocks && !values ? a.Q[j] : a.R; },
         [&](std::size_t j, std::size_t first, std::size_t c) {
-            const u32* q = j + 1 < blocks ? a.Q[j] : a.R;
+            const u32* q = j + 1 < blocks && !shape.values ? a.Q[j] : a.R;
             divide_by_index(first + 1, g.data() + first + 1, c, [&](std::size_t i) { return load_part(q, i, c); });
         },
         [&](std::size_t first) {
@@ -1054,8 +1095,11 @@ inline void add_lower_sub_upper(u32* a, const u32* b, std::size_t len) {
 // g = c (f / f[0])^e mod x^n, n = g.size() > kExpBase, f mod x^n given, f[0] != 0. f is read first.
 inline void pow_newton(Span f, u32 e, u32 c, Out g, Arena arena) {
     const std::size_t n = g.size();
-    const DivisionShape shape(n);
+    DivisionShape shape(n);
     const std::size_t k = shape.k, len = 2 * k, blocks = shape.blocks;  // 3 or 4 blocks with 2k = bit_ceil(n) / 2, or 5
+    // The kept transforms are exp's last step's when 2k = m (not for 5 blocks): in the leaf form.
+    const bool given = 2 * len == std::bit_ceil(n);
+    if (given) shape.values = false;
     u32* const q = arena.take(n);
     DivisionArrays a{};
     for (std::size_t t = 0; t + 1 < blocks; ++t) a.Q[t] = arena.take(len);
@@ -1073,7 +1117,7 @@ inline void pow_newton(Span f, u32 e, u32 c, Out g, Arena arena) {
     // f is not read from here on. The kept transforms are exp's last step's when 2k = m (not for 5
     // blocks); a direct last block has no transform of the block before it: T(q_1) for 3 blocks
     // (exp's last step is then direct too, c <= kDirectWindow), T(q_2) for 4.
-    const bool direct = last_block(shape, n) == LastBlock::direct, given = 2 * len == std::bit_ceil(n);
+    const bool direct = last_block(shape, n) == LastBlock::direct;
     const bool low = given && !(direct && blocks == 3), block2 = given && blocks == 4 && !direct;
     if (low) add_lower_sub_upper(a.Q[0], a.Q[1], len);  // T(q mod x^2k)
     exp_steps(q, c, g, arena, QTransforms{low ? a.Q[0] : nullptr, block2 ? a.Q[2] : nullptr});

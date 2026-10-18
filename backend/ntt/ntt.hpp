@@ -47,6 +47,10 @@
 //   t.inverse_product(terms, work, out);       // out = coefficients of A B + C D
 //   t.toeplitz_product(A1, A2, A3, B0, B1, work, out);  // out = coefficients of A2 B0 + A1 B1;
 //                                              // A3 = A3 B0 + A2 B1: 3 leaf products, not 4
+//   t.forward(std::span(g), V, Form::values);  // V = values form of g (V apart from g)
+//   t.to_values(G, V);                         // V = the values form of the leaf form G (a pass)
+//   t.inverse_product(terms, work, out, {}, Form::values);  // terms of values forms: one
+//                                              // Montgomery product per word and term
 //
 //   // Hooked ops: the caller's pass on each run of leaves in cache; pruned levels (issue #149).
 //   t.forward_hooked(in, F, hook, zero);       // F = leaf form of in; hook(F + 8 i, i, count) on runs
@@ -153,6 +157,14 @@
 // writes only the half asked for, negated through its scale. Zen 3, bench_fused.cpp: a cyclic
 // product took 0.83-0.89 of the time of the steps it replaces (copy in, forward, multiply, inverse
 // in place, copy out) from 2^12 on, 0.98 at 2^8 (notes/112-r1.md).
+//
+// The fused ops in the values form (issue #251): forward(in, V, Form::values) splits each run of
+// leaves in cache after the bottom level (forward_hooked), and inverse_product(terms, ..., Form::
+// values) sums the terms' Montgomery products and joins each run before its bottom level
+// (inverse_hooked, the 2^-32 and the join's 8 in the top level's scale). Sums of several products
+// of kept transforms (series' blocked division) then cost a product per word and term, not a leaf
+// product; at 2^19 on Zen 5, ns per word: a forward 0.46 leaves, 0.65 values; inverse_product of
+// 1 / 2 / 4 terms 1.01 / 1.46 / 2.24 leaves, 0.74 / 0.80 / 0.97 values (notes/251-r1.md).
 #pragma once
 
 #include <algorithm>
@@ -720,6 +732,24 @@ public:
         Variant::forward_from(source(in, F), checked_source(in, length()), F, lg_, roots());
     }
 
+    // The same in that form: Form::values splits each run of leaves after the bottom level, F apart
+    // from in (std::length_error past 2^kValuesMaxLog).
+    template <class Variant = SelectedForward>
+    void forward(std::span<const std::uint32_t> in, std::uint32_t* F, Form form) const {
+        if (form == Form::leaves) return forward<Variant>(in, F);
+        const std::uint32_t* rows = checked_rows();
+        const auto split = [rows] [[gnu::always_inline]] (std::uint32_t* leaves, std::size_t first, std::size_t count) {
+            detail::intrinsics::ValuesFor<simd::Native>::split(leaves, leaves, count / 8, first / 8, rows);
+        };
+        Variant::forward_hooked(source(in, F), checked_source(in, length()), F, lg_, roots(), 0, split);
+    }
+
+    // V = the values form of the leaf form F, a pass over both (V may be F). std::length_error past
+    // 2^kValuesMaxLog.
+    void to_values(const std::uint32_t* F, std::uint32_t* V) const {
+        detail::intrinsics::ValuesFor<simd::Native>::split(F, V, length() / 64, 0, checked_rows());
+    }
+
     // F = the leaf form of in times B, leaf by leaf: forward(in, F) then multiply(F, B, F) in one
     // pass. F apart from in and B.
     template <class Variant = SelectedForward>
@@ -756,14 +786,28 @@ public:
     // o: as cyclic_product; out apart from the terms. 5 to 8 products in one call took 0.79-0.91 of
     // the time of the split forms callers used before (leaf products in memory and 4 terms, or two
     // inverses and an add) on Zen 3, 2^12-2^20 (notes/143-r1.md).
+    // Form::values: the terms are values forms (a b per word; a alone if b is null), summed and
+    // joined in each run of leaves in cache before its bottom level (std::length_error past
+    // 2^kValuesMaxLog).
     template <class Variant = SelectedInverse>
-    void inverse_product(std::span<const Term> terms, std::uint32_t* work, std::span<std::uint32_t> out, Output o = {}) const {
+    void inverse_product(std::span<const Term> terms, std::uint32_t* work, std::span<std::uint32_t> out, Output o = {},
+                         Form form = Form::leaves) const {
         if (terms.empty() || terms.size() > std::size_t(detail::kMaxTerms))
             throw std::invalid_argument("fps::ntt::Transform::inverse_product: 1 to 8 terms");
         const unsigned output = checked_output(out, o);
+        const std::uint32_t* rows = form == Form::values ? checked_rows() : nullptr;
         if (out.empty()) return;
-        Variant::inverse_product(terms.data(), int(terms.size()), work, out.data(), out.size(), lg_, roots(),
-                                 inverse_roots(), output);
+        if (!rows)
+            return Variant::inverse_product(terms.data(), int(terms.size()), work, out.data(), out.size(), lg_, roots(),
+                                            inverse_roots(), output);
+        const Term* t = terms.data();
+        const int n = int(terms.size());
+        const auto join = [t, n, rows] [[gnu::always_inline]] (std::uint32_t* leaves, std::size_t first, std::size_t count) {
+            detail::intrinsics::ValuesTerms<simd::Native>::sum(t, n, 8 * first, 8 * count, leaves);
+            detail::intrinsics::ValuesFor<simd::Native>::template join<true>(leaves, leaves, count / 8, first / 8, rows);
+        };
+        Variant::inverse_hooked(join, work, out.data(), out.size(), lg_, roots(), inverse_roots(),
+                                output | detail::kJoined, 0);
     }
 
     // out[i] = coefficient o.offset + i of the polynomial whose leaf form is A2 B0 + A1 B1, negated if
