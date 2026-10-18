@@ -1187,13 +1187,39 @@ inline u32 output_scale(int lg, unsigned output) {
     return output & kNegated ? kP - s : s;
 }
 
+// Whether a fused op (cyclic_product, inverse_staged, inverse_hooked) at even lg ends with the
+// radix-2 level from words to out (lc-opt's top), each half's last radix-4 group run in place after
+// its subtrees, instead of the radix-8 top in one pass. That pass reads 8 streams of words and
+// writes up to 8 of out, 2^lg / 8 words apart. Zen 3, 2^14-2^22, huge pages: with out 0-576 bytes
+// past words modulo 4 KiB, or 64-320 bytes before it, it ran 1.02-1.15x slower than at 640 past
+// or 512 before and more, and at 2^18 up to 2.4x whatever the offset, by where the pages lay
+// (both in one 2 MiB page, or not); the radix-2 level, 2 + 2 streams, ran within 3% of the
+// radix-8 top's best at every offset and lg, 1-3% slower than it where that is at its best, but
+// at 2^18 (notes/236-r1.md).
+inline constexpr int kSplitTopMinLog = 14;
+inline constexpr std::size_t kSplitTopPast = 640, kSplitTopBefore = 448;  // bytes
+inline bool split_top(int lg, const u32* words, const u32* out) {
+    if (!has_radix2(lg) || lg < kSplitTopMinLog) return false;
+    const std::size_t d = (reinterpret_cast<std::uintptr_t>(out) - reinterpret_cast<std::uintptr_t>(words)) % 4096;
+    return lg == 18 || d < kSplitTopPast || d > 4096 - kSplitTopBefore;
+}
+
 inline void cyclic_product(const u32* in, std::size_t n, const u32* b, u32* words, u32* out, std::size_t count, int lg,
                            const u32* r, const u32* ir, unsigned output) {
+    const auto stage = [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
+        const std::size_t at = std::size_t(t - words);
+        StoredBottom::run(reinterpret_cast<Vec*>(t), b + at, leaves, at / 32, r, ir);
+    };
+    const bool split = split_top(lg, words, out);
     from_top(in, n, words, lg, r, [&] [[gnu::always_inline]] (Vec* f, std::size_t nv, std::size_t subtrees) {
-        cycle_trees(f, nv, subtrees, 0, r, ir, [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
-            const std::size_t at = std::size_t(t - words);
-            StoredBottom::run(reinterpret_cast<Vec*>(t), b + at, leaves, at / 32, r, ir);
-        });
+        if (subtrees == 8 && split) {  // radix8_lower's forward; the radix-2 level last
+            for (std::size_t k = 0; k < 2; ++k) {
+                cycle_trees(f + 4 * k * nv, nv, 4, 4 * k, r, ir, stage);
+                inverse_group(f + 4 * k * nv, nv, k, ir);
+            }
+            return;
+        }
+        cycle_trees(f, nv, subtrees, 0, r, ir, stage);
     });
     const std::size_t nv = (std::size_t(1) << lg) / 8;
     const u32 s = output_scale(lg, output);
@@ -1202,7 +1228,7 @@ inline void cyclic_product(const u32* in, std::size_t n, const u32* b, u32* word
         if (upper) return inverse_radix4_upper_out(words, nv / 4, out, count, ir, s);
         return inverse_radix4_out(words, nv / 4, out, count, ir, s);
     }
-    if (radix8_lower(lg, n)) {
+    if (radix8_lower(lg, n) && !split) {
         if (upper) return inverse_radix8_upper_out(words, nv / 8, out, count, ir, s);
         return inverse_radix8_out(words, nv / 8, out, count, ir, s);
     }
@@ -1224,10 +1250,10 @@ template <class Stage>
         if (upper) return inverse_radix4_upper_out(words, nv / 4, out, count, ir, s);
         return inverse_radix4_out(words, nv / 4, out, count, ir, s);
     }
-    if (nv == 8) {
-        inverse_trees_with(f, 4, 2, 0, ir, stage);
-        if (upper) return scale_radix2_upper_out(words, 4, out, count, s);
-        return scale_radix2_out(words, 4, out, count, s);
+    if (nv == 8 || split_top(lg, words, out)) {
+        inverse_trees_with(f, nv / 2, 2, 0, ir, stage);
+        if (upper) return scale_radix2_upper_out(words, nv / 2, out, count, s);
+        return scale_radix2_out(words, nv / 2, out, count, s);
     }
     inverse_trees_with(f, nv / 8, 8, 0, ir, stage);
     if (upper) return inverse_radix8_upper_out(words, nv / 8, out, count, ir, s);
@@ -1456,10 +1482,24 @@ inline void inverse_hooked(Hook hook, u32* words, u32* out, std::size_t count, i
     };
     auto* f = reinterpret_cast<Vec*>(words);
     const std::size_t nv = (std::size_t(1) << lg) / 8;
+    const u32 s = output_scale(lg, output);
+    if (split_top(lg, words, out)) {  // the radix-2 level to out, pruned as inverse_top_pruned
+        const std::size_t h = nv / 2, w = 8 * width;
+        inverse_pruned_with(f, h, 2, 0, ir, width, stage);
+        if (output & kUpperHalf) {
+            return last_level_pruned<1>(words, 8 * h, out, count, 8, w, [&] [[gnu::always_inline]] (auto blocks, const u32* t, u32* d, std::size_t n) {
+                if constexpr (decltype(blocks)::value > 0) scale_radix2_upper_part(reinterpret_cast<const Vec*>(t), d, n / 8, h, s);
+            });
+        }
+        return last_level_pruned<2>(words, 8 * h, out, count, 8, w, [&] [[gnu::always_inline]] (auto blocks, const u32* t, u32* d, std::size_t n) {
+            constexpr int T = decltype(blocks)::value;
+            if constexpr (T > 0) scale_radix2_part<T>(reinterpret_cast<const Vec*>(t), d, n / 8, h, s);
+        });
+    }
     if (!has_radix2(lg)) inverse_pruned_with(f, nv / 4, 4, 0, ir, width, stage);
     else if (nv == 8) inverse_pruned_with(f, 4, 2, 0, ir, width, stage);
     else inverse_pruned_with(f, nv / 8, 8, 0, ir, width, stage);
-    inverse_top_pruned(words, nv, lg, out, count, ir, output_scale(lg, output), output & kUpperHalf, width);
+    inverse_top_pruned(words, nv, lg, out, count, ir, s, output & kUpperHalf, width);
 }
 
 // Doubling (Transform::truncate_blocks, join_blocks, forward_upper_hooked; issue #149 round 2), as

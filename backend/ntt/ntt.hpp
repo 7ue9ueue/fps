@@ -179,15 +179,30 @@ inline int log_length(std::size_t n, std::size_t m) {
 inline std::size_t region_bytes(int lg) { return sizeof(std::uint32_t) * 2 * ((std::size_t(1) << lg) + kPadding) + 4096; }
 
 // The offset of a in a region (bytes, a multiple of 64 below 4096) for a product from f and g into
-// out, with b span bytes after a: a's page offset at least 256 bytes from f's and out's, b's from
-// g's. A pass between arrays 0 to 192 bytes apart modulo 4 KiB ran up to 1.7x slower (4K aliasing,
-// notes.md, issue #38 rounds 1 and 2).
-inline std::size_t place(const void* f, const void* g, const void* out, std::size_t span) {
-    const auto offset = [](const void* p) { return reinterpret_cast<std::uintptr_t>(p) % 4096; };
-    const auto apart = [](std::size_t x, std::size_t y) { return (x - y + 256) % 4096 >= 512; };
-    for (std::size_t a = 0; a < 4096; a += 64)
-        if (apart(a, offset(f)) && apart(a, offset(out)) && apart((a + span) % 4096, offset(g))) return a;
-    return 0;  // not reached: the three conditions exclude at most 3 x 512 of the 4096 bytes
+// out, with b span bytes after a: the middle of the widest gap between the offsets of f, of out
+// and of g minus span, modulo `period`, so a lies as far as it can from f and out, and b from g.
+// Arrays 0 to 192 bytes apart modulo 4 KiB ran a pass up to 1.7x slower (4K aliasing, issue #38);
+// on Zen 3 a product at 2^14-2^22 ran 3-5% faster with a 1-3 KiB from f and out than 256-512
+// bytes, the offset the rule before #236 (the first 256 bytes from each) gave (notes/236-r1.md).
+inline std::size_t place(const void* f, const void* g, const void* out, std::size_t span, std::size_t period = 4096) {
+    const std::size_t mask = period - 1;  // period: a power of two (masks, not divisions: 2^6 products)
+    const auto at = [mask](const void* p) { return std::size_t(reinterpret_cast<std::uintptr_t>(p)) & mask; };
+    std::size_t p[3] = {at(f), at(out), (at(g) - span) & mask};
+    if (p[0] > p[1]) std::swap(p[0], p[1]);
+    if (p[1] > p[2]) std::swap(p[1], p[2]);
+    if (p[0] > p[1]) std::swap(p[0], p[1]);
+    std::size_t start = p[2], gap = p[0] + period - p[2];
+    if (p[1] - p[0] > gap) start = p[0], gap = p[1] - p[0];
+    if (p[2] - p[1] > gap) start = p[1], gap = p[2] - p[1];
+    return ((start + gap / 2) & mask) / 64 * 64;
+}
+
+// place()'s period for a transform of 2^lg words: the stride of its top level's blocks (2^lg / 8
+// words at even lg, 2^lg / 4 at odd) where that is 1 to 2 KiB, so a's blocks fall between f's
+// (2^12, blocks 2 KiB apart: 1.05x slower with a 2 KiB from f), else 4 KiB.
+inline std::size_t place_period(int lg) {
+    const std::size_t stride = sizeof(std::uint32_t) << (lg - (lg % 2 == 0 ? 3 : 2));
+    return stride >= 1024 && stride < 4096 ? stride : 4096;
 }
 
 // out[i] = out[i] + x[i] mod P for n words, both canonical, any alignment.
@@ -225,7 +240,8 @@ void ragged_into(const std::uint32_t* f, std::size_t n, const std::uint32_t* g, 
                  std::uint32_t* work, const ragged::Plan& p, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
     const std::size_t N = n + m - 1, L = std::size_t(1) << p.lg;
     const auto placed = [](std::uint32_t* at, const void* x, const void* y, const void* z, std::size_t span) {
-        return at + place(x, y, z, span * sizeof(std::uint32_t)) / sizeof(std::uint32_t);
+        const std::size_t period = place_period(std::countr_zero(span - kPadding));  // span: 2^k + kPadding
+        return at + place(x, y, z, span * sizeof(std::uint32_t), period) / sizeof(std::uint32_t);
     };
     if (!p.split) {
         std::uint32_t* a = placed(work, f, g, out, L + kPadding);
@@ -288,7 +304,8 @@ void middle_into(const std::uint32_t* v, std::size_t n, const std::uint32_t* g, 
     const std::size_t L = std::size_t(1) << p.lg;
     const auto block = [](std::size_t w) { return (w + kPadding + 15) / 16 * 16; };
     const auto placed = [](std::uint32_t* at, const void* x, const void* y, const void* z, std::size_t span) {
-        return at + place(x, y, z, span * sizeof(std::uint32_t)) / sizeof(std::uint32_t);
+        const std::size_t period = place_period(std::countr_zero(span - kPadding));  // span: 2^k + kPadding
+        return at + place(x, y, z, span * sizeof(std::uint32_t), period) / sizeof(std::uint32_t);
     };
     if (!p.split) {  // a cyclic product of length L >= n: its wrapped terms land below word m - 1
         std::uint32_t* a = placed(work, v, g, out, L + kPadding);
@@ -380,7 +397,8 @@ void product(const std::uint32_t* f, std::size_t n, const std::uint32_t* g, std:
     const auto [roots, inverse_roots] = tables<Variant>(p.lg);
     const Region region = take_region(region_bytes(p.lg));
     const std::size_t span = (std::size_t(1) << p.lg) + kPadding;
-    auto* a = reinterpret_cast<std::uint32_t*>(region.start + place(f, g, out, span * sizeof(std::uint32_t)));
+    const std::size_t at = place(f, g, out, span * sizeof(std::uint32_t), place_period(p.lg));
+    auto* a = reinterpret_cast<std::uint32_t*>(region.start + at);
     run_product<Variant, kSquare>(Product{f, n, g, m, a, kSquare ? a : a + span, out, count, p.lg}, roots, inverse_roots);
     give_region(region);
 }
@@ -394,7 +412,8 @@ void middle(const std::uint32_t* f, const std::uint32_t* g, std::size_t m, std::
     const auto [roots, inverse_roots] = tables<Variant>(p.lg);
     const Region region = take_region(region_bytes(p.lg));
     const std::size_t len = std::size_t(1) << p.lg, span = len + kPadding;
-    auto* a = reinterpret_cast<std::uint32_t*>(region.start + place(f, g, out, span * sizeof(std::uint32_t)));
+    const std::size_t at = place(f, g, out, span * sizeof(std::uint32_t), place_period(p.lg));
+    auto* a = reinterpret_cast<std::uint32_t*>(region.start + at);
     std::uint32_t* b = a + span;
     // b = g x^-(m - 1) mod x^len - 1: g[m - 1] at word 0, g[0, m - 1) at the top, zeros between.
     b[0] = g[m - 1];
@@ -634,7 +653,7 @@ public:
             return;
         }
         const detail::Region region = detail::take_region(sizeof(std::uint32_t) * (len + kPadding) + 4096);
-        run(reinterpret_cast<std::uint32_t*>(region.start + detail::place(F, F, out.data(), 0)));
+        run(reinterpret_cast<std::uint32_t*>(region.start + detail::place(F, F, out.data(), 0, detail::place_period(lg_))));
         detail::give_region(region);
     }
 
