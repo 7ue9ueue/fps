@@ -11,7 +11,6 @@
 #include "backend/small/tune.hpp"
 
 static_assert(fps::small::ntt_times.get()[19] == fps::small::kNttDefaults[19]);
-static_assert(fps::small::ragged_times.get()[79] == fps::small::kRaggedDefaults[79]);
 static_assert(fps::small::variants.get()[fps::small::shape_class(64, 64)] ==
               fps::small::kDefaults[fps::small::shape_class(64, 64)]);
 

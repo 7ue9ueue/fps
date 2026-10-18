@@ -12,7 +12,8 @@
 //      squares on relative error, coefficients >= 0.
 //   3. measure_ntt and measure_ragged (tune.hpp) with that model at every lg up to 25 (median of
 //      7, >= 1 ms, no margin), starting from the sweep's NTT times at each point (past 17: the
-//      compiled defaults, scaled).
+//      compiled defaults, scaled). Fields `ntt` (ns at 2^lg) and `ragged` (the points between, over
+//      2^lg's).
 //   4. On the swept shapes, the shapes each table sends the slower way, new against compiled.
 #include <algorithm>
 #include <array>
@@ -107,11 +108,11 @@ Model fit(const std::vector<Shape>& shapes) {
 }
 
 // Shapes the tables send the slower way, and the loss: chosen / faster time.
-void misses(const char* name, const Model& model, const Top& top, const Low& low, const std::vector<Shape>& shapes) {
+void misses(const char* name, const Model& model, const Top& top, const Low& ratio, const std::vector<Shape>& shapes) {
     int count = 0;
     double worst = 1, log_sum = 0;
     for (const Shape& s : shapes) {
-        const bool small = fps::small::model_ns(model, s.n, s.m) < fps::small::ntt_ns(s.n + s.m - 1, top, low);
+        const bool small = fps::small::model_ns(model, s.n, s.m) < fps::small::ntt_ns(s.n + s.m - 1, top, ratio);
         const double chosen = small ? s.small : s.ntt;
         const double loss = chosen / std::min(s.small, s.ntt);
         log_sum += std::log(loss);
@@ -194,13 +195,13 @@ int main() {
     // Starts: the sweep's median NTT time at each point to 2^17; past it the compiled defaults,
     // scaled by the point's ratio at 2^17.
     Top top_start = fps::small::kNttDefaults;
-    Low low_start = fps::small::kRaggedDefaults;
+    Low low_start;
     const auto entry = [&](int lg, int j) -> double& {
         return j == kRaggedPoints ? top_start[lg - 6] : low_start[kRaggedPoints * (lg - 6) + j];
     };
     const auto compiled = [](int lg, int j) {
-        return j == kRaggedPoints ? fps::small::kNttDefaults[lg - 6]
-                                  : fps::small::kRaggedDefaults[kRaggedPoints * (lg - 6) + j];
+        const double ratio = j == kRaggedPoints ? 1 : fps::small::kRagged[kRaggedPoints * (lg - 6) + j];
+        return fps::small::kNttDefaults[lg - 6] * ratio;
     };
     for (int j = 0; j <= kRaggedPoints; ++j) {
         for (int lg = 6; lg <= 17; ++lg) {
@@ -224,8 +225,10 @@ int main() {
                         length, t, entry(lg, j), n, m);
         }
 
-    misses("compiled", fps::small::kModel, fps::small::kNttDefaults, fps::small::kRaggedDefaults, shapes);
-    misses("new", model, top, low, shapes);
+    Low ratio;  // the field: the times between powers of two over 2^lg's
+    for (int e = 0; e < 20 * kRaggedPoints; ++e) ratio[e] = low[e] / top[e / kRaggedPoints];
+    misses("compiled", fps::small::kModel, fps::small::kNttDefaults, fps::small::kRagged, shapes);
+    misses("new", model, top, ratio, shapes);
     std::printf("# seconds %.1f\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count());
 
     std::printf("field signature int %u\nfield variant int", fps::small::kSignature);
@@ -236,6 +239,6 @@ int main() {
     print_field("call", &model.call, 1);
     print_field("square", &model.square, 1);
     print_field("ntt", top.data(), 20);
-    print_field("ragged", low.data(), 20 * kRaggedPoints);
+    print_field("ragged", ratio.data(), 20 * kRaggedPoints);
     return 0;
 }

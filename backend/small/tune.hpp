@@ -1,14 +1,14 @@
-// Measures small's tuned choices on this machine and registers them with backend/tune, in this
-// order: the variant per shape class ("small.variant") and beats_ntt's NTT times ("small.ntt" at
-// powers of two, "small.ragged" between them), which time multiply() with the variants in place.
-// tune::run() measures, tune::save() / load() keep them.
+// Measures small's two tuned choices on this machine and registers them with backend/tune, in this
+// order: the variant per shape class ("small.variant") and beats_ntt's NTT times at powers of two
+// ("small.ntt"), which time multiply() with the variants in place. tune::run() measures,
+// tune::save() / load() keep them.
 //
 //   small::measure_variants(start, budget[, log])  // Choices: per class the fastest, else start's
 //   small::points(c, dense)                        // the shapes class c is timed at
 //   small::text(choices), parse(text)              // wisdom: kSignature, then the variant per class
 //   small::variant_names()                         // the candidates' names, e.g. "avx512.r8.u2"
 //   small::measure_ntt(model, start, budget)       // NTT times for lg = 6 .. 25 (kNttDefaults' form)
-//   small::measure_ragged(model, start, budget)    // the same between powers of two (kRaggedDefaults')
+//   small::measure_ragged(model, start, budget)    // ns at the points between (tools/tune.py, kRagged)
 //
 // measure_variants: each class with m up to 2^budget.max_octave is timed at points(c, dense): m at
 // the octave's end and at 3/4 of it (dense: also just past its start), n / m 1 / 3 / 6 / 16 by the
@@ -163,9 +163,8 @@ struct Budget {
 
 // Samples of 200 us: at 50 us, Emerald Rapids measured the NTT up to 16% slower at lg 6-9 than
 // with 1 ms samples; at 200 us within 2%. A margin of 5%: one run's median moved 2-5% on our
-// machines (backend/tune/notes.md). The ragged points to 2^12 (4 per lg; notes/212-r1.md).
+// machines (backend/tune/notes.md).
 inline constexpr Budget kRunTime = {16, 5, 2e5, 0.05};
-inline constexpr Budget kRaggedRunTime = {12, 5, 2e5, 0.05};
 
 namespace detail {
 
@@ -263,34 +262,16 @@ inline const bool kVariantRegistered = tune::add({
     },
 });
 
-// The NTT times of a wisdom text: nothing unless every value is positive and finite.
-template <std::size_t K>
-std::optional<std::array<double, K>> parse_times(std::string_view text) {
-    const auto times = tune::parse<std::array<double, K>>(text);
-    if (!times || !std::ranges::all_of(*times, [](double t) { return t > 0 && std::isfinite(t); }))
-        return std::nullopt;
-    return times;
-}
-
 inline const bool kNttRegistered = tune::add({
     "small.ntt",
     [] { ntt_times.set(measure_ntt(kModel, kNttDefaults, kRunTime)); },
     [] { return tune::text(ntt_times.get()); },
     [](std::string_view text, bool apply) {
-        const auto times = parse_times<20>(text);
-        if (times && apply) ntt_times.set(*times);
-        return times.has_value();
-    },
-});
-
-inline const bool kRaggedRegistered = tune::add({
-    "small.ragged",
-    [] { ragged_times.set(measure_ragged(kModel, kRaggedDefaults, kRaggedRunTime)); },
-    [] { return tune::text(ragged_times.get()); },
-    [](std::string_view text, bool apply) {
-        const auto times = parse_times<20 * kRaggedPoints>(text);
-        if (times && apply) ragged_times.set(*times);
-        return times.has_value();
+        const auto times = tune::parse<std::array<double, 20>>(text);
+        if (!times || !std::ranges::all_of(*times, [](double t) { return t > 0 && std::isfinite(t); }))
+            return false;
+        if (apply) ntt_times.set(*times);
+        return true;
     },
 });
 
