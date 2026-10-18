@@ -13,7 +13,9 @@ Arithmetic and lazy ranges are the intrinsics variant's (intrinsics.hpp, notes.m
 products by twiddles, forward values < 4P, inverse < 2P. A Shoup product x w - floor(x q / 2^32) P
 takes the odd words' product from a load 4 bytes on where x is loaded from memory (no shift), and
 joins the halves of the quotient with vpermt2d (p5 on Emerald Rapids, where shifts and vpminud take
-p0).
+p0). On Zen 5, whose permutes share two of four pipes with the multiplies and the shifts, some
+kernels take forms with in-lane shuffles and blends instead (Bottom.leaf, .halves, .odd; issue #152
+round 3).
 
 Kernels (the headers have their contracts):
   forward, inverse, forward_identity, inverse_identity (and forms for inputs < 2P, < P, and with
@@ -65,6 +67,9 @@ def model(machine: machines.Machine) -> dict[str, Cost]:
     ops['vpsllq'] = ops['vpsrlq']
     ops['vpbroadcastd_mask'] = machine.ops.get(('vpbroadcastd{k}', 512), ops['vpblendmd'])
     ops['vpermd'] = machine.ops[('vpermd', 512)]
+    # In-lane dword shuffles (Graph.odd_form, Bottom.leaf 'shuf'): as vpermd where the machine has
+    # no entry (Emerald Rapids: p5, a guess).
+    ops['vpshufd'] = machine.ops.get(('vpshufd', 512), ops['vpermd'])
     cost = {}
     for m, o in ops.items():
         uops = max(1, round(o.throughput * len(o.pipes)))
@@ -156,6 +161,7 @@ class Graph:
 
     def __init__(self, consts, join='perm'):
         self.ops, self.c, self.join, self.twiddles, self.ostore = [], consts, join, 'bcst', 'perm'
+        self.leaf, self.halves_form, self.odd_form = 'perm', 'merge', 'shift'
         self.memo = {}
 
     def at(self, base, disp=0, index=None, scale=1):
@@ -208,7 +214,9 @@ class Graph:
         """x w mod P in [0, 2P) for any x < 2^32; f = (w, q), q = floor(w 2^32 / P), values whose
         words 2i and 2i + 1 are equal. odd: a value whose even words are x's odd ones."""
         w, q = f
-        if odd is None:
+        if odd is None and self.odd_form == 'shuf':  # words 1, 1, 3, 3: any of Zen 5's pipes
+            odd = self.op('vpshufd', x, imm=0xf5)
+        elif odd is None:
             odd = self.op('vpsrlq', x, imm=32)
         qx = self.join_high(self.op('vpmuludq', x, q), self.op('vpmuludq', odd, q))
         return self.sub(self.op('vpmulld', x, w), self.op('vpmulld', qx, self.c['P']))
@@ -221,7 +229,11 @@ class Graph:
         return self.op('vpblendmd', self.op('vpsrlq', e, imm=32), o)
 
     def halves(self, base, d0, d1):
-        """Words d0 and d1 bytes past base, broadcast to the low and the high 8 lanes."""
+        """Words d0 and d1 bytes past base, broadcast to the low and the high 8 lanes: the second
+        merged under the mask hi by a masked broadcast ('merge'), or by vpblendmd from an embedded
+        broadcast ('blend': on Zen 5 any pipe, where the merge takes a permute's: x152/probe2.cpp)."""
+        if self.halves_form == 'blend':
+            return self.op('vpblendmd', self.load(self.bcst(base, d0)), self.bcst(base, d1), imm='hi')
         return self.op('vpbroadcastd_mask', self.load(self.bcst(base, d0)), self.bcst(base, d1))
 
     def finish(self):
@@ -266,6 +278,8 @@ def foldable(o, i):
         return i == len(o.srcs) - 1
     if m == 'vpermd':
         return i == 0
+    if m == 'vpshufd':
+        return s.kind == 'mem'
     return m in COMMUTATIVE or i == len(o.srcs) - 1
 
 
@@ -282,6 +296,7 @@ class Knobs:
     model: Optional[str] = None   # schedule on this target's model and scheduler (default: the output's)
     latency_scale: float = 1.0    # vector ops' modeled latencies times this
     width: Optional[int] = None   # at most this many vector uops per modeled cycle
+    feasible: Optional[bool] = None  # take only ops that keep the source order feasible (default: the model's)
 
 
 def latency(o, knobs):
@@ -594,10 +609,12 @@ def emit(o, reg):
         return f'vpermi2d {operand(o.srcs[2], reg)}, {operand(o.srcs[1], reg)}, {dst}'
     if m == 'vpbroadcastd_mask':  # dst = srcs[0] with its high 8 words from srcs[1]
         return f'vpbroadcastd {operand(o.srcs[1], reg, bcst=False)}, {dst}%{{%[hi]%}}'
-    if m == 'vpblendmd':  # srcs[0] with its odd words from srcs[1]
-        return f'vpblendmd {operand(o.srcs[1], reg)}, {operand(o.srcs[0], reg)}, {dst}%{{%[odd]%}}'
+    if m == 'vpblendmd':  # srcs[0] with its odd words (imm 'hi': words 8-15) from srcs[1]
+        return f'vpblendmd {operand(o.srcs[1], reg)}, {operand(o.srcs[0], reg)}, {dst}%{{%[{o.imm or "odd"}]%}}'
     if m == 'vpermd':  # dst = table srcs[0] permuted by the index srcs[1]
         return f'vpermd {operand(o.srcs[0], reg)}, {operand(o.srcs[1], reg)}, {dst}'
+    if m == 'vpshufd':  # dwords within each 128-bit lane of srcs[0] by imm
+        return f'vpshufd ${o.imm}, {operand(o.srcs[0], reg)}, {dst}'
     x, y = o.srcs  # AT&T: dst = x OP y is "op y, x, dst"; only y may be in memory
     if m in COMMUTATIVE and x.in_memory:
         x, y = y, x
@@ -609,11 +626,14 @@ def asm_lines(lines, indent='        '):
 
 
 def compile_graph(g, reserved, knobs):
+    global FEASIBLE
     g.finish()
     regs = [r for r in range(32) if r not in reserved]
     target = MACHINE.target
     if knobs.model:
         use(knobs.model)
+    if knobs.feasible is not None:
+        FEASIBLE = knobs.feasible
     try:
         seq = schedule(g.ops, len(regs), knobs)
     finally:
@@ -704,6 +724,7 @@ class Loop:
     join: str = 'perm'
     sources: Optional[tuple] = None  # (name, argument, byte offset) per twiddle, else by `twiddles`
     src: bool = False         # reads the columns at src, writes them at a
+    odd: str = 'shift'        # Graph.shoup's odd words: 'shift' or 'shuf'
 
 
 def loop_twiddles(loop):
@@ -729,6 +750,7 @@ def loop_body(loop):
     tw = {n: (Value('fixed', reg=regs[0]), Value('fixed', reg=regs[1])) for n, regs, _ in twiddles}
     reserved = {REG_P, REG_2P, REG_J} | {r for _, regs, _ in twiddles for r in regs}
     g = Graph(loop_consts(), loop.join)
+    g.odd_form = loop.odd
     base = 'src' if loop.src else 'a'
     for k in range(loop.columns):
         quarter = lambda t, extra=0, k=k: g.at(base, 64 * k + extra, *QUARTER[t])
@@ -980,6 +1002,13 @@ def bottom_multiply(g, square=False):
 # butterflies into a leaf buffer: W_t at 128 t, A_t at 128 t + 64, B_t at 512 + 64 t) and last
 # (leaf products from the buffer, inverse butterflies, stores to out); both: last of a pair
 # interleaved with first of the next.
+#
+# The leaf products' 'shuf' form (Zen 5, issue #152 round 3, notes/152-r3.md): permutes and the
+# merges of masked broadcasts share two of Zen 5's four pipes with the multiplies and the shifts,
+# while in-lane shuffles (vpshufd) run on any pipe. vpmuludq reads the even words only, so an odd
+# window j is window j - 1 with its words swapped in pairs (vpshufd 0xb1): 3 permutes per row
+# (windows 2, 4, 6), not 8. (B_t as two rows of 128-bit lanes for one vpshufd per b_i, 8 uops and
+# 4 stores more per pair, lost: multiply 0.922 of WideBottom's time against 0.898.)
 LEAF_BUF = 768
 
 
@@ -1007,8 +1036,15 @@ def multiply_last(g, square=False, pairs=1):
         for t in range(4):
             w, a = g.at('cur', dcur + 128 * t), g.at('cur', dcur + 128 * t + 64)
             win = {8: a}
-            for j in WINDOWS:
-                win[j] = g.op('vpermi2d', g.load(g.at('ix', 128 + 64 * WINDOWS.index(j))), w, a)
+            if g.leaf == 'shuf':
+                win[0] = w
+                for j in (2, 4, 6):
+                    win[j] = g.op('vpermi2d', g.load(g.at('ix', 128 + 64 * WINDOWS.index(j))), w, a)
+                for j in (1, 3, 5, 7, 9):
+                    win[j] = g.op('vpshufd', win[j - 1], imm=0xb1)
+            else:
+                for j in WINDOWS:
+                    win[j] = g.op('vpermi2d', g.load(g.at('ix', 128 + 64 * WINDOWS.index(j))), w, a)
             if square == 'stored':  # word i of B_t: bs + 32 t + 4 i (group k), 128 bytes on (group k + 1)
                 base, b0, b1 = 'bs', dout + 32 * t, dout + 128 + 32 * t
             else:
@@ -1048,6 +1084,9 @@ class Bottom:
     twiddles: str = 'bcst'  # pair twiddles by masked broadcasts ('bcst') or vpermd of a table block ('perm')
     ostore: str = 'perm'    # outputs transposed by vpermi2d ('perm') or stored in halves under masks ('mask')
     in_place: bool = False  # writes a (a u32* parameter)
+    leaf: str = 'perm'      # the leaf products' odd windows: 'perm' (vpermi2d) or 'shuf' (vpshufd)
+    halves: str = 'merge'   # Graph.halves: 'merge' or 'blend'
+    odd: str = 'shift'      # Graph.shoup's odd words: 'shift' (vpsrlq) or 'shuf' (vpshufd)
 
 
 ARG_TYPES = {'out': 'u32*', 'buf': 'u32*'}  # the others are read only
@@ -1143,11 +1182,21 @@ ZEN5_LOOPS += [
 # window 128 (0.85-0.88: its own scheduler deadlocks there); inverse 4 pairs on the Zen 5 model,
 # window 64 (0.95-0.97), 2 pairs 1.00 and 1 pair 1.08-1.10 (not emitted: the intrinsics run).
 PAIR_KNOBS = {
-    'zen5': {('bottom_forward', 4): Knobs(window=128), ('bottom_inverse', 4): Knobs(window=128),
-             ('bottom_forward', 2): Knobs(window=128, model='avx512'), ('bottom_inverse', 2): Knobs()},
+    'zen5': {('bottom_forward', 4): Knobs(window=128, model='avx512', feasible=True),
+             ('bottom_inverse', 4): Knobs(window=128),
+             ('bottom_forward', 2): Knobs(window=96, model='avx512'), ('bottom_inverse', 2): Knobs()},
     'avx512': {('bottom_forward', 4): Knobs(window=128, model='zen5'), ('bottom_forward', 2): Knobs(window=128),
                ('bottom_inverse', 4): Knobs(window=64, model='zen5')},
 }
+# Zen 5 (issue #152 round 3, notes/152-r3.md): the pair twiddles by vpblendmd (Graph.halves), and in
+# the forward's 4-pair statements the Shoup products' odd words by vpshufd (Graph.odd_form), both on
+# any of its pipes; the forward of 4 pairs on the Emerald Rapids model with the feasibility rule, of
+# 2 with window 96. Time against WideBottom<Avx512> on L1 data, before -> after: forward 4 pairs
+# 0.757 -> 0.725, 2 pairs 0.863 -> 0.844, inverse 2 pairs (its model kept: #176's note above) 0.912
+# -> 0.895. The inverse of 4 pairs so (0.809 -> 0.784) ran inverse/23-25 3-4% slower across
+# binaries (1.00 without) and gained nothing measurable there at 2^12-2^14: not changed.
+PAIR_HALVES = {'zen5': {('bottom_forward', 2): 'blend', ('bottom_inverse', 2): 'blend', ('bottom_forward', 4): 'blend'}}
+PAIR_ODD = {'zen5': {('bottom_forward', 4): 'shuf'}}
 
 
 def pair_bottoms(target):
@@ -1161,8 +1210,11 @@ def pair_bottoms(target):
                 continue
             doc = (f'{base.doc}\n{name}{pairs}(): {pairs} such pairs, k a multiple of {2 * pairs}: pair p (groups k + 2p, k + 2p + 1)\n'
                    f'at a + 64 p words.')
+            halves = PAIR_HALVES.get(target, {}).get((name, pairs), 'merge')
+            odd = PAIR_ODD.get(target, {}).get((name, pairs), 'shift')
             out.append(replace(base, name=f'{name}{pairs}', doc=doc, knobs=knobs, twiddles='bcst', ostore='perm',
-                               build=lambda g, build=build, pairs=pairs: build(g, pairs), in_place=True))
+                               build=lambda g, build=build, pairs=pairs: build(g, pairs), in_place=True,
+                               halves=halves, odd=odd))
     return out
 
 
@@ -1177,11 +1229,18 @@ def zen5_bottoms():
                               ['a', 'x', 'y'], doc if not first else f'{name}() for k = 0.', Knobs(window=window), in_place=True))
     # The product bottoms one pair per stage. Two pairs per stage (multiply_first(g, kind, 2) ...)
     # ran 0.88 of the intrinsics' time on L1 data against 0.91, but whole products 2-10% slower
-    # (twice the code: notes/152-r1.md).
+    # (twice the code: notes/152-r1.md). Round 3 (notes/152-r3.md): the odd windows of the leaf
+    # products by vpshufd and the halves (B, pair twiddles) by vpblendmd, both on any of Zen 5's
+    # pipes, where the permutes and masked broadcasts they replace share two with the multiplies;
+    # scheduled on the Emerald Rapids model, window 32: on L1 data multiply 0.863 of WideBottom's
+    # time (0.894 before), square 0.775 (0.816), stored 0.771 (0.815). _first and _last alone (a
+    # product's one pair at 2^6, each call's ends) with a window of 128 and the feasibility rule:
+    # 0.88 of the time of the same kernels at window 32 (x152/pfam.cpp, one pair per call).
     for b in BOTTOMS:
         if b.name in EMITTED_BOTTOMS:
-            knobs = Knobs(window=64, model='avx512') if b.name.startswith('multiply') else Knobs(window=64)
-            out.append(replace(b, knobs=knobs))
+            knobs = Knobs(window=32, model='avx512') if b.name.endswith('_both') else \
+                Knobs(window=128, model='avx512', feasible=True)
+            out.append(replace(b, knobs=knobs, leaf='shuf', halves='blend'))
     return out
 
 
@@ -1209,7 +1268,8 @@ def bottom_body(bottom):
     consts = bottom_consts(bottom.twiddles)
     consts['NI'] = Value('bcst', mem=mem('ix', 64 * ROW['NI']))
     g = Graph(consts, bottom.join)
-    g.twiddles, g.ostore = bottom.twiddles, bottom.ostore
+    g.twiddles, g.ostore, g.leaf, g.halves_form = bottom.twiddles, bottom.ostore, bottom.leaf, bottom.halves
+    g.odd_form = bottom.odd
     bottom.build(g)
     reserved = {v.reg for v in consts.values() if v.kind == 'fixed'}
     head = [f'vmovdqu64 {64 * ROW[name]}(%[ix]), %%zmm{v.reg}' for name, v in consts.items() if v.kind == 'fixed']
