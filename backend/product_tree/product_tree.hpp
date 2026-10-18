@@ -17,10 +17,10 @@
 // to 8 lanes, and one tree multiplies the 8 lanes side by side (pointwise products of transforms);
 // a standard tree (one polynomial per node, leaf products) multiplies the 8 lane products and the
 // larger factors; its nodes over two lane products come from the lane root's transform at twice
-// its length (lane_pairs). Both trees use one transform of each length per node (transform
-// doubling, the wrap trick): tree.hpp. Memory: one region of this thread, kept across calls
-// (ntt's), and ntt's transforms per length on one table, kept per thread. Design and
-// measurements: notes.md.
+// its length (lane_pairs, while that fits ntt: to about 2^24 small factors' degrees). Both trees
+// use one transform of each length per node (transform doubling, the wrap trick): tree.hpp.
+// Memory: one region of this thread, kept across calls (ntt's), and ntt's transforms per length on
+// one table, kept per thread. Design and measurements: notes.md.
 #pragma once
 
 #include <algorithm>
@@ -122,6 +122,12 @@ struct RegionGuard {
     ntt::detail::Region region;
     ~RegionGuard() { ntt::detail::give_region(region); }
 };
+
+// The pairs run while the lane root's transform at twice its length (16 L words) fits ntt's
+// longest, 2^kMaxLog (small factors' degrees to about 2^24); past it the standard tree takes the
+// lane products' forwards, as for lanes shorter than kPairsLength (notes/253-r1.md). Tests lower
+// it.
+inline thread_local std::size_t pairs_up_to = std::size_t(1) << ntt::kMaxLog;
 
 // Degrees below this are counted in the driver's first pass (a histogram on the stack), so the
 // counting sort needs no pass of its own when its cut is below it.
@@ -228,16 +234,17 @@ void product(const F& fs, std::span<u32> out, Mode mode) {
     }
     // Transforms on the tables of the longest: the standard root's, or the lanes' at twice the root.
     // The standard tree's nodes over two lane products by lane_pairs from the lane root's transform
-    // at twice its length (Pairs, tree.hpp), when the lanes' length is at least kPairsLength: the
-    // pairs go where the root's left child was, the root's transform at twice its length is
-    // released before the standard tree, and the lanes' coefficients too when every pair is taken.
+    // at twice its length (Pairs, tree.hpp), when the lanes' length is at least kPairsLength and
+    // that transform at most pairs_up_to words: the pairs go where the root's left child was, the
+    // root's transform at twice its length is released before the standard tree, and the lanes'
+    // coefficients too when every pair is taken.
     const std::size_t standard_length = StandardTree<>::length(u32(total));
     Pairs pairs;
     if (small) {
         const Slots<F> slots{fs, order, small};
         LaneTree<Slots<F>> tree(slots, stack);
         const std::size_t len = LaneTree<Slots<F>>::length(tree.degree(0, slots.count()));
-        const bool doubled = small >= 8 && len >= kPairsLength && !tree.base(0, slots.count());
+        const bool doubled = small >= 8 && len >= kPairsLength && 16 * len <= pairs_up_to && !tree.base(0, slots.count());
         reserve_transforms(std::max(standard_length, doubled ? 16 * len : 8 * len));
         const auto [root, values, room, coefficients_mark, values_mark] =
             doubled ? tree.root_doubled() : typename LaneTree<Slots<F>>::Doubled{tree.root()};
