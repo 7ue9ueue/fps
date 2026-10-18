@@ -204,13 +204,13 @@ Cantor and Zassenhaus) stopped near the same degree (its squares mod u, f = x^z 
 words for deg u > 2^24) and ran 6 to 114 times slower (8 to 16 times at 2^20), so it was not kept for the inputs in
 between (deg u = 2^24, or a factor x^z that takes deg f to 2^24 or more) (#192).
 
-`factor(f)` runs the backend's factorization (lc-opt's Yun and Berlekamp, #123) for deg f <= 2048
-(trailing zeros do not count): O(m^3) per square-free part of degree m, 7.2-11 us at degree 16
-and 0.05-0.21 s at 2^10 for a random f. Past 2048 it runs the frontend's own path (Yun, then per
-part a distinct-degree split by gcd(s, x^(P^d) - x) and Cantor and Zassenhaus; O(n^2 log n log P)),
-which is faster there: the kernel's cost passes it at degree 1700-3000 on the four timed targets
-(later for an irreducible f than a random one, and on Zen 5), and at 4096, the kernel's limit, the kernel
-took 5.6-20.6 s against 3.0-9.1 s (#209). Degree 2^20 is out of the kernel's reach (m x m
+`factor(f)` runs the backend's factorization (lc-opt's Yun and Berlekamp, #123, #200) for
+deg f <= 4096, its limit (trailing zeros do not count): O(m^3) per square-free part of degree m,
+7.2-11 us at degree 16; at 4096 0.62-2.8 s for a random f, 2.9-11x faster than the frontend's path
+at every degree to the limit (backend/factor/notes/200-r1.md; #209 had switched at 2048, when the
+kernel was slower above it). Past 4096 it runs the frontend's own path (Yun, then per part a
+distinct-degree split by gcd(s, x^(P^d) - x) and Cantor and Zassenhaus; O(n^2 log n log P)).
+Degree 2^20 is out of the kernel's reach (m x m
 matrices: 4 TiB), so the frontend path is the only one there (a guess from n^2 log n: days at
 2^20; its squares modulo a square-free part need it of degree <= 2^24, else the products'
 `std::length_error`). It stays until the backend has a path for large degrees (#201,

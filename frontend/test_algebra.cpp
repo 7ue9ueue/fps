@@ -446,7 +446,7 @@ void check_factor(Factors parts, u32 c, std::size_t tag) {
     CHECK(to_vecs(fps::factor(poly(f))) == parts, tag, parts.size());
 }
 
-// fps::factor's two paths give the same list: the kernel (deg f <= 2048) and the frontend's own
+// fps::factor's two paths give the same list: the kernel (deg f <= 4096) and the frontend's own
 // split (past it).
 bool same_paths(const Vec& f) {
     return to_vecs(fps::factor(poly(f))) == to_vecs(fps::detail::algebra::factor_by_splitting(poly(f)));
@@ -511,10 +511,10 @@ void test_factor() {
 // Both paths on the same inputs: random f of the sizes above and around the kernel's kept
 // factorizer (degree 256); then A^e B with A of degree 64 (multiplicity e) and B of 63 + {0, 1, 2}
 // (known irreducibles; small square-free parts keep the kernel's O(m^3) cheap): e = 31 gives
-// degrees 2047 .. 2049, around fps::factor's switch, and e = 63 gives 4095 .. 4097, around the
-// kernel's own limit (its direct call too, up to 4096).
+// degrees 2047 .. 2049, and e = 63 gives 4095 .. 4097, around fps::factor's switch, the kernel's
+// own limit (its direct call too, up to 4096).
 void test_factor_paths() {
-    static_assert(fps::detail::algebra::kFactorKernelMax == 2048 && fps::factorization::kMaxDegree == 4096);
+    static_assert(fps::detail::algebra::kFactorKernelMax == 4096 && fps::factorization::kMaxDegree == 4096);
     for (const std::size_t n : kSizes)
         for (int kind = 0; kind < 4; ++kind) {
             Vec f = random_vec(n, kind);
