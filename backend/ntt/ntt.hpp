@@ -36,6 +36,9 @@
 //   t.forward(f, Form::values);                // f -> values form (L <= 2^23); inverse(F, Form::values),
 //                                              // inverse(F, out, Form::values) undo it
 //   t.forward_upper(h, Form::values);          // the upper half of p's values form (doubling)
+//   t.forward_upper(std::span(h), H, Form::values);  // the same from h in caller memory (backend/gcd)
+//   t.inverse(F, work, out, Form::values);     // out = the first out.size() coefficients, through the
+//                                              // caller's work (F may be work)
 //
 //   // Fused ops for Newton steps: sources and outputs in caller memory, one pass each.
 //   t.forward(std::span(g), G);                // G = leaf form of g (g.size() <= L, zero past it)
@@ -599,6 +602,17 @@ public:
         detail::intrinsics::ValuesFor<simd::Native>::split(h, h, blocks, blocks, rows);
     }
 
+    // H (length() / 2 words) = forward_upper(h, form) of h = in, zero past it (in.size() <= length()
+    // / 2): the upper half of the leaf or values form of in, read from in by the first level (no copy
+    // into H). lg > kMinLog; H apart from in. The values form's split is forward_upper(h, form)'s.
+    template <class Variant = SelectedForward>
+    void forward_upper(std::span<const std::uint32_t> in, std::uint32_t* H, Form form) const {
+        forward_upper<Variant>(in, H);
+        if (form == Form::leaves) return;
+        const std::size_t blocks = length() / 128;
+        detail::intrinsics::ValuesFor<simd::Native>::split(H, H, blocks, blocks, checked_rows());
+    }
+
     // forward_upper undone: h (length() / 2 words, 32-byte aligned, kPadding after), leaves L / 16
     // .. L / 8 - 1 of p's leaf form -> the coefficients of p mod (x^(L/2) + 1), canonical. lg >
     // kMinLog. The variant is the inverse's at L / 2.
@@ -655,6 +669,18 @@ public:
         const detail::Region region = detail::take_region(sizeof(std::uint32_t) * (len + kPadding) + 4096);
         run(reinterpret_cast<std::uint32_t*>(region.start + detail::place(F, F, out.data(), 0, detail::place_period(lg_))));
         detail::give_region(region);
+    }
+
+    // out = the first out.size() coefficients of the polynomial whose leaf or values form is F, as
+    // inverse(F, out, form), through the caller's work (length() + kPadding words, 32-byte aligned):
+    // the subtrees copy or join their leaves from F into work, the top level writes out. F may be
+    // work (then F is not kept); out apart from F and work, any alignment, out.size() <= length().
+    template <class Variant = SelectedInverse>
+    void inverse(const std::uint32_t* F, std::uint32_t* work, std::span<std::uint32_t> out, Form form) const {
+        if (out.size() > length()) throw std::out_of_range("fps::ntt::Transform::inverse: coefficients past the length");
+        const std::uint32_t* rows = form == Form::values ? checked_rows() : nullptr;
+        if (out.empty()) return;
+        Variant::inverse(F, work, out.data(), out.size(), lg_, inverse_roots(), rows);
     }
 
     // out = a b leaf by leaf (leaf forms, mod x^8 - w_v); out may be a or b.

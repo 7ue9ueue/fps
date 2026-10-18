@@ -27,8 +27,9 @@
 //   jump(k - progress) on the top of the result, combine R2 R1 by cyclic products of length
 //   bit_ceil(progress), keeping the products' transforms (the parent doubles them by
 //   forward_upper). Jumps of k <= kDirect: Euclid's algorithm with fraction-free steps on the top
-//   coefficients (3 products per word in 64-bit sums, one Montgomery reduction), each step's
-//   factors from the last's in scalar code.
+//   coefficients (3 products per word in 64-bit sums, one Montgomery reduction, the words left
+//   below 3.31 P between steps), each step's factors from the last's in scalar code, the rows of
+//   the matrix's two columns in one pass.
 // - Products in the values form (ntt.hpp): a pointwise product per word instead of an 8 x 8 leaf
 //   product, for a split per forward and a join per inverse. Each product takes one Montgomery
 //   reduction and leaves its factor 2^-32: matrices and remainders only matter up to constants.
@@ -49,6 +50,7 @@
 #include <limits>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 #include "backend/division/division.hpp"
@@ -144,22 +146,40 @@ struct Step {
     }
 };
 
-// x86: from the 64-bit sums of the even and odd words, (sum + m P) / 2^32 joined, canonical.
-template <class T>
+// x86: from the 64-bit sums of the even and odd words, (sum + m P) / 2^32 joined: canonical, or
+// not reduced (kLazy): below P (1 + sum / (P 2^32)).
+template <class T, bool kLazy = false>
 [[gnu::always_inline]] inline typename T::V montgomery_join(typename T::V even, typename T::V odd) {
     using W = typename T::V;
     const W ninv = T::broadcast(kNegPinv), p = T::broadcast(kP);
     even = T::add64(even, T::mul_even(T::mul_even(even, ninv), p));
     odd = T::add64(odd, T::mul_even(T::mul_even(odd, ninv), p));
-    return modarith::Ops<T, kP>::template reduce<kP>(T::join_high(even, odd));
+    if constexpr (kLazy) return T::join_high(even, odd);
+    else return modarith::Ops<T, kP>::template reduce<kP>(T::join_high(even, odd));
 }
 
 // Neon: the same from the sums of lanes 0, 1 (low) and 2, 3 (high).
-template <class T, class Wide>
+template <class T, bool kLazy = false, class Wide>
 [[gnu::always_inline]] inline typename T::V montgomery_halves(Wide low, Wide high) {
     using W = typename T::V;
     const W m = T::mul_lo(T::lo_halves(low, high), T::broadcast(kNegPinv)), p = T::broadcast(kP);
-    return modarith::Ops<T, kP>::template reduce<kP>(T::hi_halves(T::mla_wide_lo(low, m, p), T::mla_wide_hi(high, m, p)));
+    const W r = T::hi_halves(T::mla_wide_lo(low, m, p), T::mla_wide_hi(high, m, p));
+    if constexpr (kLazy) return r;
+    else return modarith::Ops<T, kP>::template reduce<kP>(r);
+}
+
+// Euclid's words between steps: its passes may leave them unreduced (select.hpp: kLazyRows for the
+// matrix rows, kLazyRemainders for the remainders; only with 64-bit lane products). With factors <
+// P and words < B, a step's sums stay below 3 P B and its words below P (1 + 3 B / 2^32): from
+// canonical words B stays below P / (1 - 3 P / 2^32) < 3.31 P < 4P, and 3 P B + 2^32 P < 2^64.
+// Scalar code reads them through reduced() or combine3_word (canonical out).
+inline constexpr bool kLazyRowWords = kWide && kLazyRows;
+inline constexpr bool kLazyRemainderWords = kWide && kLazyRemainders;
+
+// a mod P for a < 4P.
+constexpr u32 reduced(u32 a) {
+    a = a >= 2 * kP ? a - 2 * kP : a;
+    return a >= kP ? a - kP : a;
 }
 
 // (x u + y X v + z v) kScale mod P word by word: u, v the words at j, v1 those of v at j - 1. Words
@@ -167,7 +187,7 @@ template <class T, class Wide>
 // sums (< 3 P 2^32 + 2^32 P < 2^64), one Montgomery reduction (lc-opt's); the odd words of X v are
 // the even words of v, so 2 shifts, not 3. Neon: the same with umull / umlal. Otherwise Shoup
 // products, reduced in pairs.
-template <class T>
+template <class T, bool kLazy = false>
 [[gnu::always_inline]] inline typename T::V step_vector(typename T::V u, typename T::V v1, typename T::V v, const Step& s) {
     using W = typename T::V;
     using Ops = modarith::Ops<T, kP>;
@@ -176,12 +196,12 @@ template <class T>
         const W uo = T::template shr64<32>(u), vo = T::template shr64<32>(v);
         const W even = T::add64(T::add64(T::mul_even(u, xs), T::mul_even(v1, ys)), T::mul_even(v, zs));
         const W odd = T::add64(T::add64(T::mul_even(uo, xs), T::mul_even(v, ys)), T::mul_even(vo, zs));
-        return montgomery_join<T>(even, odd);
+        return montgomery_join<T, kLazy>(even, odd);
     } else if constexpr (requires { T::mul_wide_lo(u, v); }) {
         const W xs = T::broadcast(s.x), ys = T::broadcast(s.y), zs = T::broadcast(s.z);
         const auto low = T::mla_wide_lo(T::mla_wide_lo(T::mul_wide_lo(u, xs), v1, ys), v, zs);
         const auto high = T::mla_wide_hi(T::mla_wide_hi(T::mul_wide_hi(u, xs), v1, ys), v, zs);
-        return montgomery_halves<T>(low, high);
+        return montgomery_halves<T, kLazy>(low, high);
     } else {
         const W t = Ops::template reduce<2 * kP>(T::add(Ops::shoup(u, T::broadcast(s.x), T::broadcast(s.xq)),
                                                          Ops::shoup(v1, T::broadcast(s.y), T::broadcast(s.yq))));
@@ -190,22 +210,75 @@ template <class T>
     }
 }
 
-// out = (x u + y X v + z v) kScale (step_vector) at the words [from, to), rounded out to whole
-// vectors (from down, to up), from the top vector down: the next step's scalars read the top words
-// first. Callers keep kPad words before u, v and out, and 2 kLanes after. v[j - 1] by unaligned
-// loads: lane shifts of aligned ones ran 0.99-1.07x their time (notes/157-r1.md).
-inline void combine3(const u32* u, const u32* v, u32* out, std::ptrdiff_t from, std::ptrdiff_t to, const Step& s) {
-    constexpr std::ptrdiff_t L = std::ptrdiff_t(kLanes);
-    const std::ptrdiff_t first = from & ~(L - 1);
-    for (std::ptrdiff_t j = (to - 1) & ~(L - 1); j >= first; j -= L)
-        S::store(out + j, step_vector<S>(S::load(u + j), S::load(v + j - 1), S::load(v + j), s));
+// The words of hi one lane up, lo's top lane below them: (lo[L - 1], hi[0], ..., hi[L - 2]). For
+// kAlignedShifts (select.hpp): v[j - 1] from the aligned vectors at j and j - L, which
+// store-to-load forwarding serves from the last step's stores, unlike an unaligned load across two.
+template <class T = S>
+[[gnu::always_inline]] inline typename T::V shifted_up(typename T::V hi, typename T::V lo) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if constexpr (std::is_same_v<T, simd::Avx512>) return _mm512_alignr_epi32(hi, lo, 15);
+    else
+#endif
+#if defined(__AVX2__)
+    if constexpr (std::is_same_v<T, simd::Avx2>) return _mm256_alignr_epi8(hi, _mm256_permute2x128_si256(lo, hi, 0x21), 12);
+    else
+#endif
+#if defined(__SSE4_1__)
+    if constexpr (std::is_same_v<T, simd::Sse>) return _mm_alignr_epi8(hi, lo, 12);
+    else
+#endif
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    if constexpr (std::is_same_v<T, simd::Neon>) return vextq_u32(lo, hi, 3);
+    else
+#endif
+    if constexpr (T::lanes == 1) return lo;
+    else {
+        alignas(64) u32 a[2 * T::lanes];
+        T::store(a, lo), T::store(a + T::lanes, hi);
+        return T::load(a + T::lanes - 1);
+    }
 }
 
-// Word j of combine3 from u[j], v[j - 1], v[j], in scalar: the same canonical value.
+// out = (x u + y X v + z v) kScale (step_vector, not reduced if kLazy) at the words [from, to),
+// rounded out to whole vectors (from down, to up), from the top vector down: the next step's
+// scalars read the top words first. Callers keep kPad words before u, v and out, and 2 kLanes
+// after. v[j - 1] by an unaligned load, or (kAlignedShifts) a lane shift of aligned ones.
+template <bool kLazy>
+[[gnu::always_inline]] inline void combine3(const u32* u, const u32* v, u32* out, std::ptrdiff_t from, std::ptrdiff_t to,
+                                            const Step& s) {
+    constexpr std::ptrdiff_t L = std::ptrdiff_t(kLanes);
+    const std::ptrdiff_t first = from & ~(L - 1);
+    if constexpr (kAlignedShifts) {
+        std::ptrdiff_t j = (to - 1) & ~(L - 1);
+        V hi = S::load(v + j);
+        for (; j >= first; j -= L) {
+            const V lo = S::load(v + j - L);
+            S::store(out + j, step_vector<S, kLazy>(S::load(u + j), shifted_up(hi, lo), hi, s));
+            hi = lo;
+        }
+    } else {
+        for (std::ptrdiff_t j = (to - 1) & ~(L - 1); j >= first; j -= L)
+            S::store(out + j, step_vector<S, kLazy>(S::load(u + j), S::load(v + j - 1), S::load(v + j), s));
+    }
+}
+
+// Word j of combine3 from u[j], v[j - 1], v[j] (Euclid's words: below 4P if kLazy, else
+// canonical), in scalar: the same residue, canonical.
+template <bool kLazy = kLazyRemainderWords>
 inline u32 combine3_word(const Step& s, u32 uj, u32 vj1, u32 vj) {
     const u64 t = u64(s.x) * uj + u64(s.y) * vj1 + u64(s.z) * vj;
-    if constexpr (kWide) return montgomery(t);
-    else return u32(t % kP);
+    if constexpr (!kWide) return u32(t % kP);
+    else if constexpr (kLazy) return reduced(u32((t + u64(u32(t) * kNegPinv) * kP) >> 32));
+    else return montgomery(t);
+}
+
+// a[from, to) canonical if kLazy (from >= 0), for Euclid's words: whole vectors, so the words
+// around them up to a vector out (in the arrays' padding) are below 4P too.
+template <bool kLazy>
+inline void reduce_words(u32* a, std::ptrdiff_t from, std::ptrdiff_t to) {
+    if constexpr (kLazy)
+        for (std::ptrdiff_t j = from & ~std::ptrdiff_t(kLanes - 1); j < to; j += std::ptrdiff_t(kLanes))
+            S::store(a + j, M::template reduce<kP>(M::template reduce<2 * kP>(S::load(a + j))));
 }
 
 inline constexpr std::size_t kPad = std::max<std::size_t>(kLanes, 4);  // zero words before Euclid's arrays
@@ -228,18 +301,29 @@ template <class T>
     }
 }
 
-// out[i] = (x0 y0 + x1 y1) 2^-32 mod P word by word (canonical words, n a multiple of kLanes), and
-// kept[i] the same if kept is not null.
-inline void products(const u32* x0, const u32* y0, const u32* x1, const u32* y1, u32* kept, u32* out, std::size_t n) {
-    if (!kept) {
-        for (std::size_t i = 0; i < n; i += kLanes)
-            S::store(out + i, products_vector<S>(S::load(x0 + i), S::load(y0 + i), S::load(x1 + i), S::load(y1 + i)));
-        return;
-    }
+// out[i] = (x0 y0 + x1 y1) 2^-32 mod P word by word (canonical words, n a multiple of kLanes).
+inline void products(const u32* x0, const u32* y0, const u32* x1, const u32* y1, u32* out, std::size_t n) {
+    for (std::size_t i = 0; i < n; i += kLanes)
+        S::store(out + i, products_vector<S>(S::load(x0 + i), S::load(y0 + i), S::load(x1 + i), S::load(y1 + i)));
+}
+
+// out[i] = a[i] w mod P, canonical, for i < n (a[i] < 2^32, w < P): Shoup products on vectors, not
+// a 64-bit remainder per word (the results' monic or 1 / c scaling).
+inline void scale_words(const u32* a, u32 w, u32* out, std::size_t n) {
+    const V wv = S::broadcast(w), qv = S::broadcast(M::shoup_quotient(w));
+    std::size_t i = 0;
+    for (; i + kLanes <= n; i += kLanes) S::store(out + i, M::template reduce<kP>(M::shoup(S::load(a + i), wv, qv)));
+    for (; i < n; ++i) out[i] = mul(a[i], w);
+}
+
+// Two such sums in one pass, s0 and s1 loaded once: o0 = (s0 p0 + s1 p1) 2^-32, o1 = (s0 p2 + s1
+// p3) 2^-32 (an apply's c and d, a row of a combine): 6 loads per word, not 8.
+inline void products2(const u32* s0, const u32* s1, const u32* p0, const u32* p1, const u32* p2, const u32* p3, u32* o0,
+                      u32* o1, std::size_t n) {
     for (std::size_t i = 0; i < n; i += kLanes) {
-        const V m = products_vector<S>(S::load(x0 + i), S::load(y0 + i), S::load(x1 + i), S::load(y1 + i));
-        S::store(kept + i, m);
-        S::store(out + i, m);
+        const V a = S::load(s0 + i), b = S::load(s1 + i);
+        S::store(o0 + i, products_vector<S>(a, S::load(p0 + i), b, S::load(p1 + i)));
+        S::store(o1 + i, products_vector<S>(a, S::load(p2 + i), b, S::load(p3 + i)));
     }
 }
 
@@ -389,14 +473,14 @@ public:
         }
         // Euclid's fraction-free steps on whole remainders, in padded copies.
         u32* p[3];
-        for (auto& x : p) x = take_padded(std::size_t(n + 1));
+        take_padded(std::size_t(n + 1), p);
         std::copy_n(a, n + 1, p[0]);
         std::copy_n(b, m + 1, p[1]);
         a = p[0], b = p[1];
         u32* e = p[2];
         steps<false>(a, n, b, m, e, 0, kNoFloor, nullptr);
         const u32 scale = inverse(a[n]);
-        for (std::ptrdiff_t i = 0; i < n; ++i) out[std::size_t(i)] = mul(a[i], scale);
+        scale_words(a, scale, out.data(), std::size_t(n));
         out[std::size_t(n)] = 1;
         stack_.release(top);
         return std::size_t(n + 1);
@@ -420,6 +504,15 @@ private:
         return p + kPad;
     }
 
+    // `count` such arrays of n words in one block, zeroed at once: to[i], 64-byte aligned.
+    template <std::size_t kCount>
+    void take_padded(std::size_t n, u32* (&to)[kCount]) {
+        const std::size_t stride = (n + kPad + 2 * kLanes + 15) / 16 * 16;
+        u32* const p = take(kCount * stride);
+        std::fill_n(p, kCount * stride, 0u);
+        for (std::size_t i = 0; i < kCount; ++i) to[i] = p + i * stride + kPad;
+    }
+
     static void identity(Matrix& out) {
         out.entry[0][0] = out.entry[3][0] = 1;
         out.size[0] = out.size[3] = 1;
@@ -439,33 +532,25 @@ private:
         to.progress = from.progress;
     }
 
-    // One column of Euclid's matrix by rows: row0 of c (u a + v b = c), row1 of d, row2 free; zero
-    // past their sizes. limit 1: its coefficient 0 only (for at0), when no entry in need has it.
-    struct Column {
-        u32 *row0, *row1, *row2;
-        std::size_t size0, size1, size2, limit;
-
-        // row2 = the next row by s, then rotated: (row0, row1) = (d's row, e's row).
-        [[gnu::always_inline]] void step(const Step& s) {
-            const std::size_t se = std::min(limit, std::max(size0, size1 ? size1 + 1 : 0));
-            combine3(row0, row1, row2, 0, std::ptrdiff_t(se), s);
-            // The passes write whole vectors past the sizes: zeros, from zeros (sizes stay below
-            // the limit), or words nobody reads (limit 1).
-            if (size2 > se) std::fill(row2 + se, row2 + size2, 0u);
-            size2 = se;
-            rotate();
-        }
-        [[gnu::always_inline]] void rotate() {
-            u32* const r = row0;
-            row0 = row1, row1 = row2, row2 = r;
-            const std::size_t z = size0;
-            size0 = size1, size1 = size2, size2 = z;
-        }
-    };
-    // The d row of the last step only if last_d_row.
+    // Euclid's matrix by rows: row[0] of c (u a + v b = c), row[1] of d, row[2] free; column j at
+    // row[i] + j width. A full column (some entry in need has it) takes the vector passes, zero at
+    // size[i] and past (one bound for both full columns); the other keeps its coefficient 0 only (for
+    // at0), in scalar code. A step's new row is no shorter than the row it overwrites (2 steps
+    // older), so its pass over [0, size) leaves no stale words; pseudo_divide() zeroes them. The d
+    // row of the last step only if last_d_row.
     struct Rows {
-        Column column[2];
+        u32* row[3];
+        std::size_t size[3];
+        std::size_t width, limit;  // limit: k + 1, the rows' longest
+        unsigned full;             // bit j: column j full
         bool last_d_row;
+
+        void rotate() {
+            u32* const r = row[0];
+            row[0] = row[1], row[1] = row[2], row[2] = r;
+            const std::size_t z = size[0];
+            size[0] = size[1], size[1] = size[2], size[2] = z;
+        }
     };
 
     static constexpr std::ptrdiff_t kNoFloor = std::numeric_limits<std::ptrdiff_t>::min() / 2;  // steps()' floor: all words
@@ -480,43 +565,112 @@ private:
     // locals: in memory (the old Rows), its loads waited on its own stores each step (notes/157-r1.md).
     template <bool kRows>
     static void steps(u32*& c_io, std::ptrdiff_t& n_io, u32*& d_io, std::ptrdiff_t& m_io, u32*& e_io, std::ptrdiff_t target,
-                      std::ptrdiff_t floor, Rows* rows_io) {
+                      std::ptrdiff_t floor, Rows* rows) {
         u32 *c = c_io, *d = d_io, *e = e_io;
         std::ptrdiff_t n = n_io, m = m_io;
-        Rows rows;
-        if constexpr (kRows) rows = *rows_io;
         while (m >= target) {
             if (n - m > 1) {
                 floor += n - m;
-                if constexpr (kRows) *rows_io = rows;
-                pseudo_divide(c, n, d, m, e, std::max<std::ptrdiff_t>(0, floor), kRows ? rows_io : nullptr);
-                if constexpr (kRows) rows = *rows_io, rows.column[0].rotate(), rows.column[1].rotate();
+                pseudo_divide(c, n, d, m, e, std::max<std::ptrdiff_t>(0, floor), kRows ? rows : nullptr);
+                if constexpr (kRows) rows->rotate();
                 u32* const old = c;
                 c = d, d = e, e = old;
                 n = m, m = n - 1;
-                while (m >= target && d[m] == 0) --m;
-                continue;
-            }
-            u32 beta = c[n], c1 = c[m], alpha = d[m], d1 = d[m - 1];
-            while (true) {  // n = m + 1; alpha, beta, c1, d1 = d[m], c[n], c[m], d[m - 1]
-                const Step s(alpha, beta, c1, d1);
-                const u32 e1 = combine3_word(s, c[m - 1], d[m - 2], d1);  // e[m - 1], e[m - 2]
-                const u32 e2 = combine3_word(s, c[m - 2], d[m - 3], d[m - 2]);
-                ++floor;
-                combine3(c, d, e, std::max<std::ptrdiff_t>(0, floor), m, s);
-                if constexpr (kRows)
-                    if (m > target || rows.last_d_row) rows.column[0].step(s), rows.column[1].step(s);
-                    else rows.column[0].rotate(), rows.column[1].rotate();
-                u32* const old = c;
-                c = d, d = e, e = old;
-                n = m, m = n - 1;
-                beta = alpha, c1 = d1, alpha = e1, d1 = e2;
-                if (m < target || e1 == 0) break;
+            } else if constexpr (!kRows) {
+                run<0>(c, d, e, m, target, floor, nullptr);
+                n = m + 1;
+            } else {
+                if (rows->full == 3) run<2>(c, d, e, m, target, floor, rows);
+                else run<1>(c, d, e, m, target, floor, rows);
+                n = m + 1;
             }
             while (m >= target && d[m] == 0) --m;
         }
         c_io = c, d_io = d, e_io = e, n_io = n, m_io = m;
-        if constexpr (kRows) *rows_io = rows;
+    }
+
+    // steps()' run of degree-1 steps, deg c = m + 1, while m >= target and the next remainder's
+    // top word (e1) is not zero; m ends as deg c - 1. kCols full columns of rows (0: no rows). The
+    // state in locals and the rows of both full columns in one loop: per step the scalar work was
+    // about 200 instructions against 28 per vector (perf annotate, lc-intel, notes/157-r2.md).
+    template <int kCols>
+    [[gnu::always_inline]] static void run(u32*& c_io, u32*& d_io, u32*& e_io, std::ptrdiff_t& m_io, std::ptrdiff_t target,
+                                           std::ptrdiff_t& floor_io, Rows* rows) {
+        constexpr std::ptrdiff_t L = std::ptrdiff_t(kLanes);
+        u32 *c = c_io, *d = d_io, *e = e_io;
+        std::ptrdiff_t m = m_io, floor = floor_io;
+        // r0, r1, r2: rows[i] at the first full column; the other column at + other (kCols 2: full;
+        // kCols 1: its word 0 only).
+        u32 *r0 = nullptr, *r1 = nullptr, *r2 = nullptr;
+        std::size_t s0 = 0, s1 = 0, s2 = 0, limit = 0;
+        std::ptrdiff_t at = 0, other = 0;
+        bool last_d_row = false;
+        if constexpr (kCols > 0) {
+            at = rows->full & 1 ? 0 : std::ptrdiff_t(rows->width);
+            other = std::ptrdiff_t(rows->width) - 2 * at;
+            r0 = rows->row[0] + at, r1 = rows->row[1] + at, r2 = rows->row[2] + at;
+            s0 = rows->size[0], s1 = rows->size[1], s2 = rows->size[2], limit = rows->limit;
+            last_d_row = rows->last_d_row;
+        }
+        u32 alpha = d[m], d1 = d[m - 1];
+        Step s(alpha, c[m + 1], c[m], d1);
+        while (true) {  // alpha, d1 = d[m], d[m - 1]; s from them and c[m + 1], c[m]
+            const u32 e1 = combine3_word(s, c[m - 1], d[m - 2], d1);  // e[m - 1], e[m - 2]
+            const u32 e2 = combine3_word(s, c[m - 2], d[m - 3], d[m - 2]);
+            const Step next(e1, alpha, d1, e2);
+            ++floor;
+            combine3<kLazyRemainderWords>(c, d, e, std::max<std::ptrdiff_t>(0, floor), m, s);
+            if constexpr (kCols > 0) {
+                if (m > target || last_d_row) {
+                    const std::size_t se = std::min(limit, std::max(s0, s1 + 1));
+                    // The full columns' words [0, se): column 0 (or the full one) and + other.
+                    if constexpr (kAlignedRows) {
+                        std::ptrdiff_t j = (std::ptrdiff_t(se) - 1) & ~(L - 1);
+                        V hi = S::load(r1 + j), hi2 = S::load(r1 + other + j);
+                        for (; j >= 0; j -= L) {
+                            const V lo = S::load(r1 + j - L);
+                            S::store(r2 + j, step_vector<S, kLazyRowWords>(S::load(r0 + j), shifted_up(hi, lo), hi, s));
+                            hi = lo;
+                            if constexpr (kCols == 2) {
+                                const std::ptrdiff_t o = other + j;
+                                const V lo2 = S::load(r1 + o - L);
+                                S::store(r2 + o, step_vector<S, kLazyRowWords>(S::load(r0 + o), shifted_up(hi2, lo2), hi2, s));
+                                hi2 = lo2;
+                            }
+                        }
+                    } else {
+                        for (std::ptrdiff_t j = (std::ptrdiff_t(se) - 1) & ~(L - 1); j >= 0; j -= L) {
+                            S::store(r2 + j, step_vector<S, kLazyRowWords>(S::load(r0 + j), S::load(r1 + j - 1), S::load(r1 + j), s));
+                            if constexpr (kCols == 2) {
+                                const std::ptrdiff_t o = other + j;
+                                S::store(r2 + o, step_vector<S, kLazyRowWords>(S::load(r0 + o), S::load(r1 + o - 1), S::load(r1 + o), s));
+                            }
+                        }
+                    }
+                    if constexpr (kCols == 1) r2[other] = combine3_word<false>(s, r0[other], 0, r1[other]);  // canonical words
+                    s2 = s0, s0 = s1, s1 = se;
+                } else {
+                    s2 = s0, s0 = s1, s1 = 0;  // the last step's d row, not wanted
+                }
+                u32* const r = r0;
+                r0 = r1, r1 = r2, r2 = r;
+            }
+            u32* const old = c;
+            c = d, d = e, e = old;
+            --m;
+            alpha = e1, d1 = e2;
+            if (m < target || e1 == 0) break;
+            s = next;
+        }
+        // c and d canonical again: c's words from floor - 1, d's from floor, up to c's degree m + 1.
+        const std::ptrdiff_t lo = std::max<std::ptrdiff_t>(0, floor - 1);
+        reduce_words<kLazyRemainderWords>(c, lo, m + 2);
+        reduce_words<kLazyRemainderWords>(d, lo, m + 2);
+        c_io = c, d_io = d, e_io = e, m_io = m, floor_io = floor;
+        if constexpr (kCols > 0) {
+            rows->row[0] = r0 - at, rows->row[1] = r1 - at, rows->row[2] = r2 - at;
+            rows->size[0] = s0, rows->size[1] = s1, rows->size[2] = s2;
+        }
     }
 
     // Euclid's algorithm with fraction-free steps on the coefficients of degree >= the floor
@@ -525,32 +679,32 @@ private:
         u32* const mark = stack_.mark();
         const std::ptrdiff_t floor = n - 2 * k, lo = std::max<std::ptrdiff_t>(0, floor);
         u32* p[3];
-        for (auto& x : p) x = take_padded(std::size_t(n + 1));
+        take_padded(std::size_t(n + 1), p);
         std::copy(a + lo, a + n + 1, p[0] + lo);
         std::copy(b + lo, b + m + 1, p[1] + lo);
         Rows rows;
-        for (int j = 0; j < 2; ++j) {
-            Column& col = rows.column[j];
-            col.limit = need & (5u << j) ? std::size_t(k) + 1 : 1;
-            col.row0 = take_padded(col.limit), col.row1 = take_padded(col.limit), col.row2 = take_padded(col.limit);
-            col.size0 = j == 0, col.size1 = j == 1, col.size2 = 0;
-        }
-        rows.column[0].row0[0] = 1, rows.column[1].row1[0] = 1;
+        rows.limit = std::size_t(k) + 1;
+        rows.full = (need & 5 ? 1u : 0u) | (need & 10 ? 2u : 0u);
+        // Column 1 from column 0: past column 0's vectors and kPad zero words.
+        rows.width = (rows.limit + kPad + kLanes + 15) / 16 * 16;
+        take_padded(rows.width + rows.limit, rows.row);
+        rows.row[0][0] = 1, rows.row[1][rows.width] = 1;
+        rows.size[0] = rows.full & 1, rows.size[1] = rows.full >> 1, rows.size[2] = 0;
         rows.last_d_row = need & 12;
         u32 *c = p[0], *d = p[1], *e = p[2];
         std::ptrdiff_t c_deg = n, d_deg = m;
         steps<true>(c, c_deg, d, d_deg, e, n - k, floor, &rows);
-        for (int j = 0; j < 2; ++j) {
-            const Column& col = rows.column[j];
-            const u32* const row[2] = {col.row0, col.row1};
-            const std::size_t size[2] = {col.size0, col.size1};
-            for (int i = 0; i < 2; ++i) {
-                std::copy_n(row[i], size[i], out.entry[2 * i + j]);
-                out.size[2 * i + j] = size[i];
-                out.at0[2 * i + j] = size[i] ? row[i][0] : 0;
+        for (int i = 0; i < 2; ++i)
+            for (int j = 0; j < 2; ++j) {
+                u32* const row = rows.row[i] + std::size_t(j) * rows.width;
+                std::size_t size = rows.full >> j & 1 ? rows.size[i] : 1;
+                reduce_words<kLazyRowWords>(row, 0, std::ptrdiff_t(size));
+                while (size > 0 && row[size - 1] == 0) --size;
+                std::copy_n(row, size, out.entry[2 * i + j]);
+                out.size[2 * i + j] = size;
+                out.at0[2 * i + j] = size ? row[0] : 0;
                 out.length[2 * i + j] = 0;
             }
-        }
         out.progress = std::size_t(n - c_deg);
         stack_.release(mark);
     }
@@ -558,16 +712,20 @@ private:
     // A quotient of degree delta = c_deg - d_deg > 1: e = c, then e = alpha e - e[d_deg + t] x^t d
     // for t = delta .. 0 (alpha = lc d), on the coefficients from lo; the rows alike (row[2] from
     // row[0] and row[1]) if given.
-    static void pseudo_divide(const u32* c, std::ptrdiff_t c_deg, const u32* d, std::ptrdiff_t d_deg, u32* e,
-                              std::ptrdiff_t lo, Rows* rows) {
+    [[gnu::noinline]] static void pseudo_divide(const u32* c, std::ptrdiff_t c_deg, const u32* d, std::ptrdiff_t d_deg,
+                                                u32* e, std::ptrdiff_t lo, Rows* rows) {
         const u32 alpha = d[d_deg];
         std::copy(c + lo, c + c_deg + 1, e + lo);
-        if (rows)
-            for (Column& col : rows->column) {
-                std::copy_n(col.row0, col.size0, col.row2);
-                if (col.size2 > col.size0) std::fill(col.row2 + col.size0, col.row2 + col.size2, 0u);
-                col.size2 = col.size0;
+        // Per column j: its rows at + j width, size the full columns' bound, or word 0 alone.
+        const auto words = [rows](int j, std::size_t size) { return rows->full >> j & 1 ? size : std::size_t(1); };
+        if (rows) {
+            for (int j = 0; j < 2; ++j) {
+                u32* const r2 = rows->row[2] + std::size_t(j) * rows->width;
+                std::copy_n(rows->row[0] + std::size_t(j) * rows->width, words(j, rows->size[0]), r2);
+                if (rows->full >> j & 1 && rows->size[2] > rows->size[0]) std::fill(r2 + rows->size[0], r2 + rows->size[2], 0u);
             }
+            rows->size[2] = rows->size[0];
+        }
         for (std::ptrdiff_t t = c_deg - d_deg; t >= 0; --t) {
             const u32 minus_tau = negate(e[d_deg + t]);
             for (std::ptrdiff_t j = lo; j <= d_deg + t; ++j) {
@@ -575,15 +733,17 @@ private:
                 e[j] = u32((u64(alpha) * e[j] + u64(minus_tau) * dj) % kP);
             }
             if (!rows) continue;
-            for (Column& col : rows->column) {
-                const std::size_t shift = std::size_t(t);
-                const std::size_t se = std::min(col.limit, std::max(col.size2, col.size1 ? col.size1 + shift : 0));
-                for (std::size_t j = 0; j < se; ++j) {
-                    const u32 dj = j >= shift ? col.row1[j - shift] : 0;  // zero past size1 (limit 1: j = 0 only)
-                    col.row2[j] = u32((u64(alpha) * col.row2[j] + u64(minus_tau) * dj) % kP);
+            const std::size_t shift = std::size_t(t);
+            const std::size_t se = std::min(rows->limit, std::max(rows->size[2], rows->size[1] ? rows->size[1] + shift : 0));
+            for (int j = 0; j < 2; ++j) {
+                u32* const r2 = rows->row[2] + std::size_t(j) * rows->width;
+                const u32* const r1 = rows->row[1] + std::size_t(j) * rows->width;
+                for (std::size_t i = 0; i < words(j, se); ++i) {
+                    const u32 di = i >= shift ? r1[i - shift] : 0;  // zero past size[1]
+                    r2[i] = u32((u64(alpha) * r2[i] + u64(minus_tau) * di) % kP);
                 }
-                col.size2 = se;
             }
+            rows->size[2] = se;
         }
     }
 
@@ -621,19 +781,21 @@ private:
         u32* const t = r.transform[i];
         const std::size_t half = len / 2, size = r.size[i];
         if (r.length[i] == half && size <= half + 1) {
-            u32* const upper = t + half;
-            const u32* const e = r.entry[i];
-            std::copy_n(e, std::min(size, half), upper);
-            std::fill(upper + std::min(size, half), upper + half, 0u);
-            if (size > half) upper[0] = sub1(upper[0], e[half]);
-            transform(len).forward_upper(upper, ntt::Form::values);
+            // The entry mod (x^half + 1) read in place by the first level: for half + 1 words, its
+            // word 0 is e[0] - e[half] meanwhile.
+            u32* const e = r.entry[i];
+            const u32 e0 = e[0];
+            if (size > half) e[0] = sub1(e0, e[half]);
+            transform(len).forward_upper(Span(e, std::min(size, half)), t + half, ntt::Form::values);
+            if (size > half) e[0] = e0;
         } else {
             values_of(r.entry[i], size, t, len);
         }
         r.length[i] = len;
     }
 
-    // c, d = r1 (a, b) at degrees [s2, c_deg], c_deg = deg c. With L >= n / 2, the products are
+    // c, d = r1 (a, b) at degrees [s2, c_deg] (the words below s2 unspecified), c_deg = deg c. With
+    // L >= n / 2, the products are
     // cyclic of length L; when c_deg >= L, the coefficients [0, c_deg - L] of c and d (which the
     // wrap adds to [L, c_deg]) come from the products of r1 with a, b mod x^(c_deg - L + 1).
     void apply(const u32* a, std::ptrdiff_t n, const u32* b, std::ptrdiff_t m, Matrix& r1, std::ptrdiff_t c_deg,
@@ -644,16 +806,14 @@ private:
         u32 *const ta = take(len), *const tb = take(len);
         values_of(a, std::size_t(n + 1), ta, len);
         values_of(b, std::size_t(m + 1), tb, len);
-        u32 *const pc = take(len), *const pd = take(len);
-        apply_products(r1.transform, ta, tb, pc, pd, len);
+        u32* const work = take(footprint(len) + len);  // apply_products' two arrays
         const std::ptrdiff_t l = std::ptrdiff_t(len), mixed = c_deg - l;  // c[j] + c[j + L] at j <= mixed
-        if (mixed < 0) {
-            std::copy(pc + s2, pc + c_deg + 1, c + s2);
-            std::copy(pd + s2, pd + c_deg + 1, d + s2);
-            return stack_.release(mark);
-        }
+        // c, d at [0, min(c_deg + 1, L)) from the cyclic products (the words below s2 are not read).
+        const std::size_t top = std::size_t(std::min(c_deg + 1, l));
+        apply_products(r1.transform, ta, tb, work, Out(c, top), Out(d, top), len);
+        if (mixed < 0) return stack_.release(mark);
         const std::size_t low = std::size_t(mixed + 1);
-        u32 *const lc = take(len), *const ld = take(len);
+        u32 *const lc = take(low), *const ld = take(low);
         const std::size_t short_len = std::max(kMinLength, std::bit_ceil(2 * low - 1));
         const std::size_t mb = std::min(low, std::size_t(m + 1));
         if (short_len < len) {
@@ -665,35 +825,32 @@ private:
             }
             values_of(a, low, ta, short_len);
             values_of(b, mb, tb, short_len);
-            apply_products(rt, ta, tb, lc, ld, short_len);
+            apply_products(rt, ta, tb, work, Out(lc, low), Out(ld, low), short_len);
         } else {
             values_of(a, low, ta, len);
             values_of(b, mb, tb, len);
-            apply_products(r1.transform, ta, tb, lc, ld, len);
+            apply_products(r1.transform, ta, tb, work, Out(lc, low), Out(ld, low), len);
             // Coefficient L of the low products (if n = 2L) wraps onto 0; the products are 2^-32 r1 (a, b).
             lc[0] = montgomery(u64(r1.at0[0]) * a[0] + u64(r1.at0[1]) * b[0]);
             ld[0] = montgomery(u64(r1.at0[2]) * a[0] + u64(r1.at0[3]) * b[0]);
         }
-        // [s2, mixed] from the low products, (mixed, L) as computed, [L, c_deg] unwrapped.
+        // [L, c_deg] unwrapped from the cyclic words below them, then [s2, mixed] from the low products.
+        division::detail::subtract(c, lc, c + l, low);
+        division::detail::subtract(d, ld, d + l, low);
         const std::ptrdiff_t first = std::min(s2, mixed + 1);
         std::copy(lc + first, lc + mixed + 1, c + first);
         std::copy(ld + first, ld + mixed + 1, d + first);
-        const std::ptrdiff_t from = std::max(s2, mixed + 1);
-        std::copy(pc + from, pc + l, c + from);
-        std::copy(pd + from, pd + l, d + from);
-        division::detail::subtract(pc, lc, c + l, low);
-        division::detail::subtract(pd, ld, d + l, low);
         stack_.release(mark);
     }
 
-    // c, d (len words each) = the coefficients of 2^-32 r (a, b) mod (x^len - 1) from the values
-    // forms of length len of r's entries and of a, b.
-    static void apply_products(u32* const (&r)[4], const u32* ta, const u32* tb, u32* c, u32* d, std::size_t len) {
+    // c, d = the first c.size(), d.size() coefficients of 2^-32 r (a, b) mod (x^len - 1), from the
+    // values forms of length len of r's entries and of a, b; work: 2 len words.
+    static void apply_products(u32* const (&r)[4], const u32* ta, const u32* tb, u32* work, Out c, Out d, std::size_t len) {
         const ntt::Transform& t = transform(len);
-        products(r[0], ta, r[1], tb, nullptr, c, len);
-        products(r[2], ta, r[3], tb, nullptr, d, len);
-        t.inverse(c, ntt::Form::values);
-        t.inverse(d, ntt::Form::values);
+        u32* const wd = work + footprint(len);
+        products2(ta, tb, r[0], r[1], r[2], r[3], work, wd, len);
+        t.inverse(work, work, c, ntt::Form::values);
+        t.inverse(wd, wd, d, ntt::Form::values);
     }
 
     // out = 2^-32 r2 r1 (the entries in need), progress p = r2.progress + r1.progress: cyclic
@@ -710,27 +867,34 @@ private:
         const ntt::Transform& t = transform(len);
         u32* const work = take(len);
         const bool keep = out.room >= len;
+        u32* const spare = keep || ((need & 3) != 3 && (need & 12) != 12) ? nullptr : take(len);
         const std::size_t count = std::min(p + 1, len);
-        for (int i = 0; i < 2; ++i)
+        for (int i = 0; i < 2; ++i) {
+            // out[2i + j] = (r2[2i] r1[j] + r2[2i + 1] r1[2 + j]) 2^-32: its values kept (or in work
+            // and spare), its coefficients by an inverse through work into the entry. Both of a row
+            // in one pass.
+            const unsigned row = need >> 2 * i & 3;
+            u32* const F[2] = {keep ? out.transform[2 * i] : work, keep ? out.transform[2 * i + 1] : row == 3 ? spare : work};
+            if (row == 3)
+                products2(r2.transform[2 * i], r2.transform[2 * i + 1], r1.transform[0], r1.transform[2], r1.transform[1],
+                          r1.transform[3], F[0], F[1], len);
             for (int j = 0; j < 2; ++j) {
                 const int ij = 2 * i + j;
                 out.length[ij] = 0;
                 const u32 x0 = montgomery(u64(r2.at0[2 * i]) * r1.at0[j] + u64(r2.at0[2 * i + 1]) * r1.at0[2 + j]);
                 out.at0[ij] = x0;
-                if (!(need >> ij & 1)) continue;
-                // out[ij] = (r2[2i] r1[j] + r2[2i + 1] r1[2 + j]) 2^-32: its values kept, its
-                // coefficients by the inverse of a copy in work.
-                products(r2.transform[2 * i], r1.transform[j], r2.transform[2 * i + 1], r1.transform[2 + j],
-                         keep ? out.transform[ij] : nullptr, work, len);
+                if (!(row >> j & 1)) continue;
+                if (row != 3)
+                    products(r2.transform[2 * i], r1.transform[j], r2.transform[2 * i + 1], r1.transform[2 + j], F[j], len);
                 if (keep) out.length[ij] = len;
-                t.inverse(work, ntt::Form::values);
                 u32* const e = out.entry[ij];
-                std::copy_n(work, count, e);
+                t.inverse(F[j], work, Out(e, count), ntt::Form::values);
                 if (p == len) e[len] = sub1(e[0], x0), e[0] = x0;
                 std::size_t size = p + 1;
                 while (size > 0 && e[size - 1] == 0) --size;
                 out.size[ij] = size;
             }
+        }
         out.progress = p;
         stack_.release(mark);
     }
@@ -817,7 +981,7 @@ inline std::ptrdiff_t inverse_mod_run(Stack& stack, Span f, Span g, Out h, std::
     const u32 scale = inverse(c);
     std::size_t t = r.size[1];
     while (t > 0 && r.entry[1][t - 1] == 0) --t;
-    for (std::size_t i = 0; i < t; ++i) h[i] = mul(r.entry[1][i], scale);
+    scale_words(r.entry[1], scale, h.data(), t);
     std::fill(h.begin() + std::ptrdiff_t(t), h.end(), 0u);
     return std::ptrdiff_t(t);
 }
@@ -832,7 +996,7 @@ inline std::size_t gcd(Span f, Span g, Out out, std::span<u32> scratch, std::ptr
     check_length(nf);
     if (ng == 0) {  // gcd(f, 0) = f, monic
         const u32 scale = inverse(f[nf - 1]);
-        for (std::size_t i = 0; i < nf; ++i) out[i] = mul(f[i], scale);
+        scale_words(f.data(), scale, out.data(), nf);
         return nf;
     }
     if (ng == 1) {  // a nonzero constant
