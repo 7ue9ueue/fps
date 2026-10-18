@@ -145,7 +145,8 @@ void test_mul() {
         const Vec full = vec(f * g);
         for (const std::size_t n : {h / 3, h, h + 1, 2 * h - 1, 2 * h, 2 * h + 1, 4 * h})
             CHECK(vec(fps::mul(f, g, n)) == first(full, n) && raw_mul(vec(f), vec(g), n) == first(full, n), lg, n);
-        CHECK(vec(fps::square(f)) == vec(f * f), lg);
+        const Poly copy = f;  // a product, not a square: f * f runs as a square since #271
+        CHECK(vec(fps::square(f)) == vec(f * copy), lg);
     }
 }
 
