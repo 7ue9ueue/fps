@@ -138,7 +138,11 @@ Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_produc
 - Hooked and pruned ops (issue #149, for backend/composition; notes/149-r1.md):
   `forward_hooked(in, F, hook, zero)` hands each run of leaves to the caller's hook after its
   bottom level; `inverse_hooked(hook, work, out, o, unused)` lets the hook write each run (times
-  2^-32) before its bottom level. A column bit zero in the forward's source (unused in the
+  2^-32) before its bottom level. In place (issue #210): `forward_hooked` with in at F, and an
+  `inverse_hooked` whose hook reads out's memory (every variant's top level writes out after the
+  last hook call). From another array the forward's top level moves twice the lines (the source
+  read, the destination fetched for writing): composition's forward of P at 2m ran 1.06x lc-opt's
+  in-place one at 2^20 on Zen 3 for that alone, the levels below equal (notes/210-r1.md). A column bit zero in the forward's source (unused in the
   inverse's output) prunes the groups above it to half their columns, the top level included
   (`PrunedLevel` in common.hpp; avx2 `kernels::*_columns`, intrinsics `*_group_columns`).
 - `inverse_product` of up to 8 terms (issue #143, for division's windows and power projection's
@@ -167,6 +171,9 @@ origins). One product, `product<Bottom>` (lc-opt had two paths, `Convolution` an
 
 - Depth-first radix-4 recursion; runs of sibling subtrees of at most 256 vectors in all (8 KiB
   per array) go level by level as one tile, so one bottom stage pipelines across all of them.
+  The tile's h = 4 levels are one asm loop over its groups, twiddle slots from the group index
+  (lc-opt's `lib/poly` loops; issues #87, #210): `forward_h4_pair` (a and b), `forward_h4` (a
+  square), `inverse_h4`; on a tile in L1 on Zen 3, 0.94 and 0.92-0.97 of a call per group.
 - Bottom stage: the bottom level (h = 1) fused with the leaf products and the first inverse
   level; batch j + 1's forward half is interleaved with batch j's products. `PairBottom`
   (lc-opt's `Product`): two groups per always-inlined asm statement, leaf weights from the
@@ -188,8 +195,11 @@ origins). One product, `product<Bottom>` (lc-opt had two paths, `Convolution` an
   statement. Knobs from QPoly exploration 009 (timed on EPYC 7763).
 - Scales come from a constexpr table.
 - `Transform::forward`/`inverse` (new here, not in lc-opt): the same recursion and tiles on one
-  array with the asm kernels down to h = 4; the h = 1 level is `forward_leaves`/`inverse_leaves`
-  (two groups per asm statement; canonical leaves out, canonical leaves in). Odd lg: `forward_top`
+  array with the asm kernels down to h = 4 (h = 4 as loops: `forward_h4`, `inverse_h4`); the h = 1
+  level in loops of 8 groups, `forward_leaves_loop` (lc-opt's) and `inverse_leaves_loop`
+  (`inverse_leaves`' butterfly on canonical leaves: 0.88 of `inverse_leaves`' time on a tile in
+  L1, lc-opt's loop on inputs < 2P 0.95; issue #210), else `forward_leaves`/`inverse_leaves` (two
+  groups per asm statement; canonical leaves out, canonical leaves in). Odd lg: `forward_top`
   (the first level without input reductions: 20 vector ops per column, not 33) and
   `inverse_top4`. Even lg: a radix-2 pass without reductions (canonical inputs) below 2^16,
   `forward_radix8_dense` from 2^16; `inverse_top`.

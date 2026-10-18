@@ -52,11 +52,11 @@ bool equal_mod(const u32* f, const u32* g, std::size_t n) {
 
 void test_kernels() {
     constexpr int lg = 20;  // tables of 2^lg: group indices below 2^lg / 16
-    std::vector<u32> rt(detail::table_words(lg) + kPadding), irt(detail::table_words(lg) + kPadding);
-    variant::avx2::build_table(rt.data(), (std::size_t(1) << lg) / 16, false);
-    variant::avx2::build_table(irt.data(), (std::size_t(1) << lg) / 16, true);
-    const u32 *r = rt.data(), *ir = irt.data();
-    const std::size_t h4_groups = (std::size_t(1) << lg) / 32;  // groups at h = 4 (4 vectors per quarter)
+    Words rt(detail::table_words(lg)), irt(detail::table_words(lg));  // 32-byte aligned: aligned stores
+    variant::avx2::build_table(rt.begin(), (std::size_t(1) << lg) / 16, false);
+    variant::avx2::build_table(irt.begin(), (std::size_t(1) << lg) / 16, true);
+    const u32 *r = rt.begin(), *ir = irt.begin();
+    const std::size_t h4_groups = (std::size_t(1) << lg) / 128;  // groups at h = 4: 16 vectors each
     for (int kind = 0; kind < 4; ++kind) {
         for (const std::size_t count : {1, 2, 3, 8, 16}) {
             for (const std::size_t k : {std::size_t(0), std::size_t(1), std::size_t(7), std::size_t(8),
