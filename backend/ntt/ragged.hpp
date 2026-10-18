@@ -229,12 +229,12 @@ inline void combine(u32* out, std::size_t L, std::size_t r, std::size_t s, std::
 // From v (L + r words): Abar (L words), Cbar (s words, if s) and Tbar (t words) with qbar[k] = v[L
 // + k] - v[k] (k < r): Tbar[k] = qbar[s + k] - z^s qbar[k], Cbar[k] = z^-k qbar[k] / (z^L - 1)
 // and Abar[k + s c] = v[k + s c] - z^(s c) qbar[k] / (z^L - 1) for k < min(r, s); with s = 0,
-// Tbar = qbar and Abar = v[0, L).
+// Tbar = qbar, and Abar = v[0, L) is not written (the main product reads v: issue #261, a copy of
+// L words cost the top plan 1-7% of its time).
 inline void split_transposed(const u32* v, std::size_t L, std::size_t r, std::size_t s, std::size_t t, u32* Abar, u32* Cbar,
                              u32* Tbar) {
     const u32* top = v + L;
     if (!s) {
-        std::copy_n(v, L, Abar);
         std::size_t k = 0;
         for (; k + kLanes <= r; k += kLanes) Vec::store(Tbar + k, Mod::sub(Vec::load(top + k), Vec::load(v + k)));
         for (; k < r; ++k) Tbar[k] = top[k] >= v[k] ? top[k] - v[k] : top[k] + kP - v[k];
@@ -264,8 +264,15 @@ inline void split_transposed(const u32* v, std::size_t L, std::size_t r, std::si
     }
 }
 
-// b = g x^-(m - 1) mod (x^L - 1) (m <= 2L): b[(i - (m - 1)) mod L] summed over i < m.
+// b = g x^-(m - 1) mod (x^L - 1) (m <= 2L): b[(i - (m - 1)) mod L] summed over i < m. Each word
+// written once for m <= L: g[m - 1] at b[0], g[0, m - 1) at the top, zeros between.
 inline void stage_turned(const u32* g, std::size_t m, std::size_t L, u32* b) {
+    if (m <= L) {
+        b[0] = g[m - 1];
+        std::fill(b + 1, b + L - (m - 1), 0u);
+        std::copy_n(g, m - 1, b + L - (m - 1));
+        return;
+    }
     const std::size_t o = (L - (m - 1) % L) % L;  // g[i] goes to b[(i + o) mod L]
     std::fill_n(b, L, 0u);
     for (std::size_t i = 0; i < m;) {

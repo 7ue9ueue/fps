@@ -99,7 +99,10 @@ Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_produc
   generic levels above them. Middle products (notes/155-r3.md): f's N words read, extended by its
   words past the cut chosen so that it vanishes on the nodes past it, so the cyclic product with g
   comes from the cut's nodes alone (an inverse pruned to them writes words [m - 1, N)); their plan is
-  the table's second half.
+  the table's second half. Just past a power of two (r <= L / 16, notes/261-r1.md) the top plan
+  (s = 0) wins both: its main product reads f's words straight from the caller (factors of L / 2 +
+  e words through the tail sources; middle products: v itself, not a copy), at 0.98-1.03 of 2^k's
+  ns per word for r <= L / 128 from 2^16 on, 1.01-1.08 at L / 16 (the top product of 2r words).
 - `Transform`: tables built once; forward and inverse in place on caller arrays (32-byte aligned,
   16 words of padding: the AVX2 forward kernels read 4 bytes past their last vector).
 - `Transform`'s leaf-form ops (issue #49), for `fps::Values` and the product tree. Each variant
@@ -296,9 +299,12 @@ the other variants' word for word.
   q, begin, end)` with kLoad quarters read and kStore written (the defaults, 4 and 4, are the
   in-place forms). A factor of at most half the length is read straight from the caller by both
   subtrees' first groups (`Source`: n words, zero past them), as the in-place form reads its
-  lower half; a longer one by the radix-2 level. `prefetchw` covers quarters that are written but
-  not read (zero quarters past the source): without it, Emerald Rapids ran multiply_dense at odd
-  lg from 2^17 2% slower in the unified attempt (Log).
+  lower half; one of half + e words, e <= half / 16, too from 2^10 on, each first group staging
+  its first e columns plus or minus the tail (`first_group_tail`, issue #261: the radix-2 level it
+  replaces cost products of 2^k + 1 words 2-7%, notes/261-r1.md); a longer one by the radix-2 level.
+  `prefetchw` covers quarters that are written but not read (zero quarters past the source):
+  without it, Emerald Rapids ran multiply_dense at odd lg from 2^17 2% slower in the unified
+  attempt (Log).
 
 ### avx512 (issue #150)
 
