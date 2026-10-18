@@ -62,7 +62,9 @@ void check_shape(std::size_t N) {
         if (d + 1 < s.levels) {
             const dt::Level& next = s.level[d + 1];
             ok &= next.node.k == std::size_t(l.radix) * l.node.k + l.n / c && next.node.size == c && next.n == l.n % c;
-            ok &= next.mu == (l.n / c ? u32(l.radix) : l.mu * u32(l.radix));
+            // Under a radix-2 root, x^L + 1's known words are x^L - 1's (mu 1); else mu as shape().
+            const bool sibling = d == 0 && l.radix == 2;
+            ok &= next.sibling == sibling && next.mu == (sibling ? 1 : l.n / c ? u32(l.radix) : l.mu * u32(l.radix));
         } else {
             ok &= l.n % c == 0;
         }
@@ -131,7 +133,7 @@ std::vector<u32> run_truncated(const std::vector<u32>& f, const std::vector<u32>
     for (u32& w : out.span()) w = u32(rng());
     const u32* gs = kSquare ? fw.begin() : gw.begin();
     detail::product<V, kSquare>(fw.begin(), n, gs, m, out.begin(), count, p);
-    std::vector<detail::Line> work(dr::truncated_words(std::size_t(1) << p.lg) / 16 + 1);
+    std::vector<detail::Line> work(dr::work_words(p) / 16 + 1);
     std::vector<u32> c(N);
     const auto [roots, inverse_roots] = detail::tables<V>(detail::table_log(p));
     detail::ragged_into<V, kSquare>(fw.begin(), n, gs, m, c.data(), work.data()->words, p, roots, inverse_roots);

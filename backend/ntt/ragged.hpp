@@ -409,4 +409,11 @@ constexpr std::size_t split_words(std::size_t L) { return 3 * (L + kPadding) + 2
 // split_words(L).
 constexpr std::size_t truncated_words(std::size_t L) { return 2 * (2 * L + kPadding) + 1024; }
 
+// Words of work ntt.hpp's ragged_into needs for plan p (its tables: ntt.hpp's table_log(p)): a
+// caller outside ntt (backend/series' low_product) sizes its work by it.
+constexpr std::size_t work_words(const Plan& p) {
+    const std::size_t len = std::size_t(1) << p.lg;
+    return p.split ? split_words(len) : p.truncated ? truncated_words(len) : 2 * (len + kPadding) + 1024;
+}
+
 }  // namespace fps::ntt::detail::ragged

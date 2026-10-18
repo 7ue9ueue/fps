@@ -81,11 +81,7 @@ void check_middle(const char* name, const std::vector<u32>& f, const std::vector
 // f g (or f^2: g = f) of n and m words by plan p into out (n + m - 1 words, apart from f and g).
 template <class V, bool kSquare>
 void run_plan(const u32* f, std::size_t n, const u32* g, std::size_t m, u32* out, const detail::ragged::Plan& p) {
-    const std::size_t len = std::size_t(1) << p.lg;
-    const std::size_t words = p.split       ? detail::ragged::split_words(len)
-                              : p.truncated ? detail::ragged::truncated_words(len)
-                                            : 2 * (len + kPadding) + 1024;
-    std::vector<detail::Line> work(words / 16 + 1);
+    std::vector<detail::Line> work(detail::ragged::work_words(p) / 16 + 1);
     const auto [roots, inverse_roots] = detail::tables<V>(detail::table_log(p));
     detail::ragged_into<V, kSquare>(f, n, g, m, out, work.data()->words, p, roots, inverse_roots);
 }

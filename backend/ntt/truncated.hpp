@@ -6,7 +6,7 @@
 //
 //   shape(N)                  the levels (the partial nodes, the root first) and the full nodes
 //   forward(f, n, F, s, r)    f mod each full node, into F (the leaf form of length 2L, cut)
-//   inverse(F, out, s, r, ir) F's group products -> c = out[0, N)
+//   inverse(F, out, count, s, r, ir)  F's group products -> out = c[0, count), count <= N
 //
 // Node k of s words is x^s - r(k)^2 (r: the twiddles of common.hpp); its halves are nodes 2k and 2k
 // + 1, its quarters 4k + t, the root x^(2L) - 1 node 0. A node whose s / 8 is a power of 4 is the
@@ -60,12 +60,14 @@ struct Node {
     std::size_t k, size, at;
 };
 // A partial node: its first n words unknown, 0 < n < size; children of size / radix words; mu: the
-// scale of its known words over its own (above).
+// scale of its known words over its own (above). sibling: those are the words of the node before
+// it, x^L - 1's half of a radix-2 root (c has no words from L + n on: they agree there).
 struct Level {
     Node node;
     std::size_t n;
     int radix;
     u32 mu;
+    bool sibling = false;
 };
 
 inline constexpr int kMaxLevels = 12, kMaxFulls = 3 * kMaxLevels;
@@ -89,7 +91,9 @@ constexpr Shape shape(std::size_t N) {
     for (std::size_t n = s.rr;;) {
         const int radix = ragged::radix(node.size);
         const std::size_t c = node.size / std::size_t(radix), t = n / c, rest = n % c;
-        s.level[s.levels++] = {node, n, radix, mu};
+        const bool sibling = s.levels == 1 && s.level[0].radix == 2;
+        if (sibling) mu = 1;
+        s.level[s.levels++] = {node, n, radix, mu, sibling};
         for (std::size_t u = 0; u < t; ++u) s.full[s.fulls++] = {radix * node.k + u, c, node.at + u * c};
         if (!rest) break;
         node = {radix * node.k + t, c, node.at + t * c};
@@ -220,15 +224,19 @@ void forward_level(const u32* src, std::size_t len, std::size_t c, int last, u32
 // f (n < 2L words, canonical) mod each full node of s into F, the leaf form of length 2L (2L words
 // kept). r: the forward table of 2L. Outputs < 2P (group products take < 4P).
 inline void forward(const u32* f, std::size_t n, u32* F, const Shape& s, const u32* r) {
+    // A radix-2 root and n <= L: f is its own residue mod x^L -+ 1, so the root writes x^L - 1's half
+    // alone and the next level reads f: no copy of f written and read back.
+    const bool direct = s.level[0].radix == 2 && s.levels > 1 && n <= s.level[1].node.size;
     for (int d = 0; d < s.levels; ++d) {
         const Level& l = s.level[d];
         const std::size_t c = l.node.size / std::size_t(l.radix), t = l.n / c;
         const int last = int(l.n % c ? t : t - 1);
         u32* const at = F + l.node.at;
         const Twiddles w(r, l.node.k, l.radix);
-        if (d > 0) forward_level<4, false>(at, l.node.size, c, last, at, w);
+        if (d == 1 && direct) forward_level<4, false>(f, n, c, last, at, w);
+        else if (d > 0) forward_level<4, false>(at, l.node.size, c, last, at, w);
         else if (l.radix == 4) forward_level<4, true>(f, n, c, last, at, w);
-        else forward_level<2, true>(f, n, c, last, at, w);
+        else forward_level<2, true>(f, n, c, direct ? 0 : last, at, w);
     }
 }
 
@@ -259,32 +267,34 @@ struct Constants {
     }
 };
 
-// The root's words: c[at, at + kLanes), canonical; kCut: cut to N words.
+// The root's words: c[at, at + kLanes), canonical; kCut: cut to count words (count <= N).
 struct Out {
     u32* c;
-    std::size_t N;
+    std::size_t count;
     template <bool kCut>
     [[gnu::always_inline]] void put(std::size_t at, V v) const {
         v = Mod::reduce<kP>(v);
-        if (!kCut || at + kLanes <= N) Vec::store(c + at, v);
-        else if (at < N) Vec::store_first(c + at, v, int(N - at));
+        if (!kCut || at + kLanes <= count) Vec::store(c + at, v);
+        else if (at < count) Vec::store_first(c + at, v, int(count - at));
     }
 };
 
 // One column j of a level's inverse, kU of its children's residues known (R_v, v < kU, at X + v c +
-// j; the last one the partial child's in step 2, at the same scale) and p_u for u >= kU (K_u, at X +
-// u c + j; the root's zero): p_u for u < kU (P_u; the root's c[u c + j]), and with kNext R_kU (Q) to
-// X + kU c + j, at the scale of the node's words (mu 1). Radix 4, true values: E, G = p0 +- x p2; F,
-// H = p1 +- x p3; R0, R1 = E +- y F; R2, R3 = G +- z H. Radix 2: R0, R1 = p0 +- x p1. With o the
-// node's scale, R_v = o / radix times its true value and K_u = mu o times p_u.
-template <int kRadix, int kU, bool kNext, bool kRoot, bool kCut = false>
+// j; the last one the partial child's in step 2, at the same scale) and p_u for u >= kU (K_u, at
+// known + u c + j; the root's zero): p_u for u < kU (P_u; the root's c[u c + j]), and with kNext R_kU
+// (Q) to X + kU c + j, at the scale of the node's words (mu 1). Radix 4, true values: E, G = p0 +- x
+// p2; F, H = p1 +- x p3; R0, R1 = E +- y F; R2, R3 = G +- z H. Radix 2: R0, R1 = p0 +- x p1. With o
+// the node's scale, R_v = o / radix times its true value and K_u = mu o times p_u. kCut: the root's
+// words past out.count are none (0), in chunk kU - 1 (1) or anywhere (2).
+template <int kRadix, int kU, bool kNext, bool kRoot, int kCut = 0>
     requires(kRoot || kRadix == 4)
-[[gnu::always_inline]] inline void inverse_column(u32* X, std::size_t c, std::size_t j, const Constants& k, const Out& out) {
+[[gnu::always_inline]] inline void inverse_column(u32* X, const u32* known, std::size_t c, std::size_t j, const Constants& k,
+                                                  const Out& out) {
     const auto R = [&](int v) { return Vec::load(X + std::size_t(v) * c + j); };
-    const auto K = [&](int u) { return Vec::load(X + std::size_t(u) * c + j); };
-    const auto P = [&](int u, V v) {  // the root's chunk kU - 1 may pass N (kCut)
+    const auto K = [&](int u) { return Vec::load(known + std::size_t(u) * c + j); };
+    const auto P = [&](int u, V v) {
         if constexpr (kRoot) {
-            if (kCut && u == kU - 1) out.put<true>(std::size_t(u) * c + j, v);
+            if (kCut == 2 || (kCut == 1 && u == kU - 1)) out.put<true>(std::size_t(u) * c + j, v);
             else out.put<false>(std::size_t(u) * c + j, v);
         } else {
             Vec::store(X + std::size_t(u) * c + j, v);
@@ -294,10 +304,8 @@ template <int kRadix, int kU, bool kNext, bool kRoot, bool kCut = false>
     const auto twice = [](V v) { return add2(v, v); };
     if constexpr (kRoot) {  // k = 0: x = y = 1, z = r(1); K = 0; outputs times sc
         if constexpr (kRadix == 2) {
-            if constexpr (kU == 1) {
-                const V p0 = twice(R(0));
-                P(0, k.sc.times(p0));
-                if constexpr (kNext) Q(p0);
+            if constexpr (kU == 1) {  // no Q: x^L + 1's known words are x^L - 1's (Level::sibling)
+                P(0, k.sc.times(twice(R(0))));
             } else {
                 const V r0 = R(0), r1 = R(1);
                 P(0, k.sc.times(add4(r0, r1))), P(1, k.sc.times(sub4(r0, r1)));
@@ -340,10 +348,10 @@ template <int kRadix, int kU, bool kNext, bool kRoot, bool kCut = false>
     }
 }
 
-template <int kRadix, int kU, bool kNext, bool kRoot, bool kCut = false>
+template <int kRadix, int kU, bool kNext, bool kRoot, int kCut = 0>
     requires(kRoot || kRadix == 4)
-[[gnu::noinline]] void inverse_columns(u32* X, std::size_t c, std::size_t j0, std::size_t j1, const Constants& k,
-                                       const Out& out) {
+[[gnu::noinline]] void inverse_columns(u32* X, const u32* known, std::size_t c, std::size_t j0, std::size_t j1,
+                                       const Constants& k, const Out& out) {
     if (prefetches<kRadix>(c)) {
         for (std::size_t j = j0; j < j1; j += kLanes) {
             if (j % 16 == 0) {  // a line per chunk read, and per chunk of out written
@@ -351,52 +359,55 @@ template <int kRadix, int kU, bool kNext, bool kRoot, bool kCut = false>
                 if constexpr (kRoot)
                     for (int u = 0; u < kU; ++u) ahead_write(out.c + std::size_t(u) * c + j);
             }
-            inverse_column<kRadix, kU, kNext, kRoot, kCut>(X, c, j, k, out);
+            inverse_column<kRadix, kU, kNext, kRoot, kCut>(X, known, c, j, k, out);
         }
         return;
     }
-    for (std::size_t j = j0; j < j1; j += kLanes) inverse_column<kRadix, kU, kNext, kRoot, kCut>(X, c, j, k, out);
+    for (std::size_t j = j0; j < j1; j += kLanes) inverse_column<kRadix, kU, kNext, kRoot, kCut>(X, known, c, j, k, out);
 }
 
-// Step 1 (top-down) or step 2 (bottom-up, second) of a level.
+// Step 1 (top-down) or step 2 (bottom-up, second) of a level; N: the product's words.
 template <int kRadix, bool kRoot>
-void inverse_step(const Level& l, bool second, u32* X, const Constants& k, const Out& out) {
+void inverse_step(const Level& l, bool second, u32* X, const u32* known, std::size_t N, const Constants& k, const Out& out) {
     const std::size_t c = l.node.size / std::size_t(kRadix), t = l.n / c, rest = l.n % c;
     with_blocks<kRadix - 1>(int(t), [&](auto u) {
         constexpr int kT = decltype(u)::value;
-        // The root has t >= radix / 2 (N > L).
         // The root's last chunk written, t in step 2 or t - 1 with no partial child, may pass N:
-        // columns from N - (its chunk) c on are cut; N > t c if rest > 0, else N > (t - 1) c.
+        // columns from N - (its chunk) c on are cut; N > t c if rest > 0, else N > (t - 1) c. A cut
+        // product (out.count < N) checks every word.
         const auto run = [&]<int kU, bool kNext>(std::size_t j0, std::size_t j1) {
             if constexpr (kRoot) {
-                const std::size_t cut = std::clamp((out.N - (kU - 1) * c) / kLanes * kLanes, j0, j1);
-                inverse_columns<kRadix, kU, kNext, kRoot>(X, c, j0, cut, k, out);
-                inverse_columns<kRadix, kU, kNext, kRoot, true>(X, c, cut, j1, k, out);
+                if (out.count < N) return inverse_columns<kRadix, kU, kNext, kRoot, 2>(X, known, c, j0, j1, k, out);
+                const std::size_t cut = kNext ? j1 : std::clamp((N - (kU - 1) * c) / kLanes * kLanes, j0, j1);
+                inverse_columns<kRadix, kU, kNext, kRoot>(X, known, c, j0, cut, k, out);
+                inverse_columns<kRadix, kU, kNext, kRoot, 1>(X, known, c, cut, j1, k, out);
             } else {
-                inverse_columns<kRadix, kU, kNext, kRoot>(X, c, j0, j1, k, out);
+                inverse_columns<kRadix, kU, kNext, kRoot>(X, known, c, j0, j1, k, out);
             }
         };
-        if constexpr (!kRoot || 2 * kT >= kRadix) {
+        if constexpr (!kRoot || 2 * kT >= kRadix) {  // the root has t >= radix / 2 (N > L)
             if (second) run.template operator()<kT + 1, false>(0, rest);
-            else if (rest) inverse_columns<kRadix, kT, true, kRoot>(X, c, rest, c, k, out);
+            else if (rest) run.template operator()<kT, true>(rest, c);
             else if constexpr (kT > 0) run.template operator()<kT, false>(0, c);
         }
     });
 }
 
-// c = out[0, N) from F, the leaf form after the group products of s's full nodes (< 2P, times
-// their scale): the levels' steps 1, then their steps 2. F is overwritten. r, ir: the tables of 2L.
-inline void inverse(u32* F, u32* out, const Shape& s, const u32* r, const u32* ir) {
-    const Out o{out, s.N};
+// out = c[0, count), count <= N, from F, the leaf form after the group products of s's full nodes
+// (< 2P, times their scale): the levels' steps 1, then their steps 2. F is overwritten. r, ir: the
+// tables of 2L.
+inline void inverse(u32* F, u32* out, std::size_t count, const Shape& s, const u32* r, const u32* ir) {
+    const Out o{out, count};
     Constants constants[kMaxLevels];
     const auto step = [&](int d, bool second) {
         const Level& l = s.level[d];
         if (!second) constants[d] = Constants(r, ir, l, s.lg + 1);
         const Constants& k = constants[d];
         u32* const X = F + l.node.at;
-        if (d > 0) inverse_step<4, false>(l, second, X, k, o);
-        else if (l.radix == 4) inverse_step<4, true>(l, second, X, k, o);
-        else inverse_step<2, true>(l, second, X, k, o);
+        const u32* known = l.sibling ? X - l.node.size : X;
+        if (d > 0) inverse_step<4, false>(l, second, X, known, s.N, k, o);
+        else if (l.radix == 4) inverse_step<4, true>(l, second, X, X, s.N, k, o);
+        else inverse_step<2, true>(l, second, X, X, s.N, k, o);
     };
     for (int d = 0; d < s.levels; ++d) step(d, false);
     for (int d = s.levels - 1; d >= 0; --d)
