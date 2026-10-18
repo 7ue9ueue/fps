@@ -261,11 +261,16 @@ template <class Variant, bool kSquare>
 // The log of the tables a plan needs: a truncated plan's of 2L.
 constexpr int table_log(const ragged::Plan& p) { return p.lg + (p.truncated ? 1 : 0); }
 
-// ragged_into's placement of an array of span = 2^k + kPadding words in work at `at`: far from x, y
-// and z modulo place()'s period.
+// ragged_into's placement of an array of span = 2^k + kPadding words in work at `at` (64-byte
+// aligned) or less than place()'s period past it: far from x, y and z modulo the period. place()'s
+// offset is from a base aligned to the period, so `at`'s own offset is taken off (before #261 it
+// was added: the top plan's middle product at 2^14 + 2^9 put a 64-128 bytes past f and out modulo
+// 4 KiB, and ran 1.05x slower on Zen 3).
 inline std::uint32_t* placed(std::uint32_t* at, const void* x, const void* y, const void* z, std::size_t span) {
     const std::size_t period = place_period(std::countr_zero(span - kPadding));
-    return at + place(x, y, z, span * sizeof(std::uint32_t), period) / sizeof(std::uint32_t);
+    const std::size_t target = place(x, y, z, span * sizeof(std::uint32_t), period);
+    const std::size_t now = std::size_t(reinterpret_cast<std::uintptr_t>(at)) & (period - 1);
+    return at + ((target - now) & (period - 1)) / sizeof(std::uint32_t);
 }
 
 // c = A + (x^L - 1) q's A = c mod (x^L - 1), the variant's product of length L of f and g (each
@@ -403,7 +408,7 @@ void middle_into(const std::uint32_t* v, std::size_t n, const std::uint32_t* g, 
     ragged::split_transposed(v, L, r, s, t, Abar, Cbar, t ? Pbar + (top - t) : Pbar);  // t = 0: top wraps
     {  // out[i] = (Abar g x^-(m - 1) mod (x^L - 1))[i mod L]
         const std::uint32_t* A = s ? Abar : v;
-        std::uint32_t* a = placed(rest, A, out, out, L + kPadding);
+        std::uint32_t* a = placed(rest, A, g, out, L + kPadding);  // b far from g: stage_turned copies it
         std::uint32_t* b = a + L + kPadding;
         ragged::stage_turned(g, m, L, b);
         Variant::multiply(Product{A, L, b, L, a, b, out, std::min(count, L), p.lg}, roots, inverse_roots);

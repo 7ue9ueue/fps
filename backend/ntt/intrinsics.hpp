@@ -2697,11 +2697,14 @@ struct Ntt : Butterflies<S> {
         inverse_radix2_out(p.a, half, p.out, p.count, fold ? 0 : s);
     }
     // Whether a factor of n words is read by both subtrees under a radix-2 top (multiply, square): n
-    // <= half, or half + e with e <= half / 16, whose subtrees' first groups stage e words more
-    // (first_group_tail) instead of the radix-2 level writing 2 half words. For products of 2^k + 1
-    // words (the ragged top plan's main product, factors of 2^(k-1) + 1 words) that level ran 2-7% of
-    // their time on Emerald Rapids, Zen 5 and Neoverse V2 (issue #261).
-    static constexpr bool shares(std::size_t n, std::size_t half) { return n <= half + half / 16; }
+    // <= half, or half + e with e <= half / 16 from 2^10 on, whose subtrees' first groups stage e
+    // words more (first_group_tail) instead of the radix-2 level writing 2 half words. For products
+    // of 2^k + 1 words (the ragged top plan's main product, factors of 2^(k-1) + 1 words) that level
+    // ran 2-7% of their time on Emerald Rapids, Zen 5 and Neoverse V2; at 2^8, whose first groups
+    // have 32 columns, the staging cost Neoverse V2 7% and Zen 5 4% (issue #261).
+    static constexpr bool shares(std::size_t n, std::size_t half) {
+        return n <= half || (half >= 512 && n <= half + half / 16);
+    }
     // The source of subtree x^half - 1, or x^half + 1 (upper: the tail subtracted), of a factor f of
     // n words: f itself (shared), or its residue in a after the radix-2 level.
     static Source source(bool share, const u32* f, std::size_t n, u32* a, std::size_t half, bool upper) {
