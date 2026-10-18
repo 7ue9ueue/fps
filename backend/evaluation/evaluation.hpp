@@ -62,12 +62,11 @@ inline std::size_t padded(std::size_t m) { return std::max((m + 7) / 8 * 8, 8 * 
 
 // Stack words of a PointTree of m8 points and its kept transforms, at most.
 inline std::size_t tree_words(std::size_t m8, bool left) {
-    const std::size_t slots = m8 / 8, lanes = 8 * lane_length(slots) + 8, top = top_length(m8) + 8;
-    const std::size_t top_kept = (left ? 2 : 1) * (Stack::footprint(top_length(m8)) + 2 * Stack::footprint(top_length(m8 / 2)) +
-                                                  4 * Stack::footprint(top_length(m8 / 4)));
-    return Stack::footprint(slots + 1) + Stack::footprint(2 * slots + 2) + lane_kept_words(slots, left) + 6 * Stack::footprint(lanes) +
-           Stack::footprint(8 * row_stride(slots)) +
-           Stack::footprint(16) + Stack::footprint(32) + top_kept + 4 * Stack::footprint(top) + 1024;
+    const std::size_t slots = m8 / 8, L = lane_length(slots), lanes = 8 * L + 8;
+    const std::size_t top = Stack::footprint(16 * L) + (left ? 4 : 2) * Stack::footprint(4 * L) + (left ? 2 : 1) * Stack::footprint(8 * L) +
+                            Stack::footprint(8 * L) + Stack::footprint(8 * L + 8);
+    return Stack::footprint(slots + 1) + Stack::footprint(2 * slots + 2) + lane_kept_words(slots, left) + top + 6 * Stack::footprint(lanes) +
+           1024;
 }
 
 // For tests: with workspace_exact, a Workspace's stack has exactly the words asked for, and
