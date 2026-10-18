@@ -820,7 +820,8 @@ struct Bottom : Butterflies<L> {
         }
     }
 
-    // A leaf's product for inverse_sum: leaf_product (avx2.hpp passes its asm one).
+    // A leaf's product for inverse_sum: leaf_product (avx2.hpp passes its asm one, which takes rows
+    // of Shoup's products not reduced: kRawRows, fill_rows<true>).
     struct LeafProduct {
         [[gnu::always_inline]] V operator()(const u32* window, const u32* b, std::size_t j) const {
             return leaf_product(window, b, j);
@@ -847,9 +848,10 @@ struct Bottom : Butterflies<L> {
     static void sum_pass(u32* out, const LeafTerm* terms, std::size_t count, std::size_t first, const u32* r,
                          const u32* ir, Product product) {
         Rows rows[2][C];
+        constexpr bool raw = requires { requires Product::kRawRows; };
         const auto fill = [&] [[gnu::always_inline]] (std::size_t k, Rows* to) {
             #pragma GCC unroll 8
-            for (int i = 0; i < C; ++i) fill_rows(terms[i].a + 32 * k, to[i], k, r);
+            for (int i = 0; i < C; ++i) fill_rows<raw>(terms[i].a + 32 * k, to[i], k, r);
         };
         fill(first, rows[0]);
         for (std::size_t g = 0; g < count; ++g) {
@@ -938,11 +940,15 @@ struct Bottom : Butterflies<L> {
     }
 
     // Leaf products of leaf forms (Transform::multiply): rows [w_t A_t, A_t] of group k from
-    // canonical a, as forward_leaves; the products read 1 word past the last row.
+    // canonical a, as forward_leaves; the products read 1 word past the last row. kRaw: w_t A_t is
+    // Shoup's product, not reduced: below (1 + P / 2^32) P < 1.24 P for A_t < P, so a leaf
+    // product's 64-bit sums stay below 8 * 1.24 P^2 + 2^32 P < 2^64 and its Montgomery reduction
+    // below 3.3 P, then 2P (avx2's AsmLeaf, notes/218-r1.md).
     struct alignas(64) Rows {
         u32 window[4][16];
         u32 past[16];
     };
+    template <bool kRaw = false>
     [[gnu::always_inline]] static void fill_rows(const u32* a, Rows& out, std::size_t k, const u32* r) {
         const u32* yz = r + slot(2 * k);
         const F w[4] = {B::factor(yz[0], yz[8]), B::factor(kP - yz[0], ~yz[8]), B::factor(yz[1], yz[9]),
@@ -953,7 +959,7 @@ struct Bottom : Butterflies<L> {
             for (int t = 0; t < 4; ++t) {
                 const V v = L::load(a + 8 * t + j);
                 L::store(out.window[t] + 8 + j, v);
-                L::store(out.window[t] + j, canonical(B::mul(v, w[t])));
+                L::store(out.window[t] + j, kRaw ? B::mul(v, w[t]) : canonical(B::mul(v, w[t])));
             }
         }
     }

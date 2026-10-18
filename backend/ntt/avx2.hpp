@@ -869,7 +869,8 @@ inline void inverse(const u32* from, u32* words, u32* out, std::size_t count, in
 // zero past them) into words; for a cyclic product, each run of subtrees' bottom stage with the
 // leaf products (StoredBottom), then the inverse levels, the top level writing count words of the
 // lower or upper half to out; for an inverse of leaf products, the bottom stage from the stored
-// leaves (LeavesBottom, SumBottom). The leaf products of forward_product: a tile hook in cache.
+// leaves (LeavesBottom, SideBottom; sums: TermsLeaf::inverse_sum). The leaf products of
+// forward_product: a tile hook in cache.
 
 // forward_tiles() and inverse_tiles() in one recursion: on each run of subtrees, the forward levels,
 // the bottom stage stage(f, total) (forward bottom level, leaf products, inverse bottom level) and
@@ -1012,25 +1013,6 @@ struct LeavesBottom {
     }
 };
 
-// The same for a sum of 2 leaf products (bottom_leaves2_*: each product reduced, then added). Term
-// k's leaf buffers at leaves[.][2k].
-struct SumBottom {
-    static void run(Vec* out, const LeafTerm* terms, std::size_t at, std::size_t nv, std::size_t first, const u32* r,
-                    const u32* ir) {
-        Leaves leaves[2][4];
-        const u32 *a0 = terms[0].a + at, *a1 = terms[1].a + at, *b0 = terms[0].b + at, *b1 = terms[1].b + at;
-        product_kernels::bottom_leaves2_first(a0, a1, leaves[0], r + slot(first), r + slot(2 * first));
-        for (std::size_t j = 0, k = first;; j += 8, k += 2) {
-            const std::size_t cur = j / 8 % 2, next = cur ^ 1;
-            const u32 *ix = ir + slot(k), *iy = ir + slot(2 * k);
-            if (j + 8 == nv) return product_kernels::bottom_leaves2_last(out + j, leaves[cur], b0 + 8 * j, b1 + 8 * j, ix, iy);
-            const std::size_t n8 = 8 * (j + 8);
-            product_kernels::bottom_leaves2_both(a0 + n8, a1 + n8, leaves[next], r + slot(k + 2), r + slot(2 * k + 4), out + j,
-                                                 leaves[cur], b0 + 8 * j, b1 + 8 * j, ix, iy);
-        }
-    }
-};
-
 // A product of leaves a, b plus a leaf form alone at side (bottom_side_*; its first stage is
 // bottom_leaves_first): the leaves of a b + side, with 2^-32, through the inverse butterflies.
 struct SideBottom {
@@ -1048,41 +1030,25 @@ struct SideBottom {
     }
 };
 
-// Transform::toeplitz_product's bottom (bottom_toeplitz_*): the rows of S, D1, D3 at leaves[.][0, 2,
-// 4]; m1 + m2 through the inverse butterflies, m1 + m3 over A3. The 'both' kernels take the current
-// batches' A2, B1, B0, A3 at the next batches' minus 256 bytes.
-struct ToeplitzBottom {
-    static void run(Vec* out, const Toeplitz& z, std::size_t at, std::size_t nv, std::size_t first, const u32* r,
-                    const u32* ir) {
-        Leaves leaves[2][6];
-        const u32 *a1 = z.a1 + at, *a2 = z.a2 + at, *b0 = z.b0 + at, *b1 = z.b1 + at;
-        u32* const a3 = z.a3 + at;
-        product_kernels::bottom_toeplitz_first(a1, a2, a3, b0, b1, leaves[0], r + slot(first), r + slot(2 * first));
-        for (std::size_t j = 0, k = first;; j += 8, k += 2) {
-            const std::size_t cur = j / 8 % 2, next = cur ^ 1, w = 8 * j;
-            const u32 *ix = ir + slot(k), *iy = ir + slot(2 * k);
-            if (j + 8 == nv)
-                return product_kernels::bottom_toeplitz_last(out + j, leaves[cur], a2 + w, b1 + w, b0 + w, a3 + w, ix, iy);
-            const std::size_t n8 = 8 * (j + 8);
-            product_kernels::bottom_toeplitz_both(a1 + n8, a2 + n8, a3 + n8, b0 + n8, b1 + n8, leaves[next], r + slot(k + 2),
-                                                  r + slot(2 * k + 4), out + j, leaves[cur], ix, iy);
-        }
-    }
-};
-
 // Sums with a term alone (but one product and one term alone, SideBottom): the intrinsics' bottom on
 // Avx2 (Bottom::inverse_terms).
 using TermsLeaf = intrinsics::Bottom<simd::Avx2>;
 
-// Sums of 3 to kMaxTerms products: TermsLeaf::inverse_sum<K, kSumPass> with lc-opt's leaf product
+// Sums of 2 to kMaxTerms products: TermsLeaf::inverse_sum<K, kSumPass> with lc-opt's leaf product
 // (its lib/poly/transform.hpp), one asm statement per leaf in a fixed order: b_i broadcast once,
 // times the windows at 8 - i and 9 - i (even and odd lanes), then Montgomery's reduction, < 2P.
 // Zen 3 (notes/143-r1.md): against the intrinsics' leaf_product there (GCC spilled sums and
 // reloaded constants) 0.87-0.97 of the time at 2^12-2^20; for 3 products against bottom_leaves3_*
 // (two groups per asm statement) 1.00 at 2^12, 0.90-0.92 at 2^14-2^20. Passes of 3 terms: 0.77-0.94
-// of one pass's time at 2^14-2^16 (4 to 8 products), 0.99-1.02 elsewhere.
+// of one pass's time at 2^14-2^16 (4 to 8 products), 0.99-1.02 elsewhere. 2 products, with the rows
+// not reduced: 0.98-1.00 of the time of bottom_leaves2_* at 2^12-2^20 (notes/218-r1.md); 1 product
+// stays bottom_leaves_* (this form took 1.02-1.04x its time).
 inline constexpr int kSumPass = 3;
 struct AsmLeaf {
+    // Rows of w A not reduced (< 1.24 P; Bottom::fill_rows<true>): the sums stay below 2^64, the
+    // reduction below 3.3 P, the result below 2P. Zen 3: inverse_product of 3, 5 and 8 products at
+    // 2^8-2^20 0.95-0.99 of the time with them reduced (notes/218-r1.md).
+    static constexpr bool kRawRows = true;
     [[gnu::always_inline]] Vec operator()(const u32* w, const u32* b, std::size_t) const {
         const Vec ni = broadcast(kernels::kNI), p = broadcast(kP), p2 = broadcast(2 * kP);
         Vec even, odd, bi, t0, t1, t2, t3;
@@ -1139,6 +1105,70 @@ struct AsmLeaf {
             : [w] "r"(w), [b] "r"(b), [ni] "x"(ni), [p] "x"(p), [p2] "x"(p2),
               "m"(*reinterpret_cast<const u32(*)[17]>(w)), "m"(*reinterpret_cast<const u32(*)[8]>(b)));
         return even;
+    }
+};
+
+// Transform::toeplitz_product's bottom as lc-opt's ToeplitzBottom (lib/poly/log.hpp): intrinsics
+// around AsmLeaf on groups [first, first + count) (out: group g at out + 32 g). Rows of S = B0 + B1,
+// D1 = A1 - A2 and D3 = A3 - A2 for group g + 1 are filled before group g's products m1 = S A2,
+// m2 = D1 B1, m3 = D3 B0, each reduced (< 2P, with 2^-32); m1 + m2 through the inverse butterflies,
+// m1 + m3 times 2^32 (a Shoup product) over A3, canonical. Zen 3 (notes/218-r1.md): 0.95-0.98 of
+// the time of the generated bottom_toeplitz_* (two groups per asm statement, windows of at most 4
+// ops), 1.02-1.04 of lc-opt's, which keeps m1 + m3 times 2^-32 and saves the Shoup product
+// (0.97-0.98 with that).
+struct ToeplitzLeaf {
+    using Rows = TermsLeaf::Rows;
+    using B = TermsLeaf::B;
+
+    // x - y mod P for x, y < P: x - y wraps above P exactly when it is negative.
+    [[gnu::always_inline]] static Vec difference(Vec x, Vec y) {
+        const Vec t = _mm256_sub_epi32(x, y);
+        return _mm256_min_epu32(t, _mm256_add_epi32(t, broadcast(kP)));
+    }
+
+    // Rows [w X, X] of S, D1, D3 for group k, X canonical. w X is Shoup's product, not reduced: for
+    // x < P it is below (1 + P / 2^32) P < 1.24 P, so a leaf product's 64-bit sums stay below
+    // 8 * 1.24 P^2 + 2^32 P < 2^64 and its Montgomery reduction below 3.3 P, then 2P.
+    [[gnu::always_inline]] static void fill(const Toeplitz& z, std::size_t k, Rows (&rows)[3], const u32* r) {
+        const u32* yz = r + slot(2 * k);
+        const B::F w[4] = {B::factor(yz[0], yz[8]), B::factor(kP - yz[0], ~yz[8]), B::factor(yz[1], yz[9]),
+                           B::factor(kP - yz[1], ~yz[9])};
+        #pragma GCC unroll 4
+        for (int t = 0; t < 4; ++t) {
+            const std::size_t i = 32 * k + 8 * std::size_t(t);
+            const Vec a2 = load(z.a2 + i);
+            const Vec v[3] = {reduce(add(load(z.b0 + i), load(z.b1 + i)), kP), difference(load(z.a1 + i), a2),
+                              difference(load(z.a3 + i), a2)};
+            #pragma GCC unroll 3
+            for (int j = 0; j < 3; ++j) {
+                store(rows[j].window[t] + 8, v[j]);
+                store(rows[j].window[t], B::mul(v[j], w[t]));
+            }
+        }
+    }
+
+    static void run(u32* out, const Toeplitz& z, std::size_t count, std::size_t first, const u32* r, const u32* ir) {
+        B::F to_r = B::factor(kR);
+        asm("" : "+x"(to_r.w), "+x"(to_r.q));  // else GCC multiplies by 2^32 mod P with 3 shifts and 2 adds
+        const AsmLeaf leaf;
+        Rows rows[2][3];
+        fill(z, first, rows[0], r);
+        for (std::size_t g = 0; g < count; ++g, out += 32) {
+            const std::size_t k = first + g;
+            if (g + 1 < count) fill(z, k + 1, rows[(g + 1) % 2], r);
+            const Rows* in = rows[g % 2];
+            B::Column f;
+            #pragma GCC unroll 4
+            for (int t = 0; t < 4; ++t) {
+                const std::size_t i = 32 * k + 8 * std::size_t(t);
+                const Vec m1 = leaf(in[0].window[t], z.a2 + i, 0);
+                f[t] = B::low(B::add(m1, leaf(in[1].window[t], z.b1 + i, 0)));
+                store(z.a3 + i, B::canonical(B::mul(B::add(m1, leaf(in[2].window[t], z.b0 + i, 0)), to_r)));
+            }
+            B::inverse4(f, B::entry(ir, k), B::entry(ir, 2 * k), B::entry(ir, 2 * k + 1));
+            #pragma GCC unroll 4
+            for (int t = 0; t < 4; ++t) store(out + 8 * t, f[t]);
+        }
     }
 };
 
@@ -1261,16 +1291,14 @@ template <class Stage>
 inline void inverse_product(const LeafTerm* terms, int n, u32* words, u32* out, std::size_t count, int lg, const u32* r,
                             const u32* ir, unsigned output) {
     if (n == 1 && !terms[0].b && output == 0) return inverse(terms[0].a, words, out, count, lg, ir, nullptr);
-    // Products only, 1 or 2 of them, or a product and a term alone: the generated bottoms; 3 to 8
-    // products: inverse_sum with AsmLeaf, in passes of kSumPass; other lists: the intrinsics' bottom.
-    const bool all = std::all_of(terms, terms + n, [](const LeafTerm& t) { return t.b != nullptr; });
-    const int products = all ? n : 0;
-    const int side = n == 2 && !all && (terms[0].b || terms[1].b) ? (terms[0].b ? 1 : 0) : -1;  // the term alone
+    // One product, or a product and a term alone: the generated bottoms; 2 to 8 products:
+    // inverse_sum with AsmLeaf, in passes of kSumPass; other lists: the intrinsics' bottom.
+    const bool single = n == 1 && terms[0].b;
+    const int side = n == 2 && !terms[0].b != !terms[1].b ? (terms[0].b ? 1 : 0) : -1;  // the term alone
     inverse_staged(words, out, count, lg, ir, output, [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
         const std::size_t at = std::size_t(t - words);
         auto* v = reinterpret_cast<Vec*>(t);
-        if (products == 1) LeavesBottom::run(v, terms[0].a + at, terms[0].b + at, leaves, at / 32, r, ir);
-        else if (products == 2) SumBottom::run(v, terms, at, leaves, at / 32, r, ir);
+        if (single) LeavesBottom::run(v, terms[0].a + at, terms[0].b + at, leaves, at / 32, r, ir);
         else if (side >= 0)
             SideBottom::run(v, terms[1 - side].a + at, terms[1 - side].b + at, terms[side].a + at, leaves, at / 32, r, ir);
         else if (!intrinsics::for_products(terms, n, [&]<int K> {
@@ -1283,8 +1311,7 @@ inline void inverse_product(const LeafTerm* terms, int n, u32* words, u32* out, 
 inline void toeplitz_product(const Toeplitz& z, u32* words, u32* out, std::size_t count, int lg, const u32* r,
                              const u32* ir, unsigned output) {
     inverse_staged(words, out, count, lg, ir, output, [&] [[gnu::always_inline]] (u32* t, std::size_t leaves) {
-        const std::size_t at = std::size_t(t - words);
-        ToeplitzBottom::run(reinterpret_cast<Vec*>(t), z, at, leaves, at / 32, r, ir);
+        ToeplitzLeaf::run(t, z, leaves / 4, std::size_t(t - words) / 32, r, ir);
     });
 }
 

@@ -146,10 +146,19 @@ Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_produc
   argument) in passes of up to C terms over a run's groups; one pass keeps each output's sum in
   registers, more keep partial sums (< 2P) in the run's output and read 2C leaf forms at a time
   (out of L2 that was up to 1.5x faster). C: avx2 3 (with lc-opt's fixed-order asm leaf product,
-  `AsmLeaf`; 1 and 2 products keep the generated bottoms), zmm one pass while K L <= 7 2^15 words
-  (Emerald Rapids) or 3 2^15 (Zen 5), else 1; Sse and scalar 2; Neon 1, but the neon variant runs
+  `AsmLeaf`, from 2 products; one keeps the generated bottom), zmm one pass while K L <= 7 2^15
+  words (Emerald Rapids) or 3 2^15 (Zen 5), else 1; Sse and scalar 2; Neon 1, but the neon variant runs
   its generated passes (`inverse_sums`, one product each). Other lists (terms alone): the run-time
   loop (`inverse_mixed`).
+- `toeplitz_product` (issue #87 r2; avx2 issue #218): out from m1 + m2, A3 = m1 + m3 exact, with
+  m1 = A2 (B0 + B1), m2 = (A1 - A2) B1, m3 = (A3 - A2) B0. avx2 runs lc-opt's ToeplitzBottom
+  structure (`ToeplitzLeaf`: intrinsics around `AsmLeaf`, group g + 1's rows filled before group g's
+  products); A3's exactness costs one Shoup product by 2^32 per vector, about 3% of the op on Zen 3
+  (lc-opt keeps m1 + m3 times 2^-32: notes/218-r1.md).
+- Rows not reduced (issue #218): with `AsmLeaf` (avx2's sums of 3 to 8 products, `ToeplitzLeaf`)
+  the rows' w A is Shoup's product as it comes, below (1 + P / 2^32) P < 1.24 P for a canonical A:
+  the leaf product's 64-bit sums stay below 8 * 1.24 P^2 + 2^32 P < 2^64 and its Montgomery
+  reduction below 3.3 P, so its one min(x, x - 2P) still gives < 2P. Two ops less per row.
 
 ### avx2
 
