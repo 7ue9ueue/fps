@@ -322,18 +322,14 @@ constexpr bool truncates(std::size_t N) {
     return rounded(L, N - L) < L;
 }
 
-// The plan of a kind for N words. A kind that is no plan here falls back to the next in the order
-// truncated, ceil, floor, top, plain: N <= 2^kMinLog, a truncated transform that needs all of x^L + 1
-// (truncates), a piece outside [max(2^kMinLog, L / kMaxChunks), L / 2] (r too short or above L / 2),
-// or products not shorter than the plain one's (s + 2t - 1 >= L: the top product is about 2t words).
-constexpr Plan plan(std::size_t N, int kind) {
+// The plan of a kind below kTruncated for N words. A kind that is no plan here falls back to the
+// next in the order ceil, floor, top, plain: N <= 2^kMinLog, a piece outside [max(2^kMinLog, L /
+// kMaxChunks), L / 2] (r too short or above L / 2), or products not shorter than the plain one's (s
+// + 2t - 1 >= L: the top product is about 2t words).
+constexpr Plan split_plan(std::size_t N, int kind) {
     const int lg = std::max(kMinLog, int(std::bit_width(N - 1)));
     if (N <= (std::size_t(1) << kMinLog)) return {lg, 0, 0, false, false};
     const std::size_t L = std::size_t(1) << (lg - 1), r = N - L;
-    if (kind == kTruncated) {
-        if (truncates(N)) return {lg - 1, 0, 0, false, true};
-        --kind;
-    }
     const std::size_t least = std::max<std::size_t>(std::size_t(1) << kMinLog, L / kMaxChunks);
     for (; kind > kPlain; --kind) {
         const std::size_t s = kind == kTop ? 0 : kind == kFloor ? std::bit_floor(r) : std::bit_ceil(r), t = r > s ? r - s : 0;
@@ -341,6 +337,15 @@ constexpr Plan plan(std::size_t N, int kind) {
     }
     return {lg, 0, 0, false, false};
 }
+
+// The truncated plan of N words, or where it needs all of x^L + 1 (truncates) the next kind's, ceil.
+constexpr Plan truncated_plan(std::size_t N) {
+    if (truncates(N)) return {int(std::bit_width(N - 1)) - 1, 0, 0, false, true};
+    return split_plan(N, kCeil);
+}
+
+// The plan of any kind for N words (kTruncated falls back to ceil, floor, top, plain).
+constexpr Plan plan(std::size_t N, int kind) { return kind == kTruncated ? truncated_plan(N) : split_plan(N, kind); }
 
 constexpr bool operator==(const Plan& a, const Plan& b) {
     return a.lg == b.lg && a.s == b.s && a.t == b.t && a.split == b.split && a.truncated == b.truncated;
@@ -388,14 +393,19 @@ constexpr int entry(std::size_t N) {
 // The plan for N words outside multiply and square: the table's kind for its length and bucket (one
 // table read), never truncated (middle products; backend/series' ragged_into).
 inline Plan choose(std::size_t N) {
-    if (N <= (std::size_t(1) << kMinLog) || N > (std::size_t(1) << kMaxLog)) return plan(N, kPlain);
-    return plan(N, other_kind(kinds.get()[entry(N)]));
+    if (N <= (std::size_t(1) << kMinLog) || N > (std::size_t(1) << kMaxLog)) return split_plan(N, kPlain);
+    return split_plan(N, other_kind(kinds.get()[entry(N)]));
 }
+
+// The truncated plan out of line (choose_product): multiply()'s inlined path stays as before.
+[[gnu::noinline]] inline Plan truncated_choice(std::size_t N) { return truncated_plan(N); }
 
 // The plan of multiply and square for N words: as choose, truncated where the table says.
 inline Plan choose_product(std::size_t N) {
-    if (N <= (std::size_t(1) << kMinLog) || N > (std::size_t(1) << kMaxLog)) return plan(N, kPlain);
-    return plan(N, product_kind(kinds.get()[entry(N)]));
+    if (N <= (std::size_t(1) << kMinLog) || N > (std::size_t(1) << kMaxLog)) return split_plan(N, kPlain);
+    const int v = kinds.get()[entry(N)];
+    if (v >= kTruncated) return truncated_choice(N);
+    return split_plan(N, v);
 }
 
 // Words of scratch a split plan with main length L needs, beyond out: the main product (a factor

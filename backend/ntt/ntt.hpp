@@ -439,11 +439,11 @@ void product(const std::uint32_t* f, std::size_t n, const std::uint32_t* g, std:
 }
 
 // out[i] = (f g)[m - 1 + i] for i < count (f: m - 1 + count words read, g: m) by plan p: the plain
-// middle product, a cyclic product of length 2^p.lg >= m - 1 + count, or a split (ragged_middle).
+// middle product, a cyclic product of length 2^p.lg >= m - 1 + count, or a split (ragged_middle);
+// not truncated (ragged::choose).
 template <class Variant>
 void middle(const std::uint32_t* f, const std::uint32_t* g, std::size_t m, std::uint32_t* out, std::size_t count,
             const ragged::Plan& p) {
-    if (p.truncated) return middle<Variant>(f, g, m, out, count, ragged::plan(m - 1 + count, ragged::kPlain));  // none
     if (p.split) return ragged_middle<Variant>(f, g, m, out, count, p);
     const auto [roots, inverse_roots] = tables<Variant>(p.lg);
     const Region region = take_region(region_bytes(p.lg));
