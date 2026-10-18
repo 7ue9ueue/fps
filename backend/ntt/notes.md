@@ -140,10 +140,11 @@ Generated, do not edit: `avx2_kernels.hpp` (`gen_avx2_kernels.py`), `avx2_produc
   bottom level; `inverse_hooked(hook, work, out, o, unused)` lets the hook write each run (times
   2^-32) before its bottom level. In place (issue #210): `forward_hooked` with in at F, and an
   `inverse_hooked` whose hook reads out's memory (every variant's top level writes out after the
-  last hook call). From another array the forward's top level moves twice the lines (the source
-  read, the destination fetched for writing): composition's forward of P at 2m ran 1.06x lc-opt's
-  in-place one at 2^20 on Zen 3 for that alone, the levels below equal (notes/210-r1.md). A column bit zero in the forward's source (unused in the
-  inverse's output) prunes the groups above it to half their columns, the top level included
+  last hook call). From another array the forward's top level moves 1.25 times the lines (the
+  destination fetched for writing): composition's forward of P at 2m ran 1.03-1.07x lc-opt's
+  in-place one at 2^20 on Zen 3 for that alone, the levels below equal (notes/210-r1.md). A
+  column bit zero in the forward's source (unused in the inverse's output) prunes the groups
+  above it to half their columns, the top level included
   (`PrunedLevel` in common.hpp; avx2 `kernels::*_columns`, intrinsics `*_group_columns`).
 - `inverse_product` of up to 8 terms (issue #143, for division's windows and power projection's
   column sums; notes/143-r1.md). Lists of products only: `inverse_sum<K, C>` (K a template
