@@ -12,7 +12,7 @@
       --sanitize, only the listed units are built with ASan/UBSan (none, if the list is empty);
       the gate uses it, and tools/sanitize.py runs them all.
   kernel.py [--image IMAGE] bench UNIT [--target T] [--base DIR [--base-image IMAGE]] [--rounds N]
-                            [--filter RE] [--json FILE]
+                            [--filter RE] [--json FILE] [--cxxflags F] [--base-cxxflags F]
       Time the unit's bench*.cpp, each its own binary (e.g. frontend/bench_values.cpp, whose
       code changes how GCC compiles bench.cpp's). Case names must be unique across a unit's
       bench files: a duplicate within one round is an error. With --base (another checkout,
@@ -21,6 +21,9 @@
       IMAGE its tools/kernel.py pins (or --base-image), new with this one's (or --image); if they
       differ, each side also runs in its own image (libstdc++), one container per side and round.
       To compare compilers on the same code, pass the same commit as base and new and --image.
+      --cxxflags (new) and --base-cxxflags (base) add compiler flags to one side's builds; to time
+      the same code with and without a flag, pass --base . and the flag to one side, e.g.
+      --cxxflags=-falign-loops=32 (#230: where a hot loop's address costs time).
 
 A unit is a backend kernel (folder backend/<kernel>/) or `frontend` (folder frontend/, headers in
 include/fps/).
@@ -214,12 +217,15 @@ def unit_dir(unit: str) -> str:
 
 
 def compile_(tree: Path, unit: str, source: str, target: str, sanitize: bool = False,
-             image: str | None = None) -> tuple[Path, str | None]:
+             image: str | None = None, extra: str = '') -> tuple[Path, str | None]:
     """Compile <unit folder>/<source> in tree, from relative paths, so the same sources give
-    byte-identical binaries in any tree. Returns the binary and, on a failure, the output."""
-    out = f'build/{target}/{unit}-{Path(source).stem}{"-san" if sanitize else ""}'
+    byte-identical binaries in any tree. extra: more compiler flags, after the target's (the
+    binary's name then carries their hash, so one tree can hold builds with and without them).
+    Returns the binary and, on a failure, the output."""
+    tag = f'-x{hashlib.sha256(extra.encode()).hexdigest()[:8]}' if extra else ''
+    out = f'build/{target}/{unit}-{Path(source).stem}{"-san" if sanitize else ""}{tag}'
     result = sh({'w': tree}, lambda _: f'mkdir -p build/{target}\n'
-                f'{CXX} {options(sanitize)} {flags(target)} {unit_dir(unit)}/{source} -o {out}', image)
+                f'{CXX} {options(sanitize)} {flags(target)} {extra} {unit_dir(unit)}/{source} -o {out}', image)
     return tree / out, (result.stdout + result.stderr if result.returncode else None)
 
 
@@ -243,8 +249,9 @@ def fingerprints(tree: Path, jobs: list[tuple[str, str, bool]], target: str) -> 
     return {job: None if hashes[str(i)] == '-' else hashes[str(i)] for i, job in enumerate(jobs)}
 
 
-def build(tree: Path, unit: str, source: str, target: str, sanitize: bool = False, image: str | None = None) -> Path:
-    binary, error = compile_(tree, unit, source, target, sanitize, image)
+def build(tree: Path, unit: str, source: str, target: str, sanitize: bool = False, image: str | None = None,
+          extra: str = '') -> Path:
+    binary, error = compile_(tree, unit, source, target, sanitize, image, extra)
     if error is not None:
         sys.exit(f'build failed in {tree}:\n{error}')
     return binary
@@ -311,14 +318,17 @@ def bench(args) -> int:
     images = {'new': IMAGE}
     if args.base:
         images['base'] = args.base_image or pins(trees['base'])[0]
+    extra = {'new': args.cxxflags, 'base': args.base_cxxflags}
     sources = sorted(p.name for p in Path(unit_dir(args.kernel)).glob('bench*.cpp'))
     with ThreadPoolExecutor() as pool:  # base and new at once
-        builds = {name: [pool.submit(build, tree, args.kernel, source, args.target, image=images[name])
+        builds = {name: [pool.submit(build, tree, args.kernel, source, args.target, image=images[name],
+                                     extra=extra[name])
                          for source in sources
                          if (tree / unit_dir(args.kernel) / source).exists()]
                   for name, tree in trees.items()}
     binaries = {name: [b.result() for b in bs] for name, bs in builds.items()}
     report = {'kernel': args.kernel, 'target': args.target, 'flags': flags(args.target),
+              'cxxflags': args.cxxflags, 'base_cxxflags': args.base_cxxflags,
               'cpu': cpu_name(), 'compiler': 'clang++' if MAC else IMAGE, 'rounds': args.rounds,
               'base_compiler': 'clang++' if MAC else images.get('base'),
               'identical': False, 'cases': {}}
@@ -365,6 +375,9 @@ def bench(args) -> int:
     print(f'{report["cpu"]}, target {args.target} ({report["flags"] or "no flags"}), {args.rounds} rounds')
     if not MAC and len(set(images.values())) > 1:
         print(f'new built with {images["new"]}\nbase built with {images["base"]}')
+    for name in trees:
+        if extra[name]:
+            print(f'{name} built with extra flags: {extra[name]}')
     if args.base:
         rows, geomean = summarize(report['cases'])
         print(table(rows))
@@ -409,6 +422,8 @@ def main() -> int:
     p.add_argument('--rounds', type=int, default=11)
     p.add_argument('--filter', default='', help='regex the case names must contain')
     p.add_argument('--json', help='write the raw times here')
+    p.add_argument('--cxxflags', default='', help="more compiler flags for new's builds")
+    p.add_argument('--base-cxxflags', default='', help="more compiler flags for base's builds")
     p.set_defaults(run=bench)
     p = sub.add_parser('check')
     p.set_defaults(run=check)

@@ -42,6 +42,7 @@
 
 #include "backend/division/division.hpp"
 #include "backend/modarith/modarith.hpp"
+#include "backend/simd/align.hpp"
 #include "backend/simd/select.hpp"
 #include "fps/modular.hpp"
 #include "fps/polynomial.hpp"
@@ -64,6 +65,10 @@ using Out = std::span<u32>;
 inline constexpr std::size_t kSparseTerms = 16;
 inline constexpr std::size_t kSparseGap = 8;
 inline constexpr std::size_t kRecurrenceTerms = 2;
+// arm: the nops after the 32-byte alignment before the recurrence's loop (divide_recurrence). With
+// GCC 15.2's and 16.2's setup code in between, it starts at 4 mod 32: the fastest start measured,
+// 0.1-0.9% ahead of 8 and 12, 1-3% of 0 and 16 (frontend/notes/230-r1.md).
+inline constexpr int kRecurrenceLoopNops = 2;
 
 // g trimmed to d + 1 words, d = deg g, and its nonzero coefficients below g[d] from the top down,
 // if at most kSparseTerms (count = kSparseTerms + 1: more). Throws for g = 0.
@@ -185,12 +190,30 @@ void divide_recurrence(Span f, const Divisor& D, Out q, Out r) {
     std::array<u32, kRecurrenceTerms> a{}, ca{};
     std::array<std::size_t, kRecurrenceTerms> e{};  // distances d - j
     for (std::size_t u = 0; u < t; ++u) a[u] = D.g[D.terms[u]], ca[u] = mod_mul<P>(c, a[u]), e[u] = d - D.terms[u];
+#if defined(__aarch64__)
+    // arm: every term each word (an absent one has e = k: never reached), so no inner loop, and the
+    // loop pinned (simd/align.hpp; frontend/notes/230-r1.md). The inner loop over t (10
+    // instructions) ran 8% slower where it took 3 blocks of 32 bytes, as with GCC 15.2; without it
+    // x^13 + a x + b takes 16-19% less time.
+    for (std::size_t u = t; u < kRecurrenceTerms; ++u) e[u] = k;
+    const u32* fp = f.data() + n - 1;
+    u32* qp = q.data();
+    std::size_t p = 0;
+    simd::align_loop<kRecurrenceLoopNops>(fp, qp, p);
+    do {
+        u64 s = kBias + u64(c) * *fp--;
+        for (std::size_t u = 0; u < kRecurrenceTerms; ++u)
+            if (e[u] <= p) s -= u64(ca[u]) * qp[-std::ptrdiff_t(e[u])];
+        *qp++ = u32(s % P);
+    } while (++p != k);
+#else
     for (std::size_t p = 0; p < k; ++p) {
         u64 s = kBias + u64(c) * f[n - 1 - p];
         for (std::size_t u = 0; u < t; ++u)
             if (e[u] <= p) s -= u64(ca[u]) * q[p - e[u]];
         q[p] = u32(s % P);
     }
+#endif
     std::ranges::reverse(q);
     for (std::size_t m = 0; m < r.size(); ++m) {
         u64 s = kBias + f[m];

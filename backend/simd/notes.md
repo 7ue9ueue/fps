@@ -3,7 +3,8 @@
 Vector wrappers, one struct per ISA, so kernels are templates written once (`simd.hpp`, API at the
 top). `select.hpp` picks `simd::Native` per target and lists every struct the target can run
 (`simd::All`). Also here: `probe.cpp` (instruction latency and throughput in cycles),
-`machines.py` (machine models of the four timing machines), `stream.hpp` (bench helper).
+`machines.py` (machine models of the four timing machines), `stream.hpp` (bench helper),
+`align.hpp` (`align_loop`: a hot loop at a fixed address on arm, issue #230; `notes/230-r1.md`).
 
 ## Design
 

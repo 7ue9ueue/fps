@@ -38,6 +38,7 @@
 #include <type_traits>
 
 #include "backend/modarith/modarith.hpp"
+#include "backend/simd/align.hpp"
 #include "backend/simd/simd.hpp"
 
 namespace fps::factorization {
@@ -247,6 +248,11 @@ template <class S>
 inline constexpr int kRows = S::registers >= 32 && HasMulEven<S> ? 8 : 4;
 template <class S>
 inline constexpr int kRowVectors = 1;
+// Neon: the nops after the 32-byte alignment before rows_block's loop over columns (simd/align.hpp).
+// The loop on s it replaces (18 instructions) ran 3% slower at 0 mod 32 (main's GCC 16.2 build) than
+// at 12, and 10% at one more start; this one (17) is within 0.4% at every start from 0 to 16
+// (notes/230-r1.md).
+inline constexpr int kRowsLoopNops = 0;
 
 // Row r < R: out_r[t] = scale init_r[t] + sum_s coef_r[s] column_s[t], t < V W, with out_r =
 // out + r ostride, init_r = init + r istride, coef_r[s] = coef[r cstride + s sstride], column_s =
@@ -283,6 +289,25 @@ template <class S, int R, int V>
 #pragma GCC novector  // #183
 #endif
             for (int s = s0; s < s1; ++s) step(s);
+        } else if constexpr (std::is_same_v<A, Halves<S>>) {
+            // Neon: a loop on pointers, pinned (kRowsLoopNops; notes/230-r1.md).
+            if (s0 < s1) {
+                const u32 *column = base + s0 * stride, *c = coef + s0 * sstride;
+                int n = s1 - s0;
+                simd::align_loop<kRowsLoopNops>(column, c, n);
+                do {
+                    typename A::Op x[V];
+#pragma GCC unroll 4
+                    for (int v = 0; v < V; ++v) x[v] = A::op(S::load(column + W * v));
+#pragma GCC unroll 8
+                    for (int r = 0; r < R; ++r) {
+                        const typename S::V cr = S::broadcast(c[r * cstride]);
+#pragma GCC unroll 4
+                        for (int v = 0; v < V; ++v) A::mac(acc[r][v], cr, x[v]);
+                    }
+                    column += stride, c += sstride;
+                } while (--n != 0);
+            }
         } else {
             for (int s = s0; s < s1; ++s) step(s);
         }

@@ -28,6 +28,9 @@ no `select.hpp`; `-DFPS_FACTOR_SMALL=0` turns off the ymm register path for modu
   8 on AVX-512 (variants measured, notes/123-r1.md). Krylov: the first 8 rows q_j by mat-vecs with
   the multiplication matrix X of x^P, then each block of 8 is the block before times the
   multiplication matrix of q_8 (q_(j+8) = q_j q_8 mod g). The powers of v in the split alike.
+- Neon: `rows_block`'s loop over columns is a loop on pointers at a fixed address
+  (`simd::align_loop`, issue #230): the old loop ran 3-10% slower at some starts, this one
+  within 0.4% at every start (`notes/230-r1.md`).
 - Elimination: lc-opt's fraction-free blocks of 16 columns, but pivot rows are swapped to the
   front of the trailing rows, so the trailing rows stay contiguous and a block's update is one
   `combine_rows`; its coefficients are the panel columns scaled in place (one vector product per
