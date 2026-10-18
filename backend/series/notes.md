@@ -3,8 +3,8 @@
 Power series modulo P = 998244353: inverse, log, exp, pow and sqrt into caller memory. API:
 `series.hpp` (`inverse`, `log`, `exp` as `(f, out)`, `pow(f, e, c, out)`, `sqrt(f, c, out)`, in
 this thread's memory or with a last `scratch` argument of `*_scratch(n)` words). Tests: `test.cpp`,
-`test_pow_sqrt.cpp`, `test_ragged.cpp`; bench: `bench.cpp`, `bench_pow_sqrt.cpp`, `bench_ragged.cpp`
-(ragged n). Attempts: `notes/` (one file per
+`test_pow_sqrt.cpp`, `test_ragged.cpp`, `test_inverse_blocks.cpp`; bench: `bench.cpp`,
+`bench_pow_sqrt.cpp`, `bench_ragged.cpp` (ragged n). Attempts: `notes/` (one file per
 issue round). From lc-opt's `lib/poly/{inverse,log,exp,pow,sqrt,calculus}.hpp` (its
 `lib/poly/notes.md`: Inverse, Log, Exp, Power, Sqrt), rewritten
 on `ntt::Transform`'s leaf form and `backend/simd`, so every target runs it (lc-opt's transform
@@ -46,11 +46,8 @@ Newton k -> 2k with transforms of 2k (lc-opt's step): G = T(g mod x^k) (half-zer
 g[k, k + c) = -(e g mod x^c) by a cyclic product of e with G in place (negated). 5 transforms and
 2 leaf products of 2k a step. 10 T(n) + 4 LP(n) for n = 2^j.
 
-Last step from k to k + c with c <= k/2 (`inverse_half_step`), at length k: since g f = 1 mod
-x^k, the cyclic product (g f_lo) mod (x^k - 1) is 1 + (g f_lo)[k, 2k); with f_hi = f[k, k + c),
-g_c = g mod x^c, e = (g f_lo)[k, k + c) + (g_c f_hi) mod x^c from one inverse_product of
-T(f_lo) T(g) (a forward_product) + T(f_hi) T(g_c), then g[k, k + c) = -(g_c e mod x^c). 6
-transforms and 3 leaf products of k against 5 and 2 of 2k. G_c at G + k, T(f_hi) at W + k + 64.
+A last step from k to k + c with c <= k/2 ran at length k (`inverse_half_step`, 6 transforms and
+3 leaf products of k) until issue #214 r2, which replaced it by blocks (Ragged n, below).
 
 ### log
 
@@ -124,12 +121,16 @@ KiB) made the last step's inverse_product of G G at 2^18 cost 590-685 us against
 it (Zen 3, notes/107-r1.md); `half_residual` halves by a shift and a product of the low bit by
 (P + 1) / 2, with a fast path when f covers the block.
 
-### Ragged n (issue #214, notes/214-r1.md)
+### Ragged n (issue #214, notes/214-r1.md, notes/214-r2.md)
 
-n = L + r, L = bit_floor(n). inverse for r <= 9L/32: the chain (`inverse_chain`), steps whose
-lengths halve down from n so they land on it; a step to n' = L' + r' at length L' has the
-power-of-two step's transforms and two products of r' words (the corners: f_hi g_r and g_r e2 mod
-x^r'). Above 9L/32 the corners cost more than they save: the steps to L and the half step. exp,
+n = L + r, L = bit_floor(n). inverse for r <= 5L/32 (L/4 on Zen 5 and below L = 2^14): the chain
+(`inverse_chain`), steps whose lengths halve down from n so they land on it; a step to n' = L' +
+r' at length L' has the power-of-two step's transforms and two products of r' words (the corners:
+f_hi g_r and g_r e2 mod x^r'). To r = L/2: the blocked division with N = 1 (`inverse_blocks`,
+`divide<true>`: h = 1 / f mod x^k into g, T(h) is Q_0, the blocks' products by h negated), 5
+blocks of L/4 to L/4 and 3 of L/2 beyond: 3 blocks cost 2 transforms of L fewer than the steps to
+L and the old half step, 5 blocks 2 transforms fewer and 2 leaf products more than the chain's
+steps at r = L/4. Past L/2 Newton's steps (4 blocks cost about the step at 2L). exp,
 sqrt and the division's last block (log, pow): products of a last step's c coefficients as
 `low_product` (the NTT's ragged products, about 2c words) where c <= 9m/32 and its work fits, and to
 16 coefficients their windows of full-length products by sums of products (`window()`), no
