@@ -32,8 +32,8 @@ restart them.
 
 The only lock is the merge lock, held for seconds: from the last look at main to the merge. If
 main moved while the tests ran, the tests run again only when the new commits touch a unit this
-pull request affects (with the same include closure) or a shared file; otherwise the result
-still holds and it merges.
+pull request affects (with the same include closure) or a shared file, and then only for those
+units: the others build the same text as before, so their result still holds.
 
 It runs as origin/main's copy of tools/ (gate.py, kernel.py, vm.py), whatever the checkout it is
 started from: a coordinator's checkout can lag main by hours, and the gate's rules are main's.
@@ -287,8 +287,9 @@ def gh_json(*args: str) -> dict:
                                      timeout=NETWORK_TIMEOUT).stdout)
 
 
-def gate(args) -> tuple[bool, str, str, str, list[str]]:
-    """Returns (passed, report, the base commit it ran against, the head commit, affected units)."""
+def gate(args, only: set[str] | None = None) -> tuple[bool, str, str, str, list[str]]:
+    """Returns (passed, report, the base commit it ran against, the head commit, affected units).
+    only: after main moved, the units to test again (the others passed against the older main)."""
     git('fetch', '--quiet', 'origin', 'main')
     pr = args.target if args.target.isdigit() else None
     if pr:
@@ -314,6 +315,10 @@ def gate(args) -> tuple[bool, str, str, str, list[str]]:
 
     units = affected(base, tree)
     lines = [f'Gate for {label} ({head[:10]}) merged into {args.base} ({base[:10]}).', '']
+    if only is not None:
+        lines += [f'Main moved after a pass: testing again only {", ".join(sorted(only & set(units))) or "nothing"}; '
+                  f'{", ".join(sorted(set(units) - only)) or "no other unit"} passed against the older main.', '']
+        units = [u for u in units if u in only]
     if not units:
         return True, '\n'.join(lines + ['No unit affected.', '', 'Gate: pass']), base, head, []
     sanitized = touched(base, tree, units)
@@ -408,9 +413,11 @@ def main() -> int:
     parser.add_argument('--merge', action='store_true', help='squash-merge the pull request on a pass')
     args = parser.parse_args()
     pr = args.target if args.target.isdigit() else None
+    only = None
+    tested = {}  # unit -> the main it last passed against
     for _ in range(3):
         start = time.monotonic()
-        passed, report, base, head, units = gate(args)
+        passed, report, base, head, units = gate(args, only)
         before, _, verdict = report.rpartition('\nGate: ')
         report = f'{before}\nRan in {minutes(start):.1f} min.\n\nGate: {verdict}'
         print(report)
@@ -420,6 +427,7 @@ def main() -> int:
             set_status(head, passed, url)
         if not (passed and args.merge and pr):
             return 0 if passed else 1
+        tested.update(dict.fromkeys(units, base))
         with merge_lock(f'pr{pr}'):
             git('fetch', '--quiet', 'origin', 'main')
             tip = git('rev-parse', 'origin/main').stdout.strip()
@@ -428,10 +436,15 @@ def main() -> int:
                 if merged.returncode:
                     log(f'main moved to {tip[:10]} and now conflicts: rebase, then run the gate again')
                     return 1
-                if stale(base, tip, merged.stdout.split()[0], units):
-                    log(f'main moved to {tip[:10]} and touches {", ".join(units)}: running the gate again')
+                tree = merged.stdout.split()[0]
+                # again: units main's new commits touch, and units the pull request now reaches
+                # through includes that landed with them
+                only = {u for u in tested if stale(tested[u], tip, tree, [u])}
+                only |= set(affected(tip, tree)) - set(tested)
+                if only:
+                    log(f'main moved to {tip[:10]} and touches {", ".join(sorted(only))}: testing those again')
                     continue
-                log(f'main moved to {tip[:10]} but touches none of {", ".join(units) or "no units"}: merging')
+                log(f'main moved to {tip[:10]} but touches none of {", ".join(tested) or "no units"}: merging')
             if subprocess.run(['gh', 'pr', 'merge', pr, '--squash', '--match-head-commit', head],
                               timeout=NETWORK_TIMEOUT).returncode:
                 log(f'merge of {head[:10]} refused: if the pull request moved on, run the gate again')
