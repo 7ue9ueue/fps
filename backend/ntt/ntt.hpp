@@ -349,7 +349,7 @@ inline std::size_t middle_words(std::size_t m, std::size_t count, const ragged::
     if (p.truncated) return ragged::truncated_words(len);
     if (!p.split) return 2 * block(len) + 1024;
     const std::size_t s = p.s, t = p.t, nt = std::min(count, t), mt = std::min(m, t);
-    const std::size_t arrays = block(len) + (s ? block(s) : 0) + (t ? block(nt + mt - 1) + block(nt) : 0);
+    const std::size_t arrays = (s ? block(len) + block(s) : 0) + (t ? block(nt + mt - 1) + block(nt) : 0);
     std::size_t more = 2 * block(len) + 1024;
     if (s) more = std::max(more, 3 * block(s) + 1024);
     if (t) more = std::max(more, middle_words(mt, nt, ragged::choose_middle(nt + mt - 1)));
@@ -394,18 +394,19 @@ void middle_into(const std::uint32_t* v, std::size_t n, const std::uint32_t* g, 
         return;
     }
     const std::size_t r = n - L, s = p.s, t = p.t, nt = std::min(count, t), mt = std::min(m, t), top = nt + mt - 1;
-    std::uint32_t* Abar = work;
-    std::uint32_t* Cbar = Abar + block(L);
+    std::uint32_t* Abar = s ? work : nullptr;  // s = 0: v[0, L) itself
+    std::uint32_t* Cbar = work + (s ? block(L) : 0);
     std::uint32_t* Pbar = Cbar + (s ? block(s) : 0);  // [0 .. 0, Tbar], top words
     std::uint32_t* above = Pbar + (t ? block(top) : 0);  // the top product's out, nt words
     std::uint32_t* rest = above + (t ? block(nt) : 0);
     if (t) std::fill_n(Pbar, top - t, 0u);
     ragged::split_transposed(v, L, r, s, t, Abar, Cbar, t ? Pbar + (top - t) : Pbar);  // t = 0: top wraps
     {  // out[i] = (Abar g x^-(m - 1) mod (x^L - 1))[i mod L]
-        std::uint32_t* a = placed(rest, Abar, out, out, L + kPadding);
+        const std::uint32_t* A = s ? Abar : v;
+        std::uint32_t* a = placed(rest, A, out, out, L + kPadding);
         std::uint32_t* b = a + L + kPadding;
         ragged::stage_turned(g, m, L, b);
-        Variant::multiply(Product{Abar, L, b, L, a, b, out, std::min(count, L), p.lg}, roots, inverse_roots);
+        Variant::multiply(Product{A, L, b, L, a, b, out, std::min(count, L), p.lg}, roots, inverse_roots);
         if (count > L) std::copy_n(out, count - L, out + L);
     }
     if (s) {  // += z^i Z[(i + m - 1) mod s], Z = Cbar (z^(m - 1) g(y / z) mod (y^s - 1))

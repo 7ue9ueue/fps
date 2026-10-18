@@ -2112,10 +2112,14 @@ struct Ntt : Butterflies<S> {
     static constexpr std::size_t kStep = 2 * S::lanes;
 
     // The words a subtree's first level reads: a pointer to all of them, or a Source: n words from
-    // p, zero past them (a product from spans).
+    // p, zero past them (a product from spans). With a tail (e > 0, issue #261): p's n = 4 q words
+    // plus (minus) tail[0, e), e <= q, as a factor of half + e words mod x^half -+ 1.
     struct Source {
         const u32* p;
         std::size_t n;
+        const u32* tail = nullptr;
+        std::size_t e = 0;
+        bool minus = false;
     };
 
     // Group k on quarters of q words from `from` into f; in < kIn P.
@@ -2125,6 +2129,8 @@ struct Ntt : Butterflies<S> {
     }
     template <int kIn>
     static void first_group(Source s, u32* f, std::size_t q, std::size_t k, const u32* r) {
+        if constexpr (kIn >= 2)  // tails: multiply's and square's subtrees (inputs < 2P)
+            if (s.e) return first_group_tail<kIn>(s, f, q, k, r);
         if (s.n >= 4 * q) return B::template forward_group<kIn>(s.p, f, q, k, r);
         first_level<4>(s.p, s.n, f, q, kStep,
                        [&] [[gnu::always_inline]] (auto blocks, const u32* from, u32* to, std::size_t words) {
@@ -2135,6 +2141,24 @@ struct Ntt : Butterflies<S> {
     [[gnu::noinline]] static void first_group_part(const u32* from, u32* f, std::size_t q, std::size_t words,
                                                    std::size_t k, const u32* r) {
         B::template forward_group_part<kIn, kLoad>(from, f, q, words, k, r);
+    }
+    // From a Source with a tail: columns [0, E) (e rounded up to kStep) staged in f, quarter 0 as p
+    // +- tail (< 2P: kIn >= 2), and run in place; the rest read from p. Staging 4 E words costs less
+    // than the radix-2 level it replaces (L words written) while e is short (multiply: tail_share).
+    template <int kIn>
+    [[gnu::noinline]] static void first_group_tail(Source s, u32* f, std::size_t q, std::size_t k, const u32* r) {
+        const std::size_t E = std::min(q, (s.e + kStep - 1) / kStep * kStep);
+        for (std::size_t u = 1; u < 4; ++u) std::copy_n(s.p + u * q, E, f + u * q);
+        const V p = S::broadcast(kP);
+        std::size_t j = 0;
+        for (; j + S::lanes <= s.e; j += S::lanes) {
+            const V x = S::load(s.p + j), t = S::load(s.tail + j);
+            S::store(f + j, s.minus ? S::sub(S::add(x, p), t) : S::add(x, t));
+        }
+        for (; j < s.e; ++j) f[j] = s.minus ? s.p[j] + kP - s.tail[j] : s.p[j] + s.tail[j];
+        std::copy(s.p + s.e, s.p + E, f + s.e);
+        first_group_part<kIn, 4>(f, f, q, E, k, r);
+        if (E < q) first_group_part<kIn, 4>(s.p + E, f + E, q, q - E, k, r);
     }
 
     // Both transforms, the leaf products and the inverse transform of a subtree; inputs < kIn P.
@@ -2654,24 +2678,36 @@ struct Ntt : Butterflies<S> {
         }
         // A factor of at most half the length ("sparse") is its own residue mod x^(len/2) - 1 and
         // mod x^(len/2) + 1: no radix-2 level, both subtrees' first levels read it, the upper one
-        // first. Not for nv / 2 = 4, whose first level is the bottom (in place only).
+        // first. Not for nv / 2 = 4, whose first level is the bottom (in place only). A factor of
+        // half + e words with a short tail (shares) too: its residues differ in their first e words.
         const std::size_t half = len / 2;
-        const bool share_a = p.n <= half && nv / 2 >= 16, share_b = p.m <= half && nv / 2 >= 16;
+        const bool share_a = shares(p.n, half) && nv / 2 >= 16, share_b = shares(p.m, half) && nv / 2 >= 16;
         if (!share_a) forward_radix2_from(p.f, p.n, p.a, half);
         if (!share_b) forward_radix2_from(p.g, p.m, p.b, half);
-        const auto source = [half](bool share, const u32* f, std::size_t n, u32* a) {
-            return share ? Source{f, n} : Source{a, half};
-        };
         const u32* fold = fold_scale(nv / 2, p.lg, true);
         if (kJoin && nv == 8) {
             bottom_multiply<false>(p.a, p.b, 2, 0, r, ir);
         } else {
-            multiply_tree<2>(source(share_a, p.f, p.n, p.a + half), source(share_b, p.g, p.m, p.b + half), p.a + half,
-                             p.b + half, nv / 2, 1, r, ir, fold);
-            multiply_tree<2>(source(share_a, p.f, p.n, p.a), source(share_b, p.g, p.m, p.b), p.a, p.b, nv / 2, 0, r, ir,
+            multiply_tree<2>(source(share_a, p.f, p.n, p.a + half, half, true),
+                             source(share_b, p.g, p.m, p.b + half, half, true), p.a + half, p.b + half, nv / 2, 1, r, ir,
                              fold);
+            multiply_tree<2>(source(share_a, p.f, p.n, p.a, half, false), source(share_b, p.g, p.m, p.b, half, false), p.a,
+                             p.b, nv / 2, 0, r, ir, fold);
         }
         inverse_radix2_out(p.a, half, p.out, p.count, fold ? 0 : s);
+    }
+    // Whether a factor of n words is read by both subtrees under a radix-2 top (multiply, square): n
+    // <= half, or half + e with e <= half / 16, whose subtrees' first groups stage e words more
+    // (first_group_tail) instead of the radix-2 level writing 2 half words. For products of 2^k + 1
+    // words (the ragged top plan's main product, factors of 2^(k-1) + 1 words) that level ran 2-7% of
+    // their time on Emerald Rapids, Zen 5 and Neoverse V2 (issue #261).
+    static constexpr bool shares(std::size_t n, std::size_t half) { return n <= half + half / 16; }
+    // The source of subtree x^half - 1, or x^half + 1 (upper: the tail subtracted), of a factor f of
+    // n words: f itself (shared), or its residue in a after the radix-2 level.
+    static Source source(bool share, const u32* f, std::size_t n, u32* a, std::size_t half, bool upper) {
+        if (!share) return Source{a, half};
+        if (n <= half) return Source{f, n};
+        return Source{f, half, f + half, n - half, upper};
     }
 
     // The square of p.f (g, m and b unused): multiply(p) with one forward transform.
@@ -2687,15 +2723,15 @@ struct Ntt : Butterflies<S> {
             return inverse_radix4_out(p.a, q, p.out, p.count, ir, fold ? 0 : s);
         }
         const std::size_t half = len / 2;
-        const bool share = p.n <= half && nv / 2 >= 16;
+        const bool share = shares(p.n, half) && nv / 2 >= 16;
         if (!share) forward_radix2_from(p.f, p.n, p.a, half);
-        const auto source = [&](u32* a) { return share ? Source{p.f, p.n} : Source{a, half}; };
         const u32* fold = fold_scale(nv / 2, p.lg, true);
         if (kJoin && nv == 8) {
             bottom_multiply<true>(p.a, p.a, 2, 0, r, ir);
         } else {
-            multiply_tree<2, true>(source(p.a + half), source(p.a + half), p.a + half, p.a + half, nv / 2, 1, r, ir, fold);
-            multiply_tree<2, true>(source(p.a), source(p.a), p.a, p.a, nv / 2, 0, r, ir, fold);
+            const Source upper = source(share, p.f, p.n, p.a + half, half, true), lower = source(share, p.f, p.n, p.a, half, false);
+            multiply_tree<2, true>(upper, upper, p.a + half, p.a + half, nv / 2, 1, r, ir, fold);
+            multiply_tree<2, true>(lower, lower, p.a, p.a, nv / 2, 0, r, ir, fold);
         }
         inverse_radix2_out(p.a, half, p.out, p.count, fold ? 0 : s);
     }
