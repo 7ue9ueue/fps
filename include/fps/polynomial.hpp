@@ -341,36 +341,38 @@ struct Products {
     // words (f * f, mul(f, f, n)) make a square.
     static Poly multiply(Span a, Span b, std::size_t n) {
         a = a.first(std::min(a.size(), n)), b = b.first(std::min(b.size(), n));
+        if (a.data() == b.data() && a.size() == b.size()) return square(a, n);
         if (a.empty() || b.empty()) return Poly(n);
         if (const auto t = single_term(b)) return shifted(a, *t, n);
         if (const auto t = single_term(a)) return shifted(b, *t, n);
-        const bool same = a.data() == b.data() && a.size() == b.size();
-        if (!(same ? small_square(a.size()) : small::beats_ntt(a.size(), b.size()))) {
-            Poly h(n, Poly::kUnwritten);
-            if (same) ntt::square(a, h.span());
-            else ntt::multiply(a, b, h.span());
-            return h;
-        }
-        // small::multiply writes all of a b: past n too, into spare words of the result.
-        const std::size_t size = a.size() + b.size() - 1;
-        Poly h = n >= size ? Poly(n, Poly::kUnwritten) : Poly(n, size, Poly::kUnwritten);
-        small::multiply<P>(a, b, {h.data(), size});
-        if (n > size) std::fill(h.data() + size, h.data() + n, 0u);
+        if (small::beats_ntt(a.size(), b.size())) return small_product(a, b, n);
+        Poly h(n, Poly::kUnwritten);
+        ntt::multiply(a, b, h.span());
         return h;
     }
 
-    // a^2, 2 a.size() - 1 coefficients.
-    static Poly square(Span a) { return multiply(a, a, a.empty() ? 0 : 2 * a.size() - 1); }
+    // a^2 mod x^n, a.size() <= n; square(a) all 2 a.size() - 1 coefficients.
+    static Poly square(Span a, std::size_t n) {
+        if (a.empty()) return Poly(n);
+        if (const auto t = single_term(a)) return shifted(a, *t, n);
+        if (small_square(a.size())) return small_product(a, a, n);
+        Poly h(n, Poly::kUnwritten);
+        ntt::square(a, h.span());
+        return h;
+    }
+
+    static Poly square(Span a) { return square(a, a.empty() ? 0 : 2 * a.size() - 1); }
 
     // out = a b mod x^out.size(); out apart from a and b. a and b the same words make a square.
     static void multiply_into(Span a, Span b, Out out) {
         const std::size_t n = out.size();
         a = a.first(std::min(a.size(), n)), b = b.first(std::min(b.size(), n));
         if (a.empty() || b.empty()) return void(std::ranges::fill(out, 0u));
-        if (const auto t = single_term(b)) return shift(a, *t, out);
-        if (const auto t = single_term(a)) return shift(b, *t, out);
-        const std::size_t size = a.size() + b.size() - 1;
         const bool same = a.data() == b.data() && a.size() == b.size();
+        if (const auto t = single_term(b)) return shift(a, *t, out);
+        if (!same)
+            if (const auto t = single_term(a)) return shift(b, *t, out);
+        const std::size_t size = a.size() + b.size() - 1;
         if (same ? small_square(a.size()) : small::beats_ntt(a.size(), b.size())) {
             if (n < size) return low_product(a, b, out);
             small::multiply<P>(a, b, out.first(size));
@@ -416,6 +418,16 @@ struct Products {
     static constexpr double kSquareShare = 0.85;
 
 private:
+    // a b mod x^n by small::multiply, which writes all of a b: past n too, into spare words of the
+    // result.
+    static Poly small_product(Span a, Span b, std::size_t n) {
+        const std::size_t size = a.size() + b.size() - 1;
+        Poly h = n >= size ? Poly(n, Poly::kUnwritten) : Poly(n, size, Poly::kUnwritten);
+        small::multiply<P>(a, b, {h.data(), size});
+        if (n > size) std::fill(h.data() + size, h.data() + n, 0u);
+        return h;
+    }
+
     static Poly shifted(Span f, Term t, std::size_t n) {
         Poly h(n, Poly::kUnwritten);
         shift(f, t, h.span());
