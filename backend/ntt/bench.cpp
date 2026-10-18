@@ -27,6 +27,8 @@
 //                                of N / 2 + 1 words, g of the rest, out of N = n + m - 1;
 //                                product_cut: out of N / 2 + 1; square: f of (N + 1) / 2;
 //                                middle_product: f of N, g of N / 2, out of N - N / 2 + 1.
+//   <op>/<k>+L/<d>               product, square and middle_product of N = 2^k + 2^k / d words, d =
+//                                128, 32, 16, and of 2^k + 1, for k = 12 .. 22 (issue #261).
 // Tables past 2^16 are built by a thread's first call, then kept (ntt.hpp, Memory). Repeated calls
 // reuse the last output as input, and convolution cases write no factors: the timing does not
 // depend on the values.
@@ -218,6 +220,40 @@ void add_ragged_cases(bench::Suite& suite) {
     }
 }
 
+// Just past a power of two (issue #261): N = 2^k + 1 and 2^k + 2^k / d for d = 128, 32, 16 (named
+// k+1, k+L/128, k+L/32, k+L/16), k = 12 .. 22, for product, square and middle_product, as
+// add_ragged_cases (k+1 there for k = 12, 16, 20, 22).
+void add_bucket1_cases(bench::Suite& suite) {
+    for (int k = 12; k <= 22; ++k) {
+        const std::size_t L = std::size_t(1) << k;
+        const std::string lg = std::to_string(k);
+        for (const auto& [size, N] : {std::pair{lg + "+1", L + 1}, std::pair{lg + "+L/128", L + L / 128},
+                                      std::pair{lg + "+L/32", L + L / 32}, std::pair{lg + "+L/16", L + L / 16}}) {
+            if (size.ends_with("+1") && (k % 4 == 0 || k == 22)) continue;  // in add_ragged_cases
+            const std::size_t n = N / 2 + 1, m = N - n + 1;
+            suite.add("product/" + size, [n, m, N] {
+                return [f = std::make_shared<Spans>(n, N), m] {
+                    multiply(f->fs(), f->gs().first(m), f->outs());
+                    bench::keep(f->out.begin()[0]);
+                };
+            }, N);
+            suite.add("square/" + size, [N] {
+                const std::size_t h = (N + 1) / 2;
+                return [s = std::make_shared<Spans>(h, 2 * h - 1)] {
+                    square(s->fs(), s->outs());
+                    bench::keep(s->out.begin()[0]);
+                };
+            }, N);
+            suite.add("middle_product/" + size, [N] {
+                return [s = std::make_shared<Spans>(N, N - N / 2 + 1), m = N / 2] {
+                    middle_product(s->fs(), s->gs().first(m), s->outs());
+                    bench::keep(s->out.begin()[0]);
+                };
+            }, N);
+        }
+    }
+}
+
 template <class V>
 constexpr bool only_candidate =std::is_same_v<Selected, Candidates<V>>;
 
@@ -278,5 +314,6 @@ int main(int argc, char** argv) {
     add_convolution_cases(suite);
     add_product_cases(suite);
     add_ragged_cases(suite);
+    add_bucket1_cases(suite);
     return suite.run();
 }
