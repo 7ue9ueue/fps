@@ -84,7 +84,8 @@ users may still have (`COMPAT`; its #183 miscompile is worked around). Repo copi
 keep exploration files in `~/explore/hpc_library/` and copy them back to the Mac.
 Each VM powers itself off after 30 minutes idle (no SSH connection, no live `vm.py` run, no
 container, load under 0.5; `tools/idle_shutdown.sh`, installed on every VM and on any new one);
-`gcloud compute instances start <vm> --zone=<zone>` brings it back. More capacity:
+`vm.py`, `gate.py` and `tune.py` start a stopped VM
+(and wait for one already starting) before they connect. More capacity:
 create `lc-<purpose>` in the same project and region, and add it to lc-opt's machine table.
 
 ## How work flows

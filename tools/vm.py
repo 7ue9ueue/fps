@@ -46,14 +46,60 @@ def ssh_argv(vm: str, command: str) -> list[str]:
             '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=4']
 
 
+up: set[str] = set()  # VMs seen running by this process; a failed connection looks again
+
+
+def gcloud_instance(vm: str, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(['gcloud', 'compute', 'instances', *args, vm, f'--zone={zone(vm)}', '--quiet'],
+                          capture_output=True, text=True, timeout=600)
+
+
+def ensure_running(vm: str) -> None:
+    """Start vm if it is stopped (VMs power off after 30 minutes idle: tools/idle_shutdown.sh), and
+    return once it is running and takes ssh. A running VM costs one status call. A VM another
+    process is starting, or one still powering off, is waited for, never started twice: a start
+    that fails (someone else's start won the race) is followed by another look, not an error."""
+    if vm in up:
+        return
+    waited = False
+    deadline = time.monotonic() + 600
+    while time.monotonic() < deadline:
+        look = gcloud_instance(vm, 'describe', '--format=value(status)')
+        status = look.stdout.strip()
+        if look.returncode or not status:
+            print(f'could not read the status of {vm}: {look.stderr.strip()}', file=sys.stderr)
+            return  # let ssh try and report
+        if status == 'RUNNING':
+            break
+        waited = True
+        if status in ('TERMINATED', 'SUSPENDED'):
+            action = 'start' if status == 'TERMINATED' else 'resume'
+            print(f'{vm} is stopped; {action}ing it', file=sys.stderr)
+            gcloud_instance(vm, action)
+        else:  # STAGING, PROVISIONING, STOPPING, SUSPENDING, REPAIRING: someone else's start or stop
+            print(f'{vm} is {status}; waiting', file=sys.stderr)
+            time.sleep(10)
+    else:
+        print(f'{vm} did not reach RUNNING in 10 minutes', file=sys.stderr)
+        return
+    if waited:  # a fresh boot: sshd comes up a little after RUNNING
+        for _ in range(18):
+            if subprocess.run(ssh_argv(vm, 'true'), capture_output=True, timeout=120).returncode == 0:
+                break
+            time.sleep(10)
+    up.add(vm)
+
+
 def ssh(vm: str, command: str, stdin: bytes | None = None, capture: bool = False,
         timeout: float | None = None) -> subprocess.CompletedProcess:
     """Run command on vm. A connection failure (exit 255, a connection that went silent for two
     minutes, or gcloud itself crashing on a timeout to the Compute API, seen in PR 134's gate) is
-    retried twice: every command the tools send (copy, test, bench) can safely run again.
+    retried twice: every command the tools send (copy, test, bench) can safely run again. A stopped
+    VM is started first (ensure_running).
     `timeout` (seconds, per attempt) raises subprocess.TimeoutExpired."""
     cmd = ssh_argv(vm, command)
     for attempt in range(3):
+        ensure_running(vm)
         # stderr always read, so a gcloud crash is seen on uncaptured calls too (ship: PR 156's gate)
         result = subprocess.run(cmd, input=stdin, stdout=subprocess.PIPE if capture else None,
                                 stderr=subprocess.PIPE, timeout=timeout)
@@ -64,6 +110,7 @@ def ssh(vm: str, command: str, stdin: bytes | None = None, capture: bool = False
         if result.returncode != 255 and not crashed:
             return result
         print(f'ssh to {vm} failed (exit {result.returncode}), attempt {attempt + 1} of 3', file=sys.stderr)
+        up.discard(vm)  # it may have powered off since
         time.sleep(15)
     return result
 
