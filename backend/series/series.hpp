@@ -26,8 +26,8 @@
 // of T(n) (a transform of n words) and LP(n) (leaf products of n words), as lc-opt's:
 // - inverse: k -> 2k with transforms of 2k: G = T(g mod x^k) (a half-zero source), e = (f g)[k,
 //   k + c) by a cyclic product (upper half out), then g[k, k + c) = -(e g mod x^c) by another (in
-//   place, negated): 5 transforms and 2 leaf products of 2k a step, 10 T(n) + 4 LP(n). A last step
-//   to n <= 3k/2 runs at length k: 6 T(k) + 3 LP(k). Below kInverseBase coefficients, the recurrence.
+//   place, negated): 5 transforms and 2 leaf products of 2k a step, 10 T(n) + 4 LP(n). Below
+//   kInverseBase coefficients, the recurrence.
 // - log f = integral of f' / f mod x^(n-1) in B <= 4 blocks of k coefficients (lc-opt's blocked
 //   division, divide()): h = 1 / f mod x^k, then q_j = h (f' - f Q)[jk, (j+1)k) mod x^k, Q = q mod
 //   x^(jk), (f Q)[jk, (j+1)k) = sum over i < j of (W_(j-i) q_i)[k, 2k), W_t = f[(t-1)k, (t+1)k),
@@ -47,12 +47,13 @@
 // - Divisions by indices (log's integral, exp's s): Montgomery's batch inversion (lc-opt's
 //   divide_by_index), divisors below 2^13 from a table.
 // Ragged n (issue #214), n = L + r, L = bit_floor(n): about the time of n coefficients, not of
-// 2L (ns per coefficient at 2^20 + 1, 1.25 2^20 and 6e5 within 0.91-1.16 of 2^21's on Zen 3,
-// Emerald Rapids, Zen 5 and Neoverse V2, against 1.12-1.70 before; 1.07-1.15 at 1.75 2^20:
-// notes/214-r1.md):
-// - inverse, r <= 9L/32: Newton steps whose lengths halve down from n, so they land on it; a step
-//   to n' = L' + r' runs at length L' with two products of r' words (the corners) besides
-//   (inverse_ragged_step).
+// 2L (ns per coefficient at 2^20 + 1, 1.25 and 1.5 2^20 and 6e5 within 0.90-1.14 of 2^21's on Zen
+// 3, Emerald Rapids, Zen 5 and Neoverse V2, against 1.12-1.70 before; 1.06-1.14 at 1.75 2^20:
+// notes/214-r1.md, notes/214-r2.md):
+// - inverse, r <= 5L/32 (L/4 on Zen 5 and below 2^14): Newton steps whose lengths halve down from
+//   n, so they land on it; a step to n' = L' + r' runs at length L' with two products of r' words
+//   (the corners) besides (inverse_ragged_step). To r = L/2: the blocked division with N = 1
+//   (inverse_blocks: 5 blocks of L/4, or 3 of L/2). Past L/2, Newton's steps.
 // - exp, sqrt, the division's last block (log, pow): a last step or block of c coefficients runs
 //   its products of c words as low products (about the cost of 2c words, NTT products of ragged
 //   length) to 9m/32, its windows by sums of products (window()) to kDirectWindow, and the step
@@ -63,9 +64,9 @@
 //
 // Memory: this thread's region of the NTT (ntt::detail::take_region, kept across calls), or the
 // caller's scratch: with N = bit_ceil(n), 2 N words for inverse (the chain: 3 L words and its
-// corners'), about n + 2 B (n / 2 + 80) for log (B <= 5 blocks), n + 5.5 N for exp, n + 7 N for
-// pow and n + 2.25 N for sqrt. The transforms' tables: one ntt::Transform per length, kept per
-// thread, 2^lg bytes each.
+// corners'; B blocks of k: 2B - 1 arrays of 2k words and k more, 4.75 or 5.5 L), about n + 2 B (n
+// / 2 + 80) for log (B <= 5 blocks), n + 5.5 N for exp, n + 7 N for pow and n + 2.25 N for sqrt.
+// The transforms' tables: one ntt::Transform per length, kept per thread, 2^lg bytes each.
 #pragma once
 
 #include <algorithm>
@@ -502,32 +503,17 @@ void add_words(u32* dst, const u32* a, const u32* b, std::size_t n) {
     for (; i < n; ++i) dst[i] = kSub ? (a[i] >= b[i] ? a[i] - b[i] : a[i] + kP - b[i]) : u32((u64(a[i]) + b[i]) % kP);
 }
 
+// p[i] = -p[i] mod P for i < n, canonical words.
+inline void negate(u32* p, std::size_t n) {
+    std::size_t i = 0;
+    for (; i + kLanes <= n; i += kLanes) S::store(p + i, M::sub(S::broadcast(0), S::load(p + i)));
+    for (; i < n; ++i) p[i] = p[i] ? kP - p[i] : 0;
+}
+
 // ---- inverse ----------------------------------------------------------------------------------
 
 // Arrays of inverse_newton for n coefficients: 2 of bit_ceil(n) words.
 inline std::size_t inverse_words(std::size_t n) { return n <= kInverseBase ? 0 : 2 * footprint(std::bit_ceil(n)); }
-
-// The last step from k to k + c, c <= k/2, k >= 64, at length k: as g f = 1 mod x^k, the cyclic
-// product (g f_lo) mod (x^k - 1) is 1 + (g f_lo)[k, 2k); with f_hi = f[k, k + c) and g_c = g mod
-// x^c, e = (f g)[k, k + c) = (g f_lo)[k, k + c) + (g_c f_hi) mod x^c, both from one inverse of
-// T(f_lo) T(g) + T(f_hi) T(g_c); then g[k, k + c) = -(g_c e mod x^c). 6 transforms and 3 leaf
-// products of length k, against 5 and 2 of length 2k. G, W: arrays of 2k + kGap words: T(g) at G,
-// T(g_c) at G + k (G's padding is read, never written), T(f_lo) T(g) at W, T(f_hi) at W + k + 64
-// (256 bytes from T(g_c)'s page offset, as W from G's); the inverse works in G, the last product in W.
-inline void inverse_half_step(Span f, Out g, std::size_t k, std::size_t c, u32* G, u32* W) {
-    const ntt::Transform& t = transform(std::countr_zero(k));
-    u32 *const Gc = G + k, *const F = W + k + 64;
-    const std::size_t lo = std::min(f.size(), k), hi = std::min(f.size(), k + c) - lo;
-    const Out e = g.subspan(k, c);
-    t.forward(Span(g.data(), k), G);
-    t.forward_product(f.first(lo), G, W);
-    t.forward(Span(g.data(), c), Gc);
-    t.forward(f.subspan(lo, hi), F);
-    const ntt::Term terms[] = {{W, nullptr}, {F, Gc}};
-    t.inverse_product(terms, G, e);  // e[i] + [i = 0]
-    e[0] = e[0] ? e[0] - 1 : kP - 1;
-    t.cyclic_product(e, Gc, W, e, {.negate = true});
-}
 
 // g = 1 / f mod x^n, n = g.size() >= 1, f mod x^n given (f[0] != 0); g apart from f. G, W: arrays
 // of bit_ceil(n) + kGap words. A step k -> 2k at length 2k: G = T(g mod x^k) (half zero), e =
@@ -538,7 +524,6 @@ inline void inverse_newton(Span f, Out g, u32* G, u32* W) {
     inverse_direct(f, g.first(std::min(n, kInverseBase)));
     for (std::size_t k = kInverseBase; k < n; k *= 2) {
         const std::size_t c = std::min(k, n - k);
-        if (2 * c <= k && k >= (std::size_t(1) << ntt::kMinLog)) return inverse_half_step(f, g, k, c, G, W);
         const ntt::Transform& t = transform(std::countr_zero(2 * k));
         const Out e = g.subspan(k, c);
         t.forward(Span(g.data(), k), G);
@@ -554,13 +539,6 @@ inline void inverse_newton(Span f, Out g, u32* G, u32* W) {
 struct ChainArrays {
     u32 *G, *W, *E, *C, *work;
 };
-
-// Whether inverse runs the chain at n: n = L + r, L = bit_floor(n) >= 64, 0 < r <= 9L/32 (beyond
-// it, the corners cost more than the steps to L and inverse_half_step: notes/214-r1.md).
-inline bool use_chain(std::size_t n) {
-    const std::size_t L = std::bit_floor(n);
-    return L >= 64 && n > L && 32 * (n - L) <= 9 * L;
-}
 
 inline std::size_t chain_words(std::size_t n) {
     const std::size_t L = std::bit_floor(n - 1), r = n - L;
@@ -688,26 +666,38 @@ inline std::size_t division_words(const DivisionShape& s) {
 // Q_1 by one toeplitz_product (3 leaf products), block 3's from W_3 and W_1 Q_2. (3 + 5B)
 // transforms and 2 + B + B(B - 1)/2 leaf products of 2k for B blocks, one fewer for B = 4; a short
 // last block as last_block() says.
-template <class Numerator, class Place, class Done, class Prefix>
+// kOne: N = 1, so q = 1 / f mod x^count (inverse_blocks, issue #214 r2): q_0 = h is written at
+// place(0) (h_c is read there, a.hc unused) and Q_0 = T(h) is H (a.Q[0] == a.H); the blocks from 1
+// on have N = 0 there, so their product by h is negated (no numerator pass), and a last block that is
+// not full puts its residual in R (H is one of its terms). The temporaries of h: W_1 and work.
+template <bool kOne = false, class Numerator, class Place, class Done, class Prefix>
 void divide(Span f, std::size_t count, const DivisionShape& shape, const DivisionArrays& a, const Numerator& numerator,
             const Place& place, const Done& done, const Prefix& prefix) {
     const std::size_t k = shape.k, len = 2 * k, blocks = shape.blocks, c_last = count - (blocks - 1) * k;
     const LastBlock last = last_block(shape, count);
     const bool direct = last == LastBlock::direct, toeplitz = blocks - direct == 4;  // 4 blocks by transforms
     const ntt::Transform& t = transform(std::countr_zero(len));
-    inverse_newton(f.first(std::min(f.size(), k)), Out(a.H, k), a.W[1], a.Q[0]);  // h = 1 / f mod x^k
-    if (last != LastBlock::full) std::copy_n(a.H, c_last, a.hc);
-    t.forward(Span(a.H, k), a.H);
+    const u32* hc = a.hc;
+    if constexpr (kOne) {
+        u32* const h = place(0);
+        inverse_newton(f.first(std::min(f.size(), k)), Out(h, k), a.W[1], a.work);  // h = 1 / f mod x^k
+        t.forward(Span(h, k), a.H);
+        hc = h;
+    } else {
+        inverse_newton(f.first(std::min(f.size(), k)), Out(a.H, k), a.W[1], a.Q[0]);  // h = 1 / f mod x^k
+        if (last != LastBlock::full) std::copy_n(a.H, c_last, a.hc);
+        t.forward(Span(a.H, k), a.H);
+    }
     for (std::size_t j = 1; j < (direct ? blocks - 1 : blocks); ++j) {  // W_j = T(f[(j-1)k, (j+1)k))
         const std::size_t lo = std::min(f.size(), (j - 1) * k), hi = std::min(f.size(), (j + 1) * k);
         t.forward(f.subspan(lo, hi - lo), a.W[j]);
     }
-    for (std::size_t j = 0; j < blocks; ++j) {
+    for (std::size_t j = kOne ? 1 : 0; j < blocks; ++j) {
         const std::size_t first = j * k, c = std::min(k, count - first);
         const bool is_last = j + 1 == blocks;
         u32* const p = place(j);
         // The residual at p, or for a last block that is not full at H (T(h) is not read for it)
-        u32* const res = is_last && last != LastBlock::full ? a.H : p;
+        u32* const res = is_last && last != LastBlock::full ? (kOne ? a.R : a.H) : p;
         const Out r(res, c);
         if (j == 0) {
             numerator(0, c, nullptr, res);
@@ -723,12 +713,75 @@ void divide(Span f, std::size_t count, const DivisionShape& shape, const Divisio
                 for (std::size_t i = 0; i < j; ++i) terms[i] = {a.W[j - i], a.Q[i]};
                 t.inverse_product(std::span<const ntt::Term>(terms.data(), j), a.work, r, {.offset = k});
             }
-            numerator(first, c, res, res);
+            if constexpr (!kOne) numerator(first, c, res, res);
         }
-        if (res != p) low_product(Span(a.hc, c), Span(res, c), c, p, a.W[1]);  // q_j = h_c (residual) mod x^c
-        else t.cyclic_product(r, a.H, a.work, r);                              // q_j = h (residual) mod x^k
+        if (res != p) {  // q_j = h_c (residual) mod x^c
+            low_product(Span(hc, c), Span(res, c), c, p, a.W[1]);
+            if constexpr (kOne) negate(p, c);
+        } else {  // q_j = h (residual) mod x^k
+            t.cyclic_product(r, a.H, a.work, r, {.negate = kOne});
+        }
         done(j, first, c);
         if (j + 1 < blocks && !(direct && j + 2 == blocks)) t.forward(Span(p, k), a.Q[j]);
+    }
+}
+
+// ---- inverse by blocks (issue #214 r2) ----------------------------------------------------------
+
+// The arrays of inverse_blocks: H (= Q_0), W_1 .. W_(B-1), Q_1 .. Q_(B-2), work (2k words each), R (k).
+inline std::size_t inverse_block_words(std::size_t n) {
+    const DivisionShape s(n);
+    return (2 * s.blocks - 1) * footprint(2 * s.k) + footprint(s.k);
+}
+
+// g = 1 / f mod x^n by the blocked division with N = 1 (divide<true>), n = g.size() > 64, f mod x^n
+// given: B blocks of k coefficients from h = 1 / f mod x^k (n in (L, 2L), L = 2^j: 5 blocks of L/4
+// to 1.25 L, 3 of L/2 to 1.5 L, else 4 of L/2) with transforms of 2k, so a block costs about its
+// k coefficients: (5B - 5) transforms and B(B+1)/2 - 1 leaf products of 2k (4 blocks: one fewer);
+// 3 blocks of L/2: 2 transforms of L fewer than Newton's steps to L and a half step at L (the step
+// to L keeps T(f mod x^L) and T(h) for the last block).
+inline void inverse_blocks(Span f, Out g, Arena arena) {
+    const std::size_t n = g.size();
+    const DivisionShape shape(n);
+    const std::size_t k = shape.k, len = 2 * k, blocks = shape.blocks;
+    DivisionArrays a{};
+    a.H = arena.take(len);
+    for (std::size_t t = 1; t < blocks; ++t) a.W[t] = arena.take(len);
+    a.Q[0] = a.H;
+    for (std::size_t t = 1; t + 1 < blocks; ++t) a.Q[t] = arena.take(len);
+    a.work = arena.take(len);
+    a.R = arena.take(k);
+    u32* const x = g.data();
+    divide<true>(
+        f, n, shape, a, [](std::size_t, std::size_t, const u32*, u32*) {}, [x, k](std::size_t j) { return x + j * k; },
+        [](std::size_t, std::size_t, std::size_t) {}, [x](std::size_t) { return static_cast<const u32*>(x); });
+}
+
+// How inverse runs at n = L + r, L = bit_floor(n) (issue #214): Newton's steps for r = 0 and past
+// kBlocksUpTo (4 blocks of L/2 cost about the step at 2L there, more on Zen 5); the ragged chain to
+// chain_up_to(L) (its corners, products of r words, are small); blocks between: 5 of L/4 to L/4, 3
+// of L/2 to L/2. In 32nds of L, measured (notes/214-r2.md): 5 blocks have 2 transforms fewer and 2
+// leaf products more than the chain's steps at r = L/4, which Zen 5's leaf products (about a
+// transform's cost there) do not repay, nor below 2^14 Emerald Rapids' and Neoverse V2's.
+enum class InverseMethod { direct, newton, chain, blocks };
+inline constexpr std::size_t kBlocksUpTo = 16;
+constexpr std::size_t chain_up_to(std::size_t L) {
+    return tune::kTarget == tune::Target::zen5 || L < (std::size_t(1) << 14) ? 8 : 5;
+}
+inline InverseMethod inverse_method(std::size_t n) {
+    if (n <= kInverseBase) return InverseMethod::direct;
+    const std::size_t L = std::bit_floor(n), r = n - L;
+    if (r == 0 || L < 64) return InverseMethod::newton;
+    if (32 * r <= chain_up_to(L) * L) return InverseMethod::chain;
+    if (32 * r <= kBlocksUpTo * L) return InverseMethod::blocks;
+    return InverseMethod::newton;
+}
+inline std::size_t inverse_method_words(std::size_t n) {
+    switch (inverse_method(n)) {
+        case InverseMethod::direct: return 0;
+        case InverseMethod::chain: return chain_words(n);
+        case InverseMethod::blocks: return inverse_block_words(n);
+        default: return inverse_words(n);
     }
 }
 
@@ -1153,10 +1206,7 @@ inline void sqrt_newton(Span f, u32 c, Out g, Arena arena) {
 }  // namespace detail
 
 // Words of scratch the forms with a scratch span take for n coefficients.
-inline std::size_t inverse_scratch(std::size_t n) {
-    const bool chain = n > detail::kInverseBase && detail::use_chain(n);
-    return detail::kAlignSlack + (chain ? detail::chain_words(n) : detail::inverse_words(n));
-}
+inline std::size_t inverse_scratch(std::size_t n) { return detail::kAlignSlack + detail::inverse_method_words(n); }
 inline std::size_t log_scratch(std::size_t n) { return detail::kAlignSlack + detail::log_words(n); }
 inline std::size_t exp_scratch(std::size_t n) { return detail::kAlignSlack + detail::exp_words(n); }
 inline std::size_t pow_scratch(std::size_t n) { return detail::kAlignSlack + detail::pow_words(n); }
@@ -1188,17 +1238,17 @@ inline void inverse(std::span<const u32> f, std::span<u32> out, std::span<u32> s
     if (n == 0) return;
     detail::check_length(n, "fps::series::inverse: n > 2^25");
     f = f.first(std::min(f.size(), n));
-    if (n <= detail::kInverseBase) return detail::inverse_direct(f, out);
-    if (detail::use_chain(n)) {
-        const std::size_t L = std::max<std::size_t>(64, std::bit_floor(n - 1)), r = n - std::bit_floor(n - 1);
-        return detail::with_memory(detail::chain_words(n), scratch, [&](detail::Arena a) {
-            const detail::ChainArrays arrays{a.take(L), a.take(L), a.take(L), a.take(r),
-                                             a.take(detail::low_product_words(r))};
-            detail::inverse_chain(f, out, arrays);
-        });
-    }
-    const std::size_t len = std::bit_ceil(n);
-    detail::with_memory(detail::inverse_words(n), scratch, [&](detail::Arena a) {
+    using detail::InverseMethod;
+    const InverseMethod method = detail::inverse_method(n);
+    if (method == InverseMethod::direct) return detail::inverse_direct(f, out);
+    detail::with_memory(detail::inverse_method_words(n), scratch, [&](detail::Arena a) {
+        if (method == InverseMethod::chain) {
+            const std::size_t L = std::max<std::size_t>(64, std::bit_floor(n - 1)), r = n - std::bit_floor(n - 1);
+            const detail::ChainArrays arrays{a.take(L), a.take(L), a.take(L), a.take(r), a.take(detail::low_product_words(r))};
+            return detail::inverse_chain(f, out, arrays);
+        }
+        if (method == InverseMethod::blocks) return detail::inverse_blocks(f, out, a);
+        const std::size_t len = std::bit_ceil(n);
         u32* G = a.take(len);
         u32* W = a.take(len);
         detail::inverse_newton(f, out, G, W);
