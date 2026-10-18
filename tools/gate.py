@@ -95,6 +95,14 @@ def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
         raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
     return result
 
+def fetch_pr_head(pr: str) -> str:
+    """The pull request's head, fetched into a ref of its own: gates run side by side in one checkout,
+    and FETCH_HEAD is shared, so another gate's fetch can replace it before it is read (PR 277's gate
+    read PR 275's head and tested that)."""
+    ref = f'refs/gate/pr{pr}'
+    git('fetch', '--quiet', 'origin', f'+pull/{pr}/head:{ref}')
+    return git('rev-parse', ref).stdout.strip()
+
 
 def log(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
@@ -303,8 +311,7 @@ def gate(args, only: set[str] | None = None) -> tuple[bool, str, str, str, list[
                      f'Only {owner}\'s own pull requests are gated.')
         if info['state'] != 'OPEN':
             sys.exit(f'pull request {pr} is {info["state"].lower()}')
-        git('fetch', '--quiet', 'origin', f'pull/{pr}/head')  # the merge names this head
-        head = git('rev-parse', 'FETCH_HEAD').stdout.strip()
+        head = fetch_pr_head(pr)  # the merge names this head
         label = f'pr{pr}'
     else:
         head = git('rev-parse', args.target).stdout.strip()
@@ -440,8 +447,7 @@ def main() -> int:
     tested = {}  # unit -> the main it last passed against
     if pr and args.base == 'origin/main' and not args.fresh:
         git('fetch', '--quiet', 'origin', 'main')
-        git('fetch', '--quiet', 'origin', f'pull/{pr}/head')
-        head = git('rev-parse', 'FETCH_HEAD').stdout.strip()
+        head = fetch_pr_head(pr)
         tested = earlier_passes(pr, head)
         tip = git('rev-parse', 'origin/main').stdout.strip()
         merged = git('merge-tree', '--write-tree', tip, head, check=False)
