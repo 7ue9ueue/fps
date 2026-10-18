@@ -524,6 +524,17 @@ void lane_windows(const u32* lanes, std::size_t T, std::size_t shift, const u32*
     }
 }
 
+// A node's two children's products from one read of its state s: out = s c 2^-32, then s = s b
+// 2^-32, word by word (canonical); s, b, c < P. n a multiple of S::lanes.
+template <class S>
+void pointwise_twice(u32* s, const u32* b, const u32* c, u32* out, std::size_t n) {
+    for (std::size_t i = 0; i < n; i += S::lanes) {
+        const typename S::V x = S::load(s + i);
+        S::store(out + i, montgomery_canonical<S>(x, S::load(c + i)));
+        S::store(s + i, montgomery_canonical<S>(x, S::load(b + i)));
+    }
+}
+
 // out = a b + c d (pointwise, each product times 2^-32), canonical; the same into copy if not
 // null. n a multiple of S::lanes; out and copy may be a or c.
 template <class S>

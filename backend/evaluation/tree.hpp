@@ -503,13 +503,14 @@ private:
     }
 
     // Node [lo, hi) of the lane tree with state s (factor 1 / u).
-    void descend_lanes(std::size_t lo, std::size_t hi, const u32* s, u32 u, u32* values, Stack& stack) const {
+    void descend_lanes(std::size_t lo, std::size_t hi, u32* s, u32 u, u32* values, Stack& stack) const {
         const std::size_t length = lane_length(lanes_.degree(lo, hi)), words = 8 * length, mid = lanes_.split(lo, hi);
+        const Stack::Mark mark = stack.mark();
+        u32* const products[2] = {s, stack.take(words)};  // the children's products; s read once
+        pointwise_twice<Wide>(s, lane_store_.right(mid, words), lane_store_.left(mid), products[1], words);
         for (int side = 0; side < 2; ++side) {
             const std::size_t clo = side ? mid : lo, chi = side ? hi : mid;
-            const Stack::Mark mark = stack.mark();
-            u32* const p = stack.take(words);
-            Lane::product(s, side ? lane_store_.left(mid) : lane_store_.right(mid, words), p, words);
+            u32* const p = products[side];
             if (lanes_.base(clo, chi)) {
                 inverse(p, words);
                 u32* const w = p + 8 * (length - (chi - clo));
@@ -519,8 +520,8 @@ private:
                 const bool halved = to_child<8>(p, length, length, lane_length(lanes_.degree(clo, chi)));
                 descend_lanes(clo, chi, p, halved ? half(u) : u, values, stack);
             }
-            stack.release(mark);
         }
+        stack.release(mark);
     }
 
     // The descent below a base node from its window w (hi - lo coefficients of 8 words): its
@@ -609,14 +610,15 @@ private:
 
     // Node [lo, hi) of the lane tree with descent state s (factor 1 / u): its children's
     // descents and subtrees, then its sum's transform of length out_length into out.
-    void interpolate_lanes(std::size_t lo, std::size_t hi, const u32* s, u32 u, const u32* y, std::size_t m, u32* out,
+    void interpolate_lanes(std::size_t lo, std::size_t hi, u32* s, u32 u, const u32* y, std::size_t m, u32* out,
                            std::size_t out_length, Stack& stack) const {
         const std::size_t length = lane_length(lanes_.degree(lo, hi)), words = 8 * length, mid = lanes_.split(lo, hi);
+        const Stack::Mark mark = stack.mark();
+        u32* const products[2] = {s, stack.take(words)};  // the children's products; s read once
+        pointwise_twice<Wide>(s, lane_store_.right(mid, words), lane_store_.left(mid), products[1], words);
         sums(mid, length, out, out_length, stack, [&](int side, u32* to) {
             const std::size_t clo = side ? mid : lo, chi = side ? hi : mid;
-            const Stack::Mark mark = stack.mark();
-            u32* const p = stack.take(words);
-            Lane::product(s, side ? lane_store_.left(mid) : lane_store_.right(mid, words), p, words);
+            u32* const p = products[side];
             if (lanes_.base(clo, chi)) {
                 inverse(p, words);
                 u32* const w = p + 8 * (length - (chi - clo));
@@ -628,8 +630,8 @@ private:
                 const bool halved = to_child<8>(p, length, length, lane_length(lanes_.degree(clo, chi)));
                 interpolate_lanes(clo, chi, p, halved ? half(u) : u, y, m, to, length, stack);
             }
-            stack.release(mark);
         });
+        stack.release(mark);
     }
 
     // The sum of base node [lo, hi) (hi - lo coefficients of 8 words) from its slots' weights w
