@@ -21,9 +21,9 @@
 //                                multiply(f, g, out) into 2^lg words (a transform of 2^(lg + 1)),
 //                                then 2^lg / 2 + 1 words moved down.
 //   <op>/<N>                     ragged lengths (issue #155) for product, product_cut, square and
-//                                middle_product: N = 2^k + 1, 1.25 2^k, 1.5 2^k, 1.75 2^k and
+//                                middle_product: N = 2^k + 1, 1.25, 1.5, 1.625, 1.75, 1.875 2^k and
 //                                2^(k + 1) - 1 for k = 8, 12, 16, 20, 22 (named k+1, k.25, k.5,
-//                                k.75, (k+1)-1), and 5e5, 1e6, 1.2e6. Items per call: N. product: f
+//                                k.625, k.75, k.875, (k+1)-1), and 5e5, 1e6, 1.2e6. Items per call: N. product: f
 //                                of N / 2 + 1 words, g of the rest, out of N = n + m - 1;
 //                                product_cut: out of N / 2 + 1; square: f of (N + 1) / 2;
 //                                middle_product: f of N, g of N / 2, out of N - N / 2 + 1.
@@ -184,7 +184,8 @@ std::vector<std::pair<std::string, std::size_t>> ragged_lengths() {
         const std::size_t len = std::size_t(1) << k;
         const std::string lg = std::to_string(k);
         lengths.insert(lengths.end(), {{lg + "+1", len + 1}, {lg + ".25", len + len / 4}, {lg + ".5", len + len / 2},
-                                       {lg + ".75", 2 * len - len / 4}, {std::to_string(k + 1) + "-1", 2 * len - 1}});
+                                       {lg + ".625", len + 5 * len / 8}, {lg + ".75", 2 * len - len / 4},
+                                       {lg + ".875", 2 * len - len / 8}, {std::to_string(k + 1) + "-1", 2 * len - 1}});
     }
     lengths.insert(lengths.end(), {{"5e5", 500000}, {"1e6", 1000000}, {"1.2e6", 1200000}});
     return lengths;

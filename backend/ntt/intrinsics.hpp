@@ -3211,6 +3211,17 @@ struct intrinsics {
         Ntt::square(p, roots, inverse_roots);
     }
 
+    // Group products (truncated.hpp): a b mod the polynomial of group k with nv leaves (nv a power
+    // of 4, nv >= 16), x^(8 nv) - r(k)^2, into a times nv 2^-32, < 2P; a, b < 4P, b destroyed.
+    static void group_product(std::uint32_t* a, std::uint32_t* b, std::size_t nv, std::size_t k, const std::uint32_t* roots,
+                              const std::uint32_t* inverse_roots) {
+        Ntt::template multiply_tree<4, false>(a, b, nv, k, roots, inverse_roots);
+    }
+    static void group_square(std::uint32_t* a, std::size_t nv, std::size_t k, const std::uint32_t* roots,
+                             const std::uint32_t* inverse_roots) {
+        Ntt::template multiply_tree<4, true>(a, a, nv, k, roots, inverse_roots);
+    }
+
     // Leaf-form operations (ntt.hpp, Transform): their contracts are the Transform calls'.
     static void leaf_products(const std::uint32_t* a, const std::uint32_t* b, std::uint32_t* out, int lg,
                               const std::uint32_t* roots, bool accumulate) {

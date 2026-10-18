@@ -1,11 +1,15 @@
 // Products of ragged length (issue #155): N = n + m - 1 words with L < N <= 2L, L = 2^lg, at about
 // the cost of N words, not of the transform of 2L. ntt.hpp runs them (multiply, square, and
 // middle_product as the transpose, below); this header has the plans and the passes around the
-// power-of-two products.
+// power-of-two products. A second form, the truncated transform of 2L (truncated.hpp, round 2),
+// serves multiply and square; it is a plan kind here.
 //
 //   plan(N, kind), options(N, plans)   the plan of a kind; the distinct plans of N
-//   choose(N)                          the tuned plan: kinds.get()[entry(N)] ("ntt.ragged")
-//   twist_fold, fold, combine          the passes of a product
+//   choose_product(N)                  the tuned plan of multiply and square ("ntt.ragged")
+//   choose(N)                          the tuned plan of the others (middle products, ragged_into's
+//                                      callers outside ntt): never truncated
+//   truncates(N), rounded(size, n)     whether N has a truncated plan; the words it computes
+//   twist_fold, fold, combine          the passes of a split product
 //   split_transposed, stage_turned, unfold_add   those of a middle product
 //
 // c = f g, N = L + r, 0 < r <= L. With A = c mod (x^L - 1) (a cyclic product of length L) and q =
@@ -47,13 +51,29 @@ inline constexpr u32 kZeta = 3;
 inline constexpr std::size_t kMaxChunks = 32;
 
 // A product of N words. split: c mod (x^L - 1) at 2^lg, the twisted piece of s words (0: none), the
-// top t words of c from the top product; N = L + r, t = r - s if r > s else 0. Else a plain product
-// at 2^lg >= N.
+// top t words of c from the top product; N = L + r, t = r - s if r > s else 0. truncated: c mod (x^L
+// - 1) at 2^lg and a truncated transform of x^L + 1 (truncated.hpp; tables of 2^(lg + 1)). Else a
+// plain product at 2^lg >= N.
 struct Plan {
     int lg = 0;
     std::size_t s = 0, t = 0;
-    bool split = false;
+    bool split = false, truncated = false;
 };
+
+// Truncated plans: x^L + 1's leaf form to a prefix of words, in nodes of at least kMinNode words
+// (group products of 16 leaves and more; truncated.hpp).
+inline constexpr std::size_t kMinNode = 128;
+constexpr bool power_of_4(std::size_t x) { return std::has_single_bit(x) && std::countr_zero(x) % 2 == 0; }
+// The children of a node of `size` words: its quarters where they are groups (size / 32 leaves a
+// power of 4), else its halves.
+constexpr int radix(std::size_t size) { return power_of_4(size / 32) ? 4 : 2; }
+// The words of a node of `size` words its first n words take in nodes of kMinNode words and more:
+// n rounded up, a child shorter than kMinNode taken whole.
+constexpr std::size_t rounded(std::size_t size, std::size_t n) {
+    const std::size_t c = size / std::size_t(radix(size));
+    if (c < kMinNode) return size;
+    return n % c ? n / c * c + rounded(c, n % c) : n;
+}
 
 using Vec = simd::Native;
 using Mod = modarith::Ops<Vec, kP>;
@@ -92,7 +112,11 @@ private:
 // A constant w < P and its Shoup quotient: times(x) = x w in [0, 2P), x < 2^32.
 struct Constant {
     V w, q;
-    explicit Constant(u32 x = 0) : w(Vec::broadcast(x)), q(Vec::broadcast(quotient(x))) {}
+    Constant() = default;  // unset
+    explicit Constant(u32 x) : w(Vec::broadcast(x)), q(Vec::broadcast(quotient(x))) {}
+    Constant(u32 x, u32 shoup) : w(Vec::broadcast(x)), q(Vec::broadcast(shoup)) {}  // shoup = quotient(x)
+    // Entry k of a twiddle table (common.hpp: values, then their quotients).
+    static Constant entry(const u32* table, std::size_t k) { return {table[slot(k)], table[slot(k) + 8]}; }
     [[gnu::always_inline]] V times(V x) const { return Mod::shoup(x, w, q); }
 };
 
@@ -286,27 +310,46 @@ inline void unfold_add(const u32* Z, std::size_t s, std::size_t rot, u32* out, s
 
 // Plan kinds for N = L + r: the plain product at 2L, the top product alone (s = 0, t = r), the
 // twisted piece of bit_floor(r) words and the top product of the rest, the piece of bit_ceil(r)
-// words alone (t = 0).
-enum Kind : std::uint8_t { kPlain, kTop, kFloor, kCeil };
-inline constexpr int kKinds = 4;
+// words alone (t = 0), and the truncated transform of x^L + 1 (truncated.hpp; products only).
+enum Kind : std::uint8_t { kPlain, kTop, kFloor, kCeil, kTruncated };
+inline constexpr int kKinds = 5;
 
-// The plan of a kind for N words. A kind that is no split here falls back to the next in the order
-// ceil, floor, top, plain: N <= 2^kMinLog, a piece outside [max(2^kMinLog, L / kMaxChunks), L / 2]
-// (r too short or above L / 2), or products not shorter than the plain one's (s + 2t - 1 >= L: the
-// top product is about 2t words).
-constexpr Plan plan(std::size_t N, int kind) {
+// Whether a truncated plan exists for N words, L < N < 2L: x^L + 1's nodes to r words take fewer
+// than its L (rounded() < L), and 2L <= 2^kMaxLog.
+constexpr bool truncates(std::size_t N) {
+    if (N <= (std::size_t(1) << kMinLog) || N > (std::size_t(1) << kMaxLog)) return false;
+    const std::size_t L = std::bit_floor(N - 1);
+    return rounded(L, N - L) < L;
+}
+
+// The plan of a kind below kTruncated for N words. A kind that is no plan here falls back to the
+// next in the order ceil, floor, top, plain: N <= 2^kMinLog, a piece outside [max(2^kMinLog, L /
+// kMaxChunks), L / 2] (r too short or above L / 2), or products not shorter than the plain one's (s
+// + 2t - 1 >= L: the top product is about 2t words).
+constexpr Plan split_plan(std::size_t N, int kind) {
     const int lg = std::max(kMinLog, int(std::bit_width(N - 1)));
-    if (N <= (std::size_t(1) << kMinLog)) return {lg, 0, 0, false};
+    if (N <= (std::size_t(1) << kMinLog)) return {lg, 0, 0, false, false};
     const std::size_t L = std::size_t(1) << (lg - 1), r = N - L;
     const std::size_t least = std::max<std::size_t>(std::size_t(1) << kMinLog, L / kMaxChunks);
     for (; kind > kPlain; --kind) {
         const std::size_t s = kind == kTop ? 0 : kind == kFloor ? std::bit_floor(r) : std::bit_ceil(r), t = r > s ? r - s : 0;
-        if (s + 2 * t <= L && (s == 0 || (s >= least && s <= L / 2))) return {lg - 1, s, t, true};
+        if (s + 2 * t <= L && (s == 0 || (s >= least && s <= L / 2))) return {lg - 1, s, t, true, false};
     }
-    return {lg, 0, 0, false};
+    return {lg, 0, 0, false, false};
 }
 
-constexpr bool operator==(const Plan& a, const Plan& b) { return a.lg == b.lg && a.s == b.s && a.t == b.t && a.split == b.split; }
+// The truncated plan of N words, or where it needs all of x^L + 1 (truncates) the next kind's, ceil.
+constexpr Plan truncated_plan(std::size_t N) {
+    if (truncates(N)) return {int(std::bit_width(N - 1)) - 1, 0, 0, false, true};
+    return split_plan(N, kCeil);
+}
+
+// The plan of any kind for N words (kTruncated falls back to ceil, floor, top, plain).
+constexpr Plan plan(std::size_t N, int kind) { return kind == kTruncated ? truncated_plan(N) : split_plan(N, kind); }
+
+constexpr bool operator==(const Plan& a, const Plan& b) {
+    return a.lg == b.lg && a.s == b.s && a.t == b.t && a.split == b.split && a.truncated == b.truncated;
+}
 
 // The distinct plans of N words, plans[0] the plain one; returns their number.
 constexpr int options(std::size_t N, std::array<Plan, kKinds>& plans) {
@@ -318,18 +361,26 @@ constexpr int options(std::size_t N, std::array<Plan, kKinds>& plans) {
     return count;
 }
 
-// The tuned choice "ntt.ragged" (backend/tune): the kind per main length L = 2^lg (kMinLog <= lg <
-// kMaxLog) and bucket of r / L, (b - 1) / 16 < r / L <= b / 16. tune.hpp measures it: every kind
-// at the middle of each bucket; compiled defaults from tools/tune.py ntt (tuned.hpp).
-inline constexpr int kBuckets = 16, kRows = kMaxLog - kMinLog;
+// The tuned choice "ntt.ragged" (backend/tune): an entry per main length L = 2^lg (kMinLog <= lg <
+// kMaxLog) and bucket of r / L, (b - 1) / 16 < r / L <= b / 16. Entry v < kTruncated: the kind of
+// every product there; v >= kTruncated: products (multiply, square) truncated, the others (middle
+// products, which have no truncated form, and ragged_into's callers outside ntt) kind v - kTruncated.
+// tune.hpp measures it: every kind at the middle of each bucket; compiled defaults from
+// tools/tune.py ntt (tuned.hpp).
+inline constexpr int kBuckets = 16, kRows = kMaxLog - kMinLog, kEntries = 2 * kTruncated;
 using Kinds = std::array<std::uint8_t, kRows * kBuckets>;
+
+constexpr int product_kind(int v) { return v < kTruncated ? v : kTruncated; }
+constexpr int other_kind(int v) { return v < kTruncated ? v : v - kTruncated; }
+// The entry for a product kind and the others' kind (< kTruncated).
+constexpr std::uint8_t encode(int product, int other) { return std::uint8_t(product == kTruncated ? kTruncated + other : product); }
 
 inline constexpr Kinds kKindDefaults = [] {
     Kinds kinds{};
     for (int i = 0; i < kRows * kBuckets; ++i) kinds[i] = std::uint8_t(tuned::ragged[int(tune::kTarget)][i]);
     return kinds;
 }();
-static_assert(std::ranges::all_of(kKindDefaults, [](std::uint8_t k) { return k < kKinds; }));
+static_assert(std::ranges::all_of(kKindDefaults, [](std::uint8_t k) { return k < kEntries; }));
 inline constinit tune::Table<kKindDefaults> kinds;
 
 // The entry of N words in Kinds, N > 2^kMinLog.
@@ -339,10 +390,22 @@ constexpr int entry(std::size_t N) {
     return (lg - kMinLog) * kBuckets + int((r * kBuckets - 1) >> lg);
 }
 
-// The plan for N words: the table's kind for its length and bucket (one table read).
+// The plan for N words outside multiply and square: the table's kind for its length and bucket (one
+// table read), never truncated (middle products; backend/series' ragged_into).
 inline Plan choose(std::size_t N) {
-    if (N <= (std::size_t(1) << kMinLog) || N > (std::size_t(1) << kMaxLog)) return plan(N, kPlain);
-    return plan(N, kinds.get()[entry(N)]);
+    if (N <= (std::size_t(1) << kMinLog) || N > (std::size_t(1) << kMaxLog)) return split_plan(N, kPlain);
+    return split_plan(N, other_kind(kinds.get()[entry(N)]));
+}
+
+// The truncated plan out of line (choose_product): multiply()'s inlined path stays as before.
+[[gnu::noinline]] inline Plan truncated_choice(std::size_t N) { return truncated_plan(N); }
+
+// The plan of multiply and square for N words: as choose, truncated where the table says.
+inline Plan choose_product(std::size_t N) {
+    if (N <= (std::size_t(1) << kMinLog) || N > (std::size_t(1) << kMaxLog)) return split_plan(N, kPlain);
+    const int v = kinds.get()[entry(N)];
+    if (v >= kTruncated) return truncated_choice(N);
+    return split_plan(N, v);
 }
 
 // Words of scratch a split plan with main length L needs, beyond out: the main product (a factor
@@ -350,5 +413,17 @@ inline Plan choose(std::size_t N) {
 // (L + kPadding)) or the top product (under L words: at most this), each array kPadding words
 // longer, and 4 KiB to place a (place() in ntt.hpp) and to align.
 constexpr std::size_t split_words(std::size_t L) { return 3 * (L + kPadding) + 2048; }
+
+// Words of scratch a truncated plan with main length L needs: the leaf forms of length 2L of both
+// factors, and 4 KiB to place them. A top product of a split plan (under L words) fits in
+// split_words(L).
+constexpr std::size_t truncated_words(std::size_t L) { return 2 * (2 * L + kPadding) + 1024; }
+
+// Words of work ntt.hpp's ragged_into needs for plan p (its tables: ntt.hpp's table_log(p)): a
+// caller outside ntt (backend/series' low_product) sizes its work by it.
+constexpr std::size_t work_words(const Plan& p) {
+    const std::size_t len = std::size_t(1) << p.lg;
+    return p.split ? split_words(len) : p.truncated ? truncated_words(len) : 2 * (len + kPadding) + 1024;
+}
 
 }  // namespace fps::ntt::detail::ragged

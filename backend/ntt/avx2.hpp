@@ -1668,6 +1668,20 @@ struct avx2 {
         detail::avx2::square<detail::avx2::PairSquareBottom>(p, roots, inverse_roots);
     }
 
+    // Group products (truncated.hpp; intrinsics.hpp's contract): group k's subtree of nv >= 16 leaves.
+    static void group_product(std::uint32_t* a, std::uint32_t* b, std::size_t nv, std::size_t k, const std::uint32_t* roots,
+                              const std::uint32_t* inverse_roots) {
+        using detail::avx2::Vec;
+        detail::avx2::Tree<detail::avx2::PairBottom>(roots, inverse_roots)
+            .visit(reinterpret_cast<Vec*>(a), reinterpret_cast<Vec*>(b), nv, 1, k);
+    }
+    static void group_square(std::uint32_t* a, std::size_t nv, std::size_t k, const std::uint32_t* roots,
+                             const std::uint32_t* inverse_roots) {
+        using detail::avx2::Vec;
+        detail::avx2::Tree<detail::avx2::PairSquareBottom>(roots, inverse_roots)
+            .visit(reinterpret_cast<Vec*>(a), reinterpret_cast<Vec*>(a), nv, 1, k);
+    }
+
     // Leaf-form operations (ntt.hpp, Transform): their contracts are the Transform calls'.
     static void leaf_products(const std::uint32_t* a, const std::uint32_t* b, std::uint32_t* out, int lg,
                               const std::uint32_t* roots, bool accumulate) {

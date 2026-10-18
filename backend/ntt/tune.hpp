@@ -8,7 +8,7 @@
 //   ntt::variant_names()                 // the candidates' names, e.g. "intrinsics_avx512"
 //   ntt::op_name(op)                     // "forward", "inverse", "multiply", "product"
 //
-//   ntt::measure_ragged(start, budget[, log])   // detail::ragged::Kinds: the plan per length and bucket
+//   ntt::measure_ragged(start, budget[, log])   // detail::ragged::Kinds: the plans per length and bucket
 //
 // measure: for each op and lg up to budget.max_lg, every candidate is timed in turn (tune::time_each)
 // the way the library runs it, at the op's points: forward and inverse on a Transform and an array
@@ -181,12 +181,12 @@ inline std::optional<Choices> parse(std::string_view s) {
 // The ragged plans ("ntt.ragged", ragged.hpp): for each main length 2^lg, kMinLog <= lg <=
 // budget.max_lg (and lg < kMaxLog), and each bucket b of r / L, every kind's plan at N = L + (2b - 1)
 // L / 32 (the bucket's middle), a product of factors of N / 2 + 1 and N - N / 2 words by multiply's
-// path (detail::product). The fastest kind wins unless start's is within the margin; a row keeps the
-// least kind with the plan that won (a kind falls back to a lesser one where it is no split, and the
-// middle may fall back where other words of the bucket do not). Rows run from
-// short to long and each is set before the next, so a top product runs the measured rows. Past
-// max_lg each bucket keeps start's kind, unless its choice at max_lg changed: then the longer rows
-// take the new one.
+// path (detail::product). The fastest kind wins unless start's is within the margin, for products and
+// (truncated plans aside) for the others; a row keeps the least kind with the plan that won (a kind
+// falls back to a lesser one where it is no plan, and the middle may fall back where other words of
+// the bucket do not). Rows run from short to long and each is set before the next, so a top product
+// runs the measured rows. Past max_lg each bucket keeps start's entry, unless its choice at max_lg
+// changed: then the longer rows take the new one.
 struct RaggedTimes {
     int lg, bucket;
     std::vector<int> kinds;   // the distinct kinds timed
@@ -219,12 +219,22 @@ inline detail::ragged::Kinds measure_ragged(const detail::ragged::Kinds& start, 
                                                          detail::ragged::plan(N, k));
                 asm volatile("" : : "r"(out.data()) : "memory");
             });
-            const int best = int(std::ranges::min_element(ns) - ns.begin());
-            // ids holds the least kind of each plan: stored rather than start's own kind, which may
-            // fall back to that plan at the bucket's middle and not elsewhere in it.
-            const auto now = std::ranges::find_if(ids, [&](int k) { return detail::ragged::plan(N, k) == detail::ragged::plan(N, start[i]); });
-            const bool keep = now != ids.end() && ns[now - ids.begin()] <= ns[best] * (1 + budget.margin);
-            kinds[i] = std::uint8_t(keep ? *now : ids[best]);
+            // The kind among those `allowed` (products: all; others: no truncated plan): the fastest,
+            // unless `current`'s plan is within the margin. ids holds the least kind of each plan: stored
+            // rather than start's own kind, which may fall back to that plan at the bucket's middle and
+            // not elsewhere in it.
+            const auto pick = [&](int current, auto allowed) {
+                int best = -1;
+                for (std::size_t j = 0; j < ids.size(); ++j)
+                    if (allowed(ids[j]) && (best < 0 || ns[j] < ns[best])) best = int(j);
+                const auto now = std::ranges::find_if(ids, [&](int k) {
+                    return allowed(k) && detail::ragged::plan(N, k) == detail::ragged::plan(N, current);
+                });
+                return now != ids.end() && ns[now - ids.begin()] <= ns[best] * (1 + budget.margin) ? *now : ids[best];
+            };
+            const int product = pick(detail::ragged::product_kind(start[i]), [](int) { return true; });
+            const int other = pick(detail::ragged::other_kind(start[i]), [](int k) { return k != detail::ragged::kTruncated; });
+            kinds[i] = detail::ragged::encode(product, other);
             if (log) log->push_back({lg, b, ids, ns});
         }
 #ifndef FPS_NO_TUNER
@@ -262,7 +272,7 @@ inline const bool kRaggedRegistered = tune::add({
     [] { return tune::text(detail::ragged::kinds.get()); },
     [](std::string_view s, bool apply) {
         const auto values = tune::parse<std::array<unsigned, detail::ragged::kRows * detail::ragged::kBuckets>>(s);
-        if (!values || !std::ranges::all_of(*values, [](unsigned k) { return k < unsigned(detail::ragged::kKinds); })) return false;
+        if (!values || !std::ranges::all_of(*values, [](unsigned k) { return k < unsigned(detail::ragged::kEntries); })) return false;
         if (apply) {
             detail::ragged::Kinds kinds{};
             std::ranges::copy(*values, kinds.begin());
