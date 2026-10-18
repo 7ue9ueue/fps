@@ -164,6 +164,7 @@
 #include "backend/ntt/memory.hpp"
 #include "backend/ntt/ragged.hpp"
 #include "backend/ntt/select.hpp"
+#include "backend/ntt/truncated.hpp"
 
 namespace fps::ntt {
 
@@ -232,17 +233,62 @@ template <class Variant, bool kSquare>
     else Variant::multiply(p, roots, inverse_roots);
 }
 
+// The log of the tables a plan needs: a truncated plan's of 2L.
+constexpr int table_log(const ragged::Plan& p) { return p.lg + (p.truncated ? 1 : 0); }
+
+// ragged_into's placement of an array of span = 2^k + kPadding words in work at `at`: far from x, y
+// and z modulo place()'s period.
+inline std::uint32_t* placed(std::uint32_t* at, const void* x, const void* y, const void* z, std::size_t span) {
+    const std::size_t period = place_period(std::countr_zero(span - kPadding));
+    return at + place(x, y, z, span * sizeof(std::uint32_t), period) / sizeof(std::uint32_t);
+}
+
+// c = A + (x^L - 1) q's A = c mod (x^L - 1), the variant's product of length L of f and g (each
+// folded mod x^L - 1 first if longer), to out[0, L); work: 3 (L + kPadding) + 1024 words.
+template <class Variant, bool kSquare>
+void cyclic_into(const std::uint32_t* f, std::size_t n, const std::uint32_t* g, std::size_t m, std::uint32_t* out,
+                 std::uint32_t* work, int lg, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
+    const std::size_t L = std::size_t(1) << lg;
+    const std::uint32_t *ff = f, *gg = g;
+    std::size_t nn = n, mm = m;
+    std::uint32_t* next = work;
+    if (n > L) ragged::fold(f, n, L, next), ff = next, nn = L, next += L + kPadding;
+    if (m > L) ragged::fold(g, m, L, next), gg = next, mm = L, next += L + kPadding;
+    std::uint32_t* a = placed(next, ff, gg, out, L + kPadding);
+    run_product<Variant, kSquare>(Product{ff, nn, kSquare ? ff : gg, kSquare ? nn : mm, a, kSquare ? a : a + L + kPadding,
+                                          out, L, lg},
+                                  roots, inverse_roots);
+}
+
+// f g (f^2 if kSquare) of N = n + m - 1 words by a truncated plan into out (truncated.hpp): f and g
+// to the leaf form of length 2L cut to shape(N)'s nodes, the group products, the inverse into out.
+// work: ragged::truncated_words(L); tables of 2L.
+template <class Variant, bool kSquare>
+void truncated_into(const std::uint32_t* f, std::size_t n, const std::uint32_t* g, std::size_t m, std::uint32_t* out,
+                    std::uint32_t* work, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
+    const truncated::Shape s = truncated::shape(n + m - 1);
+    const std::size_t span = (std::size_t(2) << s.lg) + kPadding;
+    std::uint32_t* const a = placed(work, f, g, out, span);
+    std::uint32_t* const b = a + span;
+    truncated::forward(f, n, a, s, roots);
+    if (!kSquare) truncated::forward(g, m, b, s, roots);
+    for (int i = 0; i < s.fulls; ++i) {
+        const truncated::Node& node = s.full[i];
+        if constexpr (kSquare) Variant::group_square(a + node.at, node.size / 8, node.k, roots, inverse_roots);
+        else Variant::group_product(a + node.at, b + node.at, node.size / 8, node.k, roots, inverse_roots);
+    }
+    truncated::inverse(a, out, s, roots, inverse_roots);
+}
+
 // f g (f^2 if kSquare: g = f) by plan p into out, N = n + m - 1 words of memory apart from f and g
-// (ragged.hpp). work: 64-byte aligned, ragged::split_words(2^p.lg) words (p.split) or
-// 2 (2^p.lg + kPadding) + 1024; tables for 2^p.lg at least.
+// (ragged.hpp). work: 64-byte aligned, ragged::split_words(2^p.lg) words (p.split),
+// ragged::truncated_words(2^p.lg) (p.truncated) or 2 (2^p.lg + kPadding) + 1024; tables for
+// 2^table_log(p) at least.
 template <class Variant, bool kSquare>
 void ragged_into(const std::uint32_t* f, std::size_t n, const std::uint32_t* g, std::size_t m, std::uint32_t* out,
                  std::uint32_t* work, const ragged::Plan& p, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
     const std::size_t N = n + m - 1, L = std::size_t(1) << p.lg;
-    const auto placed = [](std::uint32_t* at, const void* x, const void* y, const void* z, std::size_t span) {
-        const std::size_t period = place_period(std::countr_zero(span - kPadding));  // span: 2^k + kPadding
-        return at + place(x, y, z, span * sizeof(std::uint32_t), period) / sizeof(std::uint32_t);
-    };
+    if (p.truncated) return truncated_into<Variant, kSquare>(f, n, g, m, out, work, roots, inverse_roots);
     if (!p.split) {
         std::uint32_t* a = placed(work, f, g, out, L + kPadding);
         run_product<Variant, kSquare>(Product{f, n, g, m, a, kSquare ? a : a + L + kPadding, out, N, p.lg}, roots,
@@ -252,21 +298,11 @@ void ragged_into(const std::uint32_t* f, std::size_t n, const std::uint32_t* g, 
     const std::size_t r = N - L, s = p.s, t = p.t;
     if (t) {  // T, the top t words of c, from the top t words of f and g, to out[L + s, N)
         const std::size_t nt = std::min(n, t), mt = std::min(m, t), count = nt + mt - 1;
-        ragged_into<Variant, kSquare>(f + (n - nt), nt, g + (m - mt), mt, out, work, ragged::choose(count), roots,
+        ragged_into<Variant, kSquare>(f + (n - nt), nt, g + (m - mt), mt, out, work, ragged::choose_product(count), roots,
                                       inverse_roots);
         std::copy(out + (count - t), out + count, out + L + s);
     }
-    {  // A = c mod (x^L - 1) to out[0, L); a factor longer than L folded first
-        const std::uint32_t *ff = f, *gg = g;
-        std::size_t nn = n, mm = m;
-        std::uint32_t* next = work;
-        if (n > L) ragged::fold(f, n, L, next), ff = next, nn = L, next += L + kPadding;
-        if (m > L) ragged::fold(g, m, L, next), gg = next, mm = L, next += L + kPadding;
-        std::uint32_t* a = placed(next, ff, gg, out, L + kPadding);
-        run_product<Variant, kSquare>(Product{ff, nn, kSquare ? ff : gg, kSquare ? nn : mm, a, kSquare ? a : a + L + kPadding,
-                                              out, L, p.lg},
-                                      roots, inverse_roots);
-    }
+    cyclic_into<Variant, kSquare>(f, n, g, m, out, work, p.lg, roots, inverse_roots);  // A = c mod (x^L - 1)
     std::uint32_t* C = work;  // the twisted piece: f(z y) g(z y) mod (y^s - 1)
     if (s) {
         std::uint32_t *fs = work, *gs = work + s + kPadding;
@@ -303,10 +339,6 @@ void middle_into(const std::uint32_t* v, std::size_t n, const std::uint32_t* g, 
                  const std::uint32_t* inverse_roots) {
     const std::size_t L = std::size_t(1) << p.lg;
     const auto block = [](std::size_t w) { return (w + kPadding + 15) / 16 * 16; };
-    const auto placed = [](std::uint32_t* at, const void* x, const void* y, const void* z, std::size_t span) {
-        const std::size_t period = place_period(std::countr_zero(span - kPadding));  // span: 2^k + kPadding
-        return at + place(x, y, z, span * sizeof(std::uint32_t), period) / sizeof(std::uint32_t);
-    };
     if (!p.split) {  // a cyclic product of length L >= n: its wrapped terms land below word m - 1
         std::uint32_t* a = placed(work, v, g, out, L + kPadding);
         std::uint32_t* b = a + L + kPadding;
@@ -378,8 +410,9 @@ template <class Variant, bool kSquare>
     // out itself when it takes all of c and apart from f and g; else c in the region, then copied.
     const bool direct = count == N && apart(f, n) && apart(g, m);
     const std::size_t own = direct ? 0 : (N + kPadding + 15) / 16 * 16;
-    const auto [roots, inverse_roots] = tables<Variant>(p.lg);
-    const Region region = take_region(sizeof(std::uint32_t) * (own + ragged::split_words(L)));
+    const auto [roots, inverse_roots] = tables<Variant>(table_log(p));
+    const std::size_t words = p.truncated ? ragged::truncated_words(L) : ragged::split_words(L);
+    const Region region = take_region(sizeof(std::uint32_t) * (own + words));
     auto* start = reinterpret_cast<std::uint32_t*>(region.start);
     std::uint32_t* c = direct ? out : start;
     ragged_into<Variant, kSquare>(f, n, g, m, c, start + own, p, roots, inverse_roots);
@@ -393,7 +426,7 @@ template <class Variant, bool kSquare>
 template <class Variant, bool kSquare>
 void product(const std::uint32_t* f, std::size_t n, const std::uint32_t* g, std::size_t m, std::uint32_t* out,
              std::size_t count, const ragged::Plan& p) {
-    if (p.split) return ragged_product<Variant, kSquare>(f, n, g, m, out, count, p);
+    if (p.split || p.truncated) return ragged_product<Variant, kSquare>(f, n, g, m, out, count, p);
     const auto [roots, inverse_roots] = tables<Variant>(p.lg);
     const Region region = take_region(region_bytes(p.lg));
     const std::size_t span = (std::size_t(1) << p.lg) + kPadding;
@@ -408,6 +441,7 @@ void product(const std::uint32_t* f, std::size_t n, const std::uint32_t* g, std:
 template <class Variant>
 void middle(const std::uint32_t* f, const std::uint32_t* g, std::size_t m, std::uint32_t* out, std::size_t count,
             const ragged::Plan& p) {
+    if (p.truncated) return middle<Variant>(f, g, m, out, count, ragged::plan(m - 1 + count, ragged::kPlain));  // none
     if (p.split) return ragged_middle<Variant>(f, g, m, out, count, p);
     const auto [roots, inverse_roots] = tables<Variant>(p.lg);
     const Region region = take_region(region_bytes(p.lg));
@@ -432,7 +466,7 @@ void multiply(std::span<const std::uint32_t> f, std::span<const std::uint32_t> g
     const std::size_t count = n && m ? std::min(n + m - 1, out.size()) : 0;
     if (count) {
         if (detail::log_length(n, m) > kMaxLog) throw std::length_error("fps::ntt::multiply: product longer than 2^kMaxLog");
-        detail::product<Variant, false>(f.data(), n, g.data(), m, out.data(), count, detail::ragged::choose(n + m - 1));
+        detail::product<Variant, false>(f.data(), n, g.data(), m, out.data(), count, detail::ragged::choose_product(n + m - 1));
     }
     std::fill(out.begin() + count, out.end(), 0u);
 }
@@ -444,7 +478,7 @@ void square(std::span<const std::uint32_t> f, std::span<std::uint32_t> out) {
     const std::size_t count = n ? std::min(2 * n - 1, out.size()) : 0;
     if (count) {
         if (detail::log_length(n, n) > kMaxLog) throw std::length_error("fps::ntt::square: square longer than 2^kMaxLog");
-        detail::product<Variant, true>(f.data(), n, f.data(), n, out.data(), count, detail::ragged::choose(2 * n - 1));
+        detail::product<Variant, true>(f.data(), n, f.data(), n, out.data(), count, detail::ragged::choose_product(2 * n - 1));
     }
     std::fill(out.begin() + count, out.end(), 0u);
 }

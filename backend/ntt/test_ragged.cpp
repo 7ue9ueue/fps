@@ -68,10 +68,11 @@ template <class V>
 void check_middle(const char* name, const std::vector<u32>& f, const std::vector<u32>& g, std::size_t count,
                   const std::vector<u32>& want, std::size_t offset = 0) {
     const std::size_t m = g.size(), n = m - 1 + count;
-    std::array<detail::ragged::Plan, 4> plans;
+    std::array<detail::ragged::Plan, detail::ragged::kKinds> plans;
     const int options = detail::ragged::options(n, plans);
     for (int i = 0; i < options; ++i)
-        expect(run_middle<V>(f, g, count, plans[i], offset) == want, name, ((n * 1000000 + m) * 10 + i) * 10 + 2);
+        if (!plans[i].truncated)  // products only
+            expect(run_middle<V>(f, g, count, plans[i], offset) == want, name, ((n * 1000000 + m) * 10 + i) * 10 + 2);
     std::vector<u32> chosen(count);
     middle_product<V>(std::span(f).first(n), g, chosen);
     expect(chosen == want, name, (n * 1000000 + m) * 100 + 3);
@@ -81,16 +82,18 @@ void check_middle(const char* name, const std::vector<u32>& f, const std::vector
 template <class V, bool kSquare>
 void run_plan(const u32* f, std::size_t n, const u32* g, std::size_t m, u32* out, const detail::ragged::Plan& p) {
     const std::size_t len = std::size_t(1) << p.lg;
-    const std::size_t words = p.split ? detail::ragged::split_words(len) : 2 * (len + kPadding) + 1024;
+    const std::size_t words = p.split       ? detail::ragged::split_words(len)
+                              : p.truncated ? detail::ragged::truncated_words(len)
+                                            : 2 * (len + kPadding) + 1024;
     std::vector<detail::Line> work(words / 16 + 1);
-    const auto [roots, inverse_roots] = detail::tables<V>(p.lg);
+    const auto [roots, inverse_roots] = detail::tables<V>(detail::table_log(p));
     detail::ragged_into<V, kSquare>(f, n, g, m, out, work.data()->words, p, roots, inverse_roots);
 }
 
 // f g (or f^2) by plan p, cut to count <= n + m - 1 words: in caller memory `offset` words into a
 // page and ending its allocation (ASan sees any access past it), out full of garbage first;
-// detail::product (the API's path); for the plain plan also run_plan (the path of a top product),
-// which must agree.
+// detail::product (the API's path); for the plain and truncated plans also run_plan (the path of a
+// top product), which must agree.
 template <class V, bool kSquare>
 std::vector<u32> run(const std::vector<u32>& f, const std::vector<u32>& g, std::size_t count, const detail::ragged::Plan& p,
                      std::size_t offset = 0) {
@@ -118,7 +121,7 @@ void check_plans(const char* name, const std::vector<u32>& f, const std::vector<
                  const std::vector<u32>& want, std::size_t offset = 0) {
     const std::size_t n = std::min(f.size(), count), m = std::min(g.size(), count);
     if (!n || !m) return;
-    std::array<detail::ragged::Plan, 4> plans;
+    std::array<detail::ragged::Plan, detail::ragged::kKinds> plans;
     const int options = detail::ragged::options(n + m - 1, plans);
     for (int i = 0; i < options; ++i) {
         const auto got = run<V, kSquare>(f, g, count, plans[i], offset);
@@ -176,7 +179,7 @@ void long_lengths(const char* name, int max_lg) {
         for (const std::size_t N : {len - 1, len, len + 1, len + len / 4, len + len / 2, 2 * len - len / 4, 2 * len - 1, len + 77}) {
             const std::size_t n = N / 2 + 1, m = N + 1 - n;
             const auto f = random_poly(n, k % 2), g = random_poly(m, k % 2);
-            std::array<detail::ragged::Plan, 4> plans;
+            std::array<detail::ragged::Plan, detail::ragged::kKinds> plans;
             detail::ragged::options(N, plans);
             const std::vector<u32> plain = run<V, false>(f, g, N, plans[0]);
             bool ok = true;
@@ -245,12 +248,17 @@ void test_plans() {
             lengths.insert(lengths.end(), {(std::size_t(1) << k) - d, (std::size_t(1) << k) + d});
     for (const std::size_t N : lengths) {
         if (N > (std::size_t(1) << kMaxLog)) continue;
-        std::array<detail::ragged::Plan, 4> plans;
+        std::array<detail::ragged::Plan, detail::ragged::kKinds> plans;
         const int count = detail::ragged::options(N, plans);
-        expect(!plans[0].split && (std::size_t(1) << plans[0].lg) >= N && plans[0].lg >= kMinLog, "plan: plain", N);
+        expect(!plans[0].split && !plans[0].truncated && (std::size_t(1) << plans[0].lg) >= N && plans[0].lg >= kMinLog,
+               "plan: plain", N);
         for (int i = 1; i < count; ++i) {
             const auto& p = plans[i];
             const std::size_t L = std::size_t(1) << p.lg, r = N - L;
+            if (p.truncated) {  // test_truncated.cpp checks the shape
+                expect(!p.split && L < N && N < 2 * L && detail::ragged::truncates(N), "plan: truncated", N * 10 + i);
+                continue;
+            }
             bool ok = p.split && L < N && N <= 2 * L && p.s + 2 * p.t <= L && (p.s == 0 || p.t <= p.s);
             ok &= p.s == 0 || (std::has_single_bit(p.s) && p.s >= std::max<std::size_t>(64, L / detail::ragged::kMaxChunks) && p.s <= L / 2);
             ok &= p.t ? p.s + p.t == r : p.s >= r;
@@ -261,15 +269,25 @@ void test_plans() {
             expect(e >= 0 && e < detail::ragged::kRows * detail::ragged::kBuckets, "plan: entry", N);
         }
     }
-    // The compiled table holds the least kind of each plan at the buckets' middles, as measured.
+    // The compiled table holds the least kind of each plan at the buckets' middles, as measured: for
+    // products, and for the others among the kinds but truncated.
     for (int i = 0; i < detail::ragged::kRows * detail::ragged::kBuckets; ++i) {
         const int lg = kMinLog + i / detail::ragged::kBuckets, b = i % detail::ragged::kBuckets + 1;
         const std::size_t L = std::size_t(1) << lg, N = L + std::max<std::size_t>(1, (2 * b - 1) * L / 32);
-        const int kind = detail::ragged::kKindDefaults[i];
-        bool least = true;
-        for (int k = 0; k < kind; ++k) least &= !(detail::ragged::plan(N, k) == detail::ragged::plan(N, kind));
+        const int product = detail::ragged::product_kind(detail::ragged::kKindDefaults[i]);
+        const int other = detail::ragged::other_kind(detail::ragged::kKindDefaults[i]);
+        bool least = other < detail::ragged::kTruncated;
+        for (int k = 0; k < product; ++k) least &= !(detail::ragged::plan(N, k) == detail::ragged::plan(N, product));
+        for (int k = 0; k < other; ++k) least &= !(detail::ragged::plan(N, k) == detail::ragged::plan(N, other));
         expect(least, "plan: compiled kind not the least of its plan", i);
     }
+}
+
+// The least kind among those below `end` with kind's plan at N.
+int least_kind(std::size_t N, int kind, int end = detail::ragged::kKinds) {
+    int least = 0;
+    while (least < end && !(detail::ragged::plan(N, least) == detail::ragged::plan(N, kind))) ++least;
+    return least;
 }
 
 // measure_ragged at a small budget: valid kinds, the rows past max_lg start's or the new kind at
@@ -281,7 +299,7 @@ void test_tuning() {
     const Budget quick = {9, 1, 2e3, 0};
     std::vector<RaggedTimes> log;
     const Kinds measured = measure_ragged(mixed, quick, &log);
-    expect(std::ranges::all_of(measured, [](std::uint8_t k) { return k < detail::ragged::kKinds; }), "ragged tuning: valid");
+    expect(std::ranges::all_of(measured, [](std::uint8_t k) { return k < detail::ragged::kEntries; }), "ragged tuning: valid");
     for (int b = 0; b < detail::ragged::kBuckets; ++b) {
         const int last = (quick.max_lg - kMinLog) * detail::ragged::kBuckets + b;
         for (int lg = quick.max_lg + 1; lg < kMaxLog; ++lg) {
@@ -295,9 +313,10 @@ void test_tuning() {
     for (int i = 0; i < 3 * detail::ragged::kBuckets; ++i) {  // rows 2^6 to 2^8: start's plan
         const int lg = kMinLog + i / detail::ragged::kBuckets, b = i % detail::ragged::kBuckets + 1;
         const std::size_t L = std::size_t(1) << lg, N = L + std::max<std::size_t>(1, (2 * b - 1) * L / 32);
-        int least = 0;  // the least kind with mixed[i]'s plan at N
-        while (!(detail::ragged::plan(N, least) == detail::ragged::plan(N, mixed[i]))) ++least;
-        expect(kept[i] == least, "ragged tuning: margin keeps start", i);
+        // the least kinds with mixed[i]'s plans at N (the others' among those but truncated)
+        const int product = least_kind(N, detail::ragged::product_kind(mixed[i]));
+        const int other = least_kind(N, detail::ragged::other_kind(mixed[i]), detail::ragged::kTruncated);
+        expect(kept[i] == detail::ragged::encode(product, other), "ragged tuning: margin keeps start", i);
     }
     const std::string path = "fps-ntt-ragged-wisdom-" + std::to_string(std::random_device{}());
     detail::ragged::kinds.set(mixed);
@@ -315,7 +334,7 @@ void huge() {
     for (const std::size_t N : {(std::size_t(1) << 23) + (std::size_t(1) << 21) + 3, (std::size_t(1) << 24) + 7}) {
         const std::size_t n = N / 2 + 1, m = N + 1 - n;
         const auto f = random_poly(n, 0), g = random_poly(m, 1);
-        std::array<detail::ragged::Plan, 4> plans;
+        std::array<detail::ragged::Plan, detail::ragged::kKinds> plans;
         detail::ragged::options(N, plans);
         const auto plain = run<SelectedMultiply, false>(f, g, N, plans[0]);
         check_plans<SelectedMultiply, false>("selected, long", f, g, N, plain);

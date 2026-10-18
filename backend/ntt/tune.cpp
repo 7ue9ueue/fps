@@ -7,8 +7,9 @@
 //   2. Per op and lg the candidates' geometric mean of time / fastest and their times per point;
 //      then the points the compiled and the new table send to a candidate more than 2% slower than
 //      the fastest there.
-//   3. measure_ragged(): the plan kind per main length and bucket of r / L (ragged.hpp), every main
-//      length (scalar and sse: to 2^14), 5 samples of at least 1 ms, margin 1%; the times per kind.
+//   3. measure_ragged(): the plan kinds per main length and bucket of r / L (ragged.hpp; "truncated/
+//      floor": products truncated, the others floor), every main length (scalar and sse: to 2^14), 5
+//      samples of at least 1 ms, margin 1%; the times per kind.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -72,11 +73,15 @@ int main() {
     const bool slow = fps::tune::kTarget == fps::tune::Target::scalar || fps::tune::kTarget == fps::tune::Target::sse;
     std::vector<RaggedTimes> ragged_log;
     const auto kinds = measure_ragged(detail::ragged::kKindDefaults, {slow ? 14 : kMaxLog - 1, 5, 1e6, 0.01}, &ragged_log);
-    constexpr const char* kind_names[] = {"plain", "top", "floor", "ceil"};
+    constexpr const char* kind_names[] = {"plain", "top", "floor", "ceil", "truncated"};
+    const auto entry_name = [&](int v) {
+        const int product = detail::ragged::product_kind(v), other = detail::ragged::other_kind(v);
+        return std::string(kind_names[product]) + (product == other ? "" : std::string("/") + kind_names[other]);
+    };
     for (const RaggedTimes& t : ragged_log) {
         const int i = (t.lg - kMinLog) * detail::ragged::kBuckets + t.bucket - 1;
-        std::printf("# ragged %d %d: %s (compiled %s)", t.lg, t.bucket, kind_names[kinds[i]],
-                    kind_names[detail::ragged::kKindDefaults[i]]);
+        std::printf("# ragged %d %d: %s (compiled %s)", t.lg, t.bucket, entry_name(kinds[i]).c_str(),
+                    entry_name(detail::ragged::kKindDefaults[i]).c_str());
         for (std::size_t k = 0; k < t.kinds.size(); ++k) std::printf(" %s %.1f", kind_names[t.kinds[k]], t.ns[k]);
         std::printf("\n");
     }

@@ -258,6 +258,34 @@ struct scalar {
         std::copy_n(p.a, p.count, p.out);
     }
 
+    // Group products (truncated.hpp; intrinsics.hpp's contract): group k's levels, its leaves (k nv
+    // to (k + 1) nv of the transform), the levels undone, times 2^-32 as the other variants' leaves.
+    static void group_product(std::uint32_t* a, std::uint32_t* b, std::size_t nv, std::size_t k, const std::uint32_t* roots,
+                              const std::uint32_t* inverse_roots) {
+        constexpr std::uint32_t kMontgomery = detail::power(detail::kR, detail::kP - 2);  // 2^-32
+        for (std::size_t i = 0; i < 8 * nv; ++i) a[i] %= detail::kP, b[i] %= detail::kP;
+        detail::scalar::forward_levels(a, 2 * nv, k, 1, roots);
+        if (b != a) detail::scalar::forward_levels(b, 2 * nv, k, 1, roots);
+        for (std::size_t v = 0; v < nv; ++v) {
+            const std::size_t leaf = k * nv + v;
+            const std::uint32_t w = leaf % 2 ? detail::scalar::sub(0, roots[detail::slot(leaf / 2)]) : roots[detail::slot(leaf / 2)];
+            const std::uint32_t *x = a + 8 * v, *y = b + 8 * v;
+            std::uint32_t c[8];
+            for (int l = 0; l < 8; ++l) {
+                std::uint64_t low = 0, high = 0;  // each < 8 P^2 < 2^63
+                for (int i = 0; i <= l; ++i) low += std::uint64_t(x[i]) * y[l - i];
+                for (int i = l + 1; i < 8; ++i) high += std::uint64_t(x[i]) * y[l + 8 - i];
+                c[l] = detail::scalar::add(std::uint32_t(low % detail::kP), detail::scalar::mul(w, std::uint32_t(high % detail::kP)));
+            }
+            for (int l = 0; l < 8; ++l) a[8 * v + l] = detail::scalar::mul(c[l], kMontgomery);
+        }
+        detail::scalar::inverse_levels(a, 2 * nv, k, 1, inverse_roots);
+    }
+    static void group_square(std::uint32_t* a, std::size_t nv, std::size_t k, const std::uint32_t* roots,
+                             const std::uint32_t* inverse_roots) {
+        group_product(a, a, nv, k, roots, inverse_roots);
+    }
+
     // Leaf-form operations (ntt.hpp, Transform): their contracts are the Transform calls'.
     static void leaf_products(const std::uint32_t* a, const std::uint32_t* b, std::uint32_t* out, int lg,
                               const std::uint32_t* roots, bool accumulate) {

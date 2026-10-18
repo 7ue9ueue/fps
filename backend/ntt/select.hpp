@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -188,6 +189,20 @@ template <class... V>
     (void)((i++ == v && (V::square(p, r, ir), true)) || ...);
 }
 
+template <class... V>
+[[gnu::always_inline]] inline void run_group_product(Candidates<V...>, int v, std::uint32_t* a, std::uint32_t* b,
+                                                     std::size_t nv, std::size_t k, const std::uint32_t* r,
+                                                     const std::uint32_t* ir) {
+    int i = 0;
+    (void)((i++ == v && (V::group_product(a, b, nv, k, r, ir), true)) || ...);
+}
+template <class... V>
+[[gnu::always_inline]] inline void run_group_square(Candidates<V...>, int v, std::uint32_t* a, std::size_t nv,
+                                                    std::size_t k, const std::uint32_t* r, const std::uint32_t* ir) {
+    int i = 0;
+    (void)((i++ == v && (V::group_square(a, nv, k, r, ir), true)) || ...);
+}
+
 // Transform's leaf-form ops (ntt.hpp): the values form by the forward's choice, the inverse
 // from other memory (or of the values form) by the inverse's.
 template <class... V>
@@ -324,6 +339,16 @@ struct tuned {
     // The product row's candidate (ntt::square).
     static void square(const detail::Product& p, const std::uint32_t* roots, const std::uint32_t* inverse_roots) {
         detail::run_square(Selected{}, choice(kProduct, p.lg), p, roots, inverse_roots);
+    }
+
+    // Group products (truncated.hpp): the product row's candidate at the group's length, 8 nv.
+    static void group_product(std::uint32_t* a, std::uint32_t* b, std::size_t nv, std::size_t k, const std::uint32_t* roots,
+                              const std::uint32_t* inverse_roots) {
+        detail::run_group_product(Selected{}, choice(kProduct, std::countr_zero(8 * nv)), a, b, nv, k, roots, inverse_roots);
+    }
+    static void group_square(std::uint32_t* a, std::size_t nv, std::size_t k, const std::uint32_t* roots,
+                             const std::uint32_t* inverse_roots) {
+        detail::run_group_square(Selected{}, choice(kProduct, std::countr_zero(8 * nv)), a, nv, k, roots, inverse_roots);
     }
 
     // Transform's leaf-form ops: leaf products have no row in the table (Native).
