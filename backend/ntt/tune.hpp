@@ -228,10 +228,10 @@ inline detail::ragged::Kinds measure_ragged(const detail::ragged::Kinds& start, 
                 detail::middle<SelectedMultiply>(v.data()->words, c.data()->words, mg, out.data(), mc, detail::ragged::plan(N, k));
                 asm volatile("" : : "r"(out.data()) : "memory");
             });
-            // The kind among those `allowed` (products: all; others: no truncated plan): the fastest,
-            // unless `current`'s plan is within the margin. ids holds the least kind of each plan: stored
-            // rather than start's own kind, which may fall back to that plan at the bucket's middle and
-            // not elsewhere in it.
+            // The kind among those `allowed` (products, middle products: all; others: no truncated plan)
+            // by times t: the fastest, unless `current`'s plan is within the margin. ids holds the least
+            // kind of each plan: stored rather than start's own kind, which may fall back to that plan
+            // at the bucket's middle and not elsewhere in it.
             const auto pick = [&](const std::vector<double>& t, int current, auto allowed) {
                 int best = -1;
                 for (std::size_t j = 0; j < ids.size(); ++j)
