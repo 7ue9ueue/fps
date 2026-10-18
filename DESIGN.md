@@ -107,7 +107,7 @@ with a scalar c, an integer of at most 64 bits taken mod P: `f + c`, `c + f`, `f
 ```cpp
 // Products
 Polynomial mul(f, g, n);                  // f g mod x^n: n coefficients
-Polynomial square(f);                     // f^2; one forward transform less than f * f
+Polynomial square(f);                     // f^2; one forward transform less than a product (f * f too)
 Polynomial product(std::span<const Polynomial> fs);   // balanced product tree; 1 if fs is empty
 Polynomial middle_product(f, g);          // coefficients m - 1 .. n - 1 of f g (below)
 
@@ -148,7 +148,8 @@ std::vector<std::pair<Polynomial, int>> factor(f);   // monic irreducible factor
 the n - m + 1 coefficients m - 1 .. n - 1 of f g, h[i] = sum over j < m of f[i + j] g[m - 1 - j].
 They are the coefficients whose sums meet all of g. With g reversed it is the transposed product,
 sum over j of f[i + j] g[j]. It runs a cyclic product of length >= n (the wrapped terms land
-below m - 1), not n + m - 1. `product(fs)` runs the backend's product tree (small factors 8 at a
+below m - 1), not n + m - 1, or `small::multiply` where that is faster than the cyclic product
+(#271). `product(fs)` runs the backend's product tree (small factors 8 at a
 time in lanes, one transform of each length per node); it also takes a `std::vector`.
 
 `divmod(f, g)`, `f / g`, `f % g`: f = q g + r with deg r < d = deg g. q has max(`f.size()` - d, 0)

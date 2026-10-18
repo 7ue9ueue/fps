@@ -21,11 +21,12 @@
 //
 // f * g with n and m coefficients: a factor with at most one nonzero term (c x^k) makes it a
 // shift, O(n + m); a product the backend's small::multiply does faster than the NTT on this target
-// runs it (small::beats_ntt(n, m), tuned per target: on the timed targets min(n, m) up to 38-161
-// next to a long factor of any length, or n = m up to 27-94); the rest runs ntt::multiply, which
-// needs n + m - 1 <= 2^25 (else std::length_error). Both write into the result's own memory, so
-// nothing is copied out. The same paths run mul, square, middle_product, product and raw::mul
-// (fps/products.hpp).
+// runs it (small::beats_ntt(n, m), tuned per target: on the timed targets min(n, m) up to 33-59
+// next to a factor of 2^10 coefficients, 66-110 next to one of 2^20, or n = m up to 45-101); the
+// rest runs ntt::multiply, which needs n + m - 1 <= 2^25 (else std::length_error). f * f (the same
+// polynomial on both sides) is a square: ntt::square on the NTT path, one forward transform fewer,
+// and small::multiply up to n = 41-78. Both write into the result's own memory, so nothing is
+// copied out. The same paths run mul, square, middle_product and raw::mul (fps/products.hpp).
 #pragma once
 
 #include <algorithm>
@@ -325,25 +326,29 @@ Polynomial<P> detail::unwritten_polynomial(std::size_t n) {
 
 namespace detail {
 
-// a b mod x^n for f * g, mul, square and product, the middle product, and raw::mul. Factors are
-// cut to n coefficients first. A factor with at most one nonzero term (c x^k) makes a shift, O(n);
-// a product small::beats_ntt gives to the backend's small::multiply runs it; the rest runs
-// ntt::multiply (ntt::square, ntt::middle_product), which writes into the caller's memory.
+// a b mod x^n for f * g, mul and square, the middle product, and raw::mul. Factors are cut to n
+// coefficients first. A factor with at most one nonzero term (c x^k) makes a shift, O(n); a
+// product small::beats_ntt gives to the backend's small::multiply runs it (a square or a middle
+// product: small_square, small_middle); the rest runs ntt::multiply (ntt::square,
+// ntt::middle_product), which writes into the caller's memory.
 template <std::uint32_t P>
 struct Products {
     using Poly = Polynomial<P>;
     using Span = std::span<const std::uint32_t>;
     using Out = std::span<std::uint32_t>;
 
-    // n coefficients. Both kernels write into the result's own memory: no copy out.
+    // n coefficients. Both kernels write into the result's own memory: no copy out. a and b the same
+    // words (f * f, mul(f, f, n)) make a square.
     static Poly multiply(Span a, Span b, std::size_t n) {
         a = a.first(std::min(a.size(), n)), b = b.first(std::min(b.size(), n));
         if (a.empty() || b.empty()) return Poly(n);
         if (const auto t = single_term(b)) return shifted(a, *t, n);
         if (const auto t = single_term(a)) return shifted(b, *t, n);
-        if (!small::beats_ntt(a.size(), b.size())) {
+        const bool same = a.data() == b.data() && a.size() == b.size();
+        if (!(same ? small_square(a.size()) : small::beats_ntt(a.size(), b.size()))) {
             Poly h(n, Poly::kUnwritten);
-            ntt::multiply(a, b, h.span());
+            if (same) ntt::square(a, h.span());
+            else ntt::multiply(a, b, h.span());
             return h;
         }
         // small::multiply writes all of a b: past n too, into spare words of the result.
@@ -354,17 +359,10 @@ struct Products {
         return h;
     }
 
-    // a^2: as multiply(a, a, 2 a.size() - 1), with ntt::square on the NTT path.
-    static Poly square(Span a) {
-        const std::size_t n = a.empty() ? 0 : 2 * a.size() - 1;
-        if (a.empty() || small::beats_ntt(a.size(), a.size())) return multiply(a, a, n);
-        if (const auto t = single_term(a)) return shifted(a, *t, n);
-        Poly h(n, Poly::kUnwritten);
-        ntt::square(a, h.span());
-        return h;
-    }
+    // a^2, 2 a.size() - 1 coefficients.
+    static Poly square(Span a) { return multiply(a, a, a.empty() ? 0 : 2 * a.size() - 1); }
 
-    // out = a b mod x^out.size(); out apart from a and b.
+    // out = a b mod x^out.size(); out apart from a and b. a and b the same words make a square.
     static void multiply_into(Span a, Span b, Out out) {
         const std::size_t n = out.size();
         a = a.first(std::min(a.size(), n)), b = b.first(std::min(b.size(), n));
@@ -372,12 +370,14 @@ struct Products {
         if (const auto t = single_term(b)) return shift(a, *t, out);
         if (const auto t = single_term(a)) return shift(b, *t, out);
         const std::size_t size = a.size() + b.size() - 1;
-        if (small::beats_ntt(a.size(), b.size())) {
+        const bool same = a.data() == b.data() && a.size() == b.size();
+        if (same ? small_square(a.size()) : small::beats_ntt(a.size(), b.size())) {
             if (n < size) return low_product(a, b, out);
             small::multiply<P>(a, b, out.first(size));
             return void(std::fill(out.begin() + size, out.end(), 0u));
         }
-        ntt::multiply(a, b, out);
+        if (same) ntt::square(a, out);
+        else ntt::multiply(a, b, out);
     }
 
     // Coefficients m - 1 .. n - 1 of f g, for n = f.size() >= m = g.size() >= 1: ntt::middle_product
@@ -385,7 +385,7 @@ struct Products {
     // result's own memory, then the n - m + 1 coefficients moved down.
     static Poly middle(Span f, Span g) {
         const std::size_t n = f.size(), m = g.size(), count = n - m + 1;
-        if (!small::beats_ntt(n, m)) {
+        if (!small_middle(n, m)) {
             Poly h(count, Poly::kUnwritten);
             ntt::middle_product(f, g, h.span());
             return h;
@@ -395,6 +395,25 @@ struct Products {
         std::memmove(h.data(), h.data() + (m - 1), count * sizeof(std::uint32_t));
         return h;
     }
+
+    // Whether small::multiply beats the NTT path, by small's cost model against the NTT's time at
+    // the length the NTT runs (backend/small: model_ns, ntt_ns, the NTT's tuned times). beats_ntt
+    // takes ntt::multiply at n + m - 1 words; these take the NTT ops the paths above run instead:
+    // - a^2 for a of n >= 1 words: ntt::square at 2 n - 1, one forward transform fewer than a
+    //   product, kSquareShare of its time;
+    // - the middle product of f of n >= g of m >= 1 words: ntt::middle_product, a cyclic product of
+    //   length >= n (as a product of n words), while small::multiply computes all n + m - 1.
+    static bool small_square(std::size_t n) {
+        return small::model_ns(small::kModel, n, n) < kSquareShare * small::ntt_ns(2 * n - 1);
+    }
+
+    static bool small_middle(std::size_t n, std::size_t m) {
+        return small::model_ns(small::kModel, n, m) < small::ntt_ns(n);
+    }
+
+    // ntt::square's time over ntt::multiply's at the same length where squares cross small: 0.74-0.92
+    // at n = 10-160 on the timed targets (frontend/notes/271.md).
+    static constexpr double kSquareShare = 0.85;
 
 private:
     static Poly shifted(Span f, Term t, std::size_t n) {

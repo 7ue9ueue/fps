@@ -6,26 +6,34 @@
 //   fps::middle_product(f, g)          // coefficients m - 1 .. n - 1 of f g, n = f.size() >= m = g.size()
 //   fps::raw::mul<P>(a, b, out)        // out = a b mod x^out.size(), into the caller's memory
 //
-// mul, square, middle_product, product and raw::mul run the paths of f * g (fps/polynomial.hpp):
-// a shift for a factor with one nonzero term, small::multiply where small::beats_ntt says it is
-// faster, else ntt::multiply (ntt::square, ntt::middle_product), which reads the factors and writes
-// the product cut to the output's size in the caller's memory. Nothing is copied in or out. The NTT path throws std::length_error
-// past 2^25 coefficients (factors cut to n for mul); a short factor next to a longer one runs
-// small::multiply and does not throw.
+// mul, square, middle_product and raw::mul run the paths of f * g (fps/polynomial.hpp): a shift
+// for a factor with one nonzero term, small::multiply where it is faster than the NTT op the call
+// would run, else that op: ntt::multiply (ntt::square, ntt::middle_product), which reads the
+// factors and writes the product cut to the output's size in the caller's memory. Nothing is
+// copied in or out. The choice is small's cost model against the NTT's time at the length that op
+// runs (backend/small: small::beats_ntt for products, at n + m - 1 words; for squares and middle
+// products Products::small_square and small_middle, issue #271). The NTT path throws
+// std::length_error past 2^25 coefficients (factors cut to n for mul); a short factor next to a
+// longer one runs small::multiply and does not throw.
 //
 // mul cuts both factors to n coefficients and pads the result with zeros past their product.
 // small::multiply writes all of the cut product, so on that path the result keeps up to 2 n - 1
 // words (fps/words.hpp); a copy is tight.
 //
 // square(f): ntt::square on the NTT path, one forward transform instead of two (backend issue
-// #55; backend/ntt/notes.md has its time against f * f).
+// #55; backend/ntt/notes.md has its time against a product). f * f, mul(f, f, n) and raw::mul(a,
+// a, out), the same coefficients on both sides, run it too (#271). small::multiply runs squares up
+// to n = 41-78 on the timed targets, products of two factors of n up to n = 45-101: ntt::square
+// takes about 0.85 of a product's time there.
 //
 // middle_product(f, g)[i] = sum_{j < m} f[i + j] g[m - 1 - j] for i <= n - m: the coefficients of
 // f g whose sums use all of g. With g reversed it is the transposed product, sum_j f[i + j] g[j].
 // It throws std::domain_error unless n >= m >= 1. On the NTT path ntt::middle_product writes the
 // result: a cyclic product of length >= n, not n + m - 1 (backend issue #55); on small::multiply's,
-// all of f g, then the n - m + 1 coefficients moved down. The NTT path throws std::length_error
-// past n = 2^25.
+// all of f g, then the n - m + 1 coefficients moved down. small::multiply runs it where its cost
+// beats the NTT's at n words (#271): on the timed targets m up to 24-45 for n = 2 m, and about
+// where products switch next to a long factor (m up to 66-110 at n = 2^20). The NTT path throws
+// std::length_error past n = 2^25.
 //
 // product(fs) runs the backend's product_tree::product into the result's memory (a tree with one
 // transform of each length per node; small factors 8 at a time in lanes). An empty factor makes

@@ -270,7 +270,8 @@ void test_results() {
     CHECK(fps::small::beats_ntt(16, 16));
     check_spare(fps::mul(poly(a), poly(b), 20), first(naive_product(a, b), 20));
     const Vec f = random_vec(3000), g = random_vec(1000), s = random_vec(16);
-    CHECK(!fps::small::beats_ntt(3000, 1000) && fps::small::beats_ntt(3000, 16));
+    using Products = fps::detail::Products<P>;
+    CHECK(!Products::small_middle(3000, 1000) && Products::small_middle(3000, 16));
     check_spare(fps::middle_product(poly(f), poly(g)), naive_middle(f, g));
     check_spare(fps::middle_product(poly(f), poly(s)), naive_middle(f, s));
 }
