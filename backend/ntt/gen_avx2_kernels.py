@@ -353,12 +353,17 @@ def inverse_leaves(g, groups=2):
 LEAVES = {'forward_leaves': forward_leaves, 'inverse_leaves': inverse_leaves}
 
 
-# The two lowest forward levels as loops over a run of groups (Transform's forward, issue #87; lc-opt's
+# The two lowest levels as loops over a run of groups (Transform's forward, issue #87; lc-opt's
 # lib/poly/gen_kernels.py): h = 4 one group per iteration, its twiddle addresses from the group
 # index (slot(k) = k + (k & ~7)); h = 1 eight groups per iteration, their twiddles one table block
 # of x and two of y, z. Against a call per group at h = 4 and forward_leaves at h = 1: a forward of
-# 2^17-2^21 in 0.96-0.97 of the time on Zen 3 (notes/87-r2.md). Knobs (H4_KNOBS, LEAVES_LOOP_KNOBS):
-# lc-opt's, timed on EPYC 7B13.
+# 2^17-2^21 in 0.96-0.97 of the time on Zen 3 (notes/87-r2.md). The inverse loops and the h = 4
+# loop on a product's two factors (issue #210), against a call per group (inverse, forward_pair)
+# and inverse_leaves, on a 256-vector tile in L1 on Zen 3: inverse_h4 0.92-0.97, forward_h4_pair
+# 0.94, inverse_leaves_loop 0.88 (inverse_leaves' butterfly on canonical inputs; lc-opt's body on
+# inputs < 2P 0.95). Knobs (H4_KNOBS, LEAVES_LOOP_KNOBS): lc-opt's, timed on EPYC 7B13;
+# INVERSE_LEAVES_LOOP_KNOBS timed there too (windows 16-36: 3.13-3.27 cycles per vector; 40 and up
+# deadlock).
 
 
 def group_twiddles(g, x, y, i=0):
@@ -368,19 +373,45 @@ def group_twiddles(g, x, y, i=0):
             'WZ': g.scalar(y, yd + 4), 'QZ': g.scalar(y, yd + 36)}
 
 
-def forward_quarters(g, tw, quarters, canonical):
-    """forward_butterfly on the vectors at byte offsets quarters of a, in place; canonical out or < 4P."""
-    f = [g.at('a', q) for q in quarters]
+def forward_quarters(g, tw, quarters, canonical, array='a'):
+    """forward_butterfly on the vectors at byte offsets quarters of array, in place; canonical out or < 4P."""
+    f = [g.at(array, q) for q in quarters]
     a, b = g.low(f[0]), g.low(f[1])
-    cc = g.shoup(f[2], tw['WX'], tw['QX'], odd=g.at('a', quarters[2] + 4))
-    dd = g.shoup(f[3], tw['WX'], tw['QX'], odd=g.at('a', quarters[3] + 4))
+    cc = g.shoup(f[2], tw['WX'], tw['QX'], odd=g.at(array, quarters[2] + 4))
+    dd = g.shoup(f[3], tw['WX'], tw['QX'], odd=g.at(array, quarters[3] + 4))
     ac = g.low(g.add(a, cc))
     amc = g.low_signed(g.op('vpsubd', a, cc))
     bd, bmd = g.add(b, dd), g.diff(b, dd)
     y = g.shoup(bd, tw['WY'], tw['QY'])
     z = g.shoup(bmd, tw['WZ'], tw['QZ'])
     for q, v in zip(quarters, [g.add(ac, y), g.diff(ac, y), g.add(amc, z), g.diff(amc, z)]):
-        g.store(g.canonical(v) if canonical else v, 'a', None, q)
+        g.store(g.canonical(v) if canonical else v, array, None, q)
+
+
+def inverse_quarters(g, tw, quarters):
+    """inverse_butterfly on the vectors at byte offsets quarters of a, in place, values < 2P."""
+    f = [g.at('a', q) for q in quarters]
+    ab, cd = g.low(g.add(f[0], f[1])), g.low(g.add(f[2], f[3]))
+    amb = g.shoup(g.diff(f[0], f[1]), tw['WY'], tw['QY'])
+    cmd = g.shoup(g.diff(f[2], f[3]), tw['WZ'], tw['QZ'])
+    g.store(g.low(g.add(ab, cd)), 'a', None, quarters[0])
+    g.store(g.low(g.add(amb, cmd)), 'a', None, quarters[1])
+    g.store(g.shoup(g.diff(ab, cd), tw['WX'], tw['QX']), 'a', None, quarters[2])
+    g.store(g.shoup(g.diff(amb, cmd), tw['WX'], tw['QX']), 'a', None, quarters[3])
+
+
+def leaf_quarters(g, tw, base):
+    """inverse_leaves' butterfly (canonical inputs: no reductions of the sums) on the group at byte
+    offset base of a, in place, values < 2P."""
+    c = g.c
+    f = [g.at('a', base + 32 * t) for t in range(4)]
+    ab, cd = g.add(f[0], f[1]), g.add(f[2], f[3])  # < 2P
+    amb = g.shoup(g.op('vpsubd', g.op('vpaddd', f[0], c['P']), f[1]), tw['WY'], tw['QY'])
+    cmd = g.shoup(g.op('vpsubd', g.op('vpaddd', f[2], c['P']), f[3]), tw['WZ'], tw['QZ'])
+    g.store(g.low(g.add(ab, cd)), 'a', None, base)
+    g.store(g.low(g.add(amb, cmd)), 'a', None, base + 32)
+    g.store(g.shoup(g.diff(ab, cd), tw['WX'], tw['QX']), 'a', None, base + 64)
+    g.store(g.shoup(g.diff(amb, cmd), tw['WX'], tw['QX']), 'a', None, base + 96)
 
 
 def group_loop_body(build, knobs):
@@ -391,39 +422,65 @@ def group_loop_body(build, knobs):
     return [emit(o, reg) for o in seq]
 
 
-def forward_h4_function():
+H4_DOC = {'forward_h4': ['// Forward radix-4 butterflies at h = 4 of count >= 1 groups from group k (16 vectors each),',
+                         '// values < 4P; table: the twiddle table. Reads 4 bytes past the last vector.'],
+          'forward_h4_pair': ['// forward_h4 on a and b, a group of each per iteration (a product\'s two factors). Reads 4',
+                              '// bytes past the last vectors.'],
+          'inverse_h4': ['// Inverse radix-4 butterflies at h = 4 of count >= 1 groups from group k (16 vectors each),',
+                         '// values < 2P; table: the inverse twiddle table.']}
+
+
+def h4_function(name):
     def build(g):
         tw = group_twiddles(g, 'tx', 'ty')
         for j in range(4):
-            forward_quarters(g, tw, [32 * (j + 4 * s) for s in range(4)], canonical=False)
+            quarters = [32 * (j + 4 * s) for s in range(4)]
+            if name == 'inverse_h4':
+                inverse_quarters(g, tw, quarters)
+            else:
+                for array in ('ab' if name == 'forward_h4_pair' else 'a'):
+                    forward_quarters(g, tw, quarters, False, array)
+    pair = name == 'forward_h4_pair'
     # tx = table + 4 slot(k), ty = table + 4 slot(2k)
     slots = ['mov %[k], %[tx]', 'and $-8, %[tx]', 'add %[k], %[tx]', 'lea (%[table],%[tx],4), %[tx]',
              'lea (%[k],%[k]), %[ty]', 'and $-8, %[ty]', 'lea (%[ty],%[k],2), %[ty]', 'lea (%[table],%[ty],4), %[ty]']
     head = ['vpbroadcastd %[P], %%ymm15', 'vpbroadcastd %[P2], %%ymm14', '.p2align 5', '1:']
-    tail = ['add $512, %[a]', 'inc %[k]', 'cmp %[end], %[a]', 'jne 1b']
-    lines = ['// Forward radix-4 butterflies at h = 4 of count >= 1 groups from group k (16 vectors each),',
-             '// values < 4P; table: the twiddle table. Reads 4 bytes past the last vector.',
-             '[[gnu::noinline]] inline void forward_h4(Vec* a, std::size_t count, const std::uint32_t* table, std::size_t k) {',
-             '    Vec* const end = a + 16 * count;', '    const std::uint32_t *tx, *ty;', '    asm volatile(']
+    tail = ['add $512, %[a]'] + (['add $512, %[b]'] if pair else []) + ['inc %[k]', 'cmp %[end], %[a]', 'jne 1b']
+    arrays = 'Vec* a, Vec* b' if pair else 'Vec* a'
+    lines = H4_DOC[name] + [
+        f'[[gnu::noinline]] inline void {name}({arrays}, std::size_t count, const std::uint32_t* table, std::size_t k) {{',
+        '    Vec* const end = a + 16 * count;', '    const std::uint32_t *tx, *ty;', '    asm volatile(']
     lines += asm_lines(head + slots + group_loop_body(build, H4_KNOBS) + tail)
-    lines += ['        : [a] "+r"(a), [k] "+r"(k), [tx] "=&r"(tx), [ty] "=&r"(ty)',
+    lines += ['        : [a] "+r"(a), ' + ('[b] "+r"(b), ' if pair else '') + '[k] "+r"(k), [tx] "=&r"(tx), [ty] "=&r"(ty)',
               '        : [end] "r"(end), [table] "r"(table), [P] "m"(kP), [P2] "m"(k2P)',
               '        : ' + CLOBBERS + ', "cc");', '}']
     return lines
 
 
-def forward_leaves_loop_function():
+LEAVES_LOOP_DOC = {
+    'forward_leaves_loop': ['// Forward radix-4 butterflies at h = 1 of count groups from group k (4 vectors each), canonical',
+                            '// outputs: the leaves. count and k multiples of 8; x, y: slots k and 2k of the table. Reads 4',
+                            '// bytes past the last vector.'],
+    'inverse_leaves_loop': ['// Inverse radix-4 butterflies at h = 1 of count groups from group k (4 vectors each), canonical',
+                            '// inputs (the leaves), values < 2P out. count and k multiples of 8; x, y: slots k and 2k of the',
+                            '// inverse table.']}
+
+
+def leaves_loop_function(name):
     def build(g):
         for i in range(8):
-            forward_quarters(g, group_twiddles(g, 'x', 'y', i), [128 * i + 32 * t for t in range(4)], canonical=True)
+            tw = group_twiddles(g, 'x', 'y', i)
+            if name == 'forward_leaves_loop':
+                forward_quarters(g, tw, [128 * i + 32 * t for t in range(4)], canonical=True)
+            else:
+                leaf_quarters(g, tw, 128 * i)
+    knobs = LEAVES_LOOP_KNOBS if name == 'forward_leaves_loop' else INVERSE_LEAVES_LOOP_KNOBS
     head = ['vpbroadcastd %[P], %%ymm15', 'vpbroadcastd %[P2], %%ymm14', '.p2align 5', '1:']
     tail = ['add $1024, %[a]', 'add $64, %[x]', 'add $128, %[y]', 'cmp %[end], %[a]', 'jne 1b']
-    lines = ['// Forward radix-4 butterflies at h = 1 of count groups from group k (4 vectors each), canonical',
-             '// outputs: the leaves. count and k multiples of 8; x, y: slots k and 2k of the table. Reads 4',
-             '// bytes past the last vector.',
-             '[[gnu::noinline]] inline void forward_leaves_loop(Vec* a, std::size_t count, const std::uint32_t* x, const std::uint32_t* y) {',
-             '    Vec* const end = a + 4 * count;', '    asm volatile(']
-    lines += asm_lines(head + group_loop_body(build, LEAVES_LOOP_KNOBS) + tail)
+    lines = LEAVES_LOOP_DOC[name] + [
+        f'[[gnu::noinline]] inline void {name}(Vec* a, std::size_t count, const std::uint32_t* x, const std::uint32_t* y) {{',
+        '    Vec* const end = a + 4 * count;', '    asm volatile(']
+    lines += asm_lines(head + group_loop_body(build, knobs) + tail)
     lines += ['        : [a] "+r"(a), [x] "+r"(x), [y] "+r"(y)', '        : [end] "r"(end), [P] "m"(kP), [P2] "m"(k2P)',
               '        : ' + CLOBBERS + ', "cc");', '}']
     return lines
@@ -636,6 +693,7 @@ BOTTOM_SHIFT = -0.05  # 'both': the first stage's ops start this fraction earlie
 LEAVES_KNOBS = {'forward_leaves': Knobs(window=20), 'inverse_leaves': Knobs(window=20)}
 H4_KNOBS = Knobs(window=16)
 LEAVES_LOOP_KNOBS = Knobs(window=40, margin=1)
+INVERSE_LEAVES_LOOP_KNOBS = Knobs(window=32, margin=1)
 
 
 def loop_body(loop, spacing=32):
@@ -837,8 +895,11 @@ def generate():
     lines += ['// Bottom level of a transform alone: leaves out (forward), leaves in (inverse).', '']
     for name in LEAVES:
         lines += leaves_function(name) + ['']
-    lines += ['// The lowest forward levels of a run of groups as loops (Transform\'s forward).', '']
-    lines += forward_h4_function() + [''] + forward_leaves_loop_function() + ['']
+    lines += ['// The lowest levels of a run of groups as loops (Transform\'s forward and inverse, products).', '']
+    for name in ('forward_h4', 'forward_leaves_loop'):  # issue #87's order
+        lines += (h4_function(name) if name.endswith('h4') else leaves_loop_function(name)) + ['']
+    for name in ('forward_h4_pair', 'inverse_h4', 'inverse_leaves_loop'):
+        lines += (h4_function(name) if 'h4' in name else leaves_loop_function(name)) + ['']
     lines += ['}  // namespace fps::ntt::avx2_kernels']
     return '\n'.join(lines) + '\n'
 
