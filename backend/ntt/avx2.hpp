@@ -1181,11 +1181,9 @@ inline void inverse_radix8_upper_out(u32* f, std::size_t q, u32* out, std::size_
     });
 }
 
-// The scale of a fused product's top level: product_scale, negated for kNegated.
-inline u32 output_scale(int lg, unsigned output) {
-    const u32 s = product_scale(lg);
-    return output & kNegated ? kP - s : s;
-}
+// The scale of a fused product's top level: product_scale (values_product_scale for kJoined),
+// negated for kNegated.
+inline u32 output_scale(int lg, unsigned output) { return hooked_scale(lg, output); }
 
 // Whether a fused op (cyclic_product, inverse_staged, inverse_hooked) at even lg ends with the
 // radix-2 level from words to out (lc-opt's top), each half's last radix-4 group run in place after

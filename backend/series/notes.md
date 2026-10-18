@@ -3,8 +3,9 @@
 Power series modulo P = 998244353: inverse, log, exp, pow and sqrt into caller memory. API:
 `series.hpp` (`inverse`, `log`, `exp` as `(f, out)`, `pow(f, e, c, out)`, `sqrt(f, c, out)`, in
 this thread's memory or with a last `scratch` argument of `*_scratch(n)` words). Tests: `test.cpp`,
-`test_pow_sqrt.cpp`, `test_ragged.cpp`, `test_inverse_blocks.cpp`; bench: `bench.cpp`,
-`bench_pow_sqrt.cpp`, `bench_ragged.cpp` (ragged n). Attempts: `notes/` (one file per
+`test_pow_sqrt.cpp`, `test_ragged.cpp`, `test_inverse_blocks.cpp`, `test_values_division.cpp`;
+bench: `bench.cpp`, `bench_pow_sqrt.cpp`, `bench_ragged.cpp` (ragged n), `bench_powers.cpp` (the
+other powers of two). Attempts: `notes/` (one file per
 issue round). From lc-opt's `lib/poly/{inverse,log,exp,pow,sqrt,calculus}.hpp` (its
 `lib/poly/notes.md`: Inverse, Log, Exp, Power, Sqrt), rewritten
 on `ntt::Transform`'s leaf form and `backend/simd`, so every target runs it (lc-opt's transform
@@ -65,6 +66,18 @@ and log's q_j to Q_j's, so T(h) and T(q_j) run in place (`forward(in, F)` with i
 one-pass radix 8 on avx2); pow keeps q_j in q (exp reads it), so its T(q_j) stay out of place
 (the two-pass radix 8 of ntt's notes/87-r2.md).
 
+The values form (issue #251, notes/251-r1.md): with 5 blocks by transforms (every target) and 4 on
+Zen 5 for k = 2^11 .. 2^18 (`values_division`), W_t and Q_i are ntt values forms
+(`Transform::forward(in, F, Form::values)`), so each residual is one `inverse_product(...,
+Form::values)`: a Montgomery product per word and term, summed and joined in the inverse's runs,
+against a leaf product (0.05-0.15 against 0.45-0.5 ns per word on Zen 5), for a split in each
+forward of W and Q (+0.19 ns per word there, +0.34-0.64 elsewhere). H stays a leaf form (the
+products by h are fused cyclic products); no Toeplitz product; log's q_j in R (a values-form
+forward does not run in place); inverse_blocks' Q_0 by `to_values` from H. pow keeps the leaf form
+where exp's last step takes its kept transforms (3 and 4 blocks). Log and pow at 1.25 2^j and 6e5
+0.92-0.98 of the leaf form's time on Zen 5, 0.97-0.99 elsewhere; log at 2^13 .. 2^20 0.97-0.99 on
+Zen 5.
+
 ### exp
 
 lc-opt's step from m to 2m with h = 1 / g mod x^(m/2), H = T_m(h), q = x f' (x g' = q g),
@@ -123,7 +136,9 @@ it (Zen 3, notes/107-r1.md); `half_residual` halves by a shift and a product of 
 
 ### Ragged n (issue #214, notes/214-r1.md, notes/214-r2.md)
 
-n = L + r, L = bit_floor(n). inverse for r <= 5L/32 (L/4 on Zen 5 and below L = 2^14): the chain
+n = L + r, L = bit_floor(n). inverse for r <= 4L/32 (5L/32 on Neoverse V2, more below L = 256 and
+on Zen 5 from 2^21: `chain_up_to`, notes/251-r1.md; before #251 5L/32, and L/4 on Zen 5 and below
+L = 2^14): the chain
 (`inverse_chain`), steps whose lengths halve down from n so they land on it; a step to n' = L' +
 r' at length L' has the power-of-two step's transforms and two products of r' words (the corners:
 f_hi g_r and g_r e2 mod x^r'). To r = L/2: the blocked division with N = 1 (`inverse_blocks`,
