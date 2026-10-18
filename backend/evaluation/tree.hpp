@@ -289,7 +289,7 @@ public:
     // left: keep left children's transforms too (evaluate, interpolate), else right ones only (the
     // Newton basis). Everything goes in the stack.
     PointTree(const u32* x, std::size_t slots, Stack& stack, bool left)
-        : slots_{x, slots}, count_(slots), m8_(8 * slots), lane_length_(lane_length(slots)), top_length_(8 * lane_length_),
+        : slots_{x, slots}, count_(slots), m8_(8 * slots), lane_length_(lane_length(slots)),
           lanes_(slots_, stack, Store::Keeper{&lane_store_}) {
         const auto lane_words = [](u32 d) { return 8 * lane_length(d); };
         lane_store_.reset(stack, count_, Store::words(lanes_, 0, count_, lane_words, left), left);
@@ -685,7 +685,7 @@ private:
     }
 
     PointSlots slots_;
-    std::size_t count_, m8_, lane_length_, top_length_;
+    std::size_t count_, m8_, lane_length_;
     Store lane_store_;
     LaneTree<PointSlots, Store::Keeper> lanes_;
     // The top tree's kept transforms: the lanes at T (the leaves, 16 L words); pair 2h + side's
