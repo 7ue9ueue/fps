@@ -53,6 +53,10 @@ leaf-form ops and `backend/simd`, so every target runs it. One variant per op: n
   V's inverse at 2m uses x < L/2, R's at 4m x < L. The levels above the bit run on half the
   columns (the top level included), the group holding it on half its inputs or outputs (r2). From
   32 words on the forwards do not use the masked words: no zero fills (`zero_columns` below 32).
+- compose's up pass (issue #210): P^'s forward at 2m in place in p, as lc-opt's; the product hook
+  reads that leaf form, and the inverse at 4m writes R's upper half to p after its last hook call
+  (ntt's contract). From p into FP its top level moved 1.25 times the lines: the forwards of P^ took
+  33.9 ms of compose at m = 2^20 on Zen 3, in place 31.6, lc-opt 31.9 (ntt notes/210-r1.md).
 - Doubling (lc-opt's `Doubling`; issue #149 r2), generic levels 3 .. T - 4 from m = 512 on: level
   s's leaf form at 4m from the previous level's V (W) at 2m, whose rows of 2L words are the blocks
   of `ntt::Transform::truncate_blocks` (the lower half: Q_s mod (y^Y - 1) is V cut to x < L, block

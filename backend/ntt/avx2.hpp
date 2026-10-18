@@ -94,6 +94,14 @@ inline void inverse_group(Vec* f, std::size_t h, std::size_t k, const u32* ir) {
     kernels::inverse(f, h, ir + slot(k), ir + slot(2 * k));
 }
 
+// The inverse levels h = 4 .. nv / 4 of a run of total vectors at f, subtrees of nv vectors from
+// group k: h = 4 as one loop over the run (inverse_h4, lc-opt's), then a call per group.
+inline void inverse_levels(Vec* f, std::size_t nv, std::size_t total, std::size_t k, const u32* ir) {
+    if (nv >= 16) kernels::inverse_h4(f, total / 16, ir, k * (nv / 16));
+    for (std::size_t h = 16; h < nv; h *= 4)
+        for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) inverse_group(f + j, h, g, ir);
+}
+
 struct alignas(64) Leaves {
     u32 window[4][16];  // [w A_t, A_t]: x^i A_t mod x^8 - w is a sliding window
     u32 coefficients[4][8];
@@ -210,15 +218,19 @@ private:
     }
 
     // Subtrees of NV vectors each, total vectors from a and b; the first is group k of its level,
-    // so the groups with stride h are numbered from k NV / 4h.
+    // so the groups with stride h are numbered from k NV / 4h. h = 4 as one loop over the run's
+    // groups (forward_h4_pair: a and b; forward_h4 for a square; inverse_h4).
     template <std::size_t NV>
     [[gnu::noinline]] void tile(Vec* a, Vec* b, std::size_t total, std::size_t k) const {
-        for (std::size_t h = NV / 4; h >= 4; h /= 4)
+        for (std::size_t h = NV / 4; h >= 16; h /= 4)
             for (std::size_t j = 0, g = k * (NV / (4 * h)); j < total; j += 4 * h, ++g)
                 forward_factors<Bottom::kSquare>(a + j, b + j, h, g, r_);
+        if constexpr (NV >= 16) {
+            if constexpr (Bottom::kSquare) kernels::forward_h4(a, total / 16, r_, k * (NV / 16));
+            else kernels::forward_h4_pair(a, b, total / 16, r_, k * (NV / 16));
+        }
         Bottom::run(a, b, total, k * (NV / 4), r_, ir_);
-        for (std::size_t h = 4; h < NV; h *= 4)
-            for (std::size_t j = 0, g = k * (NV / (4 * h)); j < total; j += 4 * h, ++g) inverse_group(a + j, h, g, ir_);
+        inverse_levels(a, NV, total, k, ir_);
     }
 
     const u32 *r_, *ir_;
@@ -646,8 +658,11 @@ inline void forward_levels(Vec* f, std::size_t nv, std::size_t total, std::size_
     if (nv >= 16) kernels::forward_h4(f, total / 16, r, k * (nv / 16));
 }
 
-// Inverse groups [first, first + count) with h = 1; canonical in, < 2P out. first and count even.
+// Inverse groups [first, first + count) with h = 1; canonical in, < 2P out. first and count even;
+// multiples of 8: one loop of 8 groups per step (inverse_leaves_loop: on a tile in L1 on Zen 3,
+// 0.88 of the time of inverse_leaves' two groups per call; issue #210).
 inline void inverse_bottom(Vec* f, std::size_t count, std::size_t first, const u32* ir) {
+    if (count % 8 == 0 && first % 8 == 0) return kernels::inverse_leaves_loop(f, count, ir + slot(first), ir + slot(2 * first));
     for (std::size_t k = first; k < first + count; k += 2, f += 8) kernels::inverse_leaves(f, ir + slot(k), ir + slot(2 * k));
 }
 
@@ -679,8 +694,7 @@ inline void inverse_trees(Vec* f, std::size_t nv, std::size_t count, std::size_t
     const std::size_t run = std::min(count, kTile / nv), total = run * nv;
     for (std::size_t k = first; k < first + count; k += run, f += total) {
         inverse_bottom(f, total / 4, k * (nv / 4), ir);
-        for (std::size_t h = 4; h < nv; h *= 4)
-            for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) inverse_group(f + j, h, g, ir);
+        inverse_levels(f, nv, total, k, ir);
     }
 }
 
@@ -724,8 +738,7 @@ inline void inverse_tiles(Vec* f, std::size_t nv, std::size_t count, std::size_t
     for (std::size_t k = first; k < first + count; k += run, f += total) {
         tile(reinterpret_cast<u32*>(f), total);
         inverse_bottom(f, total / 4, k * (nv / 4), ir);
-        for (std::size_t h = 4; h < nv; h *= 4)
-            for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) inverse_group(f + j, h, g, ir);
+        inverse_levels(f, nv, total, k, ir);
     }
 }
 
@@ -890,8 +903,7 @@ inline void cycle_trees(Vec* f, std::size_t nv, std::size_t count, std::size_t f
     for (std::size_t k = first; k < first + count; k += run, f += total) {
         forward_levels(f, nv, total, k, r);
         stage(reinterpret_cast<u32*>(f), total);
-        for (std::size_t h = 4; h < nv; h *= 4)
-            for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) inverse_group(f + j, h, g, ir);
+        inverse_levels(f, nv, total, k, ir);
     }
 }
 
@@ -909,8 +921,7 @@ inline void inverse_trees_with(Vec* f, std::size_t nv, std::size_t count, std::s
     const std::size_t run = std::min(count, kTile / nv), total = run * nv;
     for (std::size_t k = first; k < first + count; k += run, f += total) {
         stage(reinterpret_cast<u32*>(f), total);
-        for (std::size_t h = 4; h < nv; h *= 4)
-            for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) inverse_group(f + j, h, g, ir);
+        inverse_levels(f, nv, total, k, ir);
     }
 }
 
@@ -1406,10 +1417,12 @@ inline void forward_pruned_tiles(Vec* f, std::size_t nv, std::size_t count, std:
     }
 }
 
-// inverse_trees_with() with pruned groups.
+// inverse_trees_with() with pruned groups; h = 4 (below kPruneInverse: whole groups) as one loop
+// over the run, as inverse_levels.
 template <class Stage>
 inline void inverse_pruned_with(Vec* f, std::size_t nv, std::size_t count, std::size_t first, const u32* ir,
                                 std::size_t width, Stage stage) {
+    static_assert(kPruneInverse > 4);
     if (nv > kTile) {
         for (std::size_t k = first; k < first + count; ++k, f += nv) {
             inverse_pruned_with(f, nv / 4, 4, 4 * k, ir, width, stage);
@@ -1420,7 +1433,8 @@ inline void inverse_pruned_with(Vec* f, std::size_t nv, std::size_t count, std::
     const std::size_t run = std::min(count, kTile / nv), total = run * nv;
     for (std::size_t k = first; k < first + count; k += run, f += total) {
         stage(reinterpret_cast<u32*>(f), total);
-        for (std::size_t h = 4; h < nv; h *= 4)
+        if (nv >= 16) kernels::inverse_h4(f, total / 16, ir, k * (nv / 16));
+        for (std::size_t h = 16; h < nv; h *= 4)
             for (std::size_t j = 0, g = k * (nv / (4 * h)); j < total; j += 4 * h, ++g) inverse_group_pruned(f + j, h, g, ir, width);
     }
 }

@@ -898,7 +898,8 @@ public:
     // level of each run, which may read and change those leaves (canonical); the runs come in
     // increasing order of first, so a hook may write F's words below 8 first. in[i] counts as 0 where
     // i & zero is not 0: it must be 0 there, except that with 32 <= zero < length() / 4 those words
-    // are not used (detail::kUnreadWidth) and may hold anything.
+    // are not used (detail::kUnreadWidth) and may hold anything. F apart from in, or in place (in at
+    // F, any in.size(); issue #210).
     template <class Variant = SelectedForward, class Hook>
     void forward_hooked(std::span<const std::uint32_t> in, std::uint32_t* F, Hook hook, std::size_t zero = 0) const {
         Variant::forward_hooked(source(in, F), checked_source(in, length()), F, lg_, roots(), checked_bit(zero), hook);
@@ -907,7 +908,8 @@ public:
     // out[i] = coefficient o.offset + i of the polynomial whose leaf form times 2^-32 (as Montgomery
     // products leave it) the hook writes: hook(work + 8 first, first, count) writes those leaves,
     // canonical, then the inverse levels of the run. out[i] is unspecified where (o.offset + i) &
-    // unused is not 0. work, o: as cyclic_product.
+    // unused is not 0. work, o: as cyclic_product. out is written after the hook's last call, so the
+    // hook may read out's memory (composition: P's leaf form in the array that gets R; issue #210).
     template <class Variant = SelectedInverse, class Hook>
     void inverse_hooked(Hook hook, std::uint32_t* work, std::span<std::uint32_t> out, Output o = {},
                         std::size_t unused = 0) const {
