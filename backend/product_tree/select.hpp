@@ -40,6 +40,10 @@ inline constexpr bool kLinearSlots = true;
 inline constexpr std::uint32_t kLaneBase = 16;
 inline constexpr std::uint32_t kStandardBase = 32;
 
+// The standard tree's nodes over two lane products come from the lane root's transform (lane_pairs)
+// when the lanes have at least this length (the nodes' length is twice it, >= 64).
+inline constexpr std::size_t kPairsLength = 32;
+
 // Lanes run when at least this many factors are small (degree at most 1/64 of the sum of all
 // degrees): from 16 linear factors on Zen 3 (notes.md).
 inline constexpr std::size_t kMinLaneFactors = 16;
