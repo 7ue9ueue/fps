@@ -10,7 +10,8 @@
 //   3. measure_ragged(): the plan kinds per main length and bucket of r / L (ragged.hpp; "truncated/
 //      floor": products truncated, the others floor; then the middle products' kind), every main
 //      length (scalar and sse: to 2^14), 5 samples of at least 1 ms, margin 1%; the times per kind,
-//      products then middle products. Fields ragged and middle: the two tables of Kinds.
+//      products then middle products (at the bucket's middle / its first length). Fields ragged and
+//      middle: the two tables of Kinds.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -86,7 +87,8 @@ int main() {
         for (std::size_t k = 0; k < t.kinds.size(); ++k) std::printf(" %s %.1f", kind_names[t.kinds[k]], t.ns[k]);
         std::printf("\n# middle %d %d: %s (compiled %s)", t.lg, t.bucket, kind_names[detail::ragged::middle_kind(kinds[im])],
                     kind_names[detail::ragged::middle_kind(detail::ragged::kKindDefaults[im])]);
-        for (std::size_t k = 0; k < t.kinds.size(); ++k) std::printf(" %s %.1f", kind_names[t.kinds[k]], t.middle[k]);
+        for (std::size_t k = 0; k < t.kinds.size(); ++k)
+            std::printf(" %s %.1f/%.1f", kind_names[t.kinds[k]], t.middle[k], t.first[k]);  // the middle, the first length
         std::printf("\n");
     }
     std::printf("# seconds %.1f\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count());

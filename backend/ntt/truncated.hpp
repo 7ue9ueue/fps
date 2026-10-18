@@ -492,7 +492,7 @@ template <bool kRoot>
 // Column j of a radix-4 level's co_forward (above): p(u) is p_u's word j (u <= kT in step 1, u < kT
 // in step 2), X + v c + j gets R_v (v <= kT in step 1, v < kT in step 2; R_kT is read there in step
 // 2) and, below the root, the free p_u (u > kT in step 1, u >= kT in step 2). kRoot: node 0 (x = y =
-// 1, z = r(1)), kT >= 1 there. In [0, 2P) from [0, 2P).
+// 1, z = r(1)), kT >= 2 there (rr > L: t = 2 with rest > 0, or 3). In [0, 2P) from [0, 2P).
 template <bool kSecond, int kT, bool kRoot, class Load>
 [[gnu::always_inline]] inline void co_column4(Load p, u32* X, std::size_t c, std::size_t j, const MiddleConstants& k) {
     const auto R = [&](int v) { return Vec::load(X + std::size_t(v) * c + j); };
@@ -508,9 +508,9 @@ template <bool kSecond, int kT, bool kRoot, class Load>
         put(0, add2(e, f)), put(1, sub2(e, f)), put(2, twice(g));
         if constexpr (!kRoot) put(3, k.inv_x.times(sub4(q1, gz)));
     } else if constexpr (!kSecond && kT == 1) {  // R2 = R3 = 0: p2 = p0 / x, p3 = p1 / x
-        const V q0 = p(0), q1 = p(1), yq1 = by<kRoot>(k.y, q1);
-        put(0, twice(add2(q0, yq1))), put(1, twice(sub2(q0, yq1)));
-        if constexpr (!kRoot) put(2, k.inv_x.times(q0)), put(3, k.inv_x.times(q1));
+        static_assert(!kRoot);
+        const V q0 = p(0), q1 = p(1), yq1 = k.y.times(q1);
+        put(0, twice(add2(q0, yq1))), put(1, twice(sub2(q0, yq1))), put(2, k.inv_x.times(q0)), put(3, k.inv_x.times(q1));
     } else if constexpr (!kSecond) {  // kT = 0: P = p0 (X + y)(X^2 + x) / (x y)
         static_assert(!kRoot);
         const V q0 = p(0);
@@ -633,9 +633,9 @@ inline void co_forward(const u32* v, u32* F, const Shape& s, const u32* r, const
             if (d > 0) {
                 if (second) co_columns<true, kT>(X, c, j0, j1, k);
                 else co_columns<false, kT>(X, c, j0, j1, k);
-            } else if constexpr (kT >= 1) {  // a radix-4 root: t >= 2 (N > L)
-                if (!second) co_root<4, false, kT>(v, s.N, X, c, j0, j1, k);
-                else if constexpr (kT >= 2) co_root<4, true, kT>(v, s.N, X, c, j0, j1, k);
+            } else if constexpr (kT >= 2) {  // a radix-4 root: kt >= 2 (rr > L)
+                if (second) co_root<4, true, kT>(v, s.N, X, c, j0, j1, k);
+                else co_root<4, false, kT>(v, s.N, X, c, j0, j1, k);
             }
         });
     };
@@ -687,7 +687,7 @@ template <int kT>
 }
 
 // The root's words at column j (true scale, canonical) to sink(u, word): radix 2 from R0, R1;
-// radix 4 from R_v, v <= kT (zero past).
+// radix 4 from R_v, v <= kT (zero past; kT >= 2: rr > L).
 template <int kRadix, int kT, class Sink>
 [[gnu::always_inline]] inline void pi_root_column(const u32* X, std::size_t c, std::size_t j, const MiddleConstants& k,
                                                   Sink sink) {
@@ -696,9 +696,6 @@ template <int kRadix, int kT, class Sink>
     const V r0 = R(0), r1 = R(1);
     if constexpr (kRadix == 2) {
         out(0, k.sc.times(add4(r0, r1))), out(1, k.sc.times(sub4(r0, r1)));
-    } else if constexpr (kT == 1) {
-        const V s = k.sc.times(add4(r0, r1)), a = k.sc.times(sub4(r0, r1));
-        out(0, s), out(1, a), out(2, s), out(3, a);
     } else {
         const V s01 = add2(r0, r1), a = k.sc.times(sub4(r0, r1));
         V s23 = R(2), b;
@@ -782,7 +779,7 @@ inline void pruned_inverse(u32* F, u32* out, std::size_t lo, std::size_t hi, con
         with_blocks<3>(int(rest ? t : t - 1), [&](auto u) {
             constexpr int kT = decltype(u)::value;
             if (d > 0) pi_columns<kT>(X, c, k);
-            else if constexpr (kT >= 1) pi_root<4, kT>(X, c, out, lo, hi, k);  // t >= 2 at a radix-4 root
+            else if constexpr (kT >= 2) pi_root<4, kT>(X, c, out, lo, hi, k);  // kt >= 2 at a radix-4 root (rr > L)
         });
     }
 }

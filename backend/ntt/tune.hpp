@@ -182,10 +182,14 @@ inline std::optional<Choices> parse(std::string_view s) {
 // budget.max_lg (and lg < kMaxLog), and each bucket b of r / L, every kind's plan at N = L + (2b - 1)
 // L / 32 (the bucket's middle), a product of factors of N / 2 + 1 and N - N / 2 words by multiply's
 // path (detail::product), and a middle product of f of N words and g of N / 2 (out of N - N / 2 + 1,
-// the bench's) by middle_product's (detail::middle). The fastest kind wins unless start's is within
-// the margin, for products, for the others (the products' times, truncated plans aside) and for
-// middle products; a row keeps the least kind with the plan that won (a kind falls back to a lesser
-// one where it is no plan, and the middle may fall back where other words of the bucket do not).
+// the bench's) by middle_product's (detail::middle), there and at the bucket's first length, L + (b -
+// 1) L / 16 + 1 (in bucket 1 the split plans' cost falls to the main product's as r -> 0, the
+// truncated plan's partial levels do not: at 2^16 + 1 it ran 1.04x the top plan's time on Zen 5,
+// tying at the middle). The fastest kind wins unless start's is within the margin, for products and
+// for the others (the products' times, truncated plans aside); for middle products the kind whose
+// worse time of the two over the fastest's there is least. A row keeps the least kind with the plan
+// that won (a kind falls back to a lesser one where it is no plan, and the middle may fall back where
+// other words of the bucket do not).
 // Rows run from short to long and each is set before the next, so a top product runs the measured
 // rows. Past max_lg each bucket keeps start's entries, unless its choice at max_lg changed: then the
 // longer rows take the new one.
@@ -194,6 +198,7 @@ struct RaggedTimes {
     std::vector<int> kinds;      // the distinct kinds timed
     std::vector<double> ns;      // their products' times
     std::vector<double> middle;  // their middle products'
+    std::vector<double> first;   // their middle products' at the bucket's first length
 };
 
 inline detail::ragged::Kinds measure_ragged(const detail::ragged::Kinds& start, const Budget& budget, std::vector<RaggedTimes>* log = nullptr) {
@@ -205,7 +210,8 @@ inline detail::ragged::Kinds measure_ragged(const detail::ragged::Kinds& start, 
             const std::size_t N = L + std::max<std::size_t>(1, (2 * std::size_t(b) - 1) * L / (2 * detail::ragged::kBuckets));
             const std::size_t n = N / 2 + 1, m = N + 1 - n;
             const std::vector<detail::Line> a = detail::random_lines(n), c = detail::random_lines(m);
-            const std::size_t mg = N / 2, mc = N - mg + 1;  // a middle product's g and out
+            const std::size_t mg = N / 2;  // a middle product's g (out of N - mg + 1 words)
+            const std::size_t N0 = L + (std::size_t(b) - 1) * L / detail::ragged::kBuckets + 1, mg0 = N0 / 2;
             const std::vector<detail::Line> v = detail::random_lines(N);
             std::vector<std::uint32_t> out(N);
             std::vector<int> ids;  // kinds with distinct plans; kPlain first
@@ -224,10 +230,14 @@ inline detail::ragged::Kinds measure_ragged(const detail::ragged::Kinds& start, 
                                                          detail::ragged::plan(N, k));
                 asm volatile("" : : "r"(out.data()) : "memory");
             });
-            const std::vector<double> middle = tune::time_each(budget.samples, budget.min_sample_ns, ids, [&](int k) {
-                detail::middle<SelectedMultiply>(v.data()->words, c.data()->words, mg, out.data(), mc, detail::ragged::plan(N, k));
-                asm volatile("" : : "r"(out.data()) : "memory");
-            });
+            const auto middle_times = [&](std::size_t len, std::size_t g) {
+                return tune::time_each(budget.samples, budget.min_sample_ns, ids, [&](int k) {
+                    detail::middle<SelectedMultiply>(v.data()->words, c.data()->words, g, out.data(), len - g + 1,
+                                                     detail::ragged::plan(len, k));
+                    asm volatile("" : : "r"(out.data()) : "memory");
+                });
+            };
+            const std::vector<double> middle = middle_times(N, mg), first = middle_times(N0, mg0);
             // The kind among those `allowed` (products, middle products: all; others: no truncated plan)
             // by times t: the fastest, unless `current`'s plan is within the margin. ids holds the least
             // kind of each plan: stored rather than start's own kind, which may fall back to that plan
@@ -245,8 +255,11 @@ inline detail::ragged::Kinds measure_ragged(const detail::ragged::Kinds& start, 
             const int product = pick(ns, detail::ragged::product_kind(start[i]), all);
             const int other = pick(ns, detail::ragged::other_kind(start[i]), [](int k) { return k != detail::ragged::kTruncated; });
             kinds[i] = detail::ragged::encode(product, other);
-            kinds[im] = std::uint8_t(pick(middle, detail::ragged::middle_kind(start[im]), all));
-            if (log) log->push_back({lg, b, ids, ns, middle});
+            std::vector<double> worse(ids.size());  // middle products: each kind's worse ratio to the fastest
+            const double best = *std::ranges::min_element(middle), best0 = *std::ranges::min_element(first);
+            for (std::size_t j = 0; j < ids.size(); ++j) worse[j] = std::max(middle[j] / best, first[j] / best0);
+            kinds[im] = std::uint8_t(pick(worse, detail::ragged::middle_kind(start[im]), all));
+            if (log) log->push_back({lg, b, ids, ns, middle, first});
         }
 #ifndef FPS_NO_TUNER
         detail::ragged::kinds.set(kinds);
