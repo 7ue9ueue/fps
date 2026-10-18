@@ -61,9 +61,22 @@ inline constexpr std::size_t kDirectInterpolate = 32, kDirectNewton = 64;  // a 
 // fraction of it (lc-opt's choice; newton_slots).
 inline constexpr double kNewtonPad = 0.65;
 
+// interpolate(): lane nodes of at most this many slots (4 bases of 16) run as one group: the
+// descent to all their bases' values, one inversion for them all (one power), then the sums.
+// Against 32 slots (two bases), interpolate at 2^12-2^20: Zen 5 0.978-0.991 of the time, Zen 3,
+// Neoverse V2 0.993-1.002, Emerald Rapids 0.99-1.00; 128 and 256 no better (notes/136-r3.md).
+// -DFPS_EVALUATION_GROUP=s sets another (at least 32).
+#if defined(FPS_EVALUATION_GROUP)
+inline constexpr std::size_t kInterpolateGroup = FPS_EVALUATION_GROUP;
+#else
+inline constexpr std::size_t kInterpolateGroup = 64;
+#endif
+
 // The lanes' halvings leave their combine (P_lo -+ T) to the child's products, which then read
 // both halves (pointwise_twice): the descent at 2^17 0.978 of the time on Zen 3 and 0.985 on
-// Emerald Rapids, 0.976-1.003 on Zen 5 (two runs), 1.005 on Neoverse V2 (notes/136-r2.md).
+// Emerald Rapids, 0.976-1.003 on Zen 5 (two runs), 1.005 on Neoverse V2 (notes/136-r2.md). The
+// Newton basis' too (combine_product, #136 r3): newton 0.995-1.000 on Zen 3, about 1 on Emerald
+// Rapids and Zen 5.
 #if defined(__ARM_NEON) && defined(__aarch64__)
 inline constexpr bool kDeferredCombine = false;
 #else

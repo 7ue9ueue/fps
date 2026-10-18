@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -40,6 +41,7 @@ using product_tree::detail::LaneNode;
 using product_tree::detail::lane_pairs;
 using product_tree::detail::LaneTree;
 using product_tree::detail::leaf_products;
+using product_tree::detail::leaf_products_twice;
 using product_tree::detail::leaf_weights;
 using product_tree::detail::pointwise;
 using product_tree::detail::Rooms;
@@ -314,7 +316,7 @@ public:
     const u32* product_transform() const { return qt_; }
 
     // Stack words the passes take past the tree, at most.
-    static std::size_t pass_words(std::size_t m8) { return 12 * Stack::footprint(8 * lane_length(m8 / 8)) + 4096; }
+    static std::size_t pass_words(std::size_t m8) { return 12 * Stack::footprint(8 * lane_length(m8 / 8)) + group_words() + 4096; }
 
     // values[8 k + l] = the window of slot k of lane l, from the root's window w (m8 words) of
     // the evaluation's descent; canonical.
@@ -322,7 +324,7 @@ public:
         const Stack::Mark mark = stack.mark();
         u32* const lanes = stack.take(16 * lane_length_);
         const u32 u = descend_top(w, lanes, stack);
-        descend_lanes(0, count_, lanes, kDeferredCombine ? -1 : 0, u, values, stack);
+        descend_lanes(0, count_, lanes, kDeferredCombine ? -1 : 0, u, values, 0, stack);
         stack.release(mark);
     }
 
@@ -332,8 +334,9 @@ public:
     void descend_newton(const u32* w, u32* values, Stack& stack) const {
         const Stack::Mark mark = stack.mark();
         u32* const lanes = stack.take(16 * lane_length_);
-        const u32 u = newton_top(w, lanes, stack);
-        newton_lanes(0, count_, lanes, u, values, stack);
+        int pending = 0;
+        const u32 u = newton_top(w, lanes, pending, stack);
+        newton_lanes(0, count_, lanes, pending, u, values, stack);
         stack.release(mark);
     }
 
@@ -357,8 +360,30 @@ private:
     using Top = Layout<1>;
     using Lane = Layout<8>;
 
+    // A group's bases' products (interpolate_group), in slot order, in the stack: at most
+    // kInterpolateGroup / 8 of them (a base has at least kLaneBase / 2 slots).
+    struct Kept {
+        BaseProducts* products;
+        std::size_t count = 0;
+    };
+    static constexpr std::size_t kBaseWords = (sizeof(BaseProducts) + 63) / 64 * 16;
+    static constexpr std::size_t kGroupChains = 8;  // divide_slots' chains over a group's values
+    static_assert(kInterpolateGroup >= 2 * kLaneBase, "a group holds two bases at least");
+    static std::size_t group_words() {
+        return Stack::footprint(8 * kInterpolateGroup) + Stack::footprint((kInterpolateGroup / 8 + 1) * kBaseWords);
+    }
+
     // Factor u = 1 / f_v times 2^32 mod P, for scale().
     static u32 montgomery_factor(u32 u) { return multiply_mod(u, kR); }
+
+    // to = the transform of length `length` of w (n words) right-aligned: read in place by the
+    // transform's first level when n = length (C = L), else copied behind zeros.
+    static void forward_window(const u32* w, std::size_t n, u32* to, std::size_t length) {
+        if (n == length) return transform(length).forward(std::span<const u32>(w, n), to);
+        std::fill(to, to + length - n, 0u);
+        std::copy_n(w, n, to + length - n);
+        forward(to, length);
+    }
 
     // The top tree from the lane tree's root: its transform at T = 2L in doubled_ (the root's
     // product pass writes the lower half, forward_upper from its coefficients the upper); the
@@ -420,20 +445,21 @@ private:
         const std::size_t L = lane_length_, T = 2 * L;
         const Stack::Mark mark = stack.mark();
         u32* const s = stack.take(4 * T);
-        std::fill(s, s + 4 * T - m8_, 0u);
-        std::copy_n(w, m8_, s + 4 * T - m8_);
-        forward(s, 4 * T);
-        u32* const p = stack.take(4 * T);
+        forward_window(w, m8_, s, 4 * T);
+        // Each node's two children's products from one window of its state (leaf_products_twice):
+        // half 0's (s Q_1) in s, half 1's (s Q_0) beside it; pair 2h's in half h's state, 2h + 1's
+        // in q.
+        u32* const halves[2] = {s, stack.take(4 * T)};
+        leaf_products_twice<Lanes>(s, halves_[1], halves_[0], halves[0], halves[1], 4 * T / 8, leaf_weights(4 * T / 8));
         const u32* states[4];
         for (int h = 0; h < 2; ++h) {
-            Top::product(s, halves_[1 - h], p, 4 * T);
+            u32* const p = halves[h];
             to_child<1>(p, 4 * T, 4 * T, 2 * T);
-            for (int side = 0; side < 2; ++side) {
-                u32* const q = stack.take(2 * T);
-                Top::product(p, pairs_[h][1 - side], q, 2 * T);
-                to_child<1>(q, 2 * T, 2 * T, T);
-                states[2 * h + side] = q;
-            }
+            u32* const q = stack.take(2 * T);
+            leaf_products_twice<Lanes>(p, pairs_[h][1], pairs_[h][0], p, q, 2 * T / 8, leaf_weights(2 * T / 8));
+            to_child<1>(p, 2 * T, 2 * T, T);
+            to_child<1>(q, 2 * T, 2 * T, T);
+            states[2 * h] = p, states[2 * h + 1] = q;
         }
         pairs_to_lanes<Lanes>(states, doubled_, T, lanes, twist_factors<false>(T / 8));
         to_child_deferred(lanes, T, T, L);
@@ -446,12 +472,13 @@ private:
     // halving when C = L), a left child's (W_v Q_r)[s_r, s_v). On the rightmost path the windows
     // are prefixes of w (lc-opt's): the states there are forwards of them, scaled by 2 per level
     // as the halvings scale the others. The leaves: when C = L, one halving of the lanes with a
-    // sign per lane (left leaves the upper half, right ones the lower); else the lanes' inverse and
-    // each lane's window.
-    u32 newton_top(const u32* w, u32* lanes, Stack& stack) const {
+    // sign per lane (left leaves the upper half, right ones the lower; left to the lane root's
+    // product where kDeferredCombine: pending 2), else the lanes' inverse and each lane's window.
+    u32 newton_top(const u32* w, u32* lanes, int& pending, Stack& stack) const {
         const std::size_t L = lane_length_, T = 2 * L, C = count_;
         const Stack::Mark mark = stack.mark();
         const auto known = [&](u32* to, std::size_t n, std::size_t length, u32 factor) {
+            if (factor == 1) return forward_window(w, n, to, length);
             std::fill(to, to + length - n, 0u);
             scale<Wide>(w, montgomery_factor(factor), to + length - n, n);
             forward(to, length);
@@ -479,7 +506,8 @@ private:
         if (C == L) {
             lanes_inverse_upper(lanes + 8 * L, 16 * L);
             forward(lanes + 8 * L, 8 * L);
-            combine_alternating<Wide>(lanes, 8 * L);
+            if constexpr (kDeferredCombine) pending = 2;
+            else combine_alternating<Wide>(lanes, 8 * L);
             u = half(half(half(1)));
         } else {
             alignas(64) u32 factors[8];
@@ -529,8 +557,11 @@ private:
         else pointwise_twice<Wide>(s, r, l, right, words);
     }
 
-    // Node [lo, hi) of the lane tree with state s (factor 1 / u; pending: children_products).
-    void descend_lanes(std::size_t lo, std::size_t hi, u32* s, int pending, u32 u, u32* values, Stack& stack) const {
+    // Node [lo, hi) of the lane tree with state s (factor 1 / u; pending: children_products): its
+    // slots' windows into values (slot first first); kept: its bases' products constructed there
+    // (from kept->count on, in slot order) and left for the caller (interpolate_group).
+    void descend_lanes(std::size_t lo, std::size_t hi, u32* s, int pending, u32 u, u32* values, std::size_t first, Stack& stack,
+                       Kept* kept = nullptr) const {
         const std::size_t length = lane_length(lanes_.degree(lo, hi)), words = 8 * length, mid = lanes_.split(lo, hi);
         const Stack::Mark mark = stack.mark();
         u32* const products[2] = {s, stack.take(words)};
@@ -542,10 +573,12 @@ private:
                 inverse(p, words);
                 u32* const w = p + 8 * (length - (chi - clo));
                 scale<Wide>(w, montgomery_factor(u), w, 8 * (chi - clo));
-                base_descend(clo, chi, w, values + 8 * clo);
+                u32* const to = values + 8 * (clo - first);
+                if (kept) base_descend(*new (kept->products + kept->count++) BaseProducts(slots_, clo, chi), 1, clo, chi, w, to);
+                else base_descend(clo, chi, w, to);
             } else {
                 const int sign = to_child_deferred(p, length, length, lane_length(lanes_.degree(clo, chi)));
-                descend_lanes(clo, chi, p, kDeferredCombine ? sign : 0, sign ? half(u) : u, values, stack);
+                descend_lanes(clo, chi, p, kDeferredCombine ? sign : 0, sign ? half(u) : u, values, first, stack, kept);
             }
         }
         stack.release(mark);
@@ -567,15 +600,22 @@ private:
         base_descend(products, 2 * v + 1, mid, hi, right, out + 8 * (mid - lo));
     }
 
-    void newton_lanes(std::size_t lo, std::size_t hi, u32* s, u32 u, u32* values, Stack& stack) const {
+    // Node [lo, hi) of the Newton basis' lane tree with state s (factor 1 / u): its one product
+    // (the left child's) with the halving's combine left undone in s when pending (combine_product:
+    // -1, 1, or 2 for combine_alternating's signs), then its children.
+    void newton_lanes(std::size_t lo, std::size_t hi, u32* s, int pending, u32 u, u32* values, Stack& stack) const {
         const std::size_t length = lane_length(lanes_.degree(lo, hi)), words = 8 * length, mid = lanes_.split(lo, hi);
         const std::size_t e = length - (mid - lo);
         const Stack::Mark mark = stack.mark();
         u32* const p = stack.take(words);
-        Lane::product(s, lane_store_.right(mid, words), p, words);
+        const u32* const r = lane_store_.right(mid, words);
+        if (pending == 0) Lane::product(s, r, p, words);
+        else if (pending < 0) combine_product<Wide, -1>(s, r, p, words);
+        else if (pending == 1) combine_product<Wide, 1>(s, r, p, words);
+        else combine_product<Wide, 2>(s, r, p, words);
         const std::size_t sides[2][3] = {{lo, mid, length}, {mid, hi, e}};
         u32* const states[2] = {p, s};
-        bool halved[2] = {};
+        int sign[2] = {};
         for (int side = 0; side < 2; ++side) {
             const auto [clo, chi, end] = sides[side];
             if (lanes_.base(clo, chi)) {
@@ -583,13 +623,13 @@ private:
                 u32* const w = states[side] + 8 * (end - (chi - clo));
                 scale<Wide>(w, montgomery_factor(u), w, 8 * (chi - clo));
             } else {
-                halved[side] = to_child<8>(states[side], length, end, lane_length(lanes_.degree(clo, chi)));
+                sign[side] = to_child_deferred(states[side], length, end, lane_length(lanes_.degree(clo, chi)));
             }
         }
         for (int side = 0; side < 2; ++side) {
             const auto [clo, chi, end] = sides[side];
             if (lanes_.base(clo, chi)) newton_base(clo, chi, states[side] + 8 * (end - (chi - clo)), values);
-            else newton_lanes(clo, chi, states[side], halved[side] ? half(u) : u, values, stack);
+            else newton_lanes(clo, chi, states[side], kDeferredCombine ? sign[side] : 0, sign[side] ? half(u) : u, values, stack);
         }
         stack.release(mark);
     }
@@ -610,16 +650,16 @@ private:
     // Interpolation. Lane node [lo, hi)'s sum R_v = sum over its points of w_i Q_v / (1 - a_i x)
     // = R_l Q_r + R_r Q_l, of degree < s_v <= L: its transform of length L from the children's
     // (at length L) and the kept ones; then, for a longer parent, doubled as the product tree's
-    // nodes (inverse, forward_upper). out: the transform at out_length >= L.
-    template <class Child>
-    void sums(std::size_t mid, std::size_t length, u32* out, std::size_t out_length, Stack& stack, Child child) const {
+    // nodes (inverse, forward_upper). out: the transform at out_length >= L. children(a, b): the
+    // children's sums' transforms of length L into a and b.
+    template <class Children>
+    void sums(std::size_t mid, std::size_t length, u32* out, std::size_t out_length, Stack& stack, Children children) const {
         const std::size_t words = 8 * length;
         const Stack::Mark mark = stack.mark();
         u32* const upper = out + words;
         u32* const a = out_length >= 2 * length ? upper : stack.take(words);
         u32* const b = stack.take(words);
-        child(0, a);
-        child(1, b);
+        children(a, b);
         const bool longer = out_length > 2 * length;
         u32* const copy = out_length == length ? nullptr : longer ? stack.take(words + 8) : upper;
         Lane::product_sums(a, lane_store_.right(mid, words), b, lane_store_.left(mid), out, copy, b, words);
@@ -637,28 +677,77 @@ private:
 
     // Node [lo, hi) of the lane tree with descent state s (factor 1 / u; pending: children_products):
     // its children's descents and subtrees, then its sum's transform of length out_length into out.
+    // Nodes of at most kInterpolateGroup slots run as one group.
     void interpolate_lanes(std::size_t lo, std::size_t hi, u32* s, int pending, u32 u, const u32* y, std::size_t m, u32* out,
                            std::size_t out_length, Stack& stack) const {
+        if (hi - lo <= kInterpolateGroup) return interpolate_group(lo, hi, s, pending, u, y, m, out, out_length, stack);
         const std::size_t length = lane_length(lanes_.degree(lo, hi)), words = 8 * length, mid = lanes_.split(lo, hi);
         const Stack::Mark mark = stack.mark();
         u32* const products[2] = {s, stack.take(words)};
         children_products(s, pending, mid, words, products[1]);
-        sums(mid, length, out, out_length, stack, [&](int side, u32* to) {
-            const std::size_t clo = side ? mid : lo, chi = side ? hi : mid;
-            u32* const p = products[side];
-            if (lanes_.base(clo, chi)) {
-                inverse(p, words);
-                u32* const w = p + 8 * (length - (chi - clo));
-                scale<Wide>(w, montgomery_factor(u), w, 8 * (chi - clo));
-                base_interpolate(clo, chi, w, y, m, to);
-                std::fill(to + 8 * (chi - clo), to + words, 0u);
-                forward(to, words);
-            } else {
-                const int sign = to_child_deferred(p, length, length, lane_length(lanes_.degree(clo, chi)));
-                interpolate_lanes(clo, chi, p, kDeferredCombine ? sign : 0, sign ? half(u) : u, y, m, to, length, stack);
+        sums(mid, length, out, out_length, stack, [&](u32* a, u32* b) {
+            u32* const to[2] = {a, b};
+            for (int side = 0; side < 2; ++side) {
+                const std::size_t clo = side ? mid : lo, chi = side ? hi : mid;
+                u32* const p = products[side];
+                if (lanes_.base(clo, chi)) {  // a group of 2 kLaneBase slots beside it (node 2 kLaneBase + 1)
+                    inverse(p, words);
+                    u32* const w = p + 8 * (length - (chi - clo));
+                    scale<Wide>(w, montgomery_factor(u), w, 8 * (chi - clo));
+                    base_interpolate(clo, chi, w, y, m, to[side]);
+                    std::fill(to[side] + 8 * (chi - clo), to[side] + words, 0u);
+                    forward(to[side], words);
+                } else {
+                    const int sign = to_child_deferred(p, length, length, lane_length(lanes_.degree(clo, chi)));
+                    interpolate_lanes(clo, chi, p, kDeferredCombine ? sign : 0, sign ? half(u) : u, y, m, to[side], length, stack);
+                }
             }
         });
         stack.release(mark);
+    }
+
+    // The interpolation below node [lo, hi) of at most kInterpolateGroup slots (#136 r3): the
+    // descent to its bases' values M'(a_i) first (descend_lanes, each base's products kept), the
+    // weights y_i / M'(a_i) by one inversion for all of them (divide_slots: one power, where each
+    // base had its own), then the sums up the subtree (group_sums). Throws as interpolate().
+    void interpolate_group(std::size_t lo, std::size_t hi, u32* s, int pending, u32 u, const u32* y, std::size_t m, u32* out,
+                           std::size_t out_length, Stack& stack) const {
+        const Stack::Mark mark = stack.mark();
+        u32* const values = stack.take(8 * (hi - lo));
+        Kept kept{reinterpret_cast<BaseProducts*>(stack.take(bases(lo, hi) * kBaseWords))};
+        descend_lanes(lo, hi, s, pending, u, values, lo, stack, &kept);
+        if (!divide_slots<Lanes, kGroupChains, 8 * kInterpolateGroup>(values, y + 8 * lo, 8 * lo, m, 8 * (hi - lo)))
+            throw std::domain_error("fps::evaluation::interpolate: repeated points");
+        kept.count = 0;
+        group_sums(lo, hi, values, lo, kept, out, out_length, stack);
+        stack.release(mark);
+    }
+
+    // Node [lo, hi) of a group's sums from its slots' weights (values, slot first first) and its
+    // bases' kept products (in slot order, from kept.count on): as interpolate_lanes' sums.
+    void group_sums(std::size_t lo, std::size_t hi, const u32* values, std::size_t first, Kept& kept, u32* out, std::size_t out_length,
+                    Stack& stack) const {
+        const std::size_t length = lane_length(lanes_.degree(lo, hi)), words = 8 * length, mid = lanes_.split(lo, hi);
+        sums(mid, length, out, out_length, stack, [&](u32* a, u32* b) {
+            u32* const to[2] = {a, b};
+            for (int side = 0; side < 2; ++side) {
+                const std::size_t clo = side ? mid : lo, chi = side ? hi : mid;
+                if (lanes_.base(clo, chi)) {
+                    base_ascend(kept.products[kept.count++], 1, clo, chi, values + 8 * (clo - first), to[side]);
+                    std::fill(to[side] + 8 * (chi - clo), to[side] + words, 0u);
+                    forward(to[side], words);
+                } else {
+                    group_sums(clo, chi, values, first, kept, to[side], length, stack);
+                }
+            }
+        });
+    }
+
+    // Base nodes below node [lo, hi).
+    std::size_t bases(std::size_t lo, std::size_t hi) const {
+        if (lanes_.base(lo, hi)) return 1;
+        const std::size_t mid = lanes_.split(lo, hi);
+        return bases(lo, mid) + bases(mid, hi);
     }
 
     // The sum of base node [lo, hi) (hi - lo coefficients of 8 words) from its slots' weights w
@@ -672,9 +761,9 @@ private:
         cross_units<Lanes>(left, mid - lo, right, hi - mid, products[2 * v], products[2 * v + 1], out);
     }
 
-    // Base node [lo, hi) of the interpolation from its window w: the descent to its slots' values
-    // M'(a_i), the weights y_i / M'(a_i) (0 past the m points; one inversion per base), then its
-    // sum (hi - lo coefficients of 8 words) into out from the same products.
+    // Base node [lo, hi) of the interpolation alone from its window w: the descent to its slots'
+    // values M'(a_i), the weights y_i / M'(a_i) (0 past the m points), then its sum (hi - lo
+    // coefficients of 8 words) into out from the same products.
     void base_interpolate(std::size_t lo, std::size_t hi, const u32* w, const u32* y, std::size_t m, u32* out) const {
         const BaseProducts products(slots_, lo, hi);
         alignas(64) u32 values[8 * kLaneBase];
