@@ -4,32 +4,34 @@
 // (truncated_into) for multiply and square when ragged.hpp's plan is truncated; this header has the
 // shape and the levels above the group products.
 //
-//   shape(N)                  the levels (the partial nodes, the root first) and the full nodes
-//   forward(f, n, F, s, r)    f mod each full node, into F (the leaf form of length 2L, cut)
+//   shape(N)                          the levels (the partial nodes, the root first), the full nodes
+//   forward(f, n, F, s, r)            f mod each full node, into F (the leaf form of length 2L, cut)
 //   inverse(F, out, count, s, r, ir)  F's group products -> out = c[0, count), count <= N
 //
 // Node k of s words is x^s - r(k)^2 (r: the twiddles of common.hpp); its halves are nodes 2k and 2k
 // + 1, its quarters 4k + t, the root x^(2L) - 1 node 0. A node whose s / 8 is a power of 4 is the
 // variants' group k with s / 8 leaves; nodes split into quarters where those are groups, else into
-// halves (as the variants' trees: a radix-2 level, then radix-4 ones), so only the root has radix 2. The leaf form's first rr
-// words (rr: N rounded up, ragged::rounded) are the full nodes; as c has no words past rr, its
-// residues there give c (van der Hoeven's truncated transform, with the roots of unity of the
-// transform of 2L, so no twist pass).
+// halves (as the variants' trees: a radix-2 level, then radix-4 ones), so only the root has radix
+// 2. The leaf form's first rr words (rr: N rounded up, ragged::rounded) are the full nodes; as c has
+// no words past rr, its residues there give c (van der Hoeven's truncated transform, with the roots
+// of unity of the transform of 2L, so no twist pass).
 //
 // Levels: a partial node of s words, its first n words unknown (0 < n < s), has children of c = s /
 // radix words: t = n / c full ones (group products), then a partial child with n mod c unknown words
 // if n mod c > 0, and none past it. Its forward writes those children. Its inverse runs on columns
 // j < c: word j of each chunk p_u = p[u c, (u + 1) c) and of each child's residue R_v = sum_u rho_v^u
 // p_u (rho = y, -y, z, -z with y = r(2k), z = r(2k + 1); radix 2: x, -x with x = r(k)). Step 1,
-// top-down, on the columns j >= n mod c: p_u is known for u >= t (the root's are zero), so the full
-// children give p_u for u < t, and R_t, the partial child's known word j. Step 2, bottom-up after the
-// partial child, on j < n mod c: p_u for u <= t from R_v, v <= t. The p_u go in place of the
-// children's words (the root's to out); known words are not read again.
+// top-down, on the columns j >= n mod c: p_u is known for u >= t (the root's are zero; under a
+// radix-2 root, x^L + 1's are x^L - 1's, read in place), so the full children give p_u for u < t,
+// and R_t, the partial child's known word j. Step 2, bottom-up after the partial child, on j < n mod
+// c: p_u for u <= t from R_v, v <= t. The p_u go in place of the children's words (the root's to
+// out); known words are not read again.
 //
 // Scales: unnormalized, as the variants' inverses: a group product of nv leaves is nv 2^-32 times
 // its residue, a node's p comes out times its leaves 2^-32 too, and the root's scale goes into its
 // level's constants. A node's known words are mu times its scale (mu, a power of 2, folded into its
-// constants): radix when its parent had full children, else the parent's mu times radix.
+// constants): radix when its parent had full children, else the parent's mu times radix (1 for x^L
+// + 1's under a radix-2 root).
 //
 // Sources, read for the ideas: J. van der Hoeven, "The truncated Fourier transform and
 // applications", ISSAC 2004; D. Harvey, "A cache-friendly truncated FFT", Theor. Comp. Sci. 410
@@ -131,15 +133,16 @@ inline bool prefetches(std::size_t c) {
 struct Twiddles {
     Constant x, y, z;
     Twiddles(const u32* r, std::size_t k, int radix)
-        : x(Constant::entry(r, k)), y(Constant::entry(r, radix == 4 ? 2 * k : k)), z(Constant::entry(r, radix == 4 ? 2 * k + 1 : k)) {}
+        : x(Constant::entry(r, k)), y(Constant::entry(r, radix == 4 ? 2 * k : k)),
+          z(Constant::entry(r, radix == 4 ? 2 * k + 1 : k)) {}
 };
 
 // Children t <= kLast of a node at column j from chunks u < kLoad of src (the others zero, not
 // read), c words apart; kEdge: each chunk read to len words. kRoot: k = 0 (x = y = 1). In and out
 // < 2P, to dst + t c.
 template <int kRadix, int kLoad, int kLast, bool kEdge, bool kRoot>
-[[gnu::always_inline]] inline void forward_column(const u32* src, std::size_t c, std::size_t len, u32* dst, std::size_t j,
-                                                  const Twiddles& w) {
+[[gnu::always_inline]] inline void forward_column(const u32* src, std::size_t c, std::size_t len, u32* dst,
+                                                  std::size_t j, const Twiddles& w) {
     const V zero = Vec::broadcast(0);
     const auto load = [&]<int u>() -> V {
         if constexpr (u >= kLoad) return zero;
@@ -200,7 +203,8 @@ template <int kRadix, int kLoad, int kLast, bool kEdge, bool kRoot>
         }
         return;
     }
-    for (std::size_t j = j0; j < j1; j += kLanes) forward_column<kRadix, kLoad, kLast, kEdge, kRoot>(src, c, len, dst, j, w);
+    for (std::size_t j = j0; j < j1; j += kLanes)
+        forward_column<kRadix, kLoad, kLast, kEdge, kRoot>(src, c, len, dst, j, w);
 }
 
 // One level's forward: the node's residue from src (its first len <= size words, zero past them),
@@ -258,9 +262,11 @@ struct Constants {
                 sc_z = Constant(multiply_mod(product_scale(lg2), ir[slot(2 * k + 1)]));
             } else {
                 x = Constant::entry(r, k), y = Constant::entry(r, 2 * k);
-                x_mu = Constant(multiply_mod(r[slot(k)], inv_mu)), y_mu = Constant(multiply_mod(r[slot(2 * k)], inv_mu));
+                x_mu = Constant(multiply_mod(r[slot(k)], inv_mu));
+                y_mu = Constant(multiply_mod(r[slot(2 * k)], inv_mu));
                 two_y = Constant(multiply_mod(2, ir[slot(2 * k)]));
-                inv_x = Constant::entry(ir, k), inv_y = Constant::entry(ir, 2 * k), inv_z = Constant::entry(ir, 2 * k + 1);
+                inv_x = Constant::entry(ir, k), inv_y = Constant::entry(ir, 2 * k);
+                inv_z = Constant::entry(ir, 2 * k + 1);
             }
         }
         if (root) sc = Constant(product_scale(lg2));
@@ -288,8 +294,8 @@ struct Out {
 // words past out.count are none (0), in chunk kU - 1 (1) or anywhere (2).
 template <int kRadix, int kU, bool kNext, bool kRoot, int kCut = 0>
     requires(kRoot || kRadix == 4)
-[[gnu::always_inline]] inline void inverse_column(u32* X, const u32* known, std::size_t c, std::size_t j, const Constants& k,
-                                                  const Out& out) {
+[[gnu::always_inline]] inline void inverse_column(u32* X, const u32* known, std::size_t c, std::size_t j,
+                                                  const Constants& k, const Out& out) {
     const auto R = [&](int v) { return Vec::load(X + std::size_t(v) * c + j); };
     const auto K = [&](int u) { return Vec::load(known + std::size_t(u) * c + j); };
     const auto P = [&](int u, V v) {
@@ -363,12 +369,14 @@ template <int kRadix, int kU, bool kNext, bool kRoot, int kCut = 0>
         }
         return;
     }
-    for (std::size_t j = j0; j < j1; j += kLanes) inverse_column<kRadix, kU, kNext, kRoot, kCut>(X, known, c, j, k, out);
+    for (std::size_t j = j0; j < j1; j += kLanes)
+        inverse_column<kRadix, kU, kNext, kRoot, kCut>(X, known, c, j, k, out);
 }
 
 // Step 1 (top-down) or step 2 (bottom-up, second) of a level; N: the product's words.
 template <int kRadix, bool kRoot>
-void inverse_step(const Level& l, bool second, u32* X, const u32* known, std::size_t N, const Constants& k, const Out& out) {
+void inverse_step(const Level& l, bool second, u32* X, const u32* known, std::size_t N, const Constants& k,
+                  const Out& out) {
     const std::size_t c = l.node.size / std::size_t(kRadix), t = l.n / c, rest = l.n % c;
     with_blocks<kRadix - 1>(int(t), [&](auto u) {
         constexpr int kT = decltype(u)::value;

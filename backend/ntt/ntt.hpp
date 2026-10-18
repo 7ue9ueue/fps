@@ -83,9 +83,14 @@
 // length and r / L is a tuned choice ("ntt.ragged"); the plain product at 2L stays one of its
 // options, and powers of two run it. Against the plain products, same run, on Zen 3, Emerald
 // Rapids, Zen 5 and Neoverse V2 (notes/155-r1.md): N = 2^20 + 1 0.49-0.51x the time, 1.25 2^20
-// 0.66-0.69x, 1.5 2^20 0.80-0.82x, 1.75 2^20 1.00 (plain); ns per word of N 1.00-1.05, 1.10-1.13,
-// 1.12-1.15 and 1.17-1.22 of a product of 2^20. Convolution::length and Transform stay powers of
-// two: callers size memory and Newton steps by them.
+// 0.66-0.69x, 1.5 2^20 0.80-0.82x; ns per word of N 1.00-1.05, 1.10-1.13 and 1.12-1.15 of a product
+// of 2^20. multiply and square have a third form (truncated.hpp, notes/155-r2.md): the transform of
+// 2L cut to the first N words of its leaf form (rounded up to nodes of 128 words), the variants'
+// group products on its nodes and generic levels above them; it wins most of (1.25, 1.94) 2^k from
+// 2^12 on: 1.75 2^20 0.90-0.92x the time of the plain product (1.05-1.14 per word of 2^20's, was
+// 1.17-1.24), 1.625 2^20 0.90-0.96x, 1.875 2^20 0.95-0.98x. Middle products have no truncated form.
+// Convolution::length and Transform stay powers of two: callers size memory and Newton steps by
+// them.
 //
 // Memory of a product: each thread keeps the largest region a product of it used and hands it to
 // the next one. Constructing, multiplying and destroying a 32 x 32 Convolution takes 110 ns on Zen
